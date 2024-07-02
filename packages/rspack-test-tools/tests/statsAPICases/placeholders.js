@@ -4,7 +4,7 @@ class TestPlugin {
 	apply(compiler) {
 		compiler.hooks.thisCompilation.tap("custom", compilation => {
 			compilation.hooks.optimizeModules.tap("test plugin", () => {
-				stats = compiler.compilation.getStats().toJson({});
+				stats = compiler._lastCompilation.getStats().toJson({});
 			});
 		});
 	}
@@ -22,16 +22,19 @@ module.exports = {
 	},
 	async check() {
 		expect(stats.entrypoints).toMatchInlineSnapshot(`
-      Object {
-        "main": Object {
-          "assets": Array [],
-          "assetsSize": 0,
-          "chunks": Array [
-            null,
-          ],
-          "name": "main",
-        },
-      }
-    `);
+		Object {
+		  "main": Object {
+		    "assets": Array [],
+		    "assetsSize": 0,
+		    "auxiliaryAssets": Array [],
+		    "auxiliaryAssetsSize": 0,
+		    "children": Object {},
+		    "chunks": Array [
+		      null,
+		    ],
+		    "name": "main",
+		  },
+		}
+	`);
 	}
 };

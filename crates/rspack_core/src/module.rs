@@ -14,17 +14,16 @@ use rspack_util::source_map::ModuleSourceMapConfig;
 use rustc_hash::FxHashSet as HashSet;
 use swc_core::ecma::atoms::Atom;
 
-use crate::tree_shaking::visitor::OptimizeAnalyzeResult;
+use crate::concatenated_module::ConcatenatedModule;
 use crate::{
   AsyncDependenciesBlock, BoxDependency, ChunkGraph, ChunkUkey, CodeGenerationResult, Compilation,
-  CompilerContext, CompilerOptions, ConcatenationScope, ConnectionState, Context, ContextModule,
-  DependenciesBlock, DependencyId, DependencyTemplate, ExportInfoProvided, ExternalModule,
-  ImmutableModuleGraph, ModuleDependency, ModuleGraph, ModuleGraphAccessor, ModuleType,
-  MutableModuleGraph, NormalModule, RawModule, Resolve, RuntimeSpec, SelfModule,
-  SharedPluginDriver, SourceType,
+  CompilerOptions, ConcatenationScope, ConnectionState, Context, ContextModule, DependenciesBlock,
+  DependencyId, DependencyTemplate, ExportInfoProvided, ExternalModule, ImmutableModuleGraph,
+  ModuleDependency, ModuleGraph, ModuleGraphAccessor, ModuleType, MutableModuleGraph, NormalModule,
+  RawModule, Resolve, RunnerContext, RuntimeSpec, SelfModule, SharedPluginDriver, SourceType,
 };
 pub struct BuildContext<'a> {
-  pub compiler_context: CompilerContext,
+  pub runner_context: RunnerContext,
   pub plugin_driver: SharedPluginDriver,
   pub compiler_options: &'a CompilerOptions,
 }
@@ -51,6 +50,7 @@ pub struct BuildInfo {
   pub all_star_exports: Vec<DependencyId>,
   pub need_create_require: bool,
   pub json_data: Option<JsonValue>,
+  pub top_level_declarations: Option<HashSet<String>>,
   pub module_concatenation_bailout: Option<String>,
 }
 
@@ -69,6 +69,7 @@ impl Default for BuildInfo {
       all_star_exports: Vec::default(),
       need_create_require: false,
       json_data: None,
+      top_level_declarations: None,
       module_concatenation_bailout: None,
     }
   }
@@ -97,7 +98,13 @@ pub enum BuildMetaDefaultObject {
   #[default]
   False,
   Redirect,
-  RedirectWarn,
+  RedirectWarn {
+    // Whether to ignore the warning, should use false for most cases
+    // Only ignore the cases that do not follow the standards but are
+    // widely used by the community, making it difficult to migrate.
+    // For example, JSON named exports.
+    ignore: bool,
+  },
 }
 
 #[derive(Debug, Default, Clone, Copy, Hash)]
@@ -150,7 +157,6 @@ pub struct BuildResult {
   /// Whether the result is cacheable, i.e shared between builds.
   pub build_meta: BuildMeta,
   pub build_info: BuildInfo,
-  pub analyze_result: OptimizeAnalyzeResult,
   pub dependencies: Vec<BoxDependency>,
   pub blocks: Vec<AsyncDependenciesBlock>,
   pub optimization_bailouts: Vec<String>,
@@ -159,8 +165,6 @@ pub struct BuildResult {
 #[derive(Debug, Default, Clone)]
 pub struct FactoryMeta {
   pub side_effect_free: Option<bool>,
-  /// For old tree shaking
-  pub side_effect_free_old: Option<bool>,
 }
 
 pub type ModuleIdentifier = Identifier;
@@ -192,7 +196,7 @@ pub trait Module:
   fn readable_identifier(&self, _context: &Context) -> Cow<str>;
 
   /// The size of the original source, which will used as a parameter for code-splitting.
-  fn size(&self, _source_type: &SourceType) -> f64;
+  fn size(&self, source_type: Option<&SourceType>, compilation: &Compilation) -> f64;
 
   /// The actual build of the module, which will be called by the `Compilation`.
   /// Build can also returns the dependencies of the module, which will be used by the `Compilation` to build the dependency graph.
@@ -214,7 +218,6 @@ pub trait Module:
       build_meta: Default::default(),
       dependencies: Vec::new(),
       blocks: Vec::new(),
-      analyze_result: Default::default(),
       optimization_bailouts: vec![],
     })
   }
@@ -344,24 +347,29 @@ pub trait Module:
     ConnectionState::Bool(true)
   }
 
-  fn is_available(&self, modified_file: &HashSet<PathBuf>) -> bool {
+  fn need_build(&self) -> bool {
     if let Some(build_info) = self.build_info() {
       if !build_info.cacheable {
-        return false;
+        return true;
       }
+    }
+    false
+  }
 
+  fn depends_on(&self, modified_file: &HashSet<PathBuf>) -> bool {
+    if let Some(build_info) = self.build_info() {
       for item in modified_file {
         if build_info.file_dependencies.contains(item)
           || build_info.build_dependencies.contains(item)
           || build_info.context_dependencies.contains(item)
           || build_info.missing_dependencies.contains(item)
         {
-          return false;
+          return true;
         }
       }
     }
 
-    true
+    false
   }
 }
 
@@ -386,7 +394,7 @@ fn get_exports_type_impl(
       BuildMetaExportsType::Namespace => ExportsType::Namespace,
       BuildMetaExportsType::Default => match default_object {
         BuildMetaDefaultObject::Redirect => ExportsType::DefaultWithNamed,
-        BuildMetaDefaultObject::RedirectWarn => {
+        BuildMetaDefaultObject::RedirectWarn { .. } => {
           if strict {
             ExportsType::DefaultOnly
           } else {
@@ -402,7 +410,7 @@ fn get_exports_type_impl(
           fn handle_default(default_object: &BuildMetaDefaultObject) -> ExportsType {
             match default_object {
               BuildMetaDefaultObject::Redirect => ExportsType::DefaultWithNamed,
-              BuildMetaDefaultObject::RedirectWarn => ExportsType::DefaultWithNamed,
+              BuildMetaDefaultObject::RedirectWarn { .. } => ExportsType::DefaultWithNamed,
               _ => ExportsType::DefaultOnly,
             }
           }
@@ -575,6 +583,7 @@ impl_module_downcast_helpers!(RawModule, raw_module);
 impl_module_downcast_helpers!(ContextModule, context_module);
 impl_module_downcast_helpers!(ExternalModule, external_module);
 impl_module_downcast_helpers!(SelfModule, self_module);
+impl_module_downcast_helpers!(ConcatenatedModule, concatenated_module);
 
 pub struct LibIdentOptions<'me> {
   pub context: &'me str,
@@ -669,7 +678,7 @@ mod test {
           unreachable!()
         }
 
-        fn size(&self, _source_type: &SourceType) -> f64 {
+        fn size(&self, _source_type: Option<&SourceType>, _compilation: &Compilation) -> f64 {
           unreachable!()
         }
 

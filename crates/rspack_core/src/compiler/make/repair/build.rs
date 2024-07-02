@@ -4,10 +4,10 @@ use rspack_error::{Diagnostic, IntoTWithDiagnosticArray};
 
 use super::{process_dependencies::ProcessDependenciesTask, MakeTaskContext};
 use crate::{
-  cache::Cache,
   utils::task_loop::{Task, TaskResult, TaskType},
-  AsyncDependenciesBlock, BoxDependency, BuildContext, BuildResult, CompilerContext,
-  CompilerOptions, DependencyParents, Module, ModuleProfile, ResolverFactory, SharedPluginDriver,
+  AsyncDependenciesBlock, BoxDependency, BuildContext, BuildResult, CompilerModuleContext,
+  CompilerOptions, DependencyParents, Module, ModuleProfile, ResolverFactory, RunnerContext,
+  SharedPluginDriver,
 };
 
 #[derive(Debug)]
@@ -17,7 +17,6 @@ pub struct BuildTask {
   pub resolver_factory: Arc<ResolverFactory>,
   pub compiler_options: Arc<CompilerOptions>,
   pub plugin_driver: SharedPluginDriver,
-  pub cache: Arc<Cache>,
 }
 
 #[async_trait::async_trait]
@@ -30,7 +29,6 @@ impl Task<MakeTaskContext> for BuildTask {
       compiler_options,
       resolver_factory,
       plugin_driver,
-      cache,
       current_profile,
       mut module,
     } = *self;
@@ -38,58 +36,42 @@ impl Task<MakeTaskContext> for BuildTask {
       current_profile.mark_building_start();
     }
 
-    let (build_result, is_cache_valid) = cache
-      .build_module_occasion
-      .use_cache(&mut module, |module| async {
-        plugin_driver
-          .compilation_hooks
-          .build_module
-          .call(module)
-          .await?;
-
-        let result = module
-          .build(
-            BuildContext {
-              compiler_context: CompilerContext {
-                options: compiler_options.clone(),
-                resolver_factory: resolver_factory.clone(),
-                module: module.identifier(),
-                module_context: module.as_normal_module().and_then(|m| m.get_context()),
-                module_source_map_kind: module.get_source_map_kind().clone(),
-                plugin_driver: plugin_driver.clone(),
-                cache: cache.clone(),
-              },
-              plugin_driver: plugin_driver.clone(),
-              compiler_options: &compiler_options,
-            },
-            None,
-          )
-          .await;
-
-        plugin_driver
-          .compilation_hooks
-          .succeed_module
-          .call(module)
-          .await?;
-
-        result.map(|t| {
-          let diagnostics = module
-            .clone_diagnostics()
-            .into_iter()
-            .map(|d| d.with_module_identifier(Some(module.identifier())))
-            .collect();
-          (t.with_diagnostic(diagnostics), module)
-        })
-      })
+    plugin_driver
+      .compilation_hooks
+      .build_module
+      .call(&mut module)
       .await?;
 
-    if is_cache_valid {
-      plugin_driver
-        .compilation_hooks
-        .still_valid_module
-        .call(&mut module)
-        .await?;
-    }
+    let result = module
+      .build(
+        BuildContext {
+          runner_context: RunnerContext {
+            options: compiler_options.clone(),
+            resolver_factory: resolver_factory.clone(),
+            module: CompilerModuleContext::from_module(module.as_ref()),
+            module_source_map_kind: *module.get_source_map_kind(),
+          },
+          plugin_driver: plugin_driver.clone(),
+          compiler_options: &compiler_options,
+        },
+        None,
+      )
+      .await;
+
+    plugin_driver
+      .compilation_hooks
+      .succeed_module
+      .call(&mut module)
+      .await?;
+
+    let build_result = result.map(|t| {
+      let diagnostics = module
+        .clone_diagnostics()
+        .into_iter()
+        .map(|d| d.with_module_identifier(Some(module.identifier())))
+        .collect();
+      t.with_diagnostic(diagnostics)
+    });
 
     if let Some(current_profile) = &current_profile {
       current_profile.mark_building_end();
@@ -102,7 +84,6 @@ impl Task<MakeTaskContext> for BuildTask {
         build_result: Box::new(build_result),
         diagnostics,
         current_profile,
-        from_cache: is_cache_valid,
       })]
     })
   }
@@ -114,7 +95,6 @@ struct BuildResultTask {
   pub build_result: Box<BuildResult>,
   pub diagnostics: Vec<Diagnostic>,
   pub current_profile: Option<Box<ModuleProfile>>,
-  pub from_cache: bool,
 }
 
 impl Task<MakeTaskContext> for BuildResultTask {
@@ -127,46 +107,33 @@ impl Task<MakeTaskContext> for BuildResultTask {
       build_result,
       diagnostics,
       current_profile,
-      from_cache,
     } = *self;
 
-    if let Some(counter) = &mut context.build_cache_counter {
-      if from_cache {
-        counter.hit();
-      } else {
-        counter.miss();
-      }
-    }
-
+    let artifact = &mut context.artifact;
     let module_graph =
-      &mut MakeTaskContext::get_module_graph_mut(&mut context.module_graph_partial);
-    if context.compiler_options.builtins.tree_shaking.enable() {
-      context
-        .optimize_analyze_result_map
-        .insert(module.identifier(), build_result.analyze_result);
-    }
+      &mut MakeTaskContext::get_module_graph_mut(&mut artifact.module_graph_partial);
 
     if !diagnostics.is_empty() {
-      context.make_failed_module.insert(module.identifier());
+      artifact.make_failed_module.insert(module.identifier());
     }
 
     tracing::trace!("Module built: {}", module.identifier());
-    context.diagnostics.extend(diagnostics);
+    artifact.diagnostics.extend(diagnostics);
     module_graph
       .get_optimization_bailout_mut(&module.identifier())
       .extend(build_result.optimization_bailouts);
-    context
+    artifact
       .file_dependencies
-      .extend(build_result.build_info.file_dependencies.clone());
-    context
+      .add_batch_file(&build_result.build_info.file_dependencies);
+    artifact
       .context_dependencies
-      .extend(build_result.build_info.context_dependencies.clone());
-    context
+      .add_batch_file(&build_result.build_info.context_dependencies);
+    artifact
       .missing_dependencies
-      .extend(build_result.build_info.missing_dependencies.clone());
-    context
+      .add_batch_file(&build_result.build_info.missing_dependencies);
+    artifact
       .build_dependencies
-      .extend(build_result.build_info.build_dependencies.clone());
+      .add_batch_file(&build_result.build_info.build_dependencies);
 
     let mut queue = VecDeque::new();
     let mut all_dependencies = vec![];
@@ -208,7 +175,7 @@ impl Task<MakeTaskContext> for BuildResultTask {
       let mgm = module_graph
         .module_graph_module_by_identifier_mut(&module.identifier())
         .expect("Failed to get mgm");
-      mgm.__deprecated_all_dependencies = all_dependencies.clone();
+      mgm.all_dependencies = all_dependencies.clone();
       if let Some(current_profile) = current_profile {
         mgm.set_profile(current_profile);
       }

@@ -121,6 +121,10 @@ impl SplitChunksPlugin {
           .chunk_graph
           .get_module_chunks(module.identifier());
 
+      if belong_to_chunks.is_empty() {
+        return Ok(());
+      }
+
       let chunks_key = Self::get_key(belong_to_chunks.iter());
 
       let mut temp = Vec::with_capacity(self.cache_groups.len());
@@ -153,21 +157,24 @@ impl SplitChunksPlugin {
           );
         }
 
-        temp.push((idx, is_match));
+        temp.push(is_match);
       }
       let mut chunk_key_to_string = HashMap::<ChunksKey, String, ChunksKeyHashBuilder>::default();
-      temp.sort_by(|a, b| a.0.cmp(&b.0));
 
       let filtered = self
         .cache_groups
         .iter()
         .enumerate()
-        .filter(|(index, _)| temp[*index].1);
+        .filter(|(index, _)| temp[*index]);
 
       for (cache_group_index, (idx, cache_group)) in filtered.enumerate() {
         let combs = get_combination(chunks_key);
 
         for chunk_combination in combs {
+          if chunk_combination.is_empty() {
+            continue;
+          }
+
           // Filter by `splitChunks.cacheGroups.{cacheGroup}.minChunks`
           if chunk_combination.len() < cache_group.min_chunks as usize {
             tracing::trace!(
@@ -223,13 +230,15 @@ impl SplitChunksPlugin {
               selected_chunks_key,
             },
             &module_group_map,
-            &mut chunk_key_to_string
+            &mut chunk_key_to_string,
+            compilation
           )?;
 
           fn merge_matched_item_into_module_group_map(
             matched_item: MatchedItem<'_>,
             module_group_map: &DashMap<String, ModuleGroup>,
-            chunk_key_to_string: &mut HashMap::<ChunksKey, String, ChunksKeyHashBuilder>
+            chunk_key_to_string: &mut HashMap::<ChunksKey, String, ChunksKeyHashBuilder>,
+            compilation: &Compilation,
           ) -> Result<()> {
             let MatchedItem {
               idx,
@@ -246,15 +255,14 @@ impl SplitChunksPlugin {
               ChunkNameGetter::String(name) => Some(name.to_string()),
               ChunkNameGetter::Disabled => None,
               ChunkNameGetter::Fn(f) => {
-                let ctx = ChunkNameGetterFnCtx { module };
+                let ctx = ChunkNameGetterFnCtx { module, chunks: &selected_chunks, cache_group_key: &cache_group.key };
                 f(ctx)?
               }
             };
             let key: String = if let Some(cache_group_name) = &chunk_name {
               let mut key =
-                String::with_capacity(cache_group.key.len() + " name:".len() + cache_group_name.len());
+                String::with_capacity(cache_group.key.len() + cache_group_name.len());
               key.push_str(&cache_group.key);
-              key.push_str(" name:");
               key.push_str(cache_group_name);
               key
             } else {
@@ -269,9 +277,8 @@ impl SplitChunksPlugin {
                 },
               };
               let mut key =
-                String::with_capacity(cache_group.key.len() + " chunks:".len() + selected_chunks_key.len());
+                String::with_capacity(cache_group.key.len() + selected_chunks_key.len());
               key.push_str(&cache_group.key);
-              key.push_str(" chunks:");
               key.push_str(&selected_chunks_key);
               key
             };
@@ -282,7 +289,7 @@ impl SplitChunksPlugin {
               })
             };
 
-            module_group.add_module(module);
+            module_group.add_module(module, compilation);
             module_group
               .chunks
               .extend(selected_chunks.iter().map(|c| c.ukey));
@@ -323,7 +330,7 @@ impl SplitChunksPlugin {
             let module = module_graph
               .module_by_identifier(module)
               .unwrap_or_else(|| panic!("Module({module}) not found"));
-            other_module_group.remove_module(&**module);
+            other_module_group.remove_module(&**module, compilation);
           }
         });
 

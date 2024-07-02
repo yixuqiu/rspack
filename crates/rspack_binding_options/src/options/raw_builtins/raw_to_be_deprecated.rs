@@ -1,10 +1,6 @@
-use std::path::PathBuf;
-
 use napi_derive::napi;
 use rspack_core::Builtins;
-use rspack_swc_visitors::{
-  CustomTransform, ImportOptions, ReactOptions, RelayLanguageConfig, RelayOptions, StyleConfig,
-};
+use rspack_swc_visitors::{CustomTransform, ImportOptions, ReactOptions, StyleConfig};
 
 #[derive(Debug)]
 #[napi(object)]
@@ -118,27 +114,6 @@ impl From<RawReactOptions> for ReactOptions {
 
 #[derive(Debug)]
 #[napi(object)]
-pub struct RawRelayConfig {
-  pub artifact_directory: Option<String>,
-  #[napi(ts_type = "'javascript' | 'typescript' | 'flow'")]
-  pub language: String,
-}
-
-impl From<RawRelayConfig> for RelayOptions {
-  fn from(raw_config: RawRelayConfig) -> Self {
-    Self {
-      artifact_directory: raw_config.artifact_directory.map(PathBuf::from),
-      language: match raw_config.language.as_str() {
-        "typescript" => RelayLanguageConfig::TypeScript,
-        "flow" => RelayLanguageConfig::Flow,
-        _ => RelayLanguageConfig::JavaScript,
-      },
-    }
-  }
-}
-
-#[derive(Debug)]
-#[napi(object)]
 pub struct RawBuiltins {
   pub tree_shaking: String,
 }
@@ -148,7 +123,6 @@ impl RawBuiltins {
     Ok(Builtins {
       define: Default::default(),
       provide: Default::default(),
-      tree_shaking: self.tree_shaking.into(),
     })
   }
 }

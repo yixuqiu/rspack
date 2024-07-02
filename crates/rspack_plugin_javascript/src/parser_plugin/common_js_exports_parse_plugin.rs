@@ -4,13 +4,16 @@ use rspack_core::{
 };
 use swc_core::atoms::Atom;
 use swc_core::common::Spanned;
-use swc_core::ecma::ast::{AssignExpr, AssignTarget, CallExpr, PropOrSpread, SimpleAssignTarget};
+use swc_core::ecma::ast::{
+  AssignExpr, AssignTarget, CallExpr, PropOrSpread, SimpleAssignTarget, UnaryExpr,
+};
 use swc_core::ecma::ast::{Callee, ExprOrSpread, Ident, MemberExpr, ObjectLit};
 use swc_core::ecma::ast::{Expr, Lit, Prop, PropName, ThisExpr, UnaryOp};
 
 use super::JavascriptParserPlugin;
 use crate::dependency::{CommonJsExportRequireDependency, CommonJsExportsDependency};
 use crate::dependency::{CommonJsSelfReferenceDependency, ExportsBase, ModuleDecoratorDependency};
+use crate::utils::eval::{self, BasicEvaluatedExpression};
 use crate::visitors::expr_like::ExprLike;
 use crate::visitors::{expr_matcher, JavascriptParser, TopLevelScope};
 
@@ -273,8 +276,11 @@ impl JavascriptParserPlugin for CommonJsExportsParserPlugin {
       };
       parser.bailout();
       parser
-        .presentational_dependencies
-        .push(Box::new(ModuleDecoratorDependency::new(decorator)));
+        .dependencies
+        .push(Box::new(ModuleDecoratorDependency::new(
+          decorator,
+          !parser.is_esm,
+        )));
       Some(true)
     } else if !parser.is_esm && parser.is_exports_ident(ident) {
       parser.bailout();
@@ -403,12 +409,7 @@ impl JavascriptParserPlugin for CommonJsExportsParserPlugin {
       }
 
       if remaining.is_empty() {
-        // exports = {};
-        // module.exports = {};
-        // this = {};
-        parser.bailout();
-        parser.walk_expression(&assign_expr.right);
-        return Some(true);
+        return None;
       }
 
       parser.enable();
@@ -550,5 +551,20 @@ impl JavascriptParserPlugin for CommonJsExportsParserPlugin {
     } else {
       None
     }
+  }
+
+  fn evaluate_typeof(
+    &self,
+    _parser: &mut JavascriptParser,
+    expr: &UnaryExpr,
+    for_name: &str,
+  ) -> Option<BasicEvaluatedExpression> {
+    (for_name == "module" || for_name == "exports").then(|| {
+      eval::evaluate_to_string(
+        "object".to_string(),
+        expr.span.real_lo(),
+        expr.span.real_hi(),
+      )
+    })
   }
 }

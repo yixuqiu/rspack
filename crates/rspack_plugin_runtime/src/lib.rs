@@ -1,8 +1,6 @@
 #![feature(get_mut_unchecked)]
 mod helpers;
 pub use helpers::*;
-mod lazy_compilation;
-pub use lazy_compilation::LazyCompilationPlugin;
 mod common_js_chunk_format;
 pub use common_js_chunk_format::CommonJsChunkFormatPlugin;
 mod runtime_plugin;
@@ -22,7 +20,8 @@ mod import_scripts_chunk_loading;
 pub use import_scripts_chunk_loading::ImportScriptsChunkLoadingPlugin;
 mod runtime_module;
 pub use runtime_module::{
-  chunk_has_css, is_enabled_for_chunk, stringify_chunks, GetChunkFilenameRuntimeModule,
+  chunk_has_css, chunk_has_js, is_enabled_for_chunk, stringify_chunks,
+  GetChunkFilenameRuntimeModule,
 };
 mod startup_chunk_dependencies;
 pub use startup_chunk_dependencies::StartupChunkDependenciesPlugin;

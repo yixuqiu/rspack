@@ -8,78 +8,80 @@
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
 
-import assert from "assert";
 import type { Compilation } from "../Compilation";
 import type {
+	AssetModuleFilename,
+	Bail,
+	CacheOptions,
+	ChunkFilename,
+	ChunkLoading,
+	ChunkLoadingGlobal,
+	Clean,
 	Context,
+	CrossOriginLoading,
+	CssChunkFilename,
+	CssFilename,
 	Dependencies,
-	Node,
+	DevServer,
 	DevTool,
+	DevtoolFallbackModuleFilenameTemplate,
+	DevtoolModuleFilenameTemplate,
+	DevtoolNamespace,
+	EnabledLibraryTypes,
+	EnabledWasmLoadingTypes,
+	EntryFilename,
+	EntryRuntime,
 	EntryStatic,
+	Environment,
 	Externals,
 	ExternalsPresets,
 	ExternalsType,
-	InfrastructureLogging,
-	LibraryOptions,
-	Mode,
-	Name,
-	OptimizationRuntimeChunk,
-	Resolve,
-	Target,
-	SnapshotOptions,
-	CacheOptions,
-	StatsValue,
-	Optimization,
-	Plugins,
-	Watch,
-	WatchOptions,
-	DevServer,
-	Profile,
-	Bail,
-	Builtins,
-	EntryRuntime,
-	ChunkLoading,
-	PublicPath,
-	EntryFilename,
-	Path,
-	Clean,
 	Filename,
-	ChunkFilename,
-	CrossOriginLoading,
-	CssFilename,
-	CssChunkFilename,
-	HotUpdateMainFilename,
-	HotUpdateChunkFilename,
-	AssetModuleFilename,
-	UniqueName,
-	ChunkLoadingGlobal,
-	EnabledLibraryTypes,
-	OutputModule,
-	StrictModuleErrorHandling,
+	GeneratorOptionsByModuleType,
 	GlobalObject,
-	ImportFunctionName,
-	Iife,
-	WasmLoading,
-	EnabledWasmLoadingTypes,
-	WebassemblyModuleFilename,
-	TrustedTypes,
-	SourceMapFilename,
 	HashDigest,
 	HashDigestLength,
 	HashFunction,
 	HashSalt,
-	WorkerPublicPath,
-	RuleSetRules,
-	ParserOptionsByModuleType,
-	GeneratorOptionsByModuleType,
-	RspackFutureOptions,
+	HotUpdateChunkFilename,
 	HotUpdateGlobal,
-	ScriptType,
+	HotUpdateMainFilename,
+	Iife,
+	ImportFunctionName,
+	InfrastructureLogging,
+	LazyCompilationOptions,
+	LibraryOptions,
+	Loader,
+	Mode,
+	Name,
 	NoParseOption,
-	DevtoolNamespace,
-	DevtoolModuleFilenameTemplate,
-	DevtoolFallbackModuleFilenameTemplate,
-	RspackOptions
+	Node,
+	Optimization,
+	OptimizationRuntimeChunk,
+	OutputModule,
+	ParserOptionsByModuleType,
+	Path,
+	Performance,
+	Plugins,
+	Profile,
+	PublicPath,
+	Resolve,
+	RspackFutureOptions,
+	RspackOptions,
+	RuleSetRules,
+	ScriptType,
+	SnapshotOptions,
+	SourceMapFilename,
+	StatsValue,
+	StrictModuleErrorHandling,
+	Target,
+	TrustedTypes,
+	UniqueName,
+	WasmLoading,
+	Watch,
+	WatchOptions,
+	WebassemblyModuleFilename,
+	WorkerPublicPath
 } from "./zod";
 
 export const getNormalizedRspackOptions = (
@@ -168,10 +170,7 @@ export const getNormalizedRspackOptions = (
 						output.auxiliaryComment !== undefined
 							? output.auxiliaryComment
 							: libraryBase.auxiliaryComment,
-					amdContainer:
-						output.amdContainer !== undefined
-							? output.amdContainer
-							: libraryBase.amdContainer,
+					amdContainer: libraryBase.amdContainer,
 					export:
 						output.libraryExport !== undefined
 							? output.libraryExport
@@ -206,14 +205,25 @@ export const getNormalizedRspackOptions = (
 				devtoolNamespace: output.devtoolNamespace,
 				devtoolModuleFilenameTemplate: output.devtoolModuleFilenameTemplate,
 				devtoolFallbackModuleFilenameTemplate:
-					output.devtoolFallbackModuleFilenameTemplate
+					output.devtoolFallbackModuleFilenameTemplate,
+				environment: cloneObject(output.environment)
 			};
 		}),
 		resolve: nestedConfig(config.resolve, resolve => ({
-			...resolve
+			...resolve,
+			tsConfig: optionalNestedConfig(resolve.tsConfig, tsConfig => {
+				return typeof tsConfig === "string"
+					? { configFile: tsConfig }
+					: tsConfig;
+			})
 		})),
 		resolveLoader: nestedConfig(config.resolveLoader, resolve => ({
-			...resolve
+			...resolve,
+			tsConfig: optionalNestedConfig(resolve.tsConfig, tsConfig => {
+				return typeof tsConfig === "string"
+					? { configFile: tsConfig }
+					: tsConfig;
+			})
 		})),
 		module: nestedConfig(config.module, module => ({
 			noParse: module.noParse,
@@ -243,16 +253,8 @@ export const getNormalizedRspackOptions = (
 					...node
 				}
 		),
-		snapshot: nestedConfig(config.snapshot, snapshot => ({
-			resolve: optionalNestedConfig(snapshot.resolve, resolve => ({
-				timestamp: resolve.timestamp,
-				hash: resolve.hash
-			})),
-			module: optionalNestedConfig(snapshot.module, module => ({
-				timestamp: module.timestamp,
-				hash: module.hash
-			}))
-		})),
+		loader: cloneObject(config.loader),
+		snapshot: nestedConfig(config.snapshot, _snapshot => ({})),
 		cache: optionalNestedConfig(config.cache, cache => cache),
 		stats: nestedConfig(config.stats, stats => {
 			if (stats === false) {
@@ -293,18 +295,20 @@ export const getNormalizedRspackOptions = (
 				)
 			};
 		}),
+		performance: config.performance,
 		plugins: nestedArray(config.plugins, p => [...p]),
 		experiments: nestedConfig(config.experiments, experiments => ({
-			...experiments
+			...experiments,
+			lazyCompilation: optionalNestedConfig(
+				experiments.lazyCompilation,
+				options => (options === true ? {} : options)
+			)
 		})),
 		watch: config.watch,
 		watchOptions: cloneObject(config.watchOptions),
 		devServer: config.devServer,
 		profile: config.profile,
-		bail: config.bail,
-		builtins: nestedConfig(config.builtins, builtins => ({
-			...builtins
-		}))
+		bail: config.bail
 	};
 };
 
@@ -485,6 +489,7 @@ export interface OutputNormalized {
 	devtoolNamespace?: DevtoolNamespace;
 	devtoolModuleFilenameTemplate?: DevtoolModuleFilenameTemplate;
 	devtoolFallbackModuleFilenameTemplate?: DevtoolFallbackModuleFilenameTemplate;
+	environment?: Environment;
 }
 
 export interface ModuleOptionsNormalized {
@@ -496,10 +501,9 @@ export interface ModuleOptionsNormalized {
 }
 
 export interface ExperimentsNormalized {
-	lazyCompilation?: boolean;
+	lazyCompilation?: false | LazyCompilationOptions;
 	asyncWebAssembly?: boolean;
 	outputModule?: boolean;
-	newSplitChunks?: boolean;
 	topLevelAwait?: boolean;
 	css?: boolean;
 	futureDefaults?: boolean;
@@ -534,6 +538,7 @@ export interface RspackOptionsNormalized {
 	infrastructureLogging: InfrastructureLogging;
 	devtool?: DevTool;
 	node: Node;
+	loader: Loader;
 	snapshot: SnapshotOptions;
 	cache?: CacheOptions;
 	stats: StatsValue;
@@ -544,7 +549,7 @@ export interface RspackOptionsNormalized {
 	watchOptions: WatchOptions;
 	devServer?: DevServer;
 	ignoreWarnings?: IgnoreWarningsNormalized;
+	performance?: Performance;
 	profile?: Profile;
 	bail?: Bail;
-	builtins: Builtins;
 }

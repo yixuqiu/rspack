@@ -1,14 +1,15 @@
-use std::{fmt::Debug, path::PathBuf};
+use std::{fmt::Debug, path::PathBuf, sync::Arc};
 
 use rspack_error::{Diagnostic, Result};
 use rustc_hash::FxHashSet as HashSet;
 use sugar_path::SugarPath;
 
-use crate::{BoxDependency, BoxModule, Context, ModuleIdentifier, Resolve};
+use crate::{BoxDependency, BoxModule, CompilerOptions, Context, ModuleIdentifier, Resolve};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModuleFactoryCreateData {
   pub resolve_options: Option<Box<Resolve>>,
+  pub options: Arc<CompilerOptions>,
   pub context: Context,
   pub dependency: BoxDependency,
   pub issuer: Option<Box<str>>,
@@ -65,24 +66,17 @@ impl ModuleFactoryCreateData {
 #[derive(Debug, Default)]
 pub struct ModuleFactoryResult {
   pub module: Option<BoxModule>,
-  pub from_cache: bool,
 }
 
 impl ModuleFactoryResult {
   pub fn new_with_module(module: BoxModule) -> Self {
     Self {
       module: Some(module),
-      from_cache: false,
     }
   }
 
   pub fn module(mut self, module: Option<BoxModule>) -> Self {
     self.module = module;
-    self
-  }
-
-  pub fn from_cache(mut self, from_cache: bool) -> Self {
-    self.from_cache = from_cache;
     self
   }
 }

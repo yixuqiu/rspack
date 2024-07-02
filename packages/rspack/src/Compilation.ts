@@ -7,64 +7,57 @@
  * Copyright (c) JS Foundation and other contributors
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
+import type * as binding from "@rspack/binding";
+import {
+	type ExternalObject,
+	type JsCompatSource,
+	type JsCompilation,
+	type JsModule,
+	type JsPathData,
+	JsRspackSeverity,
+	type JsRuntimeModule,
+	type JsStatsError
+} from "@rspack/binding";
 import * as tapable from "tapable";
 import { Source } from "webpack-sources";
 
-import type {
-	ExternalObject,
-	JsAssetInfo,
-	JsChunk,
-	JsCompatSource,
-	JsCompilation,
-	JsModule,
-	JsRuntimeModule,
-	JsStatsChunk,
-	JsStatsError,
-	JsPathData,
-	JsStatsWarning
-} from "@rspack/binding";
-
+import { ContextModuleFactory } from "./ContextModuleFactory";
 import {
-	RspackOptionsNormalized,
-	StatsOptions,
+	Filename,
 	OutputNormalized,
-	StatsValue,
+	RspackOptionsNormalized,
 	RspackPluginInstance,
-	Filename
+	StatsOptions,
+	StatsValue
 } from "./config";
 import * as liteTapable from "./lite-tapable";
-import { ContextModuleFactory } from "./ContextModuleFactory";
 import ResolverFactory = require("./ResolverFactory");
-import { ChunkGroup } from "./ChunkGroup";
+import { Chunk } from "./Chunk";
+import { ChunkGraph } from "./ChunkGraph";
 import { Compiler } from "./Compiler";
+import { Entrypoint } from "./Entrypoint";
 import ErrorHelpers from "./ErrorHelpers";
-import { LogType, Logger } from "./logging/Logger";
-import { NormalModule } from "./NormalModule";
+import { CodeGenerationResult, Module } from "./Module";
 import { NormalModuleFactory } from "./NormalModuleFactory";
-import {
-	Stats,
-	normalizeFilter,
-	normalizeStatsPreset,
-	optionsOrFallback
-} from "./Stats";
+import { Stats, StatsAsset, StatsError, StatsModule } from "./Stats";
+import { LogType, Logger } from "./logging/Logger";
 import { StatsFactory } from "./stats/StatsFactory";
 import { StatsPrinter } from "./stats/StatsPrinter";
-import { concatErrorMsgAndStack, isJsStatsError, toJsAssetInfo } from "./util";
-import { createRawFromSource, createSourceFromRaw } from "./util/createSource";
-import { createFakeCompilationDependencies } from "./util/fake";
+import { concatErrorMsgAndStack } from "./util";
+import { type AssetInfo, JsAssetInfo } from "./util/AssetInfo";
 import MergeCaller from "./util/MergeCaller";
+import { createFakeCompilationDependencies } from "./util/fake";
 import { memoizeValue } from "./util/memoize";
-import { Chunk } from "./Chunk";
-import { CodeGenerationResult, Module } from "./Module";
-import { ChunkGraph } from "./ChunkGraph";
-import { Entrypoint } from "./Entrypoint";
+import { JsSource } from "./util/source";
+import Hash = require("./util/hash");
+import { JsDiagnostic, RspackError } from "./RspackError";
+export { type AssetInfo } from "./util/AssetInfo";
 
-export type AssetInfo = Partial<JsAssetInfo> & Record<string, any>;
 export type Assets = Record<string, Source>;
 export interface Asset {
 	name: string;
 	source: Source;
-	info: JsAssetInfo;
+	info: AssetInfo;
 }
 
 export type PathData = JsPathData;
@@ -99,13 +92,62 @@ export interface ExecuteModuleContext {
 	__webpack_require__: (id: string) => any;
 }
 
-type CreateStatsOptionsContext = KnownCreateStatsOptionsContext &
+export interface KnownNormalizedStatsOptions {
+	context: string;
+	// requestShortener: RequestShortener;
+	chunksSort: string;
+	modulesSort: string;
+	chunkModulesSort: string;
+	nestedModulesSort: string;
+	assetsSort: string;
+	ids: boolean;
+	cachedAssets: boolean;
+	groupAssetsByEmitStatus: boolean;
+	groupAssetsByPath: boolean;
+	groupAssetsByExtension: boolean;
+	assetsSpace: number;
+	excludeAssets: ((value: string, asset: StatsAsset) => boolean)[];
+	excludeModules: ((
+		name: string,
+		module: StatsModule,
+		type: "module" | "chunk" | "root-of-chunk" | "nested"
+	) => boolean)[];
+	warningsFilter: ((warning: StatsError, textValue: string) => boolean)[];
+	cachedModules: boolean;
+	orphanModules: boolean;
+	dependentModules: boolean;
+	runtimeModules: boolean;
+	groupModulesByCacheStatus: boolean;
+	groupModulesByLayer: boolean;
+	groupModulesByAttributes: boolean;
+	groupModulesByPath: boolean;
+	groupModulesByExtension: boolean;
+	groupModulesByType: boolean;
+	entrypoints: boolean | "auto";
+	chunkGroups: boolean;
+	chunkGroupAuxiliary: boolean;
+	chunkGroupChildren: boolean;
+	chunkGroupMaxAssets: number;
+	modulesSpace: number;
+	chunkModulesSpace: number;
+	nestedModulesSpace: number;
+	logging: false | "none" | "error" | "warn" | "info" | "log" | "verbose";
+	loggingDebug: ((value: string) => boolean)[];
+	loggingTrace: boolean;
+}
+
+export type CreateStatsOptionsContext = KnownCreateStatsOptionsContext &
+	Record<string, any>;
+
+export type NormalizedStatsOptions = KnownNormalizedStatsOptions &
+	Omit<StatsOptions, keyof KnownNormalizedStatsOptions> &
 	Record<string, any>;
 
 export class Compilation {
 	#inner: JsCompilation;
+	#cachedAssets: Record<string, Source>;
 
-	hooks: {
+	hooks: Readonly<{
 		processAssets: liteTapable.AsyncSeriesHook<Assets>;
 		afterProcessAssets: liteTapable.SyncHook<Assets>;
 		childCompiler: tapable.SyncHook<[Compiler, string, number]>;
@@ -121,30 +163,45 @@ export class Compilation {
 			void
 		>;
 		finishModules: liteTapable.AsyncSeriesHook<[Iterable<Module>], void>;
+		chunkHash: liteTapable.SyncHook<[Chunk, Hash], void>;
 		chunkAsset: liteTapable.SyncHook<[Chunk, string], void>;
 		processWarnings: tapable.SyncWaterfallHook<[Error[]]>;
 		succeedModule: liteTapable.SyncHook<[Module], void>;
 		stillValidModule: liteTapable.SyncHook<[Module], void>;
+
+		statsPreset: tapable.HookMap<
+			tapable.SyncHook<[Partial<StatsOptions>, CreateStatsOptionsContext], void>
+		>;
+		statsNormalize: tapable.SyncHook<
+			[Partial<StatsOptions>, CreateStatsOptionsContext],
+			void
+		>;
 		statsFactory: tapable.SyncHook<[StatsFactory, StatsOptions], void>;
 		statsPrinter: tapable.SyncHook<[StatsPrinter, StatsOptions], void>;
+
 		buildModule: liteTapable.SyncHook<[Module]>;
 		executeModule: liteTapable.SyncHook<
 			[ExecuteModuleArgument, ExecuteModuleContext]
 		>;
+		additionalTreeRuntimeRequirements: liteTapable.SyncHook<
+			[Chunk, Set<string>],
+			void
+		>;
 		runtimeModule: liteTapable.SyncHook<[JsRuntimeModule, Chunk], void>;
 		afterSeal: liteTapable.AsyncSeriesHook<[], void>;
-	};
-	options: RspackOptionsNormalized;
-	outputOptions: OutputNormalized;
-	compiler: Compiler;
-	resolverFactory: ResolverFactory;
-	inputFileSystem: any;
-	logging: Map<string, LogEntry[]>;
+	}>;
 	name?: string;
-	childrenCounters: Record<string, number> = {};
 	startTime?: number;
 	endTime?: number;
-	children: Compilation[] = [];
+	compiler: Compiler;
+
+	resolverFactory: ResolverFactory;
+	inputFileSystem: any;
+	options: RspackOptionsNormalized;
+	outputOptions: OutputNormalized;
+	logging: Map<string, LogEntry[]>;
+	childrenCounters: Record<string, number>;
+	children: Compilation[];
 	chunkGraph: ChunkGraph;
 	fileSystemInfo = {
 		createSnapshot() {
@@ -153,15 +210,26 @@ export class Compilation {
 		}
 	};
 
+	/**
+	 * Records the dynamically added fields for Module on the JavaScript side, using the Module identifier for association.
+	 * These fields are generally used within a plugin, so they do not need to be passed back to the Rust side.
+	 */
+	#customModules: Record<
+		string,
+		{
+			buildInfo: Record<string, unknown>;
+			buildMeta: Record<string, unknown>;
+		}
+	>;
+
 	constructor(compiler: Compiler, inner: JsCompilation) {
-		this.name = undefined;
-		this.startTime = undefined;
-		this.endTime = undefined;
+		this.#inner = inner;
+		this.#cachedAssets = this.#createCachedAssets();
+		this.#customModules = {};
 
 		const processAssetsHook = new liteTapable.AsyncSeriesHook<Assets>([
 			"assets"
 		]);
-
 		const createProcessAssetsHook = <T>(
 			name: string,
 			stage: number,
@@ -229,14 +297,25 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 				"modules"
 			]),
 			finishModules: new liteTapable.AsyncSeriesHook(["modules"]),
+			chunkHash: new liteTapable.SyncHook(["chunk", "hash"]),
 			chunkAsset: new liteTapable.SyncHook(["chunk", "filename"]),
 			processWarnings: new tapable.SyncWaterfallHook(["warnings"]),
 			succeedModule: new liteTapable.SyncHook(["module"]),
 			stillValidModule: new liteTapable.SyncHook(["module"]),
+
+			statsPreset: new tapable.HookMap(
+				() => new tapable.SyncHook(["options", "context"])
+			),
+			statsNormalize: new tapable.SyncHook(["options", "context"]),
 			statsFactory: new tapable.SyncHook(["statsFactory", "options"]),
 			statsPrinter: new tapable.SyncHook(["statsPrinter", "options"]),
+
 			buildModule: new liteTapable.SyncHook(["module"]),
 			executeModule: new liteTapable.SyncHook(["options", "context"]),
+			additionalTreeRuntimeRequirements: new liteTapable.SyncHook([
+				"chunk",
+				"runtimeRequirements"
+			]),
 			runtimeModule: new liteTapable.SyncHook(["module", "chunk"]),
 			afterSeal: new liteTapable.AsyncSeriesHook([])
 		};
@@ -246,29 +325,70 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 		this.options = compiler.options;
 		this.outputOptions = compiler.options.output;
 		this.logging = new Map();
+		this.childrenCounters = {};
+		this.children = [];
 		this.chunkGraph = new ChunkGraph(this);
-		this.#inner = inner;
-		// Cache the current NormalModuleHooks
 	}
 
-	get currentNormalModuleHooks() {
-		return NormalModule.getCompilationHooks(this);
-	}
-
-	get hash() {
+	get hash(): Readonly<string | null> {
 		return this.#inner.hash;
 	}
 
-	get fullHash() {
+	get fullHash(): Readonly<string | null> {
 		return this.#inner.hash;
 	}
 
 	/**
 	 * Get a map of all assets.
-	 *
-	 * Source: [assets](https://github.com/webpack/webpack/blob/9fcaa243573005d6fdece9a3f8d89a0e8b399613/lib/Compilation.js#L1008-L1009)
 	 */
 	get assets(): Record<string, Source> {
+		return this.#cachedAssets;
+	}
+
+	/**
+	 * Get a map of all entrypoints.
+	 */
+	get entrypoints(): ReadonlyMap<string, Entrypoint> {
+		return new Map(
+			Object.entries(this.#inner.entrypoints).map(([n, e]) => [
+				n,
+				Entrypoint.__from_binding(e, this.#inner)
+			])
+		);
+	}
+
+	get modules(): ReadonlySet<Module> {
+		return memoizeValue(
+			() =>
+				new Set(
+					this.__internal__getModules().map(item =>
+						Module.__from_binding(item, this)
+					)
+				)
+		);
+	}
+
+	get chunks(): ReadonlySet<Chunk> {
+		return memoizeValue(() => new Set(this.__internal__getChunks()));
+	}
+
+	/**
+	 * Get the named chunks.
+	 *
+	 * Note: This is a proxy for webpack internal API, only method `get` is supported now.
+	 */
+	get namedChunks(): ReadonlyMap<string, Readonly<Chunk>> {
+		return {
+			get: (property: unknown) => {
+				if (typeof property === "string") {
+					const chunk = this.#inner.getNamedChunk(property) || undefined;
+					return chunk && Chunk.__from_binding(chunk, this.#inner);
+				}
+			}
+		} as Map<string, Readonly<Chunk>>;
+	}
+
+	#createCachedAssets() {
 		return new Proxy(
 			{},
 			{
@@ -277,14 +397,14 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 						return this.__internal__getAssetSource(property);
 					}
 				},
-				set: (target, p, newValue, receiver) => {
+				set: (_, p, newValue) => {
 					if (typeof p === "string") {
 						this.__internal__setAssetSource(p, newValue);
 						return true;
 					}
 					return false;
 				},
-				deleteProperty: (target, p) => {
+				deleteProperty: (_, p) => {
 					if (typeof p === "string") {
 						this.__internal__deleteAssetSource(p);
 						return true;
@@ -313,15 +433,19 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 	}
 
 	/**
-	 * Get a map of all entrypoints.
+	 * Note: This is not a webpack public API, maybe removed in future.
+	 *
+	 * @internal
 	 */
-	get entrypoints(): ReadonlyMap<string, Entrypoint> {
-		return new Map(
-			Object.entries(this.#inner.entrypoints).map(([n, e]) => [
-				n,
-				Entrypoint.__from_binding(e, this.#inner)
-			])
-		);
+	__internal__getCustomModule(moduleIdentifier: string) {
+		let module = this.#customModules[moduleIdentifier];
+		if (!module) {
+			module = this.#customModules[moduleIdentifier] = {
+				buildInfo: {},
+				buildMeta: {}
+			};
+		}
+		return module;
 	}
 
 	getCache(name: string) {
@@ -331,103 +455,31 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 	createStatsOptions(
 		optionsOrPreset: StatsValue | undefined,
 		context: CreateStatsOptionsContext = {}
-	): StatsOptions {
-		optionsOrPreset = normalizeStatsPreset(optionsOrPreset);
-
-		let options: Partial<StatsOptions> = {};
-		if (typeof optionsOrPreset === "object" && optionsOrPreset !== null) {
-			options = Object.assign({}, optionsOrPreset);
+	): NormalizedStatsOptions {
+		if (
+			typeof optionsOrPreset === "boolean" ||
+			typeof optionsOrPreset === "string"
+		) {
+			optionsOrPreset = { preset: optionsOrPreset };
 		}
-
-		const all = options.all;
-		const optionOrLocalFallback = <V, D>(v: V, def: D) =>
-			v !== undefined ? v : all !== undefined ? all : def;
-
-		options.assets = optionOrLocalFallback(options.assets, true);
-		options.chunks = optionOrLocalFallback(
-			options.chunks,
-			!context.forToString
-		);
-		options.chunkModules = optionOrLocalFallback(
-			options.chunkModules,
-			!context.forToString
-		);
-		options.chunkRelations = optionOrLocalFallback(
-			options.chunkRelations,
-			!context.forToString
-		);
-		options.modules = optionOrLocalFallback(options.modules, true);
-		options.runtimeModules = optionOrLocalFallback(
-			options.runtimeModules,
-			!context.forToString
-		);
-		options.reasons = optionOrLocalFallback(
-			options.reasons,
-			!context.forToString
-		);
-		options.usedExports = optionOrLocalFallback(
-			options.usedExports,
-			!context.forToString
-		);
-		options.optimizationBailout = optionOrLocalFallback(
-			options.optimizationBailout,
-			!context.forToString
-		);
-		options.providedExports = optionOrLocalFallback(
-			options.providedExports,
-			!context.forToString
-		);
-		options.entrypoints = optionOrLocalFallback(options.entrypoints, true);
-		options.chunkGroups = optionOrLocalFallback(
-			options.chunkGroups,
-			!context.forToString
-		);
-		options.errors = optionOrLocalFallback(options.errors, true);
-		options.errorsCount = optionOrLocalFallback(options.errorsCount, true);
-		options.warnings = optionOrLocalFallback(options.warnings, true);
-		options.warningsCount = optionOrLocalFallback(options.warningsCount, true);
-		options.hash = optionOrLocalFallback(options.hash, true);
-		options.version = optionOrLocalFallback(options.version, true);
-		options.publicPath = optionOrLocalFallback(options.publicPath, true);
-		options.outputPath = optionOrLocalFallback(
-			options.outputPath,
-			!context.forToString
-		);
-		options.timings = optionOrLocalFallback(options.timings, true);
-		options.builtAt = optionOrLocalFallback(
-			options.builtAt,
-			!context.forToString
-		);
-		options.moduleAssets = optionOrLocalFallback(options.moduleAssets, true);
-		options.nestedModules = optionOrLocalFallback(
-			options.nestedModules,
-			!context.forToString
-		);
-		options.source = optionOrLocalFallback(options.source, false);
-		options.logging = optionOrLocalFallback(
-			options.logging,
-			context.forToString ? "info" : true
-		);
-		options.loggingTrace = optionOrLocalFallback(
-			options.loggingTrace,
-			!context.forToString
-		);
-		options.loggingDebug = []
-			.concat(optionsOrFallback(options.loggingDebug, []) || [])
-			.map(normalizeFilter);
-		options.modulesSpace =
-			options.modulesSpace || (context.forToString ? 15 : Infinity);
-		options.ids = optionOrLocalFallback(options.ids, !context.forToString);
-		options.children = optionOrLocalFallback(
-			options.children,
-			!context.forToString
-		);
-		options.orphanModules = optionOrLocalFallback(
-			options.orphanModules,
-			context.forToString ? false : true
-		);
-
-		return options;
+		if (typeof optionsOrPreset === "object" && optionsOrPreset !== null) {
+			// We use this method of shallow cloning this object to include
+			// properties in the prototype chain
+			const options: Partial<NormalizedStatsOptions> = {};
+			for (const key in optionsOrPreset) {
+				options[key as keyof NormalizedStatsOptions] =
+					optionsOrPreset[key as keyof StatsValue];
+			}
+			if (options.preset !== undefined) {
+				this.hooks.statsPreset.for(options.preset).call(options, context);
+			}
+			this.hooks.statsNormalize.call(options, context);
+			return options as NormalizedStatsOptions;
+		} else {
+			const options: Partial<NormalizedStatsOptions> = {};
+			this.hooks.statsNormalize.call(options, context);
+			return options as NormalizedStatsOptions;
+		}
 	}
 
 	createStatsFactory(options: StatsOptions) {
@@ -444,9 +496,6 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 
 	/**
 	 * Update an existing asset. Trying to update an asset that doesn't exist will throw an error.
-	 *
-	 * See: [Compilation.updateAsset](https://webpack.js.org/api/compilation-object/#updateasset)
-	 * Source: [updateAsset](https://github.com/webpack/webpack/blob/9fcaa243573005d6fdece9a3f8d89a0e8b399613/lib/Compilation.js#L4320)
 	 *
 	 * FIXME: *AssetInfo* may be undefined in update fn for webpack impl, but still not implemented in rspack
 	 */
@@ -465,12 +514,12 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 			compatNewSourceOrFunction = function newSourceFunction(
 				source: JsCompatSource
 			) {
-				return createRawFromSource(
-					newSourceOrFunction(createSourceFromRaw(source))
+				return JsSource.__to_binding(
+					newSourceOrFunction(JsSource.__from_binding(source))
 				);
 			};
 		} else {
-			compatNewSourceOrFunction = createRawFromSource(newSourceOrFunction);
+			compatNewSourceOrFunction = JsSource.__to_binding(newSourceOrFunction);
 		}
 
 		this.#inner.updateAsset(
@@ -479,16 +528,14 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 			assetInfoUpdateOrFunction === undefined
 				? assetInfoUpdateOrFunction
 				: typeof assetInfoUpdateOrFunction === "function"
-					? jsAssetInfo => toJsAssetInfo(assetInfoUpdateOrFunction(jsAssetInfo))
-					: toJsAssetInfo(assetInfoUpdateOrFunction)
+					? jsAssetInfo =>
+							JsAssetInfo.__to_binding(assetInfoUpdateOrFunction(jsAssetInfo))
+					: JsAssetInfo.__to_binding(assetInfoUpdateOrFunction)
 		);
 	}
 
 	/**
 	 * Emit an not existing asset. Trying to emit an asset that already exists will throw an error.
-	 *
-	 * See: [Compilation.emitAsset](https://webpack.js.org/api/compilation-object/#emitasset)
-	 * Source: [emitAsset](https://github.com/webpack/webpack/blob/9fcaa243573005d6fdece9a3f8d89a0e8b399613/lib/Compilation.js#L4239)
 	 *
 	 * @param file - file name
 	 * @param source - asset source
@@ -497,8 +544,8 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 	emitAsset(filename: string, source: Source, assetInfo?: AssetInfo) {
 		this.#inner.emitAsset(
 			filename,
-			createRawFromSource(source),
-			toJsAssetInfo(assetInfo)
+			JsSource.__to_binding(source),
+			JsAssetInfo.__to_binding(assetInfo)
 		);
 	}
 
@@ -512,46 +559,61 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 
 	/**
 	 * Get an array of Asset
-	 *
-	 * See: [Compilation.getAssets](https://webpack.js.org/api/compilation-object/#getassets)
-	 * Source: [getAssets](https://github.com/webpack/webpack/blob/9fcaa243573005d6fdece9a3f8d89a0e8b399613/lib/Compilation.js#L4448)
 	 */
-	getAssets(): Readonly<Asset>[] {
+	getAssets(): ReadonlyArray<Asset> {
 		const assets = this.#inner.getAssets();
 
 		return assets.map(asset => {
-			return Object.defineProperty(asset, "source", {
-				get: () => this.__internal__getAssetSource(asset.name)
-			}) as Asset;
+			return Object.defineProperties(asset, {
+				info: {
+					value: JsAssetInfo.__from_binding(asset.info)
+				},
+				source: {
+					get: () => this.__internal__getAssetSource(asset.name)
+				}
+			}) as unknown as Asset;
 		});
 	}
 
-	getAsset(name: string): Asset | void {
+	getAsset(name: string): Readonly<Asset> | void {
 		const asset = this.#inner.getAsset(name);
 		if (!asset) {
 			return;
 		}
-		return Object.defineProperty(asset, "source", {
-			get: () => this.__internal__getAssetSource(asset.name)
-		}) as Asset;
+		return Object.defineProperties(asset, {
+			info: {
+				value: JsAssetInfo.__from_binding(asset.info)
+			},
+			source: {
+				get: () => this.__internal__getAssetSource(asset.name)
+			}
+		}) as unknown as Asset;
 	}
 
-	pushDiagnostic(
-		severity: "error" | "warning",
-		title: string,
-		message: string
+	/**
+	 * Note: This is not a webpack public API, maybe removed in future.
+	 *
+	 * @internal
+	 */
+	__internal__pushDiagnostic(diagnostic: binding.JsDiagnostic) {
+		this.#inner.pushDiagnostic(diagnostic);
+	}
+
+	/**
+	 * Note: This is not a webpack public API, maybe removed in future.
+	 *
+	 * @internal
+	 */
+	__internal__pushNativeDiagnostics(
+		diagnostics: ExternalObject<"Diagnostic[]">
 	) {
-		this.#inner.pushDiagnostic(severity, title, message);
-	}
-
-	__internal__pushNativeDiagnostics(diagnostics: ExternalObject<any>) {
 		this.#inner.pushNativeDiagnostics(diagnostics);
 	}
 
-	get errors() {
+	get errors(): RspackError[] {
 		const inner = this.#inner;
-		type ErrorType = Error | JsStatsError | string;
-		const errors = inner.getStats().getErrors() as any;
+		type ErrorType = RspackError;
+		const errors = inner.getErrors();
 		const proxyMethod = [
 			{
 				method: "push",
@@ -562,21 +624,9 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 				) {
 					for (let i = 0; i < errs.length; i++) {
 						const error = errs[i];
-						if (isJsStatsError(error)) {
-							inner.pushDiagnostic(
-								"error",
-								"Error",
-								concatErrorMsgAndStack(error)
-							);
-						} else if (typeof error === "string") {
-							inner.pushDiagnostic("error", "Error", error);
-						} else {
-							inner.pushDiagnostic(
-								"error",
-								error.name,
-								concatErrorMsgAndStack(error)
-							);
-						}
+						inner.pushDiagnostic(
+							JsDiagnostic.__to_binding(error, JsRspackSeverity.Error)
+						);
 					}
 					return Reflect.apply(target, thisArg, errs);
 				}
@@ -606,25 +656,7 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 					errs: ErrorType[]
 				) {
 					const errList = errs.map(error => {
-						if (isJsStatsError(error)) {
-							return {
-								severity: "error" as const,
-								title: "Error",
-								message: concatErrorMsgAndStack(error)
-							};
-						} else if (typeof error === "string") {
-							return {
-								severity: "error" as const,
-								title: "Error",
-								message: error
-							};
-						} else {
-							return {
-								severity: "error" as const,
-								title: error.name,
-								message: concatErrorMsgAndStack(error)
-							};
-						}
+						return JsDiagnostic.__to_binding(error, JsRspackSeverity.Error);
 					});
 					inner.spliceDiagnostic(0, 0, errList);
 					return Reflect.apply(target, thisArg, errs);
@@ -638,25 +670,7 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 					[startIdx, delCount, ...errors]: [number, number, ...ErrorType[]]
 				) {
 					const errList = errors.map(error => {
-						if (isJsStatsError(error)) {
-							return {
-								severity: "error" as const,
-								title: "Error",
-								message: concatErrorMsgAndStack(error)
-							};
-						} else if (typeof error === "string") {
-							return {
-								severity: "error" as const,
-								title: "Error",
-								message: error
-							};
-						} else {
-							return {
-								severity: "error" as const,
-								title: error.name,
-								message: concatErrorMsgAndStack(error)
-							};
-						}
+						return JsDiagnostic.__to_binding(error, JsRspackSeverity.Error);
 					});
 					inner.spliceDiagnostic(startIdx, startIdx + delCount, errList);
 					return Reflect.apply(target, thisArg, [
@@ -676,11 +690,11 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 		return errors;
 	}
 
-	get warnings() {
+	get warnings(): RspackError[] {
 		const inner = this.#inner;
-		type WarnType = Error | JsStatsWarning;
+		type WarnType = Error | RspackError;
 		const processWarningsHook = this.hooks.processWarnings;
-		const warnings = inner.getStats().getWarnings();
+		const warnings = inner.getWarnings();
 		const proxyMethod = [
 			{
 				method: "push",
@@ -693,9 +707,7 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 					for (let i = 0; i < warns.length; i++) {
 						const warn = warns[i];
 						inner.pushDiagnostic(
-							"warning",
-							isJsStatsError(warn) ? "Warning" : warn.name,
-							concatErrorMsgAndStack(warn)
+							JsDiagnostic.__to_binding(warn, JsRspackSeverity.Warn)
 						);
 					}
 					return Reflect.apply(target, thisArg, warns);
@@ -727,11 +739,7 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 				) {
 					warns = processWarningsHook.call(warns as any);
 					const warnList = warns.map(warn => {
-						return {
-							severity: "warning" as const,
-							title: isJsStatsError(warn) ? "Warning" : warn.name,
-							message: concatErrorMsgAndStack(warn)
-						};
+						return JsDiagnostic.__to_binding(warn, JsRspackSeverity.Warn);
 					});
 					inner.spliceDiagnostic(0, 0, warnList);
 					return Reflect.apply(target, thisArg, warns);
@@ -746,11 +754,7 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 				) {
 					warns = processWarningsHook.call(warns as any);
 					const warnList = warns.map(warn => {
-						return {
-							severity: "warning" as const,
-							title: isJsStatsError(warn) ? "Warning" : warn.name,
-							message: concatErrorMsgAndStack(warn)
-						};
+						return JsDiagnostic.__to_binding(warn, JsRspackSeverity.Warn);
 					});
 					inner.spliceDiagnostic(startIdx, startIdx + delCount, warnList);
 					return Reflect.apply(target, thisArg, [
@@ -814,7 +818,6 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 				const logEntry: LogEntry = {
 					time: Date.now(),
 					type,
-					// @ts-expect-error
 					args,
 					// @ts-expect-error
 					trace
@@ -916,107 +919,6 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 		d => this.#inner.addBuildDependencies(d)
 	);
 
-	get modules() {
-		return memoizeValue(() => {
-			return this.__internal__getModules().map(item =>
-				Module.__from_binding(item)
-			);
-		});
-	}
-
-	// FIXME: This is not aligned with Webpack.
-	get chunks() {
-		return memoizeValue(() => {
-			return this.__internal__getChunks();
-		});
-	}
-
-	/**
-	 * Get the named chunks.
-	 *
-	 * Note: This is a proxy for webpack internal API, only method `get` is supported now.
-	 */
-	get namedChunks(): Map<string, Readonly<Chunk>> {
-		return {
-			get: (property: unknown) => {
-				if (typeof property === "string") {
-					const chunk = this.#inner.getNamedChunk(property);
-					return chunk && Chunk.__from_binding(chunk, this.#inner);
-				}
-			}
-		} as Map<string, Readonly<Chunk>>;
-	}
-
-	/**
-	 * Get the associated `modules` of an given chunk.
-	 *
-	 * Note: This is not a webpack public API, maybe removed in future.
-	 *
-	 * @internal
-	 */
-	__internal__getAssociatedModules(chunk: JsStatsChunk): any[] | undefined {
-		const modules = this.__internal__getModules();
-		const moduleMap: Map<string, JsModule> = new Map();
-		for (const module of modules) {
-			moduleMap.set(module.moduleIdentifier, module);
-		}
-		return chunk.modules?.flatMap(chunkModule => {
-			const jsModule = this.__internal__findJsModule(
-				chunkModule.issuer ?? chunkModule.identifier,
-				moduleMap
-			);
-			return {
-				...jsModule
-				// dependencies: chunkModule.reasons?.flatMap(jsReason => {
-				// 	let jsOriginModule = this.__internal__findJsModule(
-				// 		jsReason.moduleIdentifier ?? "",
-				// 		moduleMap
-				// 	);
-				// 	return {
-				// 		...jsReason,
-				// 		originModule: jsOriginModule
-				// 	};
-				// })
-			};
-		});
-	}
-
-	/**
-	 * Find a modules in an array.
-	 *
-	 * Note: This is not a webpack public API, maybe removed in future.
-	 *
-	 * @internal
-	 */
-	__internal__findJsModule(
-		identifier: string,
-		modules: Map<string, JsModule>
-	): JsModule | undefined {
-		return modules.get(identifier);
-	}
-
-	/**
-	 *
-	 * Note: This is not a webpack public API, maybe removed in future.
-	 *
-	 * @internal
-	 */
-	__internal__getModules(): JsModule[] {
-		return this.#inner.getModules();
-	}
-
-	/**
-	 *
-	 * Note: This is not a webpack public API, maybe removed in future.
-	 *
-	 * @internal
-	 */
-	__internal__getChunks(): Chunk[] {
-		return this.#inner
-			.getChunks()
-			.map(c => Chunk.__from_binding(c, this.#inner));
-	}
-
 	getStats() {
 		return new Stats(this);
 	}
@@ -1037,26 +939,29 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 		);
 	}
 
-	_rebuildModuleCaller = new MergeCaller(
-		(args: Array<[string, (err: Error, m: Module) => void]>) => {
-			this.#inner.rebuildModule(
-				args.map(item => item[0]),
-				function (err: Error, modules: JsModule[]) {
-					for (const [id, callback] of args) {
-						const m = modules.find(item => item.moduleIdentifier === id);
-						if (m) {
-							callback(err, Module.__from_binding(m));
-						} else {
-							callback(err || new Error("module no found"), null as any);
+	#rebuildModuleCaller = (function (compilation: Compilation) {
+		return new MergeCaller(
+			(args: Array<[string, (err: Error, m: Module) => void]>) => {
+				compilation.#inner.rebuildModule(
+					args.map(item => item[0]),
+					function (err: Error, modules: JsModule[]) {
+						for (const [id, callback] of args) {
+							const m = modules.find(item => item.moduleIdentifier === id);
+							if (m) {
+								callback(err, Module.__from_binding(m, compilation));
+							} else {
+								callback(err || new Error("module no found"), null as any);
+							}
 						}
 					}
-				}
-			);
-		},
-		10
-	);
+				);
+			},
+			10
+		);
+	})(this);
+
 	rebuildModule(m: Module, f: (err: Error, m: Module) => void) {
-		this._rebuildModuleCaller.push([m.identifier(), f]);
+		this.#rebuildModuleCaller.push([m.identifier(), f]);
 	}
 
 	/**
@@ -1071,7 +976,7 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 		if (!rawSource) {
 			return;
 		}
-		return createSourceFromRaw(rawSource);
+		return JsSource.__from_binding(rawSource);
 	}
 
 	/**
@@ -1082,7 +987,7 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 	 * @internal
 	 */
 	__internal__setAssetSource(filename: string, source: Source) {
-		this.#inner.setAssetSource(filename, createRawFromSource(source));
+		this.#inner.setAssetSource(filename, JsSource.__to_binding(source));
 	}
 
 	/**
@@ -1118,6 +1023,31 @@ BREAKING CHANGE: Asset processing hooks in Compilation has been merged into a si
 		return this.#inner.hasAsset(name);
 	}
 
+	/**
+	 * Note: This is not a webpack public API, maybe removed in future.
+	 *
+	 * @internal
+	 */
+	__internal__getModules(): JsModule[] {
+		return this.#inner.getModules();
+	}
+
+	/**
+	 * Note: This is not a webpack public API, maybe removed in future.
+	 *
+	 * @internal
+	 */
+	__internal__getChunks(): Chunk[] {
+		return this.#inner
+			.getChunks()
+			.map(c => Chunk.__from_binding(c, this.#inner));
+	}
+
+	/**
+	 * Note: This is not a webpack public API, maybe removed in future.
+	 *
+	 * @internal
+	 */
 	__internal_getInner() {
 		return this.#inner;
 	}

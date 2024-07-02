@@ -23,12 +23,10 @@ module.exports = {
 		expect(warnings).toMatchInlineSnapshot(`
 		Array [
 		  Object {
-		  "formatted": "  ⚠ Module parse warning:\\n  ╰─▶   ⚠ Module parse failed: require.main.require() is not supported by Rspack.\\n         ╭────\\n       1 │ require.main.require('./file');\\n         · ──────────────────────────────\\n         ╰────\\n      \\n",
 		  "index": 0,
 		  "message": "  ⚠ Module parse warning:\\n  ╰─▶   ⚠ Module parse failed: require.main.require() is not supported by Rspack.\\n         ╭────\\n       1 │ require.main.require('./file');\\n         · ──────────────────────────────\\n         ╰────\\n      \\n",
-		  "moduleId": "./require.main.require.js",
 		  "moduleIdentifier": "<cwd>packages/rspack-test-tools/tests/fixtures/errors/require.main.require.js",
-		  "moduleName": "./require.main.require.js",
+		  "name": "ModuleParseWarning",
 		},
 		]
 	`);

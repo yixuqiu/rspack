@@ -39,7 +39,7 @@ impl SelfModule {
       factory_meta: None,
       build_info: None,
       build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      source_map_kind: SourceMapKind::empty(),
     }
   }
 }
@@ -76,7 +76,7 @@ impl Module for SelfModule {
     vec![]
   }
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>, _compilation: &Compilation) -> f64 {
     self.identifier.len() as f64
   }
 
@@ -123,7 +123,6 @@ impl Module for SelfModule {
       build_meta: Default::default(),
       dependencies: Vec::new(),
       blocks: Vec::new(),
-      analyze_result: Default::default(),
       optimization_bailouts: vec![],
     })
   }

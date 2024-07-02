@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use once_cell::sync::Lazy;
-use rspack_core::tree_shaking::visitor::{get_side_effects_from_package_json, SideEffects};
 use rspack_core::{
   BoxModule, Compilation, CompilationOptimizeDependencies, ConnectionState, FactoryMeta,
   ModuleFactoryCreateData, ModuleGraph, ModuleIdentifier, MutableModuleGraph,
@@ -17,7 +17,7 @@ use rustc_hash::FxHashSet as HashSet;
 use sugar_path::SugarPath;
 // use rspack_core::Plugin;
 // use rspack_error::Result;
-use swc_core::common::{comments, Spanned, SyntaxContext, GLOBALS};
+use swc_core::common::{comments, Span, Spanned, SyntaxContext, GLOBALS};
 use swc_core::ecma::ast::*;
 use swc_core::ecma::utils::{ExprCtx, ExprExt};
 use swc_core::ecma::visit::{noop_visit_type, Visit, VisitWith};
@@ -26,6 +26,59 @@ use swc_node_comments::SwcComments;
 use crate::dependency::{
   HarmonyExportImportedSpecifierDependency, HarmonyImportSpecifierDependency,
 };
+
+#[derive(Clone, Debug)]
+enum SideEffects {
+  Bool(bool),
+  String(String),
+  Array(Vec<String>),
+}
+
+impl SideEffects {
+  pub fn from_description(description: &serde_json::Value) -> Option<Self> {
+    description.get("sideEffects").and_then(|value| {
+      if let Some(b) = value.as_bool() {
+        Some(SideEffects::Bool(b))
+      } else if let Some(s) = value.as_str() {
+        Some(SideEffects::String(s.to_owned()))
+      } else if let Some(vec) = value.as_array() {
+        let mut side_effects = vec![];
+        for value in vec {
+          if let Some(str) = value.as_str() {
+            side_effects.push(str.to_string());
+          } else {
+            return None;
+          }
+        }
+        Some(SideEffects::Array(side_effects))
+      } else {
+        None
+      }
+    })
+  }
+}
+
+fn get_side_effects_from_package_json(side_effects: SideEffects, relative_path: PathBuf) -> bool {
+  match side_effects {
+    SideEffects::Bool(s) => s,
+    SideEffects::String(s) => {
+      glob_match_with_normalized_pattern(&s, &relative_path.to_string_lossy())
+    }
+    SideEffects::Array(patterns) => patterns
+      .iter()
+      .any(|pattern| glob_match_with_normalized_pattern(pattern, &relative_path.to_string_lossy())),
+  }
+}
+
+fn glob_match_with_normalized_pattern(pattern: &str, string: &str) -> bool {
+  let trim_start = pattern.trim_start_matches("./");
+  let normalized_glob = if trim_start.contains('/') {
+    trim_start.to_string()
+  } else {
+    String::from("**/") + trim_start
+  };
+  glob_match::glob_match(&normalized_glob, string.trim_start_matches("./"))
+}
 
 pub struct SideEffectsFlagPluginVisitor<'a> {
   unresolved_ctxt: SyntaxContext,
@@ -284,17 +337,25 @@ fn is_pure_call_expr(
   call_expr: &CallExpr,
   unresolved_ctxt: SyntaxContext,
   comments: Option<&SwcComments>,
+  paren_spans: &mut Vec<Span>,
 ) -> bool {
   let callee = &call_expr.callee;
   let pure_flag = comments
     .and_then(|comments| {
-      // dbg!(&comments.leading);
-      let comment_list = comments.leading.get(&callee.span_lo())?;
-      let last_comment = comment_list.last()?;
-      match last_comment.kind {
-        comments::CommentKind::Line => None,
-        comments::CommentKind::Block => Some(PURE_COMMENTS.is_match(&last_comment.text)),
+      paren_spans.push(callee.span());
+      // dbg!(&comments.leading, &paren_spans);
+      while let Some(span) = paren_spans.pop() {
+        if let Some(comment_list) = comments.leading.get(&span.lo)
+          && let Some(last_comment) = comment_list.last()
+          && last_comment.kind == comments::CommentKind::Block
+        {
+          // iterate through the parens and check if it contains pure comment
+          if PURE_COMMENTS.is_match(&last_comment.text) {
+            return Some(true);
+          }
+        }
       }
+      None
     })
     .unwrap_or(false);
   if !pure_flag {
@@ -319,21 +380,31 @@ pub fn is_pure_expression<'a>(
   unresolved_ctxt: SyntaxContext,
   comments: Option<&'a SwcComments>,
 ) -> bool {
-  match expr {
-    Expr::Call(call) => is_pure_call_expr(call, unresolved_ctxt, comments),
-    Expr::Paren(par) => {
-      let mut cur = par.expr.as_ref();
-      while let Expr::Paren(paren) = cur {
-        cur = paren.expr.as_ref();
-      }
+  pub fn _is_pure_expression<'a>(
+    expr: &'a Expr,
+    unresolved_ctxt: SyntaxContext,
+    comments: Option<&'a SwcComments>,
+    paren_spans: &mut Vec<Span>,
+  ) -> bool {
+    match expr {
+      Expr::Call(call) => is_pure_call_expr(call, unresolved_ctxt, comments, paren_spans),
+      Expr::Paren(par) => {
+        paren_spans.push(par.span());
+        let mut cur = par.expr.as_ref();
+        while let Expr::Paren(paren) = cur {
+          paren_spans.push(paren.span());
+          cur = paren.expr.as_ref();
+        }
 
-      is_pure_expression(cur, unresolved_ctxt, comments)
+        _is_pure_expression(cur, unresolved_ctxt, comments, paren_spans)
+      }
+      _ => !expr.may_have_side_effects(&ExprCtx {
+        unresolved_ctxt,
+        is_unresolved_ref_safe: true,
+      }),
     }
-    _ => !expr.may_have_side_effects(&ExprCtx {
-      unresolved_ctxt,
-      is_unresolved_ref_safe: true,
-    }),
   }
+  _is_pure_expression(expr, unresolved_ctxt, comments, &mut vec![])
 }
 
 pub fn is_pure_class_member<'a>(
@@ -525,7 +596,6 @@ async fn nmf_module(
   if let Some(has_side_effects) = create_data.side_effects {
     module.set_factory_meta(FactoryMeta {
       side_effect_free: Some(!has_side_effects),
-      side_effect_free_old: None,
     });
     return Ok(());
   }
@@ -542,14 +612,13 @@ async fn nmf_module(
   let has_side_effects = get_side_effects_from_package_json(side_effects, relative_path);
   module.set_factory_meta(FactoryMeta {
     side_effect_free: Some(!has_side_effects),
-    side_effect_free_old: None,
   });
   Ok(())
 }
 
 #[plugin_hook(CompilationOptimizeDependencies for SideEffectsFlagPlugin)]
 fn optimize_dependencies(&self, compilation: &mut Compilation) -> Result<Option<bool>> {
-  let entries = compilation.entry_modules().collect::<Vec<_>>();
+  let entries = compilation.entry_modules();
   let level_order_module_identifier =
     get_level_order_module_ids(&compilation.get_module_graph(), entries);
   for module_identifier in level_order_module_identifier {
@@ -693,10 +762,7 @@ impl Plugin for SideEffectsFlagPlugin {
   }
 }
 
-fn get_level_order_module_ids(
-  mg: &ModuleGraph,
-  entries: Vec<ModuleIdentifier>,
-) -> Vec<ModuleIdentifier> {
+fn get_level_order_module_ids(mg: &ModuleGraph, entries: IdentifierSet) -> Vec<ModuleIdentifier> {
   let mut res = vec![];
   let mut visited = IdentifierSet::default();
   for entry in entries {
@@ -721,4 +787,116 @@ fn get_level_order_module_ids(
     ad.cmp(&bd)
   });
   res
+}
+
+#[cfg(test)]
+mod test_side_effects {
+  use super::*;
+
+  fn get_side_effects_from_package_json_helper(
+    side_effects_config: Vec<&str>,
+    relative_path: &str,
+  ) -> bool {
+    assert!(!side_effects_config.is_empty());
+    let relative_path = PathBuf::from(relative_path);
+    let side_effects = if side_effects_config.len() > 1 {
+      SideEffects::Array(
+        side_effects_config
+          .into_iter()
+          .map(String::from)
+          .collect::<Vec<_>>(),
+      )
+    } else {
+      SideEffects::String((&side_effects_config[0]).to_string())
+    };
+
+    get_side_effects_from_package_json(side_effects, relative_path)
+  }
+
+  #[test]
+  fn cases() {
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js"],
+      "./src/x/y/z.js"
+    ));
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/index.js", "./src/selection/index.js"],
+      "./src/selection/index.js"
+    ));
+    assert!(!get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js"],
+      "./x.js"
+    ));
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./**/src/x/y/z.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"./src/**/z.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/z.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"./**/x/**/z.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./**/x/**/z.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"./**/src/**",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./**/src/**"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"./**/src/*",
+    assert!(!get_side_effects_from_package_json_helper(
+      vec!["./src/x/y/z.js"],
+      "./**/src/*"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"*.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["*.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"x/**/z.js",
+    assert!(!get_side_effects_from_package_json_helper(
+      vec!["./src/x/y/z.js"],
+      "x/**/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"src/**/z.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/z.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"src/**/{x,y,z}.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["src/**/{x,y,z}.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"src/**/[x-z].js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/[x-z].js"],
+      "./src/x/y/z.js"
+    ));
+    // 		const array = ["./src/**/*.js", "./dirty.js"];
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js", "./dirty.js"],
+      "./src/x/y/z.js"
+    ));
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js", "./dirty.js"],
+      "./dirty.js"
+    ));
+    assert!(!get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js", "./dirty.js"],
+      "./clean.js"
+    ));
+  }
 }

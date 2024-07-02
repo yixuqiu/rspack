@@ -13,7 +13,7 @@ use rspack_regex::RspackRegex;
 use rspack_util::{try_all, try_any, MergeFrom};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::{Filename, ModuleType, PublicPath, Resolve};
+use crate::{Filename, Module, ModuleType, PublicPath, Resolve};
 
 #[derive(Debug)]
 pub struct ParserOptionsByModuleType(HashMap<ModuleType, ParserOptions>);
@@ -59,9 +59,8 @@ impl ParserOptions {
   get_variant!(get_javascript, Javascript, JavascriptParserOptions);
 }
 
-#[derive(Debug, Clone, Copy, Default, MergeFrom)]
+#[derive(Debug, Clone, Copy, MergeFrom)]
 pub enum DynamicImportMode {
-  #[default]
   Lazy,
   Weak,
   Eager,
@@ -77,15 +76,14 @@ impl From<&str> for DynamicImportMode {
       "lazy-once" => DynamicImportMode::LazyOnce,
       _ => {
         // TODO: warning
-        DynamicImportMode::default()
+        DynamicImportMode::Lazy
       }
     }
   }
 }
 
-#[derive(Debug, Clone, Copy, Default, MergeFrom)]
+#[derive(Debug, Clone, Copy, MergeFrom)]
 pub enum JavascriptParserUrl {
-  #[default]
   Enable,
   Disable,
   Relative,
@@ -101,9 +99,8 @@ impl From<&str> for JavascriptParserUrl {
   }
 }
 
-#[derive(Debug, Clone, Copy, Default, MergeFrom)]
+#[derive(Debug, Clone, Copy, MergeFrom)]
 pub enum JavascriptParserOrder {
-  #[default]
   Disable,
   Order(u32),
 }
@@ -133,7 +130,42 @@ impl From<&str> for JavascriptParserOrder {
   }
 }
 
-#[derive(Debug, Clone, Default, MergeFrom)]
+#[derive(Debug, Clone, Copy, MergeFrom)]
+pub enum ExportPresenceMode {
+  None,
+  Warn,
+  Auto,
+  Error,
+}
+
+impl From<&str> for ExportPresenceMode {
+  fn from(value: &str) -> Self {
+    match value {
+      "false" => Self::None,
+      "warn" => Self::Warn,
+      "error" => Self::Error,
+      _ => Self::Auto,
+    }
+  }
+}
+
+impl ExportPresenceMode {
+  pub fn get_effective_export_presence(&self, module: &dyn Module) -> Option<bool> {
+    match self {
+      ExportPresenceMode::None => None,
+      ExportPresenceMode::Warn => Some(false),
+      ExportPresenceMode::Error => Some(true),
+      ExportPresenceMode::Auto => Some(
+        module
+          .build_meta()
+          .map(|m| m.strict_harmony_module)
+          .unwrap_or_default(),
+      ),
+    }
+  }
+}
+
+#[derive(Debug, Clone, MergeFrom)]
 pub struct JavascriptParserOptions {
   pub dynamic_import_mode: DynamicImportMode,
   pub dynamic_import_preload: JavascriptParserOrder,
@@ -141,6 +173,11 @@ pub struct JavascriptParserOptions {
   pub url: JavascriptParserUrl,
   pub expr_context_critical: bool,
   pub wrapped_context_critical: bool,
+  pub exports_presence: Option<ExportPresenceMode>,
+  pub import_exports_presence: Option<ExportPresenceMode>,
+  pub reexport_exports_presence: Option<ExportPresenceMode>,
+  pub strict_export_presence: bool,
+  pub worker: Vec<String>,
 }
 
 #[derive(Debug, Clone, MergeFrom)]
@@ -335,8 +372,8 @@ impl From<String> for DataUrlEncoding {
 
 #[derive(Debug, Clone, MergeFrom)]
 pub struct CssGeneratorOptions {
-  pub exports_convention: Option<CssExportsConvention>,
   pub exports_only: Option<bool>,
+  pub es_module: Option<bool>,
 }
 
 #[derive(Debug, Clone, MergeFrom)]
@@ -344,6 +381,7 @@ pub struct CssAutoGeneratorOptions {
   pub exports_convention: Option<CssExportsConvention>,
   pub exports_only: Option<bool>,
   pub local_ident_name: Option<LocalIdentName>,
+  pub es_module: Option<bool>,
 }
 
 #[derive(Debug, Clone, MergeFrom)]
@@ -351,6 +389,7 @@ pub struct CssModuleGeneratorOptions {
   pub exports_convention: Option<CssExportsConvention>,
   pub exports_only: Option<bool>,
   pub local_ident_name: Option<LocalIdentName>,
+  pub es_module: Option<bool>,
 }
 
 #[derive(Debug, Clone, MergeFrom)]
@@ -420,7 +459,7 @@ impl Default for CssExportsConvention {
 pub type DescriptionData = HashMap<String, RuleSetCondition>;
 
 pub type RuleSetConditionFnMatcher =
-  Box<dyn Fn(&str) -> BoxFuture<'static, Result<bool>> + Sync + Send>;
+  Box<dyn Fn(&serde_json::Value) -> BoxFuture<'static, Result<bool>> + Sync + Send>;
 
 pub enum RuleSetCondition {
   String(String),
@@ -444,10 +483,15 @@ impl fmt::Debug for RuleSetCondition {
 
 impl RuleSetCondition {
   #[async_recursion]
-  pub async fn try_match(&self, data: &str) -> Result<bool> {
+  pub async fn try_match(&self, data: &serde_json::Value) -> Result<bool> {
     match self {
-      Self::String(s) => Ok(data.starts_with(s)),
-      Self::Regexp(r) => Ok(r.test(data)),
+      Self::String(s) => Ok(
+        data
+          .as_str()
+          .map(|data| data.starts_with(s))
+          .unwrap_or_default(),
+      ),
+      Self::Regexp(r) => Ok(data.as_str().map(|data| r.test(data)).unwrap_or_default()),
       Self::Logical(g) => g.try_match(data).await,
       Self::Array(l) => try_any(l, |i| async { i.try_match(data).await }).await,
       Self::Func(f) => f(data).await,
@@ -464,7 +508,7 @@ pub struct RuleSetLogicalConditions {
 
 impl RuleSetLogicalConditions {
   #[async_recursion]
-  pub async fn try_match(&self, data: &str) -> Result<bool> {
+  pub async fn try_match(&self, data: &serde_json::Value) -> Result<bool> {
     if let Some(and) = &self.and
       && try_any(and, |i| async { i.try_match(data).await.map(|i| !i) }).await?
     {

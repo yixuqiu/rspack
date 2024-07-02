@@ -9,9 +9,9 @@ use rspack_core::{
   rspack_sources::{RawSource, SourceExt},
   ApplyContext, AssetInfo, Chunk, ChunkKind, ChunkUkey, Compilation,
   CompilationAdditionalTreeRuntimeRequirements, CompilationAsset, CompilationParams,
-  CompilationProcessAssets, CompilationRecords, CompilerCompilation, CompilerContext,
-  CompilerOptions, DependencyType, LoaderContext, NormalModuleLoader, PathData, Plugin,
-  PluginContext, RuntimeGlobals, RuntimeModuleExt, RuntimeSpec, SourceType,
+  CompilationProcessAssets, CompilationRecords, CompilerCompilation, CompilerOptions,
+  DependencyType, LoaderContext, NormalModuleLoader, PathData, Plugin, PluginContext,
+  RunnerContext, RuntimeGlobals, RuntimeModuleExt, RuntimeSpec, SourceType,
 };
 use rspack_error::Result;
 use rspack_hash::RspackHash;
@@ -221,6 +221,7 @@ async fn process_assets(&self, compilation: &mut Compilation) -> Result<()> {
       }
 
       for runtime_module in new_runtime_modules {
+        compilation.code_generated_modules.insert(runtime_module);
         compilation
           .chunk_graph
           .connect_chunk_and_runtime_module(ukey, runtime_module);
@@ -235,7 +236,7 @@ async fn process_assets(&self, compilation: &mut Compilation) -> Result<()> {
         .call(compilation, &ukey, &mut manifest, &mut diagnostics)
         .await?;
 
-      compilation.push_batch_diagnostic(diagnostics);
+      compilation.extend_diagnostics(diagnostics);
 
       for entry in manifest {
         let filename = if entry.has_filename() {
@@ -330,13 +331,13 @@ async fn process_assets(&self, compilation: &mut Compilation) -> Result<()> {
 }
 
 #[plugin_hook(NormalModuleLoader for HotModuleReplacementPlugin)]
-fn normal_module_loader(&self, context: &mut LoaderContext<CompilerContext>) -> Result<()> {
+fn normal_module_loader(&self, context: &mut LoaderContext<RunnerContext>) -> Result<()> {
   context.hot = true;
   Ok(())
 }
 
 #[plugin_hook(CompilationAdditionalTreeRuntimeRequirements for HotModuleReplacementPlugin)]
-fn additional_tree_runtime_requirements(
+async fn additional_tree_runtime_requirements(
   &self,
   compilation: &mut Compilation,
   chunk_ukey: &ChunkUkey,

@@ -1,17 +1,13 @@
 #![feature(let_chains)]
 
-use std::{collections::HashMap, hash::Hash};
+use std::hash::Hasher;
 
 use async_trait::async_trait;
 use rayon::prelude::*;
-use rkyv::{from_bytes, to_bytes, AlignedVec, Archive, Deserialize, Serialize};
 use rspack_core::{
   rspack_sources::{BoxSource, RawSource, SourceExt},
-  tree_shaking::{
-    analyzer::OptimizeAnalyzer, asset_module::AssetModule, visitor::OptimizeAnalyzeResult,
-  },
-  AssetGeneratorDataUrl, AssetGeneratorDataUrlFnArgs, AssetParserDataUrl, BuildExtraDataType,
-  BuildMetaDefaultObject, BuildMetaExportsType, ChunkGraph, ChunkUkey, CodeGenerationDataAssetInfo,
+  AssetGeneratorDataUrl, AssetGeneratorDataUrlFnArgs, AssetParserDataUrl, BuildMetaDefaultObject,
+  BuildMetaExportsType, ChunkGraph, ChunkUkey, CodeGenerationDataAssetInfo,
   CodeGenerationDataFilename, CodeGenerationDataUrl, Compilation, CompilationRenderManifest,
   CompilerOptions, GenerateContext, Module, ModuleGraph, NormalModule, ParseContext,
   ParserAndGenerator, PathData, Plugin, RenderManifestEntry, ResourceData, RuntimeGlobals,
@@ -45,8 +41,7 @@ type IsInline = bool;
 const ASSET_INLINE: bool = true;
 const ASSET_RESOURCE: bool = false;
 
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-#[archive(compare(PartialEq), check_bytes)]
+#[derive(Debug, Clone)]
 enum CanonicalizedDataUrlOption {
   Source,
   Asset(IsInline),
@@ -112,7 +107,7 @@ impl AssetParserAndGenerator {
     compiler_options: &CompilerOptions,
   ) -> RspackHashDigest {
     let mut hasher = RspackHash::from(&compiler_options.output);
-    source.hash(&mut hasher);
+    hasher.write(&source.buffer());
     hasher.digest(&compiler_options.output.hash_digest)
   }
 
@@ -227,9 +222,9 @@ impl ParserAndGenerator for AssetParserAndGenerator {
     }
   }
 
-  fn size(&self, module: &dyn Module, source_type: &SourceType) -> f64 {
+  fn size(&self, module: &dyn Module, source_type: Option<&SourceType>) -> f64 {
     let original_source_size = module.original_source().map_or(0, |source| source.size()) as f64;
-    match source_type {
+    match source_type.unwrap_or(&SourceType::Asset) {
       SourceType::Asset => original_source_size,
       SourceType::JavaScript => {
         if module.original_source().is_none() {
@@ -274,8 +269,6 @@ impl ParserAndGenerator for AssetParserAndGenerator {
       source,
       build_meta,
       build_info,
-      compiler_options,
-      module_identifier,
       ..
     } = parse_context;
     build_info.strict = true;
@@ -307,11 +300,6 @@ impl ParserAndGenerator for AssetParserAndGenerator {
         ))
       }
     };
-    let analyze_result = if compiler_options.builtins.tree_shaking.enable() {
-      AssetModule::new(module_identifier).analyze()
-    } else {
-      OptimizeAnalyzeResult::default()
-    };
 
     Ok(
       rspack_core::ParseResult {
@@ -320,15 +308,13 @@ impl ParserAndGenerator for AssetParserAndGenerator {
         blocks: vec![],
         source,
         presentational_dependencies: vec![],
-        analyze_result,
+        code_generation_dependencies: vec![],
         side_effects_bailout: None,
       }
       .with_empty_diagnostic(),
     )
   }
 
-  // Safety: `original_source` and `ast_and_source` are available in code generation.
-  #[allow(clippy::unwrap_in_result)]
   fn generate(
     &self,
     source: &BoxSource,
@@ -465,19 +451,6 @@ impl ParserAndGenerator for AssetParserAndGenerator {
 
     result
   }
-  fn store(&self, extra_data: &mut HashMap<BuildExtraDataType, AlignedVec>) {
-    extra_data.insert(
-      BuildExtraDataType::AssetParserAndGenerator,
-      to_bytes::<_, 256>(&self.parsed_asset_config).expect("Failed to store extra data"),
-    );
-  }
-
-  fn resume(&mut self, extra_data: &HashMap<BuildExtraDataType, AlignedVec>) {
-    if let Some(data) = extra_data.get(&BuildExtraDataType::AssetParserAndGenerator) {
-      self.parsed_asset_config = from_bytes::<Option<CanonicalizedDataUrlOption>>(data)
-        .expect("Failed to resume extra data");
-    }
-  }
 
   fn get_concatenation_bailout_reason(
     &self,
@@ -500,43 +473,14 @@ async fn render_manifest(
   let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
   let module_graph = compilation.get_module_graph();
 
-  let ordered_modules = compilation
-    .chunk_graph
-    .get_chunk_modules(chunk_ukey, &module_graph);
+  let ordered_modules = compilation.chunk_graph.get_chunk_modules_by_source_type(
+    chunk_ukey,
+    SourceType::Asset,
+    &module_graph,
+  );
 
   let assets = ordered_modules
     .par_iter()
-    .filter(|m| {
-      let module = module_graph
-        .module_by_identifier(&m.identifier())
-        // FIXME: use result
-        .expect("Failed to get module");
-
-      let all_incoming_analyzed = module_graph
-        .get_incoming_connections(&module.identifier())
-        .iter()
-        .all(|c| {
-          if let Some(original_module_identifier) = c.original_module_identifier {
-            module_graph
-              .module_graph_module_by_identifier(&original_module_identifier)
-              .map(|original_module| {
-                !compilation
-                  .bailout_module_identifiers
-                  .contains_key(&original_module.module_identifier)
-                  && original_module.module_type.is_js_like()
-              })
-              .unwrap_or(false)
-          } else {
-            false
-          }
-        });
-
-      module.source_types().contains(&SourceType::Asset)
-        && (!all_incoming_analyzed
-          || compilation
-            .include_module_ids
-            .contains(&module.identifier()))
-    })
     .map(|m| {
       let code_gen_result = compilation
         .code_generation_results

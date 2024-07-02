@@ -1,3 +1,4 @@
+/** @type {import('../../..').TDefaultsCaseConfig} */
 module.exports = {
 	description: "no mode provided",
 	options: () => ({ mode: undefined }),
@@ -10,18 +11,19 @@ module.exports = {
 		-   "mode": "none",
 		+   "mode": undefined,
 		@@ ... @@
-		-     "chunkIds": "named",
-		+     "chunkIds": "deterministic",
-		@@ ... @@
+		-     "chunkIds": "natural",
+		-     "concatenateModules": false,
 		-     "innerGraph": false,
 		-     "mangleExports": false,
+		+     "chunkIds": "deterministic",
+		+     "concatenateModules": true,
 		+     "innerGraph": true,
 		+     "mangleExports": true,
 		@@ ... @@
 		-     "minimize": false,
 		+     "minimize": true,
 		@@ ... @@
-		-     "moduleIds": "named",
+		-     "moduleIds": "natural",
 		-     "nodeEnv": false,
 		+     "moduleIds": "deterministic",
 		+     "nodeEnv": "production",
@@ -45,10 +47,11 @@ module.exports = {
 		-     "usedExports": false,
 		+     "usedExports": true,
 		@@ ... @@
-		-       "hash": false,
-		+       "hash": true,
-		@@ ... @@
-		-       "hash": false,
-		+       "hash": true,
+		-   "performance": false,
+		+   "performance": Object {
+		+     "hints": "warning",
+		+     "maxAssetSize": 250000,
+		+     "maxEntrypointSize": 250000,
+		+   },
 	`)
 };

@@ -1,7 +1,4 @@
-const { createFsFromVolume, Volume } = require("memfs");
-
-const outputFileSystem = createFsFromVolume(new Volume());
-
+/** @type {import("../../../..").THookCaseConfig} */
 module.exports = {
 	description: "should work with duplicate",
 	options(context) {
@@ -9,7 +6,8 @@ module.exports = {
 			context: __dirname,
 			entry: "./duplicate.js",
 			optimization: {
-				moduleIds: "named"
+				moduleIds: "named",
+				concatenateModules: false
 			},
 			plugins: [
 				{
@@ -38,8 +36,4 @@ module.exports = {
 			]
 		};
 	},
-	async compiler(context, compiler) {
-		compiler.outputFileSystem = outputFileSystem;
-	},
-	async check() {}
 };

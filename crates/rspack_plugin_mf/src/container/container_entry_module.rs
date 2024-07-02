@@ -16,6 +16,7 @@ use rspack_error::{impl_empty_diagnosable_trait, Diagnostic, Result};
 use rspack_hash::RspackHash;
 use rspack_identifier::{Identifiable, Identifier};
 use rspack_util::source_map::SourceMapKind;
+use rustc_hash::FxHashSet;
 
 use super::{
   container_exposed_dependency::ContainerExposedDependency, container_plugin::ExposeOptions,
@@ -59,7 +60,7 @@ impl ContainerEntryModule {
       factory_meta: None,
       build_info: None,
       build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      source_map_kind: SourceMapKind::empty(),
       enhanced,
     }
   }
@@ -93,7 +94,7 @@ impl DependenciesBlock for ContainerEntryModule {
 impl Module for ContainerEntryModule {
   impl_module_meta_info!();
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>, _compilation: &Compilation) -> f64 {
     42.0
   }
 
@@ -145,6 +146,7 @@ impl Module for ContainerEntryModule {
             )) as Box<dyn Dependency>
           })
           .collect(),
+        None,
       );
       block.set_group_options(GroupOptions::ChunkGroup(
         ChunkGroupOptions::default().name_optional(options.name.clone()),
@@ -160,6 +162,7 @@ impl Module for ContainerEntryModule {
       build_info: BuildInfo {
         hash: Some(hash),
         strict: true,
+        top_level_declarations: Some(FxHashSet::default()),
         ..Default::default()
       },
       build_meta: BuildMeta {

@@ -1,5 +1,3 @@
-mod js_loader;
-
 use std::fmt::Formatter;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
@@ -7,47 +5,24 @@ use derivative::Derivative;
 use napi::bindgen_prelude::Either3;
 use napi::Either;
 use napi_derive::napi;
+use rspack_binding_values::RawRegex;
 use rspack_core::{
   AssetGeneratorDataUrl, AssetGeneratorDataUrlFnArgs, AssetGeneratorDataUrlOptions,
   AssetGeneratorOptions, AssetInlineGeneratorOptions, AssetParserDataUrl,
-  AssetParserDataUrlOptions, AssetParserOptions, AssetResourceGeneratorOptions, BoxLoader,
+  AssetParserDataUrlOptions, AssetParserOptions, AssetResourceGeneratorOptions,
   CssAutoGeneratorOptions, CssAutoParserOptions, CssGeneratorOptions, CssModuleGeneratorOptions,
-  CssModuleParserOptions, CssParserOptions, DescriptionData, DynamicImportMode, FuncUseCtx,
-  GeneratorOptions, GeneratorOptionsByModuleType, JavascriptParserOptions, JavascriptParserOrder,
-  JavascriptParserUrl, ModuleNoParseRule, ModuleNoParseRules, ModuleNoParseTestFn, ModuleOptions,
-  ModuleRule, ModuleRuleEnforce, ModuleRuleUse, ModuleRuleUseLoader, ModuleType, ParserOptions,
-  ParserOptionsByModuleType,
+  CssModuleParserOptions, CssParserOptions, DescriptionData, DynamicImportMode, ExportPresenceMode,
+  FuncUseCtx, GeneratorOptions, GeneratorOptionsByModuleType, JavascriptParserOptions,
+  JavascriptParserOrder, JavascriptParserUrl, ModuleNoParseRule, ModuleNoParseRules,
+  ModuleNoParseTestFn, ModuleOptions, ModuleRule, ModuleRuleEnforce, ModuleRuleUse,
+  ModuleRuleUseLoader, ModuleType, ParserOptions, ParserOptionsByModuleType,
 };
 use rspack_error::error;
-use rspack_loader_react_refresh::REACT_REFRESH_LOADER_IDENTIFIER;
-use rspack_loader_swc::SWC_LOADER_IDENTIFIER;
 use rspack_napi::regexp::{JsRegExp, JsRegExpExt};
 use rspack_napi::threadsafe_function::ThreadsafeFunction;
 use tokio::runtime::Handle;
 
-pub use self::js_loader::JsLoaderAdapter;
-pub use self::js_loader::*;
 use crate::RawResolveOptions;
-
-pub fn get_builtin_loader(builtin: &str, options: Option<&str>) -> BoxLoader {
-  if builtin.starts_with(SWC_LOADER_IDENTIFIER) {
-    return Arc::new(
-      rspack_loader_swc::SwcLoader::new(
-        serde_json::from_str(options.unwrap_or("{}")).unwrap_or_else(|e| {
-          panic!("Could not parse builtin:swc-loader options:{options:?},error: {e:?}")
-        }),
-      )
-      .with_identifier(builtin.into()),
-    );
-  }
-  if builtin.starts_with(REACT_REFRESH_LOADER_IDENTIFIER) {
-    return Arc::new(
-      rspack_loader_react_refresh::ReactRefreshLoader::default().with_identifier(builtin.into()),
-    );
-  }
-
-  unreachable!("Unexpected builtin loader: {builtin}")
-}
 
 /// `loader` is for both JS and Rust loaders.
 /// `options` is
@@ -72,41 +47,15 @@ impl Debug for RawModuleRuleUse {
 }
 
 #[napi(object, object_to_js = false)]
-pub struct RawModuleRuleUses {
-  #[napi(ts_type = r#""array" | "function""#)]
-  pub r#type: String,
-  pub array_use: Option<Vec<RawModuleRuleUse>>,
-  #[napi(ts_type = "(arg: RawFuncUseCtx) => RawModuleRuleUse[]")]
-  pub func_use: Option<ThreadsafeFunction<RawFuncUseCtx, Vec<RawModuleRuleUse>>>,
-}
-
-impl Debug for RawModuleRuleUses {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("RawModuleRuleUses")
-      .field("r#type", &self.r#type)
-      .field("array_use", &self.array_use)
-      .field("func_use", &"...")
-      .finish()
-  }
-}
-
-#[derive(Debug)]
-#[napi(object)]
-pub struct RawRegexMatcher {
-  pub source: String,
-  pub flags: String,
-}
-
-#[napi(object, object_to_js = false)]
 pub struct RawRuleSetCondition {
   #[napi(ts_type = r#""string" | "regexp" | "logical" | "array" | "function""#)]
   pub r#type: String,
   pub string_matcher: Option<String>,
-  pub regexp_matcher: Option<RawRegexMatcher>,
+  pub regexp_matcher: Option<RawRegex>,
   pub logical_matcher: Option<Vec<RawRuleSetLogicalConditions>>,
   pub array_matcher: Option<Vec<RawRuleSetCondition>>,
   #[napi(ts_type = r#"(value: string) => boolean"#)]
-  pub func_matcher: Option<ThreadsafeFunction<String, bool>>,
+  pub func_matcher: Option<ThreadsafeFunction<serde_json::Value, bool>>,
 }
 
 impl Debug for RawRuleSetCondition {
@@ -206,8 +155,8 @@ impl TryFrom<RawRuleSetCondition> for rspack_core::RuleSetCondition {
             "should have a func_matcher when RawRuleSetCondition.type is \"function\""
           )
         })?;
-        Self::Func(Box::new(move|data: &str| {
-          let data = data.to_string();
+        Self::Func(Box::new(move|data: &serde_json::Value| {
+          let data = data.clone();
           let func_matcher = func_matcher.clone();
           Box::pin(async move { func_matcher.call(data).await })
         }))
@@ -221,6 +170,8 @@ impl TryFrom<RawRuleSetCondition> for rspack_core::RuleSetCondition {
     Ok(result)
   }
 }
+
+type ThreadsafeUse = ThreadsafeFunction<RawFuncUseCtx, Vec<RawModuleRuleUse>>;
 
 #[derive(Derivative)]
 #[derivative(Debug, Default)]
@@ -242,7 +193,8 @@ pub struct RawModuleRule {
   pub resource_fragment: Option<RawRuleSetCondition>,
   pub description_data: Option<HashMap<String, RawRuleSetCondition>>,
   pub side_effects: Option<bool>,
-  pub r#use: Option<RawModuleRuleUses>,
+  #[napi(ts_type = "RawModuleRuleUse[] | ((arg: RawFuncUseCtx) => RawModuleRuleUse[])")]
+  pub r#use: Option<Either<Vec<RawModuleRuleUse>, ThreadsafeUse>>,
   pub r#type: Option<String>,
   pub parser: Option<RawParserOptions>,
   pub generator: Option<RawGeneratorOptions>,
@@ -324,6 +276,11 @@ pub struct RawJavascriptParserOptions {
   pub url: String,
   pub expr_context_critical: bool,
   pub wrapped_context_critical: bool,
+  pub exports_presence: Option<String>,
+  pub import_exports_presence: Option<String>,
+  pub reexport_exports_presence: Option<String>,
+  pub strict_export_presence: bool,
+  pub worker: Vec<String>,
 }
 
 impl From<RawJavascriptParserOptions> for JavascriptParserOptions {
@@ -335,6 +292,17 @@ impl From<RawJavascriptParserOptions> for JavascriptParserOptions {
       url: JavascriptParserUrl::from(value.url.as_str()),
       expr_context_critical: value.expr_context_critical,
       wrapped_context_critical: value.wrapped_context_critical,
+      exports_presence: value
+        .exports_presence
+        .map(|e| ExportPresenceMode::from(e.as_str())),
+      import_exports_presence: value
+        .import_exports_presence
+        .map(|e| ExportPresenceMode::from(e.as_str())),
+      reexport_exports_presence: value
+        .reexport_exports_presence
+        .map(|e| ExportPresenceMode::from(e.as_str())),
+      strict_export_presence: value.strict_export_presence,
+      worker: value.worker,
     }
   }
 }
@@ -619,16 +587,15 @@ impl From<RawAssetGeneratorDataUrlOptions> for AssetGeneratorDataUrlOptions {
 #[derive(Debug, Default)]
 #[napi(object)]
 pub struct RawCssGeneratorOptions {
-  #[napi(ts_type = r#""as-is" | "camel-case" | "camel-case-only" | "dashes" | "dashes-only""#)]
-  pub exports_convention: Option<String>,
   pub exports_only: Option<bool>,
+  pub es_module: Option<bool>,
 }
 
 impl From<RawCssGeneratorOptions> for CssGeneratorOptions {
   fn from(value: RawCssGeneratorOptions) -> Self {
     Self {
-      exports_convention: value.exports_convention.map(|n| n.into()),
       exports_only: value.exports_only,
+      es_module: value.es_module,
     }
   }
 }
@@ -640,6 +607,7 @@ pub struct RawCssAutoGeneratorOptions {
   pub exports_convention: Option<String>,
   pub exports_only: Option<bool>,
   pub local_ident_name: Option<String>,
+  pub es_module: Option<bool>,
 }
 
 impl From<RawCssAutoGeneratorOptions> for CssAutoGeneratorOptions {
@@ -648,6 +616,7 @@ impl From<RawCssAutoGeneratorOptions> for CssAutoGeneratorOptions {
       exports_convention: value.exports_convention.map(|n| n.into()),
       exports_only: value.exports_only,
       local_ident_name: value.local_ident_name.map(|n| n.into()),
+      es_module: value.es_module,
     }
   }
 }
@@ -659,6 +628,7 @@ pub struct RawCssModuleGeneratorOptions {
   pub exports_convention: Option<String>,
   pub exports_only: Option<bool>,
   pub local_ident_name: Option<String>,
+  pub es_module: Option<bool>,
 }
 
 impl From<RawCssModuleGeneratorOptions> for CssModuleGeneratorOptions {
@@ -667,6 +637,7 @@ impl From<RawCssModuleGeneratorOptions> for CssModuleGeneratorOptions {
       exports_convention: value.exports_convention.map(|n| n.into()),
       exports_only: value.exports_only,
       local_ident_name: value.local_ident_name.map(|n| n.into()),
+      es_module: value.es_module,
     }
   }
 }
@@ -717,45 +688,33 @@ impl TryFrom<RawModuleRule> for ModuleRule {
   type Error = rspack_error::Error;
 
   fn try_from(value: RawModuleRule) -> rspack_error::Result<Self> {
-    // Even this part is using the plural version of loader, it's recommended to use singular version from js side to reduce overhead (This behavior maybe changed later for advanced usage).
-    let uses = value.r#use.map(|raw| match raw.r#type.as_str() {
-      "array" => {
-        let uses = raw
-          .array_use
-          .map(|uses| {
-            uses
-              .into_iter()
-              .map(|rule_use| ModuleRuleUseLoader {
-                loader: rule_use.loader,
-                options: rule_use.options,
-              })
-              .collect::<Vec<_>>()
+    let uses = value.r#use.map(|raw| match raw {
+      Either::A(array) => {
+        let uses = array
+          .into_iter()
+          .map(|rule_use| ModuleRuleUseLoader {
+            loader: rule_use.loader,
+            options: rule_use.options,
           })
-          .unwrap_or_default();
+          .collect::<Vec<_>>();
         Ok::<ModuleRuleUse, rspack_error::Error>(ModuleRuleUse::Array(uses))
       }
-      "function" => {
-        let func_use = raw.func_use.ok_or_else(|| {
-          error!("should have a func_matcher when RawRuleSetCondition.type is \"function\"")
-        })?;
-        Ok::<ModuleRuleUse, rspack_error::Error>(ModuleRuleUse::Func(Box::new(
-          move |ctx: FuncUseCtx| {
-            let func_use = func_use.clone();
-            Box::pin(async move {
-              func_use.call(ctx.into()).await.map(|uses| {
-                uses
-                  .into_iter()
-                  .map(|rule_use| ModuleRuleUseLoader {
-                    loader: rule_use.loader,
-                    options: rule_use.options,
-                  })
-                  .collect::<Vec<_>>()
-              })
+      Either::B(tsfn) => Ok::<ModuleRuleUse, rspack_error::Error>(ModuleRuleUse::Func(Box::new(
+        move |ctx: FuncUseCtx| {
+          let tsfn = tsfn.clone();
+          Box::pin(async move {
+            tsfn.call(ctx.into()).await.map(|uses| {
+              uses
+                .into_iter()
+                .map(|rule_use| ModuleRuleUseLoader {
+                  loader: rule_use.loader,
+                  options: rule_use.options,
+                })
+                .collect::<Vec<_>>()
             })
-          },
-        )))
-      }
-      _ => Ok::<ModuleRuleUse, rspack_error::Error>(ModuleRuleUse::Array(vec![])),
+          })
+        },
+      ))),
     });
 
     let module_type = value.r#type.map(|t| (&*t).into());

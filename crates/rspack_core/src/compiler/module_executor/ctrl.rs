@@ -45,6 +45,7 @@ impl UnfinishCounter {
 }
 
 // send event can only use in sync task
+#[derive(Debug)]
 pub enum Event {
   StartBuild(ModuleIdentifier),
   // origin_module_identifier and current dependency id and target_module_identifier
@@ -84,6 +85,7 @@ impl Task<MakeTaskContext> for CtrlTask {
 
   async fn async_run(mut self: Box<Self>) -> TaskResult<MakeTaskContext> {
     while let Some(event) = self.event_receiver.recv().await {
+      tracing::info!("CtrlTask async receive {:?}", event);
       match event {
         Event::StartBuild(module_identifier) => {
           self
@@ -137,7 +139,7 @@ impl Task<MakeTaskContext> for CtrlTask {
         Event::ExecuteModule(param, execute_task) => {
           let dep_id = match &param {
             EntryParam::DependencyId(id, _) => *id,
-            EntryParam::EntryDependency(dep) => *dep.id(),
+            EntryParam::Entry(dep) => *dep.id(),
           };
           self.execute_task_map.insert(dep_id, execute_task);
           return Ok(vec![Box::new(EntryTask { param }), self]);
@@ -169,13 +171,15 @@ impl Task<MakeTaskContext> for FinishModuleTask {
       module_identifier,
     } = *self;
     let mut res: Vec<Box<dyn Task<MakeTaskContext>>> = vec![];
-    let module_graph = MakeTaskContext::get_module_graph_mut(&mut context.module_graph_partial);
+    let module_graph =
+      MakeTaskContext::get_module_graph_mut(&mut context.artifact.module_graph_partial);
     let mut queue = VecDeque::new();
     queue.push_back(module_identifier);
 
     // clean ctrl task events
     loop {
       let event = ctrl_task.event_receiver.try_recv();
+      tracing::info!("CtrlTask sync receive {:?}", event);
       let Ok(event) = event else {
         if matches!(event, Err(TryRecvError::Empty)) {
           break;
@@ -234,7 +238,7 @@ impl Task<MakeTaskContext> for FinishModuleTask {
         Event::ExecuteModule(param, execute_task) => {
           let dep_id = match &param {
             EntryParam::DependencyId(id, _) => *id,
-            EntryParam::EntryDependency(dep) => *dep.id(),
+            EntryParam::Entry(dep) => *dep.id(),
           };
           ctrl_task.execute_task_map.insert(dep_id, execute_task);
           res.push(Box::new(EntryTask { param }));
@@ -246,6 +250,7 @@ impl Task<MakeTaskContext> for FinishModuleTask {
     }
 
     while let Some(module_identifier) = queue.pop_front() {
+      tracing::info!("finish build module {:?}", module_identifier);
       ctrl_task.running_module_map.remove(&module_identifier);
 
       let mgm = module_graph
@@ -258,7 +263,10 @@ impl Task<MakeTaskContext> for FinishModuleTask {
           .connection_by_connection_id(connection_id)
           .expect("should have connection");
         if let Some(original_module_identifier) = &connection.original_module_identifier {
-          original_module_identifiers.insert(*original_module_identifier);
+          // skip self reference
+          if original_module_identifier != &module_identifier {
+            original_module_identifiers.insert(*original_module_identifier);
+          }
         } else {
           // entry
           let execute_task = ctrl_task

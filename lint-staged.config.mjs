@@ -1,9 +1,10 @@
 export default {
 	"*.rs": "rustfmt --edition 2021",
-	"*.{ts,js}": "pnpm run format:js",
+	"*.{ts,tsx,js}": "pnpm run format:js",
 	"*.toml": "npx @taplo/cli format",
-	"*.{ts,js,cts,cjs,mts,mjs}": () => [
+	"*.{ts,tsx,js,cts,cjs,mts,mjs}": () => [
 		"pnpm run lint:js",
-		"pnpm run api-extractor:ci"
+		"pnpm run lint:js-sort-imports-order",
+		"node ./x ae ci"
 	]
 };

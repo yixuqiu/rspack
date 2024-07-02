@@ -1,17 +1,18 @@
 use async_trait::async_trait;
 use rspack_core::{
-  impl_runtime_module,
+  compile_boolean_matcher, impl_runtime_module,
   rspack_sources::{BoxSource, RawSource, SourceExt},
-  ApplyContext, ChunkUkey, Compilation, CompilationAdditionalTreeRuntimeRequirements,
-  CompilerOptions, Plugin, PluginContext, RuntimeGlobals, RuntimeModule, RuntimeModuleStage,
+  ApplyContext, BooleanMatcher, Chunk, ChunkUkey, Compilation,
+  CompilationAdditionalTreeRuntimeRequirements, CompilerOptions, Plugin, PluginContext,
+  RuntimeGlobals, RuntimeModule, RuntimeModuleStage,
 };
 use rspack_error::Result;
 use rspack_hook::{plugin, plugin_hook};
 use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
+use rspack_plugin_runtime::chunk_has_js;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
+#[derive(Debug)]
 pub struct FederationRuntimeModule {
   id: Identifier,
   chunk: Option<ChunkUkey>,
@@ -19,12 +20,7 @@ pub struct FederationRuntimeModule {
 
 impl Default for FederationRuntimeModule {
   fn default() -> Self {
-    Self {
-      id: Identifier::from("module_federation/runtime"),
-      chunk: None,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
-    }
+    Self::with_default(Identifier::from("module_federation/runtime"), None)
   }
 }
 
@@ -41,20 +37,46 @@ impl RuntimeModule for FederationRuntimeModule {
     RuntimeModuleStage::Normal
   }
 
-  fn generate(&self, _: &Compilation) -> rspack_error::Result<BoxSource> {
-    Ok(RawSource::from(federation_runtime_template()).boxed())
+  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
+    let chunk = compilation
+      .chunk_by_ukey
+      .expect_get(&self.chunk.expect("The chunk should be attached."));
+    Ok(RawSource::from(federation_runtime_template(chunk, compilation)).boxed())
   }
 }
 
-fn federation_runtime_template() -> String {
+fn federation_runtime_template(chunk: &Chunk, compilation: &Compilation) -> String {
   let federation_global = format!("{}.federation", RuntimeGlobals::REQUIRE);
+
+  let condition_map =
+    compilation
+      .chunk_graph
+      .get_chunk_condition_map(&chunk.ukey, compilation, chunk_has_js);
+  let has_js_matcher = compile_boolean_matcher(&condition_map);
+
+  let chunk_matcher = if matches!(has_js_matcher, BooleanMatcher::Condition(false)) {
+    String::from("")
+  } else {
+    format!(
+      r#"
+chunkMatcher: function(chunkId) {{
+    return {has_js_matcher};
+}}
+"#,
+      has_js_matcher = &has_js_matcher.render("chunkId")
+    )
+  };
+
   format!(
     r#"
 if(!{federation_global}){{
-  {federation_global} = {{}};
+    {federation_global} = {{
+        {chunk_matcher}
+    }};
 }}
 "#,
     federation_global = federation_global,
+    chunk_matcher = chunk_matcher
   )
 }
 
@@ -63,7 +85,7 @@ if(!{federation_global}){{
 pub struct ModuleFederationRuntimePlugin;
 
 #[plugin_hook(CompilationAdditionalTreeRuntimeRequirements for ModuleFederationRuntimePlugin)]
-fn additional_tree_runtime_requirements(
+async fn additional_tree_runtime_requirements(
   &self,
   compilation: &mut Compilation,
   chunk_ukey: &ChunkUkey,

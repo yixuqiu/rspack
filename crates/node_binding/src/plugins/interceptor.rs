@@ -1,47 +1,61 @@
 use std::{
   borrow::Cow,
+  hash::Hash,
   path::PathBuf,
   sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
 use napi::{
-  bindgen_prelude::{FromNapiValue, Promise, ToNapiValue},
+  bindgen_prelude::{Buffer, FromNapiValue, Promise, ToNapiValue},
   Env, JsFunction, NapiRaw,
 };
 use rspack_binding_values::{
-  CompatSource, JsAfterResolveData, JsAfterResolveOutput, JsAssetEmittedArgs, JsBeforeResolveArgs,
-  JsBeforeResolveOutput, JsChunk, JsChunkAssetArgs, JsCompilation, JsCreateData,
-  JsExecuteModuleArg, JsModule, JsNormalModuleFactoryCreateModuleArgs, JsResolveForSchemeArgs,
-  JsResolveForSchemeOutput, JsRuntimeModule, JsRuntimeModuleArg, ToJsCompatSource, ToJsModule,
+  CompatSource, JsAdditionalTreeRuntimeRequirementsArg, JsAdditionalTreeRuntimeRequirementsResult,
+  JsAfterResolveData, JsAfterResolveOutput, JsAssetEmittedArgs, JsBeforeResolveArgs,
+  JsBeforeResolveOutput, JsChunk, JsChunkAssetArgs, JsCompilation,
+  JsContextModuleFactoryAfterResolveData, JsContextModuleFactoryAfterResolveResult,
+  JsContextModuleFactoryBeforeResolveData, JsContextModuleFactoryBeforeResolveResult, JsCreateData,
+  JsExecuteModuleArg, JsFactorizeArgs, JsFactorizeOutput, JsModule,
+  JsNormalModuleFactoryCreateModuleArgs, JsResolveArgs, JsResolveForSchemeArgs,
+  JsResolveForSchemeOutput, JsResolveOutput, JsRuntimeGlobals, JsRuntimeModule, JsRuntimeModuleArg,
+  ToJsCompatSource, ToJsModule,
 };
 use rspack_core::{
-  rspack_sources::SourceExt, AssetEmittedInfo, BoxModule, Chunk, ChunkUkey, CodeGenerationResults,
-  Compilation, CompilationAfterOptimizeModules, CompilationAfterOptimizeModulesHook,
-  CompilationAfterProcessAssets, CompilationAfterProcessAssetsHook, CompilationAfterSeal,
-  CompilationAfterSealHook, CompilationBuildModule, CompilationBuildModuleHook,
-  CompilationChunkAsset, CompilationChunkAssetHook, CompilationExecuteModule,
-  CompilationExecuteModuleHook, CompilationFinishModules, CompilationFinishModulesHook,
-  CompilationOptimizeChunkModules, CompilationOptimizeChunkModulesHook, CompilationOptimizeModules,
-  CompilationOptimizeModulesHook, CompilationOptimizeTree, CompilationOptimizeTreeHook,
-  CompilationParams, CompilationProcessAssets, CompilationProcessAssetsHook,
-  CompilationRuntimeModule, CompilationRuntimeModuleHook, CompilationStillValidModule,
-  CompilationStillValidModuleHook, CompilationSucceedModule, CompilationSucceedModuleHook,
-  CompilerAfterEmit, CompilerAfterEmitHook, CompilerAssetEmitted, CompilerAssetEmittedHook,
-  CompilerCompilation, CompilerCompilationHook, CompilerEmit, CompilerEmitHook, CompilerFinishMake,
-  CompilerFinishMakeHook, CompilerMake, CompilerMakeHook, CompilerShouldEmit,
-  CompilerShouldEmitHook, CompilerThisCompilation, CompilerThisCompilationHook,
-  ContextModuleFactoryAfterResolve, ContextModuleFactoryAfterResolveHook,
-  ContextModuleFactoryBeforeResolve, ContextModuleFactoryBeforeResolveHook, ExecuteModuleId,
-  MakeParam, ModuleFactoryCreateData, ModuleIdentifier, NormalModuleCreateData,
-  NormalModuleFactoryAfterResolve, NormalModuleFactoryAfterResolveHook,
-  NormalModuleFactoryBeforeResolve, NormalModuleFactoryBeforeResolveHook,
-  NormalModuleFactoryCreateModule, NormalModuleFactoryCreateModuleHook,
-  NormalModuleFactoryResolveForScheme, NormalModuleFactoryResolveForSchemeHook, ResourceData,
+  rspack_sources::SourceExt, AfterResolveData, AfterResolveResult, AssetEmittedInfo,
+  BeforeResolveData, BeforeResolveResult, BoxModule, Chunk, ChunkUkey, CodeGenerationResults,
+  Compilation, CompilationAdditionalTreeRuntimeRequirements,
+  CompilationAdditionalTreeRuntimeRequirementsHook, CompilationAfterOptimizeModules,
+  CompilationAfterOptimizeModulesHook, CompilationAfterProcessAssets,
+  CompilationAfterProcessAssetsHook, CompilationAfterSeal, CompilationAfterSealHook,
+  CompilationBuildModule, CompilationBuildModuleHook, CompilationChunkAsset,
+  CompilationChunkAssetHook, CompilationChunkHash, CompilationChunkHashHook,
+  CompilationExecuteModule, CompilationExecuteModuleHook, CompilationFinishModules,
+  CompilationFinishModulesHook, CompilationOptimizeChunkModules,
+  CompilationOptimizeChunkModulesHook, CompilationOptimizeModules, CompilationOptimizeModulesHook,
+  CompilationOptimizeTree, CompilationOptimizeTreeHook, CompilationParams,
+  CompilationProcessAssets, CompilationProcessAssetsHook, CompilationRuntimeModule,
+  CompilationRuntimeModuleHook, CompilationStillValidModule, CompilationStillValidModuleHook,
+  CompilationSucceedModule, CompilationSucceedModuleHook, CompilerAfterEmit, CompilerAfterEmitHook,
+  CompilerAssetEmitted, CompilerAssetEmittedHook, CompilerCompilation, CompilerCompilationHook,
+  CompilerEmit, CompilerEmitHook, CompilerFinishMake, CompilerFinishMakeHook, CompilerMake,
+  CompilerMakeHook, CompilerShouldEmit, CompilerShouldEmitHook, CompilerThisCompilation,
+  CompilerThisCompilationHook, ContextModuleFactoryAfterResolve,
+  ContextModuleFactoryAfterResolveHook, ContextModuleFactoryBeforeResolve,
+  ContextModuleFactoryBeforeResolveHook, ExecuteModuleId, ModuleFactoryCreateData,
+  ModuleIdentifier, NormalModuleCreateData, NormalModuleFactoryAfterResolve,
+  NormalModuleFactoryAfterResolveHook, NormalModuleFactoryBeforeResolve,
+  NormalModuleFactoryBeforeResolveHook, NormalModuleFactoryCreateModule,
+  NormalModuleFactoryCreateModuleHook, NormalModuleFactoryFactorize,
+  NormalModuleFactoryFactorizeHook, NormalModuleFactoryResolve,
+  NormalModuleFactoryResolveForScheme, NormalModuleFactoryResolveForSchemeHook,
+  NormalModuleFactoryResolveHook, NormalModuleFactoryResolveResult, ResourceData, RuntimeGlobals,
 };
+use rspack_hash::RspackHash;
 use rspack_hook::{Hook, Interceptor};
 use rspack_identifier::IdentifierSet;
 use rspack_napi::threadsafe_function::ThreadsafeFunction;
+use rspack_plugin_javascript::{JavascriptModulesChunkHash, JavascriptModulesChunkHashHook};
 
 #[napi(object)]
 pub struct JsTap {
@@ -296,17 +310,22 @@ pub enum RegisterJsTapKind {
   CompilationAfterOptimizeModules,
   CompilationOptimizeTree,
   CompilationOptimizeChunkModules,
+  CompilationAdditionalTreeRuntimeRequirements,
   CompilationRuntimeModule,
+  CompilationChunkHash,
   CompilationChunkAsset,
   CompilationProcessAssets,
   CompilationAfterProcessAssets,
   CompilationAfterSeal,
   NormalModuleFactoryBeforeResolve,
+  NormalModuleFactoryFactorize,
+  NormalModuleFactoryResolve,
   NormalModuleFactoryAfterResolve,
   NormalModuleFactoryCreateModule,
   NormalModuleFactoryResolveForScheme,
   ContextModuleFactoryBeforeResolve,
   ContextModuleFactoryAfterResolve,
+  JavascriptModulesChunkHash,
 }
 
 #[derive(Default, Clone)]
@@ -375,6 +394,13 @@ pub struct RegisterJsTaps {
   )]
   pub register_compilation_execute_module_taps: RegisterFunction<JsExecuteModuleArg, ()>,
   #[napi(
+    ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsAdditionalTreeRuntimeRequirementsArg) => JsAdditionalTreeRuntimeRequirementsResult | undefined); stage: number; }>"
+  )]
+  pub register_compilation_additional_tree_runtime_requirements: RegisterFunction<
+    JsAdditionalTreeRuntimeRequirementsArg,
+    Option<JsAdditionalTreeRuntimeRequirementsResult>,
+  >,
+  #[napi(
     ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsRuntimeModuleArg) => JsRuntimeModule | undefined); stage: number; }>"
   )]
   pub register_compilation_runtime_module_taps:
@@ -398,6 +424,10 @@ pub struct RegisterJsTaps {
   )]
   pub register_compilation_optimize_chunk_modules_taps: RegisterFunction<(), Promise<Option<bool>>>,
   #[napi(
+    ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsChunk) => Buffer); stage: number; }>"
+  )]
+  pub register_compilation_chunk_hash_taps: RegisterFunction<JsChunk, Buffer>,
+  #[napi(
     ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsChunkAssetArgs) => void); stage: number; }>"
   )]
   pub register_compilation_chunk_asset_taps: RegisterFunction<JsChunkAssetArgs, ()>,
@@ -419,6 +449,16 @@ pub struct RegisterJsTaps {
   pub register_normal_module_factory_before_resolve_taps:
     RegisterFunction<JsBeforeResolveArgs, Promise<JsBeforeResolveOutput>>,
   #[napi(
+    ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsFactorizeArgs) => Promise<JsFactorizeArgs>); stage: number; }>"
+  )]
+  pub register_normal_module_factory_factorize_taps:
+    RegisterFunction<JsFactorizeArgs, Promise<JsFactorizeOutput>>,
+  #[napi(
+    ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsResolveArgs) => Promise<JsResolveArgs>); stage: number; }>"
+  )]
+  pub register_normal_module_factory_resolve_taps:
+    RegisterFunction<JsResolveArgs, Promise<JsResolveOutput>>,
+  #[napi(
     ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsResolveForSchemeArgs) => Promise<[boolean | undefined, JsResolveForSchemeArgs]>); stage: number; }>"
   )]
   pub register_normal_module_factory_resolve_for_scheme_taps:
@@ -434,15 +474,23 @@ pub struct RegisterJsTaps {
   pub register_normal_module_factory_create_module_taps:
     RegisterFunction<JsNormalModuleFactoryCreateModuleArgs, Promise<()>>,
   #[napi(
-    ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsBeforeResolveArgs) => Promise<[boolean | undefined, JsBeforeResolveArgs]>); stage: number; }>"
+    ts_type = "(stages: Array<number>) => Array<{ function: ((arg: false | JsContextModuleFactoryBeforeResolveData) => Promise<false | JsContextModuleFactoryBeforeResolveData>); stage: number; }>"
   )]
-  pub register_context_module_factory_before_resolve_taps:
-    RegisterFunction<JsBeforeResolveArgs, Promise<JsBeforeResolveOutput>>,
+  pub register_context_module_factory_before_resolve_taps: RegisterFunction<
+    JsContextModuleFactoryBeforeResolveResult,
+    Promise<JsContextModuleFactoryBeforeResolveResult>,
+  >,
   #[napi(
-    ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsAfterResolveData) => Promise<boolean | undefined>); stage: number; }>"
+    ts_type = "(stages: Array<number>) => Array<{ function: ((arg: false | JsContextModuleFactoryAfterResolveData) => Promise<false | JsContextModuleFactoryAfterResolveData>); stage: number; }>"
   )]
-  pub register_context_module_factory_after_resolve_taps:
-    RegisterFunction<JsAfterResolveData, Promise<Option<bool>>>,
+  pub register_context_module_factory_after_resolve_taps: RegisterFunction<
+    JsContextModuleFactoryAfterResolveResult,
+    Promise<JsContextModuleFactoryAfterResolveResult>,
+  >,
+  #[napi(
+    ts_type = "(stages: Array<number>) => Array<{ function: ((arg: JsChunk) => Buffer); stage: number; }>"
+  )]
+  pub register_javascript_modules_chunk_hash_taps: RegisterFunction<JsChunk, Buffer>,
 }
 
 /* Compiler Hooks */
@@ -585,11 +633,27 @@ define_register!(
   skip = true,
 );
 define_register!(
+  RegisterCompilationAdditionalTreeRuntimeRequirementsTaps,
+  tap = CompilationAdditionalTreeRuntimeRequirementsTap<JsAdditionalTreeRuntimeRequirementsArg, Option<JsAdditionalTreeRuntimeRequirementsResult>> @ CompilationAdditionalTreeRuntimeRequirementsHook,
+  cache = true,
+  sync = false,
+  kind = RegisterJsTapKind::CompilationAdditionalTreeRuntimeRequirements,
+  skip = true,
+);
+define_register!(
   RegisterCompilationRuntimeModuleTaps,
   tap = CompilationRuntimeModuleTap<JsRuntimeModuleArg, Option<JsRuntimeModule>> @ CompilationRuntimeModuleHook,
   cache = true,
   sync = false,
   kind = RegisterJsTapKind::CompilationRuntimeModule,
+  skip = true,
+);
+define_register!(
+  RegisterCompilationChunkHashTaps,
+  tap = CompilationChunkHashTap<JsChunk, Buffer> @ CompilationChunkHashHook,
+  cache = true,
+  sync = false,
+  kind = RegisterJsTapKind::CompilationChunkHash,
   skip = true,
 );
 define_register!(
@@ -635,6 +699,22 @@ define_register!(
   skip = true,
 );
 define_register!(
+  RegisterNormalModuleFactoryFactorizeTaps,
+  tap = NormalModuleFactoryFactorizeTap<JsFactorizeArgs, Promise<JsFactorizeOutput>> @ NormalModuleFactoryFactorizeHook,
+  cache = true,
+  sync = false,
+  kind = RegisterJsTapKind::NormalModuleFactoryFactorize,
+  skip = true,
+);
+define_register!(
+  RegisterNormalModuleFactoryResolveTaps,
+  tap = NormalModuleFactoryResolveTap<JsResolveArgs, Promise<JsResolveOutput>> @ NormalModuleFactoryResolveHook,
+  cache = true,
+  sync = false,
+  kind = RegisterJsTapKind::NormalModuleFactoryResolve,
+  skip = true,
+);
+define_register!(
   RegisterNormalModuleFactoryResolveForSchemeTaps,
   tap = NormalModuleFactoryResolveForSchemeTap<JsResolveForSchemeArgs, Promise<JsResolveForSchemeOutput>> @ NormalModuleFactoryResolveForSchemeHook,
   cache = true,
@@ -662,7 +742,7 @@ define_register!(
 /* ContextModuleFactory Hooks */
 define_register!(
   RegisterContextModuleFactoryBeforeResolveTaps,
-  tap = ContextModuleFactoryBeforeResolveTap<JsBeforeResolveArgs, Promise<JsBeforeResolveOutput>> @ ContextModuleFactoryBeforeResolveHook,
+  tap = ContextModuleFactoryBeforeResolveTap<JsContextModuleFactoryBeforeResolveResult, Promise<JsContextModuleFactoryBeforeResolveResult>> @ ContextModuleFactoryBeforeResolveHook,
   cache = true,
   sync = false,
   kind = RegisterJsTapKind::ContextModuleFactoryBeforeResolve,
@@ -670,10 +750,20 @@ define_register!(
 );
 define_register!(
   RegisterContextModuleFactoryAfterResolveTaps,
-  tap = ContextModuleFactoryAfterResolveTap<JsAfterResolveData, Promise<Option<bool>>> @ ContextModuleFactoryAfterResolveHook,
+  tap = ContextModuleFactoryAfterResolveTap<JsContextModuleFactoryAfterResolveResult, Promise<JsContextModuleFactoryAfterResolveResult>> @ ContextModuleFactoryAfterResolveHook,
   cache = true,
   sync = false,
   kind = RegisterJsTapKind::ContextModuleFactoryAfterResolve,
+  skip = true,
+);
+
+/* JavascriptModules Hooks */
+define_register!(
+  RegisterJavascriptModulesChunkHashTaps,
+  tap = JavascriptModulesChunkHashTap<JsChunk, Buffer> @ JavascriptModulesChunkHashHook,
+  cache = true,
+  sync = false,
+  kind = RegisterJsTapKind::JavascriptModulesChunkHash,
   skip = true,
 );
 
@@ -719,11 +809,7 @@ impl CompilerCompilation for CompilerCompilationTap {
 
 #[async_trait]
 impl CompilerMake for CompilerMakeTap {
-  async fn run(
-    &self,
-    compilation: &mut Compilation,
-    _: &mut Vec<MakeParam>,
-  ) -> rspack_error::Result<()> {
+  async fn run(&self, compilation: &mut Compilation) -> rspack_error::Result<()> {
     // SAFETY:
     // 1. `Compiler` is stored on the heap and pinned in binding crate.
     // 2. `Compilation` outlives `JsCompilation` and `Compiler` outlives `Compilation`.
@@ -943,6 +1029,33 @@ impl CompilationOptimizeChunkModules for CompilationOptimizeChunkModulesTap {
 }
 
 #[async_trait]
+impl CompilationAdditionalTreeRuntimeRequirements
+  for CompilationAdditionalTreeRuntimeRequirementsTap
+{
+  async fn run(
+    &self,
+    compilation: &mut Compilation,
+    chunk_ukey: &ChunkUkey,
+    runtime_requirements: &mut RuntimeGlobals,
+  ) -> rspack_error::Result<()> {
+    let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+    let arg = JsAdditionalTreeRuntimeRequirementsArg {
+      chunk: JsChunk::from(chunk),
+      runtime_requirements: JsRuntimeGlobals::from(*runtime_requirements),
+    };
+    let result = self.function.call_with_sync(arg).await?;
+    if let Some(result) = result {
+      let _ = std::mem::replace(runtime_requirements, result.as_runtime_globals());
+    }
+    Ok(())
+  }
+
+  fn stage(&self) -> i32 {
+    self.stage
+  }
+}
+
+#[async_trait]
 impl CompilationRuntimeModule for CompilationRuntimeModuleTap {
   async fn run(
     &self,
@@ -977,6 +1090,25 @@ impl CompilationRuntimeModule for CompilationRuntimeModuleTap {
         .expect("should have module");
       module.set_custom_source(CompatSource::from(source).boxed())
     }
+    Ok(())
+  }
+
+  fn stage(&self) -> i32 {
+    self.stage
+  }
+}
+
+#[async_trait]
+impl CompilationChunkHash for CompilationChunkHashTap {
+  async fn run(
+    &self,
+    compilation: &Compilation,
+    chunk_ukey: &ChunkUkey,
+    hasher: &mut RspackHash,
+  ) -> rspack_error::Result<()> {
+    let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+    let result = self.function.call_with_sync(JsChunk::from(chunk)).await?;
+    result.hash(hasher);
     Ok(())
   }
 
@@ -1059,6 +1191,11 @@ impl NormalModuleFactoryBeforeResolve for NormalModuleFactoryBeforeResolveTap {
       .call_with_promise(JsBeforeResolveArgs {
         request: dependency.request().to_string(),
         context: data.context.to_string(),
+        issuer: data
+          .issuer
+          .as_ref()
+          .map(|issuer| issuer.to_string())
+          .unwrap_or_default(),
       })
       .await
     {
@@ -1066,6 +1203,82 @@ impl NormalModuleFactoryBeforeResolve for NormalModuleFactoryBeforeResolveTap {
         dependency.set_request(resolve_data.request);
         data.context = resolve_data.context.into();
         Ok(ret)
+      }
+      Err(err) => Err(err),
+    }
+  }
+
+  fn stage(&self) -> i32 {
+    self.stage
+  }
+}
+
+#[async_trait]
+impl NormalModuleFactoryFactorize for NormalModuleFactoryFactorizeTap {
+  async fn run(
+    &self,
+    data: &mut ModuleFactoryCreateData,
+  ) -> rspack_error::Result<Option<BoxModule>> {
+    let dependency = data
+      .dependency
+      .as_module_dependency_mut()
+      .expect("should be module dependency");
+    match self
+      .function
+      .call_with_promise(JsFactorizeArgs {
+        request: dependency.request().to_string(),
+        context: data.context.to_string(),
+        issuer: data
+          .issuer
+          .as_ref()
+          .map(|issuer| issuer.to_string())
+          .unwrap_or_default(),
+      })
+      .await
+    {
+      Ok(resolve_data) => {
+        dependency.set_request(resolve_data.request);
+        data.context = resolve_data.context.into();
+        // only supports update resolve request for now
+        Ok(None)
+      }
+      Err(err) => Err(err),
+    }
+  }
+
+  fn stage(&self) -> i32 {
+    self.stage
+  }
+}
+
+#[async_trait]
+impl NormalModuleFactoryResolve for NormalModuleFactoryResolveTap {
+  async fn run(
+    &self,
+    data: &mut ModuleFactoryCreateData,
+  ) -> rspack_error::Result<Option<NormalModuleFactoryResolveResult>> {
+    let dependency = data
+      .dependency
+      .as_module_dependency_mut()
+      .expect("should be module dependency");
+    match self
+      .function
+      .call_with_promise(JsResolveArgs {
+        request: dependency.request().to_string(),
+        context: data.context.to_string(),
+        issuer: data
+          .issuer
+          .as_ref()
+          .map(|issuer| issuer.to_string())
+          .unwrap_or_default(),
+      })
+      .await
+    {
+      Ok(resolve_data) => {
+        dependency.set_request(resolve_data.request);
+        data.context = resolve_data.context.into();
+        // only supports update resolve request for now
+        Ok(None)
       }
       Err(err) => Err(err),
     }
@@ -1111,6 +1324,11 @@ impl NormalModuleFactoryAfterResolve for NormalModuleFactoryAfterResolveTap {
       .call_with_promise(JsAfterResolveData {
         request: create_data.raw_request.to_string(),
         context: data.context.to_string(),
+        issuer: data
+          .issuer
+          .as_ref()
+          .map(|issuer| issuer.to_string())
+          .unwrap_or_default(),
         file_dependencies: data
           .file_dependencies
           .clone()
@@ -1202,24 +1420,27 @@ impl NormalModuleFactoryCreateModule for NormalModuleFactoryCreateModuleTap {
 
 #[async_trait]
 impl ContextModuleFactoryBeforeResolve for ContextModuleFactoryBeforeResolveTap {
-  async fn run(&self, data: &mut ModuleFactoryCreateData) -> rspack_error::Result<Option<bool>> {
-    let dependency = data
-      .dependency
-      .as_context_dependency_mut()
-      .expect("should be context dependency");
-    match self
-      .function
-      .call_with_promise(JsBeforeResolveArgs {
-        request: dependency.request().to_string(),
-        context: data.context.to_string(),
-      })
-      .await
-    {
-      Ok((ret, resolve_data)) => {
-        dependency.set_request(resolve_data.request);
-        data.context = resolve_data.context.into();
-        Ok(ret)
+  async fn run(&self, result: BeforeResolveResult) -> rspack_error::Result<BeforeResolveResult> {
+    let js_result = match result {
+      BeforeResolveResult::Ignored => JsContextModuleFactoryBeforeResolveResult::A(false),
+      BeforeResolveResult::Data(d) => {
+        JsContextModuleFactoryBeforeResolveResult::B(JsContextModuleFactoryBeforeResolveData {
+          context: d.context,
+          request: d.request,
+        })
       }
+    };
+    match self.function.call_with_promise(js_result).await {
+      Ok(js_result) => match js_result {
+        napi::bindgen_prelude::Either::A(_) => Ok(BeforeResolveResult::Ignored),
+        napi::bindgen_prelude::Either::B(d) => {
+          let data = BeforeResolveData {
+            context: d.context,
+            request: d.request,
+          };
+          Ok(BeforeResolveResult::Data(Box::new(data)))
+        }
+      },
       Err(err) => Err(err),
     }
   }
@@ -1231,37 +1452,52 @@ impl ContextModuleFactoryBeforeResolve for ContextModuleFactoryBeforeResolveTap 
 
 #[async_trait]
 impl ContextModuleFactoryAfterResolve for ContextModuleFactoryAfterResolveTap {
-  async fn run(&self, data: &mut ModuleFactoryCreateData) -> rspack_error::Result<Option<bool>> {
-    let dependency = data
-      .dependency
-      .as_context_dependency_mut()
-      .expect("should be context dependency");
-    self
-      .function
-      .call_with_promise(JsAfterResolveData {
-        request: dependency.request().to_string(),
-        context: data.context.to_string(),
-        file_dependencies: data
-          .file_dependencies
-          .clone()
-          .into_iter()
-          .map(|item| item.to_string_lossy().to_string())
-          .collect::<Vec<_>>(),
-        context_dependencies: data
-          .context_dependencies
-          .clone()
-          .into_iter()
-          .map(|item| item.to_string_lossy().to_string())
-          .collect::<Vec<_>>(),
-        missing_dependencies: data
-          .missing_dependencies
-          .clone()
-          .into_iter()
-          .map(|item| item.to_string_lossy().to_string())
-          .collect::<Vec<_>>(),
-        create_data: None,
-      })
-      .await
+  async fn run(&self, result: AfterResolveResult) -> rspack_error::Result<AfterResolveResult> {
+    let js_result = match result {
+      AfterResolveResult::Ignored => JsContextModuleFactoryAfterResolveResult::A(false),
+      AfterResolveResult::Data(d) => {
+        JsContextModuleFactoryAfterResolveResult::B(JsContextModuleFactoryAfterResolveData {
+          resource: d.resource.to_owned(),
+          context: d.context.to_owned(),
+          request: d.request.to_owned(),
+          reg_exp: d.reg_exp.clone().map(|r| r.into()),
+        })
+      }
+    };
+    match self.function.call_with_promise(js_result).await? {
+      napi::Either::A(_) => Ok(AfterResolveResult::Ignored),
+      napi::Either::B(d) => {
+        let data = AfterResolveData {
+          resource: d.resource,
+          context: d.context,
+          request: d.request,
+          reg_exp: match d.reg_exp {
+            Some(r) => Some(r.try_into()?),
+            None => None,
+          },
+        };
+        Ok(AfterResolveResult::Data(Box::new(data)))
+      }
+    }
+  }
+
+  fn stage(&self) -> i32 {
+    self.stage
+  }
+}
+
+#[async_trait]
+impl JavascriptModulesChunkHash for JavascriptModulesChunkHashTap {
+  async fn run(
+    &self,
+    compilation: &Compilation,
+    chunk_ukey: &ChunkUkey,
+    hasher: &mut RspackHash,
+  ) -> rspack_error::Result<()> {
+    let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+    let result = self.function.call_with_sync(JsChunk::from(chunk)).await?;
+    result.hash(hasher);
+    Ok(())
   }
 
   fn stage(&self) -> i32 {

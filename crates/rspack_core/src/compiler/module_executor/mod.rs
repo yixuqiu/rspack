@@ -3,10 +3,12 @@ mod entry;
 mod execute;
 mod overwrite;
 
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashSet};
 pub use execute::ExecuteModuleId;
+pub use execute::ExecutedRuntimeModule;
 use rspack_error::Result;
+use rspack_identifier::Identifier;
 use tokio::sync::{
   mpsc::{unbounded_channel, UnboundedSender},
   oneshot,
@@ -18,37 +20,34 @@ use self::{
   execute::{ExecuteModuleResult, ExecuteTask},
   overwrite::OverwriteTask,
 };
-use super::make::{repair::MakeTaskContext, update_module_graph_with_artifact, MakeArtifact};
+use super::make::{repair::MakeTaskContext, update_module_graph, MakeArtifact, MakeParam};
 use crate::{
   task_loop::run_task_loop_with_event, Compilation, CompilationAsset, Context, Dependency,
-  DependencyId, EntryDependency, MakeParam,
+  DependencyId, LoaderImportDependency,
 };
 
 #[derive(Debug, Default)]
 pub struct ModuleExecutor {
   request_dep_map: DashMap<String, DependencyId>,
-  make_artifact: MakeArtifact,
+  pub make_artifact: MakeArtifact,
 
   event_sender: Option<UnboundedSender<Event>>,
   stop_receiver: Option<oneshot::Receiver<MakeArtifact>>,
   assets: DashMap<String, CompilationAsset>,
+  code_generated_modules: DashSet<Identifier>,
+  pub executed_runtime_modules: DashMap<Identifier, ExecutedRuntimeModule>,
 }
 
 impl ModuleExecutor {
-  pub async fn hook_before_make(
-    &mut self,
-    compilation: &Compilation,
-    global_params: &Vec<MakeParam>,
-  ) {
+  pub async fn hook_before_make(&mut self, compilation: &Compilation) {
     let mut make_artifact = std::mem::take(&mut self.make_artifact);
-    let mut params = vec![];
-    for param in global_params {
-      if matches!(param, MakeParam::DeletedFiles(_)) {
-        params.push(param.clone());
-      }
-      if matches!(param, MakeParam::ModifiedFiles(_)) {
-        params.push(param.clone());
-      }
+    let mut params = Vec::with_capacity(5);
+    params.push(MakeParam::CheckNeedBuild);
+    if !compilation.modified_files.is_empty() {
+      params.push(MakeParam::ModifiedFiles(compilation.modified_files.clone()));
+    }
+    if !compilation.removed_files.is_empty() {
+      params.push(MakeParam::RemovedFiles(compilation.removed_files.clone()));
     }
     if !make_artifact.make_failed_dependencies.is_empty() {
       let deps = std::mem::take(&mut make_artifact.make_failed_dependencies);
@@ -58,10 +57,10 @@ impl ModuleExecutor {
       let modules = std::mem::take(&mut make_artifact.make_failed_module);
       params.push(MakeParam::ForceBuildModules(modules));
     }
+    make_artifact.diagnostics = Default::default();
+    make_artifact.has_module_graph_change = false;
 
-    make_artifact = if let Ok(artifact) =
-      update_module_graph_with_artifact(compilation, make_artifact, params).await
-    {
+    make_artifact = if let Ok(artifact) = update_module_graph(compilation, make_artifact, params) {
       artifact
     } else {
       MakeArtifact::default()
@@ -91,7 +90,7 @@ impl ModuleExecutor {
     });
   }
 
-  pub async fn hook_before_process_assets(&mut self, compilation: &mut Compilation) {
+  pub async fn hook_after_finish_modules(&mut self, compilation: &mut Compilation) {
     let sender = std::mem::take(&mut self.event_sender);
     sender
       .expect("should have sender")
@@ -110,21 +109,18 @@ impl ModuleExecutor {
       compilation.emit_asset(filename, asset);
     }
 
-    let diagnostics = std::mem::take(&mut self.make_artifact.diagnostics);
-    compilation.push_batch_diagnostic(diagnostics);
+    let diagnostics = self.make_artifact.take_diagnostics();
+    compilation.extend_diagnostics(diagnostics);
 
-    compilation
-      .file_dependencies
-      .extend(self.make_artifact.file_dependencies.iter().cloned());
-    compilation
-      .context_dependencies
-      .extend(self.make_artifact.context_dependencies.iter().cloned());
-    compilation
-      .missing_dependencies
-      .extend(self.make_artifact.missing_dependencies.iter().cloned());
-    compilation
-      .build_dependencies
-      .extend(self.make_artifact.build_dependencies.iter().cloned());
+    let built_modules = self.make_artifact.take_built_modules();
+    for id in built_modules {
+      compilation.built_modules.insert(id);
+    }
+
+    let code_generated_modules = std::mem::take(&mut self.code_generated_modules);
+    for id in code_generated_modules {
+      compilation.code_generated_modules.insert(id);
+    }
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -141,13 +137,13 @@ impl ModuleExecutor {
       .expect("should have event sender");
     let (param, dep_id) = match self.request_dep_map.entry(request.clone()) {
       Entry::Vacant(v) => {
-        let dep = EntryDependency::new(
+        let dep = LoaderImportDependency::new(
           request.clone(),
           original_module_context.unwrap_or(Context::from("")),
         );
         let dep_id = *dep.id();
         v.insert(dep_id);
-        (EntryParam::EntryDependency(Box::new(dep)), dep_id)
+        (EntryParam::Entry(Box::new(dep)), dep_id)
       }
       Entry::Occupied(v) => {
         let dep_id = *v.get();
@@ -167,10 +163,21 @@ impl ModuleExecutor {
         },
       ))
       .expect("should success");
-    let (execute_result, assets) = rx.await.expect("should receiver success");
+    let (execute_result, assets, code_generated_modules, executed_runtime_modules) =
+      rx.await.expect("should receiver success");
 
     for (key, value) in assets {
       self.assets.insert(key, value);
+    }
+
+    for id in code_generated_modules {
+      self.code_generated_modules.insert(id);
+    }
+
+    for runtime_module in executed_runtime_modules {
+      self
+        .executed_runtime_modules
+        .insert(runtime_module.identifier, runtime_module);
     }
 
     execute_result

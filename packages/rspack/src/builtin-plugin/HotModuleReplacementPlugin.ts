@@ -1,4 +1,5 @@
 import { BuiltinPlugin, BuiltinPluginName } from "@rspack/binding";
+
 import { Compiler } from "../Compiler";
 import { RspackBuiltinPlugin, createBuiltinPlugin } from "./base";
 

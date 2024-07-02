@@ -49,7 +49,7 @@ impl RawModule {
       factory_meta: None,
       build_info: None,
       build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      source_map_kind: SourceMapKind::empty(),
     }
   }
 }
@@ -87,7 +87,7 @@ impl Module for RawModule {
   }
 
   fn module_type(&self) -> &ModuleType {
-    &ModuleType::Js
+    &ModuleType::JsAuto
   }
 
   fn source_types(&self) -> &[SourceType] {
@@ -102,7 +102,7 @@ impl Module for RawModule {
     Cow::Borrowed(&self.readable_identifier)
   }
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>, _compilation: &Compilation) -> f64 {
     f64::max(1.0, self.source.size() as f64)
   }
 
@@ -117,6 +117,7 @@ impl Module for RawModule {
       build_info: BuildInfo {
         hash: Some(hasher.digest(&build_context.compiler_options.output.hash_digest)),
         cacheable: true,
+        strict: true,
         ..Default::default()
       },
       dependencies: vec![],

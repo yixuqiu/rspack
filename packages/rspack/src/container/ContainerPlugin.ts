@@ -1,8 +1,10 @@
 import {
-	RawContainerPluginOptions,
 	BuiltinPlugin,
-	BuiltinPluginName
+	BuiltinPluginName,
+	RawContainerPluginOptions
 } from "@rspack/binding";
+
+import { Compiler } from "../Compiler";
 import {
 	RspackBuiltinPlugin,
 	createBuiltinPlugin
@@ -13,10 +15,9 @@ import {
 	LibraryOptions,
 	getRawLibrary
 } from "../config";
-import { isNil } from "../util";
 import { parseOptions } from "../container/options";
-import { Compiler } from "../Compiler";
 import { ShareRuntimePlugin } from "../sharing/ShareRuntimePlugin";
+import { isNil } from "../util";
 
 export type ContainerPluginOptions = {
 	exposes: Exposes;

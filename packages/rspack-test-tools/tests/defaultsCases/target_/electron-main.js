@@ -1,3 +1,4 @@
+/** @type {import('../../..').TDefaultsCaseConfig} */
 module.exports = {
 	description: "target electron-main",
 	options: () => ({ target: "electron-main" }),
@@ -13,18 +14,16 @@ module.exports = {
 		+     "electronMain": true,
 		@@ ... @@
 		-     "node": false,
-		-     "web": true,
 		+     "node": true,
+		@@ ... @@
+		-     "web": true,
 		+     "web": false,
 		@@ ... @@
-		-         "exportsOnly": false,
-		+         "exportsOnly": true,
+		-       "document": true,
+		+       "document": false,
 		@@ ... @@
-		-         "exportsOnly": false,
-		+         "exportsOnly": true,
-		@@ ... @@
-		-         "exportsOnly": false,
-		+         "exportsOnly": true,
+		-     "target": "web",
+		+     "target": "electron-main",
 		@@ ... @@
 		-     "__dirname": "warn-mock",
 		-     "__filename": "warn-mock",
@@ -44,6 +43,9 @@ module.exports = {
 		@@ ... @@
 		-       "fetch",
 		+       "async-node",
+		@@ ... @@
+		-       "document": true,
+		+       "document": false,
 		@@ ... @@
 		-     "globalObject": "self",
 		+     "globalObject": "global",

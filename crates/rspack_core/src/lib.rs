@@ -24,8 +24,8 @@ pub mod external_module;
 pub use external_module::*;
 mod logger;
 pub use logger::*;
-pub mod cache;
 mod normal_module;
+pub mod old_cache;
 mod raw_module;
 pub use raw_module::*;
 mod exports_info;
@@ -93,7 +93,6 @@ pub mod resolver;
 pub use resolver::*;
 pub mod concatenated_module;
 pub mod reserved_names;
-pub mod tree_shaking;
 
 pub use rspack_loader_runner::{get_scheme, ResourceData, Scheme, BUILTIN_LOADER_PREFIX};
 pub use rspack_macros::{impl_runtime_module, impl_source_map_config};
@@ -116,6 +115,7 @@ pub enum SourceType {
   #[default]
   Unknown,
   CssImport,
+  Runtime,
 }
 
 impl std::fmt::Display for SourceType {
@@ -132,6 +132,7 @@ impl std::fmt::Display for SourceType {
       SourceType::Unknown => write!(f, "unknown"),
       SourceType::CssImport => write!(f, "css-import"),
       SourceType::Custom(source_type) => f.write_str(source_type),
+      SourceType::Runtime => write!(f, "runtime"),
     }
   }
 }
@@ -160,7 +161,7 @@ pub enum ModuleType {
   Css,
   CssModule,
   CssAuto,
-  Js,
+  JsAuto,
   JsDynamic,
   JsEsm,
   WasmSync,
@@ -186,7 +187,7 @@ impl ModuleType {
   pub fn is_js_like(&self) -> bool {
     matches!(
       self,
-      ModuleType::Js | ModuleType::JsEsm | ModuleType::JsDynamic
+      ModuleType::JsAuto | ModuleType::JsEsm | ModuleType::JsDynamic
     )
   }
 
@@ -202,7 +203,7 @@ impl ModuleType {
   }
 
   pub fn is_js_auto(&self) -> bool {
-    matches!(self, ModuleType::Js)
+    matches!(self, ModuleType::JsAuto)
   }
 
   pub fn is_js_esm(&self) -> bool {
@@ -220,7 +221,7 @@ impl ModuleType {
 
   pub fn as_str(&self) -> &str {
     match self {
-      ModuleType::Js => "javascript/auto",
+      ModuleType::JsAuto => "javascript/auto",
       ModuleType::JsEsm => "javascript/esm",
       ModuleType::JsDynamic => "javascript/dynamic",
 
@@ -260,7 +261,7 @@ impl From<&str> for ModuleType {
     match value {
       "mjs" => Self::JsEsm,
       "cjs" => Self::JsDynamic,
-      "js" | "javascript" | "js/auto" | "javascript/auto" => Self::Js,
+      "js" | "javascript" | "js/auto" | "javascript/auto" => Self::JsAuto,
       "js/dynamic" | "javascript/dynamic" => Self::JsDynamic,
       "js/esm" | "javascript/esm" => Self::JsEsm,
 

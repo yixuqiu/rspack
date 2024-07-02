@@ -2,23 +2,9 @@
  * Some types are modified from https://github.com/swc-project/swc/blob/16a38851/packages/types/index.ts#L647
  * license at https://github.com/swc-project/swc/blob/main/LICENSE
  */
-import type { ReactOptions } from "./react";
-import type { RelayOptions } from "./relay";
-import type { EmotionOptions } from "./emotion";
 import type { PluginImportOptions } from "./pluginImport";
-
-export type StyledComponentsOptions = {
-	displayName?: boolean;
-	ssr?: boolean;
-	fileName?: boolean;
-	meaninglessFileNames?: string[];
-	namespace?: string;
-	topLevelImportPaths?: string[];
-	transpileTemplateLiterals?: boolean;
-	minify?: boolean;
-	pure?: boolean;
-	cssProps?: boolean;
-};
+import type { PreactOptions } from "./preact";
+import type { ReactOptions } from "./react";
 
 export type JscTarget =
 	| "es3"
@@ -489,9 +475,7 @@ export type SwcLoaderOptions = {
 	 * @experimental
 	 */
 	rspackExperiments?: {
-		relay?: RelayOptions;
-		emotion?: EmotionOptions;
 		import?: PluginImportOptions;
-		styledComponents?: StyledComponentsOptions;
+		preact?: PreactOptions;
 	};
 };

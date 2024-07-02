@@ -3,21 +3,23 @@ mod context_helper;
 mod parser;
 mod util;
 
+use std::sync::Arc;
+
 use rspack_ast::javascript::Program;
-use rspack_core::needs_refactor::WorkerSyntaxList;
 use rspack_core::{
   AsyncDependenciesBlock, BoxDependency, BoxDependencyTemplate, BuildInfo, ParserOptions,
 };
 use rspack_core::{BuildMeta, CompilerOptions, ModuleIdentifier, ModuleType, ResourceData};
 use rspack_error::miette::Diagnostic;
-use rustc_hash::FxHashMap;
-use swc_core::common::comments::Comments;
-use swc_core::common::{SourceFile, Span};
+use rustc_hash::{FxHashMap, FxHashSet};
+use swc_core::common::{comments::Comments, BytePos, SourceFile, SourceMap, Span};
 use swc_core::ecma::atoms::Atom;
 
 pub use self::context_dependency_helper::create_context_dependency;
 pub use self::context_helper::{scanner_context_module, ContextModuleScanResult};
-pub use self::parser::{CallExpressionInfo, CallHooksName, ExportedVariableInfo};
+pub use self::parser::{
+  AllowedMemberTypes, CallExpressionInfo, CallHooksName, ExportedVariableInfo, PathIgnoredSpans,
+};
 pub use self::parser::{JavascriptParser, MemberExpressionInfo, TagInfoData, TopLevelScope};
 pub use self::util::*;
 use crate::dependency::Specifier;
@@ -63,9 +65,9 @@ pub enum ExtraSpanInfo {
 
 #[allow(clippy::too_many_arguments)]
 pub fn scan_dependencies(
+  source_map: Arc<SourceMap>,
   source_file: &SourceFile,
   program: &Program,
-  worker_syntax_list: &mut WorkerSyntaxList,
   resource_data: &ResourceData,
   compiler_options: &CompilerOptions,
   module_type: &ModuleType,
@@ -73,8 +75,11 @@ pub fn scan_dependencies(
   build_meta: &mut BuildMeta,
   module_identifier: ModuleIdentifier,
   module_parser_options: Option<&ParserOptions>,
+  semicolons: &mut FxHashSet<BytePos>,
+  path_ignored_spans: &mut PathIgnoredSpans,
 ) -> Result<ScanDependenciesResult, Vec<Box<dyn Diagnostic + Send + Sync>>> {
   let mut parser = JavascriptParser::new(
+    source_map,
     source_file,
     compiler_options,
     module_parser_options
@@ -83,10 +88,11 @@ pub fn scan_dependencies(
     program.comments.as_ref().map(|c| c as &dyn Comments),
     &module_identifier,
     module_type,
-    worker_syntax_list,
     resource_data,
     build_meta,
     build_info,
+    semicolons,
+    path_ignored_spans,
   );
 
   parser.walk_program(program.get_inner_program());

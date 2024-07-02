@@ -44,11 +44,13 @@ impl ParserAndGenerator for CssExtractParserAndGenerator {
 
   fn get_concatenation_bailout_reason(
     &self,
-    _module: &dyn Module,
-    _mg: &ModuleGraph,
-    _cg: &ChunkGraph,
+    module: &dyn Module,
+    mg: &ModuleGraph,
+    cg: &ChunkGraph,
   ) -> Option<String> {
-    None
+    self
+      .orig_parser_generator
+      .get_concatenation_bailout_reason(module, mg, cg)
   }
 
   #[allow(clippy::unwrap_used)]
@@ -76,7 +78,7 @@ impl ParserAndGenerator for CssExtractParserAndGenerator {
                supports,
                source_map,
                identifier_index,
-               filepath,
+               ..
              }| {
               let dep = Box::new(CssDependency::new(
                 identifier.into(),
@@ -87,7 +89,11 @@ impl ParserAndGenerator for CssExtractParserAndGenerator {
                 source_map.clone(),
                 *identifier_index,
                 idx,
-                filepath.clone(),
+                parse_context.build_info.cacheable,
+                parse_context.build_info.file_dependencies.clone(),
+                parse_context.build_info.context_dependencies.clone(),
+                parse_context.build_info.missing_dependencies.clone(),
+                parse_context.build_info.build_dependencies.clone(),
               ));
               idx += 1;
               dep
@@ -116,7 +122,11 @@ impl ParserAndGenerator for CssExtractParserAndGenerator {
     }
   }
 
-  fn size(&self, module: &dyn rspack_core::Module, source_type: &rspack_core::SourceType) -> f64 {
+  fn size(
+    &self,
+    module: &dyn rspack_core::Module,
+    source_type: Option<&rspack_core::SourceType>,
+  ) -> f64 {
     self.orig_parser_generator.size(module, source_type)
   }
 

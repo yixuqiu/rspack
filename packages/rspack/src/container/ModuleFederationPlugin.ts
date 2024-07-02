@@ -1,9 +1,9 @@
-import { ExternalsType, externalsType } from "../config";
 import { Compiler } from "../Compiler";
-import { type ModuleFederationPluginV1Options } from "./ModuleFederationPluginV1";
-import { parseOptions } from "./options";
+import { ExternalsType, externalsType } from "../config";
 import { isValidate } from "../util/validate";
+import { type ModuleFederationPluginV1Options } from "./ModuleFederationPluginV1";
 import { ModuleFederationRuntimePlugin } from "./ModuleFederationRuntimePlugin";
+import { parseOptions } from "./options";
 
 export interface ModuleFederationPluginOptions
 	extends Omit<ModuleFederationPluginV1Options, "enhanced"> {
@@ -185,7 +185,6 @@ function getDefaultEntryRuntime(
 			options.name ?? compiler.options.output.uniqueName
 		)}`,
 		compiler.webpack.Template.getFunctionContent(require("./default.runtime"))
-	].join("\n");
-	// use "application/node" to use moduleType "javascript/auto"
-	return `data:application/node,${content}`;
+	].join(";");
+	return `@module-federation/runtime/rspack.js!=!data:text/javascript,${content}`;
 }

@@ -1,6 +1,7 @@
 import path from "path";
 import type { Compiler } from "@rspack/core";
-import { normalizeOptions, type PluginOptions } from "./options";
+
+import { type PluginOptions, normalizeOptions } from "./options";
 
 export type { PluginOptions };
 

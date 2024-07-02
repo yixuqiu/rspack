@@ -30,14 +30,14 @@ import { ApiMeta } from '../../../components/ApiMeta';
 
 <ApiMeta addedVersion="0.5.1" />
 
-- **Type:** `string[]`
-- **Default:** `['browser']`
+- **类型：** `string[]`
+- **默认值：**`['browser']`
 
 定义一个字段，例如 `browser`，以依照[此规范](https://github.com/defunctzombie/package-browser-field-spec)进行解析。
 
 ## resolve.browserField
 
-<ApiMeta deprecatedVersion="0.5.1" />
+<ApiMeta deprecatedVersion="0.5.1" removedVersion="0.7.0" />
 
 - **类型：** `boolean`
 - **默认值：** `true`
@@ -52,6 +52,41 @@ import { ApiMeta } from '../../../components/ApiMeta';
 - **默认值：** `[]`
 
 与 node 的 [conditionNames](https://nodejs.org/api/packages.html#conditional-exports) 相同，用于 package.json 中的 `exports` 和 `imports` 字段。
+
+## resolve.descriptionFiles
+
+<ApiMeta addedVersion="0.6.6" />
+
+- **类型：** `string[]`
+- **默认值：** `['package.json']`
+
+用于描述的 JSON 文件。
+
+```js title="rspack.config.js"
+module.exports = {
+  resolve: {
+    descriptionFiles: ['package.json'],
+  },
+};
+```
+
+## resolve.enforceExtension
+
+<ApiMeta addedVersion="0.6.6" />
+
+- **类型：** `boolean`
+
+默认情况下，当 [resolve.extensions](#resolveextensions) 包含空字符串时，`enforceExtension` 会设置为 `true`；否则，将设置为 `false`。
+
+如果是 `true`，将不允许无扩展名文件。默认如果 `./foo` 有 `.js` 扩展，`require('./foo')` 可以正常运行。但如果启用此选项，只有 `require('./foo.js')` 能够正常工作。
+
+```js title="rspack.config.js"
+module.exports = {
+  resolve: {
+    enforceExtension: false,
+  },
+};
+```
 
 ## resolve.extensions
 
@@ -85,7 +120,67 @@ module.exports = {
 - **类型：** `Record<string, false | string>`
 - **默认值：** `{}`
 
-解析失败时的重定向。
+当常规解析失败时重定向模块请求。
+
+```js title="rspack.config.js"
+module.exports = {
+  //...
+  resolve: {
+    fallback: {
+      abc: false, // 不为 abc 引入 polyfill
+      xyz: path.resolve(__dirname, 'path/to/file.js'), // 为 xyz 引入 polyfill
+    },
+  },
+};
+```
+
+Rspack 默认不会为 Node.js 核心模块提供 polyfills，这意味着如果你在浏览器或类似环境中运行的代码中使用它们，你将需要从 NPM 安装兼容的模块并自行包含它们。
+
+你可以使用 [node-polyfill-webpack-plugin](https://www.npmjs.com/package/node-polyfill-webpack-plugin) 来自动 polyfill Node.js 核心模块。
+
+```js title="rspack.config.js"
+const NodePolyfillPlugin = require('node-polyfill-webpack-plugin');
+
+module.exports = {
+  // ...
+  plugins: [new NodePolyfillPlugin()],
+};
+```
+
+或者参考 webpack 4 使用的 Node.js polyfills 列表：
+
+```js title="rspack.config.js"
+module.exports = {
+  //...
+  resolve: {
+    fallback: {
+      assert: require.resolve('assert'),
+      buffer: require.resolve('buffer'),
+      console: require.resolve('console-browserify'),
+      constants: require.resolve('constants-browserify'),
+      crypto: require.resolve('crypto-browserify'),
+      domain: require.resolve('domain-browser'),
+      events: require.resolve('events'),
+      http: require.resolve('stream-http'),
+      https: require.resolve('https-browserify'),
+      os: require.resolve('os-browserify/browser'),
+      path: require.resolve('path-browserify'),
+      punycode: require.resolve('punycode'),
+      process: require.resolve('process/browser'),
+      querystring: require.resolve('querystring-es3'),
+      stream: require.resolve('stream-browserify'),
+      string_decoder: require.resolve('string_decoder'),
+      sys: require.resolve('util'),
+      timers: require.resolve('timers-browserify'),
+      tty: require.resolve('tty-browserify'),
+      url: require.resolve('url'),
+      util: require.resolve('util'),
+      vm: require.resolve('vm-browserify'),
+      zlib: require.resolve('browserify-zlib'),
+    },
+  },
+};
+```
 
 ## resolve.mainFields
 
@@ -135,6 +230,33 @@ module.exports = {
 
 则当配置为 `["testExports", "exports"]` 时, `import value from 'lib'` 的结果为 `lib/test.js`。
 
+## resolve.importsFields
+
+<ApiMeta addedVersion="0.6.6" />
+
+- **类型：** `string[]`
+- **默认值:** `['imports']`
+
+自定义 package.json 中的 imports 字段，用于提供包的内部请求（以 `#` 开头的请求被视为内部请求）
+
+例如：
+
+```
+// package.json
+{
+  "name": "lib",
+  "imports": {
+    "#foo": "./src/foo.js",
+    "#common/*": "./src/common/*.js"
+  }
+  "testImports": {
+    "#foo": "./src/test/foo.js",
+  }
+}
+```
+
+则当配置为 ["testImports", "imports"] 时, 当前包内 `import value from '#foo'` 的结果为 `src/test/foo.js`。
+
 ## resolve.modules
 
 - **类型：** `string[]`
@@ -153,12 +275,14 @@ module.exports = {
 
 <ApiMeta addedVersion="0.5.1" />
 
-- **Type:** `boolean`
-- **Default:** `false`
+- **类型：** `boolean`
+- **默认值：**`false`
 
 在解析时，倾向使用与 `resolve.roots` 相关的绝对路径。
 
 ## resolve.tsConfigPath
+
+<ApiMeta removedVersion="1.0.0-alpha.0" />
 
 - **类型：** `string | undefined`
 - **默认值：** `undefined`
@@ -179,24 +303,21 @@ const config = {
 module.exports = config;
 ```
 
-[点击查看例子](https://github.com/rspack-contrib/rspack-examples/tree/main/rspack/basic-ts)。
-
-:::warning
-
-不支持 `tsconfig.json#extends` 字段。
-
-:::
-
 ## resolve.tsConfig
+
+Rspack 中用来替代 [tsconfig-paths-webpack-plugin](https://www.npmjs.com/package/tsconfig-paths-webpack-plugin) 的配置。
 
 <ApiMeta addedVersion="0.3.7" />
 
-- **类型:** `object`
+- **类型：** `string | object | undefined`
 - **默认值:** `undefined`
 
 ```js title="rspack.config.js"
 module.exports = {
   resolve: {
+    // string
+    tsConfig: path.resolve(__dirname, './tsconfig.json'),
+    // or object
     tsconfig: {
       configFile: path.resolve(__dirname, './tsconfig.json'),
       references: 'auto',
@@ -205,17 +326,17 @@ module.exports = {
 };
 ```
 
+[点击查看例子](https://github.com/rspack-contrib/rspack-examples/tree/main/rspack/basic-ts)。
+
 ### resolve.tsConfig.configFile
 
-- **类型:** `string`
-
-同 [resolve.tsConfigPath](#resolvetsconfigpath).
+- **类型：** `string`
 
 这个选项接受的是 `tsconfig.json` 的文件路径。在开启这个选项后， Rspack 会基于 `tsconfig.json` 中 的 `paths` 和 `baseUrl` 来寻找模块，其功能等同于 [tsconfig-paths-webpack-plugin](https://www.npmjs.com/package/tsconfig-paths-webpack-plugin)。
 
 ### resolve.tsConfig.references
 
-- **类型:** `string[] | "auto" | undefined`
+- **类型：** `string[] | "auto" | undefined`
 - **默认值:** `undefined`
 
 支持 [tsconfig-paths-webpack-plugin](https://github.com/dividab/tsconfig-paths-webpack-plugin#references-_string-defaultundefined) 中定义的 [tsconfig project references](https://www.typescriptlang.org/docs/handbook/project-references.html).
@@ -235,8 +356,8 @@ module.exports = {
 
 <ApiMeta addedVersion="0.5.1" />
 
-- **Type:** `string[]`
-- **Default:** `[]`
+- **类型：** `string[]`
+- **默认值：**`[]`
 
 限制请求解析路径的解析限制列表。
 
@@ -244,10 +365,19 @@ module.exports = {
 
 <ApiMeta addedVersion="0.5.1" />
 
-- **Type:** `string[]`
-- **Default:** `[]`
+- **类型：** `string[]`
+- **默认值：**`[]`
 
 一个目录列表，用于解析服务器相对 URL（以'/'开头的 URL）。默认使用 context 配置选项。在非 Windows 系统上，这些请求首先作为绝对路径进行解析。
+
+## resolve.symlinks
+
+- **类型：** `boolean`
+- **默认值：**`true`
+
+是否将符号链接（symlink）解析到它们的符号链接位置（symlink location）。
+
+启用时，符号链接的资源，将解析为其**真实**路径，而不是其符号链接的位置。注意，当使用创建符号链接包的工具（如 `npm link`）时，这种方式可能会导致模块解析失败。
 
 ## resolve.byDependency
 

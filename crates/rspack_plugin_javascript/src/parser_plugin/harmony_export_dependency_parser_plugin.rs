@@ -1,4 +1,3 @@
-use rspack_core::tree_shaking::symbol::DEFAULT_JS_WORD;
 use rspack_core::{ConstDependency, DependencyLocation, DependencyType, SpanExt, DEFAULT_EXPORT};
 use swc_core::atoms::Atom;
 use swc_core::common::{Span, Spanned};
@@ -9,7 +8,7 @@ use swc_core::ecma::ast::{
 use swc_core::ecma::utils::{find_pat_ids, ExprFactory};
 
 use super::harmony_import_dependency_parser_plugin::handle_harmony_import_side_effects_dep;
-use super::JavascriptParserPlugin;
+use super::{JavascriptParserPlugin, JS_DEFAULT_KEYWORD};
 use crate::dependency::{
   DeclarationId, DeclarationInfo, HarmonyExportExpressionDependency, HarmonyExportHeaderDependency,
   HarmonyExportImportedSpecifierDependency, HarmonyExportSpecifierDependency, Specifier,
@@ -25,7 +24,7 @@ fn handle_esm_export_harmony_import_side_effects_dep(
   dep_type: DependencyType,
   export_all: bool,
 ) {
-  assert!(matches!(dep_type, DependencyType::EsmExport(_)));
+  assert!(matches!(dep_type, DependencyType::EsmExport));
   if !specifiers.is_empty() {
     specifiers.iter().for_each(|specifier| match specifier {
       Specifier::Namespace(n) => {
@@ -40,6 +39,10 @@ fn handle_esm_export_harmony_import_side_effects_dep(
             Some(n.clone()),
             false,
             None,
+            span.into(),
+            HarmonyExportImportedSpecifierDependency::create_export_presence_mode(
+              parser.javascript_options,
+            ),
           )));
         parser.build_info.harmony_named_exports.insert(n.clone());
       }
@@ -60,21 +63,17 @@ fn handle_esm_export_harmony_import_side_effects_dep(
             Some(name.clone()),
             false,
             None,
+            span.into(),
+            HarmonyExportImportedSpecifierDependency::create_export_presence_mode(
+              parser.javascript_options,
+            ),
           )));
         parser.build_info.harmony_named_exports.insert(name);
       }
     });
   }
 
-  handle_harmony_import_side_effects_dep(
-    parser,
-    request,
-    span,
-    source_span,
-    specifiers,
-    dep_type,
-    export_all,
-  )
+  handle_harmony_import_side_effects_dep(parser, request, span, source_span, dep_type, export_all)
 }
 pub struct HarmonyExportDependencyParserPlugin;
 
@@ -120,7 +119,7 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
       named_export.span,
       src.span,
       specifiers,
-      DependencyType::EsmExport(named_export.span.into()),
+      DependencyType::EsmExport,
       false,
     );
 
@@ -149,7 +148,7 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
       export_all.span,
       export_all.src.span,
       vec![],
-      DependencyType::EsmExport(export_all.span.into()),
+      DependencyType::EsmExport,
       true,
     );
 
@@ -162,6 +161,10 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
       None,
       true,
       list,
+      export_all.span.into(),
+      HarmonyExportImportedSpecifierDependency::create_export_presence_mode(
+        parser.javascript_options,
+      ),
     );
 
     parser
@@ -198,12 +201,12 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
       parser
         .dependencies
         .push(Box::new(HarmonyExportSpecifierDependency::new(
-          DEFAULT_JS_WORD.clone(),
+          JS_DEFAULT_KEYWORD.clone(),
           named_id.clone(),
         )));
       parser.rewrite_usage_span.insert(
         export_default_decl.span,
-        ExtraSpanInfo::AddVariableUsage(vec![(named_id, DEFAULT_JS_WORD.clone())]),
+        ExtraSpanInfo::AddVariableUsage(vec![(named_id, JS_DEFAULT_KEYWORD.clone())]),
       );
       parser
         .presentational_dependencies
@@ -211,10 +214,12 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
           Some(DependencyLocation::new(
             export_default_decl.decl.span().real_lo(),
             export_default_decl.decl.span().real_hi(),
+            Some(parser.source_map.clone()),
           )),
           DependencyLocation::new(
             export_default_decl.span().real_lo(),
             export_default_decl.span().real_hi(),
+            Some(parser.source_map.clone()),
           ),
         )));
       return Some(true);
@@ -231,7 +236,7 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
     };
     parser.rewrite_usage_span.insert(
       export_default_decl.span,
-      ExtraSpanInfo::AddVariableUsage(vec![(local, DEFAULT_JS_WORD.clone())]),
+      ExtraSpanInfo::AddVariableUsage(vec![(local, JS_DEFAULT_KEYWORD.clone())]),
     );
     parser
       .presentational_dependencies
@@ -239,10 +244,12 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
         DependencyLocation::new(
           export_default_decl.decl.span().real_lo(),
           export_default_decl.decl.span().real_hi(),
+          Some(parser.source_map.clone()),
         ),
         DependencyLocation::new(
           export_default_decl.span().real_lo(),
           export_default_decl.span().real_hi(),
+          Some(parser.source_map.clone()),
         ),
         match &export_default_decl.decl {
           DefaultDecl::Class(class_expr) => class_expr
@@ -257,7 +264,7 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
               f.function.body.span().real_lo()
             };
             Some(DeclarationId::Func(DeclarationInfo {
-              range: DependencyLocation::new(start, end),
+              range: DependencyLocation::new(start, end, Some(parser.source_map.clone())),
               prefix: format!(
                 "{}function{} ",
                 if f.function.is_async { "async " } else { "" },
@@ -287,7 +294,7 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
   ) -> Option<bool> {
     parser.rewrite_usage_span.insert(
       export_default_expr.span,
-      ExtraSpanInfo::AddVariableUsage(vec![(DEFAULT_EXPORT.into(), DEFAULT_JS_WORD.clone())]),
+      ExtraSpanInfo::AddVariableUsage(vec![(DEFAULT_EXPORT.into(), JS_DEFAULT_KEYWORD.clone())]),
     );
     parser
       .presentational_dependencies
@@ -295,10 +302,12 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
         DependencyLocation::new(
           export_default_expr.expr.span().real_lo(),
           export_default_expr.expr.span().real_hi(),
+          Some(parser.source_map.clone()),
         ),
         DependencyLocation::new(
           export_default_expr.span().real_lo(),
           export_default_expr.span().real_hi(),
+          Some(parser.source_map.clone()),
         ),
         None,
       )));
@@ -356,8 +365,13 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
         Some(DependencyLocation::new(
           export_decl.decl.span().real_lo(),
           export_decl.decl.span().real_hi(),
+          Some(parser.source_map.clone()),
         )),
-        DependencyLocation::new(export_decl.span().real_lo(), export_decl.span().real_hi()),
+        DependencyLocation::new(
+          export_decl.span().real_lo(),
+          export_decl.span().real_hi(),
+          Some(parser.source_map.clone()),
+        ),
       )));
     Some(true)
   }
@@ -399,7 +413,15 @@ impl JavascriptParserPlugin for HarmonyExportDependencyParserPlugin {
                     Some(export.clone()),
                     false,
                     None,
+                    named.span.into(),
+                    HarmonyExportImportedSpecifierDependency::create_export_presence_mode(
+                      parser.javascript_options,
+                    ),
                   )));
+                parser
+                  .build_info
+                  .harmony_named_exports
+                  .insert(export.clone());
               } else {
                 parser
                   .dependencies

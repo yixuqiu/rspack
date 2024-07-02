@@ -14,7 +14,7 @@ static WITH_LOADING: &str = include_str!("./runtime/with_loading.js");
 static WITH_HMR: &str = include_str!("./runtime/with_hmr.js");
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
+#[derive(Debug)]
 pub(crate) struct CssLoadingRuntimeModule {
   chunk: ChunkUkey,
   attributes: FxHashMap<String, String>,
@@ -34,16 +34,7 @@ impl CssLoadingRuntimeModule {
     loading: bool,
     hmr: bool,
   ) -> Self {
-    Self {
-      chunk,
-      attributes,
-      link_type,
-      insert,
-      loading,
-      hmr,
-      source_map_kind: rspack_util::source_map::SourceMapKind::None,
-      custom_source: None,
-    }
+    Self::with_default(chunk, attributes, link_type, insert, loading, hmr)
   }
 
   fn get_css_chunks(&self, compilation: &Compilation) -> FxHashSet<ChunkUkey> {
@@ -136,9 +127,15 @@ impl RuntimeModule for CssLoadingRuntimeModule {
         let chunk = compilation.chunk_by_ukey.expect_get(&self.chunk);
         let with_loading = WITH_LOADING.replace(
           "__INSTALLED_CHUNKS__",
-          &chunk.ids.iter().fold(String::default(), |output, id| {
-            format!("{output}\"{id}\": 0,\n")
-          }),
+          &chunk
+            .ids
+            .iter()
+            .fold(String::default(), |output, id: &String| {
+              format!(
+                "{output}{}: 0,\n",
+                serde_json::to_string(id).expect("json stringify failed")
+              )
+            }),
         );
 
         let with_loading = with_loading.replace(
@@ -155,7 +152,12 @@ impl RuntimeModule for CssLoadingRuntimeModule {
               .filter_map(|id| {
                 let chunk = compilation.chunk_by_ukey.expect_get(id);
 
-                chunk.id.as_ref().map(|id| format!("\"{}\": 1,\n", id))
+                chunk.id.as_ref().map(|id| {
+                  format!(
+                    "{}: 1,\n",
+                    serde_json::to_string(id).expect("json stringify failed")
+                  )
+                })
               })
               .collect::<String>()
           ),

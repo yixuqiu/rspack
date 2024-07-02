@@ -1,5 +1,5 @@
 use derivative::Derivative;
-use rspack_core::{ChunkUkey, Module};
+use rspack_core::{ChunkUkey, Compilation, Module};
 use rspack_identifier::IdentifierSet;
 use rustc_hash::FxHashSet;
 
@@ -51,26 +51,26 @@ impl ModuleGroup {
     }
   }
 
-  pub fn add_module(&mut self, module: &dyn Module) {
+  pub fn add_module(&mut self, module: &dyn Module, compilation: &Compilation) {
     let old_len = self.modules.len();
     self.modules.insert(module.identifier());
 
     if self.modules.len() != old_len {
       module.source_types().iter().for_each(|ty| {
         let size = self.sizes.entry(*ty).or_default();
-        *size += module.size(ty);
+        *size += module.size(Some(ty), compilation);
       });
     }
   }
 
-  pub fn remove_module(&mut self, module: &dyn Module) {
+  pub fn remove_module(&mut self, module: &dyn Module, compilation: &Compilation) {
     let old_len = self.modules.len();
     self.modules.remove(&module.identifier());
 
     if self.modules.len() != old_len {
       module.source_types().iter().for_each(|ty| {
         let size = self.sizes.entry(*ty).or_default();
-        *size -= module.size(ty);
+        *size -= module.size(Some(ty), compilation);
         *size = size.max(0.0)
       });
     }
@@ -102,13 +102,14 @@ pub(crate) fn compare_entries(a: &ModuleGroup, b: &ModuleGroup) -> f64 {
     return diff_count;
   }
 
-  // // 3. by size reduction
-  // let a_size_reduce = total_size(&a.sizes) * (a.chunks.len() - 1) as f64;
-  // let b_size_reduce = total_size(&b.sizes) * (b.chunks.len() - 1) as f64;
-  // let diff_size_reduce = a_size_reduce - b_size_reduce;
-  // if diff_size_reduce != 0f64 {
-  //   return diff_size_reduce;
-  // }
+  // 3. by size reduction
+  let a_size_reduce = total_size(&a.sizes) * (a.chunks.len() - 1) as f64;
+  let b_size_reduce = total_size(&b.sizes) * (b.chunks.len() - 1) as f64;
+  let diff_size_reduce = a_size_reduce - b_size_reduce;
+  if diff_size_reduce != 0f64 {
+    return diff_size_reduce;
+  }
+
   // 4. by cache group index
   let index_diff = b.cache_group_index as f64 - a.cache_group_index as f64;
   if index_diff != 0f64 {
@@ -140,4 +141,12 @@ pub(crate) fn compare_entries(a: &ModuleGroup, b: &ModuleGroup) -> f64 {
       _ => unreachable!(),
     }
   }
+}
+
+fn total_size(sizes: &SplitChunkSizes) -> f64 {
+  let mut size = 0f64;
+  for ty_size in sizes.0.values() {
+    size += ty_size;
+  }
+  size
 }

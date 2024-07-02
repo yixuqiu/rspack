@@ -94,16 +94,16 @@ impl ParserAndGenerator for AsyncWasmParserAndGenerator {
         dependencies,
         blocks: vec![],
         presentational_dependencies: vec![],
+        code_generation_dependencies: vec![],
         source,
-        analyze_result: Default::default(),
         side_effects_bailout: None,
       }
       .with_diagnostic(diagnostic),
     )
   }
 
-  fn size(&self, module: &dyn Module, source_type: &SourceType) -> f64 {
-    match source_type {
+  fn size(&self, module: &dyn Module, source_type: Option<&SourceType>) -> f64 {
+    match source_type.unwrap_or(&SourceType::Wasm) {
       SourceType::JavaScript => {
         40.0
           + module

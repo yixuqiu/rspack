@@ -4,13 +4,16 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use rspack_core::{
   filter_runtime, import_statement, merge_runtime, AsContextDependency,
-  AwaitDependenciesInitFragment, ConditionalInitFragment, ConnectionState, Dependency,
-  DependencyCategory, DependencyCondition, DependencyId, DependencyTemplate, DependencyType,
-  ErrorSpan, ExtendedReferencedExport, InitFragmentExt, InitFragmentKey, InitFragmentStage,
-  ModuleDependency, ModuleIdentifier, NormalInitFragment, RuntimeCondition, RuntimeGlobals,
-  TemplateContext, TemplateReplaceSource,
+  AwaitDependenciesInitFragment, BuildMetaDefaultObject, ConditionalInitFragment, ConnectionState,
+  Dependency, DependencyCategory, DependencyCondition, DependencyId, DependencyTemplate,
+  DependencyType, ErrorSpan, ExportInfoProvided, ExportsType, ExtendedReferencedExport,
+  InitFragmentExt, InitFragmentKey, InitFragmentStage, ModuleDependency, ModuleIdentifier,
+  ProvidedExports, RuntimeCondition, TemplateContext, TemplateReplaceSource,
 };
 use rspack_core::{ModuleGraph, RuntimeSpec};
+use rspack_error::miette::{MietteDiagnostic, Severity};
+use rspack_error::DiagnosticExt;
+use rspack_error::{Diagnostic, TraceableError};
 use rustc_hash::{FxHashMap, FxHashSet as HashSet};
 use swc_core::ecma::atoms::Atom;
 
@@ -44,6 +47,17 @@ pub enum Specifier {
   Named(Atom, Option<Atom>),
 }
 
+impl Specifier {
+  pub fn name(&self) -> Atom {
+    let name = match self {
+      Specifier::Namespace(name) => name,
+      Specifier::Default(name) => name,
+      Specifier::Named(name, _) => name,
+    };
+    name.clone()
+  }
+}
+
 // HarmonyImportDependency is merged HarmonyImportSideEffectDependency.
 #[derive(Debug, Clone)]
 pub struct HarmonyImportSideEffectDependency {
@@ -52,7 +66,6 @@ pub struct HarmonyImportSideEffectDependency {
   pub id: DependencyId,
   pub span: Option<ErrorSpan>,
   pub source_span: Option<ErrorSpan>,
-  pub specifiers: Vec<Specifier>,
   pub dependency_type: DependencyType,
   pub export_all: bool,
   resource_identifier: String,
@@ -64,7 +77,6 @@ impl HarmonyImportSideEffectDependency {
     source_order: i32,
     span: Option<ErrorSpan>,
     source_span: Option<ErrorSpan>,
-    specifiers: Vec<Specifier>,
     dependency_type: DependencyType,
     export_all: bool,
   ) -> Self {
@@ -75,7 +87,6 @@ impl HarmonyImportSideEffectDependency {
       request,
       span,
       source_span,
-      specifiers,
       dependency_type,
       export_all,
       resource_identifier,
@@ -97,35 +108,24 @@ pub fn harmony_import_dependency_apply<T: ModuleDependency>(
   } = code_generatable_context;
   // Only available when module factorization is successful.
   let module_graph = compilation.get_module_graph();
-  let ref_mgm = module_graph.module_graph_module_by_dependency_id(module_dependency.id());
-  let is_target_active = if compilation.options.is_new_tree_shaking() {
-    let connection = module_graph.connection_by_dependency(module_dependency.id());
-    if let Some(con) = connection {
-      Some(con.is_target_active(&module_graph, *runtime))
-    } else {
-      Some(true)
-    }
-  } else if let Some(ref_mgm) = ref_mgm {
-    Some(
-      compilation
-        .include_module_ids
-        .contains(&ref_mgm.module_identifier),
-    )
+  let connection = module_graph.connection_by_dependency(module_dependency.id());
+  let is_target_active = if let Some(con) = connection {
+    Some(con.is_target_active(&module_graph, *runtime))
   } else {
-    // This represents if module does not exist.
-    None
+    Some(true)
   };
   // Bailout only if the module does exist and not active.
   if is_target_active.is_some_and(|x| !x) {
     return;
   }
 
-  let runtime_condition =
-    if let Some(connection) = module_graph.connection_by_dependency(module_dependency.id()) {
-      filter_runtime(*runtime, |r| connection.is_target_active(&module_graph, r))
-    } else {
-      RuntimeCondition::Boolean(true)
-    };
+  let runtime_condition = if module_dependency.weak() {
+    RuntimeCondition::Boolean(false)
+  } else if let Some(connection) = module_graph.connection_by_dependency(module_dependency.id()) {
+    filter_runtime(*runtime, |r| connection.is_target_active(&module_graph, r))
+  } else {
+    RuntimeCondition::Boolean(true)
+  };
 
   let content: (String, String) = import_statement(
     *module,
@@ -139,7 +139,6 @@ pub fn harmony_import_dependency_apply<T: ModuleDependency>(
     init_fragments,
     compilation,
     module,
-    runtime_requirements,
     ..
   } = code_generatable_context;
   let ref_module = module_graph.module_identifier_by_dependency_id(module_dependency.id());
@@ -211,38 +210,184 @@ pub fn harmony_import_dependency_apply<T: ModuleDependency>(
       runtime_condition,
     )));
   }
+}
 
-  let is_new_tree_shaking = compilation.options.is_new_tree_shaking();
-  if module_dependency.is_export_all() == Some(true) && !is_new_tree_shaking {
-    runtime_requirements.insert(RuntimeGlobals::EXPORT_STAR);
-    runtime_requirements.insert(RuntimeGlobals::REQUIRE);
-    let exports_argument = module_graph
-      .module_by_identifier(&module.identifier())
-      .expect("should have mgm")
-      .get_exports_argument();
-    init_fragments.push(Box::new(NormalInitFragment::new(
-      format!(
-        "{}.{}({import_var}, {exports_argument});\n",
-        RuntimeGlobals::REQUIRE,
-        RuntimeGlobals::EXPORT_STAR,
-      ),
-      if is_async_module {
-        InitFragmentStage::StageAsyncHarmonyImports
-      } else {
-        InitFragmentStage::StageHarmonyImports
-      },
-      source_order,
-      InitFragmentKey::HarmonyExportStar(key.to_string()),
-      None,
-    )));
+pub fn harmony_import_dependency_get_linking_error<T: ModuleDependency>(
+  module_dependency: &T,
+  ids: &[Atom],
+  module_graph: &ModuleGraph,
+  additional_msg: String,
+  should_error: bool,
+) -> Option<Diagnostic> {
+  let Some(imported_module) = module_graph.get_module_by_dependency_id(module_dependency.id())
+  else {
+    return None;
+  };
+  if !imported_module.get_diagnostics().is_empty() {
+    return None;
   }
+  let parent_module_identifier = module_graph
+    .get_parent_module(module_dependency.id())
+    .expect("should have parent module for dependency");
+  let parent_module = module_graph
+    .module_by_identifier(parent_module_identifier)
+    .expect("should have module");
+  let exports_type = imported_module.get_exports_type_readonly(
+    module_graph,
+    parent_module
+      .build_meta()
+      .expect("should have build_meta")
+      .strict_harmony_module,
+  );
+  let create_error = |message: String| {
+    let (severity, title) = if should_error {
+      (Severity::Error, "HarmonyLinkingError")
+    } else {
+      (Severity::Warning, "HarmonyLinkingWarning")
+    };
+    let mut diagnostic = if let Some(span) = module_dependency.span()
+      && let Some(source) = parent_module.original_source().map(|s| s.source())
+    {
+      Diagnostic::from(
+        TraceableError::from_file(
+          source.into_owned(),
+          span.start as usize,
+          span.end as usize,
+          title.to_string(),
+          message,
+        )
+        .with_severity(severity)
+        .boxed(),
+      )
+    } else {
+      Diagnostic::from(
+        MietteDiagnostic::new(message)
+          .with_code(title)
+          .with_severity(severity)
+          .boxed(),
+      )
+    };
+    diagnostic = diagnostic.with_module_identifier(Some(*parent_module_identifier));
+    diagnostic
+  };
+  if matches!(
+    exports_type,
+    ExportsType::Namespace | ExportsType::DefaultWithNamed
+  ) {
+    if ids.is_empty() {
+      return None;
+    }
+    let imported_module_identifier = imported_module.identifier();
+    if (!matches!(exports_type, ExportsType::DefaultWithNamed) || ids[0] != "default")
+      && matches!(
+        module_graph.is_export_provided(&imported_module_identifier, ids),
+        Some(false)
+      )
+    {
+      let mut pos = 0;
+      let mut maybe_exports_info = Some(
+        module_graph
+          .get_exports_info(&imported_module_identifier)
+          .id,
+      );
+      while pos < ids.len()
+        && let Some(exports_info) = maybe_exports_info
+      {
+        let id = &ids[pos];
+        pos += 1;
+        let export_info = exports_info.get_read_only_export_info(id, module_graph);
+        if matches!(export_info.provided, Some(ExportInfoProvided::False)) {
+          let provided_exports = exports_info
+            .get_exports_info(module_graph)
+            .get_provided_exports(module_graph);
+          let more_info = if let ProvidedExports::Vec(exports) = &provided_exports {
+            if exports.is_empty() {
+              " (module has no exports)".to_string()
+            } else {
+              format!(
+                " (possible exports: {})",
+                exports
+                  .iter()
+                  .map(|e| e.as_str())
+                  .collect::<Vec<_>>()
+                  .join(", ")
+              )
+            }
+          } else {
+            " (possible exports unknown)".to_string()
+          };
+          let msg = format!(
+            "export {} {} was not found in '{}'{more_info}",
+            ids
+              .iter()
+              .take(pos)
+              .map(|id| format!("'{id}'"))
+              .collect::<Vec<_>>()
+              .join("."),
+            additional_msg,
+            module_dependency.user_request(),
+          );
+          return Some(create_error(msg));
+        }
+        maybe_exports_info = export_info.id.get_nested_exports_info(module_graph);
+      }
+      let msg = format!(
+        "export {} {} was not found in '{}'",
+        ids
+          .iter()
+          .map(|id| format!("'{id}'"))
+          .collect::<Vec<_>>()
+          .join("."),
+        additional_msg,
+        module_dependency.user_request()
+      );
+      return Some(create_error(msg));
+    }
+  }
+  match exports_type {
+    ExportsType::DefaultOnly => {
+      if !ids.is_empty() && ids[0] != "default" {
+        let msg = format!(
+          "Can't import the named export {} {} from default-exporting module (only default export is available)",
+          ids
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join("."),
+          additional_msg,
+        );
+        return Some(create_error(msg));
+      }
+    }
+    ExportsType::DefaultWithNamed => {
+      if !ids.is_empty()
+        && ids[0] != "default"
+        && matches!(
+          imported_module
+            .build_meta()
+            .expect("should have build_meta")
+            .default_object,
+          BuildMetaDefaultObject::RedirectWarn { ignore: false }
+        )
+      {
+        let msg = format!(
+          "Should not import the named export {} {} from default-exporting module (only default export is available soon)",
+          ids
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join("."),
+          additional_msg,
+        );
+        return Some(create_error(msg));
+      }
+    }
+    _ => {}
+  }
+  None
 }
 
 impl Dependency for HarmonyImportSideEffectDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "HarmonyImportSideEffectDependency"
-  }
-
   fn id(&self) -> &DependencyId {
     &self.id
   }
@@ -281,6 +426,14 @@ impl Dependency for HarmonyImportSideEffectDependency {
   fn resource_identifier(&self) -> Option<&str> {
     Some(&self.resource_identifier)
   }
+
+  fn get_referenced_exports(
+    &self,
+    _module_graph: &ModuleGraph,
+    _runtime: Option<&RuntimeSpec>,
+  ) -> Vec<ExtendedReferencedExport> {
+    vec![]
+  }
 }
 
 impl ModuleDependency for HarmonyImportSideEffectDependency {
@@ -302,14 +455,6 @@ impl ModuleDependency for HarmonyImportSideEffectDependency {
 
   fn set_request(&mut self, request: String) {
     self.request = request.into();
-  }
-
-  fn get_referenced_exports(
-    &self,
-    _module_graph: &ModuleGraph,
-    _runtime: Option<&RuntimeSpec>,
-  ) -> Vec<ExtendedReferencedExport> {
-    vec![]
   }
 
   // TODO: It's from HarmonyImportSideEffectDependency.
@@ -342,10 +487,8 @@ impl DependencyTemplate for HarmonyImportSideEffectDependency {
     } = code_generatable_context;
     let module_graph = compilation.get_module_graph();
     if let Some(scope) = concatenation_scope {
-      let module = module_graph
-        .get_module_by_dependency_id(&self.id)
-        .expect("should have module");
-      if scope.is_module_in_scope(&module.identifier()) {
+      let module = module_graph.get_module_by_dependency_id(&self.id);
+      if module.is_some_and(|m| scope.is_module_in_scope(&m.identifier())) {
         return;
       }
     }

@@ -1,9 +1,9 @@
 import { RspackOptions, rspack } from "@rspack/core";
-import { RspackDevServer, Configuration } from "@rspack/dev-server";
+import { Configuration, RspackDevServer } from "@rspack/dev-server";
 import ReactRefreshPlugin from "@rspack/plugin-react-refresh";
-import customConfig from "./fixtures/provide-plugin-custom/webpack.config";
 // @ts-expect-error
 import serializer from "jest-serializer-path";
+import customConfig from "./fixtures/provide-plugin-custom/webpack.config";
 
 expect.addSnapshotSerializer(serializer);
 
@@ -79,7 +79,7 @@ describe("normalize options snapshot", () => {
 		});
 		const server = new RspackDevServer({}, compiler);
 		await server.start();
-		const hmrPlugins = compiler.builtinPlugins.filter(
+		const hmrPlugins = compiler.__internal__builtinPlugins.filter(
 			p => p.name === "HotModuleReplacementPlugin"
 		);
 		expect(hmrPlugins.length).toBe(1);
@@ -149,7 +149,7 @@ async function getAdditionEntries(
 
 	const server = new RspackDevServer(serverConfig, compiler);
 	await server.start();
-	const entries = compiler.builtinPlugins
+	const entries = compiler.__internal__builtinPlugins
 		.filter(p => p.name === "EntryPlugin")
 		.map(p => p.options)
 		.reduce<Object>((acc, cur: any) => {

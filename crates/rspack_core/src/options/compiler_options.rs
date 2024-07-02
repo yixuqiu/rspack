@@ -24,7 +24,10 @@ pub struct CompilerOptions {
   pub profile: bool,
   pub bail: bool,
   pub builtins: Builtins,
+  pub __references: References,
 }
+
+pub type References = serde_json::Map<String, serde_json::Value>;
 
 impl CompilerOptions {
   pub fn is_incremental_rebuild_make_enabled(&self) -> bool {
@@ -37,9 +40,5 @@ impl CompilerOptions {
 
   pub fn is_incremental_rebuild_emit_asset_enabled(&self) -> bool {
     self.experiments.incremental_rebuild.emit_asset
-  }
-
-  pub fn is_new_tree_shaking(&self) -> bool {
-    self.experiments.rspack_future.new_treeshaking
   }
 }

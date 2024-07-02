@@ -2,10 +2,12 @@ import {
 	BuiltinPluginName,
 	RawBundlerInfoPluginOptions
 } from "@rspack/binding";
+
 import { create } from "./base";
 
 export type BundleInfoOptions = {
 	version?: string;
+	bundler?: string;
 	force?: boolean | string[];
 };
 
@@ -14,7 +16,8 @@ export const BundlerInfoRspackPlugin = create(
 	(options: BundleInfoOptions): RawBundlerInfoPluginOptions => {
 		return {
 			version: options.version || "unknown",
-			force: options.force ?? false
+			bundler: options.bundler || "rspack",
+			force: options.force ?? true
 		};
 	}
 );

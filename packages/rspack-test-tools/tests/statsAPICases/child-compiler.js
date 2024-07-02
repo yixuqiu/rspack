@@ -1,3 +1,4 @@
+const { createFsFromVolume, Volume } = require("memfs");
 let statsJson;
 
 class TestPlugin {
@@ -51,11 +52,16 @@ module.exports = {
 		      "chunkNames": Array [],
 		      "emitted": true,
 		      "info": Object {
+		        "chunkHash": Array [],
+		        "contentHash": Array [],
 		        "development": false,
 		        "hotModuleReplacement": false,
+		        "immutable": false,
+		        "minimized": true,
+		        "related": Object {},
 		      },
 		      "name": "TestChild.js",
-		      "size": 726,
+		      "size": 353,
 		      "type": "asset",
 		    },
 		    Object {
@@ -64,11 +70,17 @@ module.exports = {
 		      ],
 		      "emitted": true,
 		      "info": Object {
+		        "chunkHash": Array [],
+		        "contentHash": Array [],
 		        "development": false,
 		        "hotModuleReplacement": false,
+		        "immutable": false,
+		        "javascriptModule": false,
+		        "minimized": true,
+		        "related": Object {},
 		      },
 		      "name": "main.js",
-		      "size": 211,
+		      "size": 207,
 		      "type": "asset",
 		    },
 		  ],
@@ -86,11 +98,17 @@ module.exports = {
 		          ],
 		          "emitted": true,
 		          "info": Object {
+		            "chunkHash": Array [],
+		            "contentHash": Array [],
 		            "development": false,
 		            "hotModuleReplacement": false,
+		            "immutable": false,
+		            "javascriptModule": false,
+		            "minimized": true,
+		            "related": Object {},
 		          },
 		          "name": "TestChild.js",
-		          "size": 726,
+		          "size": 353,
 		          "type": "asset",
 		        },
 		      ],

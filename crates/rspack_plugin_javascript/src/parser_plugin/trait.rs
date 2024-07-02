@@ -52,12 +52,20 @@ pub trait JavascriptParserPlugin {
     None
   }
 
+  fn pre_declarator(
+    &self,
+    _parser: &mut JavascriptParser,
+    _declarator: &VarDeclarator,
+    _declaration: &VarDecl,
+  ) -> Option<bool> {
+    None
+  }
+
   fn evaluate_typeof(
     &self,
     _parser: &mut JavascriptParser,
-    _ident: &Ident,
-    _start: u32,
-    _end: u32,
+    _expr: &UnaryExpr,
+    _for_name: &str,
   ) -> Option<BasicEvaluatedExpression> {
     None
   }
@@ -82,6 +90,15 @@ pub trait JavascriptParserPlugin {
     None
   }
 
+  fn pattern(
+    &self,
+    _parser: &mut JavascriptParser,
+    _ident: &Ident,
+    _for_name: &str,
+  ) -> Option<bool> {
+    None
+  }
+
   fn call(
     &self,
     _parser: &mut JavascriptParser,
@@ -94,11 +111,11 @@ pub trait JavascriptParserPlugin {
   fn call_member_chain(
     &self,
     _parser: &mut JavascriptParser,
-    _root_info: &ExportedVariableInfo,
     _expr: &CallExpr,
-    // TODO: members: &Vec<String>,
-    // TODO: members_optionals: Vec<bool>,
-    // TODO: members_ranges: Vec<DependencyLoc>
+    _for_name: &str,
+    _members: &[Atom],
+    _members_optionals: &[bool],
+    _member_ranges: &[Span],
   ) -> Option<bool> {
     None
   }
@@ -108,6 +125,18 @@ pub trait JavascriptParserPlugin {
     _parser: &mut JavascriptParser,
     _expr: &MemberExpr,
     _for_name: &str,
+  ) -> Option<bool> {
+    None
+  }
+
+  fn member_chain(
+    &self,
+    _parser: &mut JavascriptParser,
+    _expr: &MemberExpr,
+    _for_name: &str,
+    _members: &[Atom],
+    _members_optionals: &[bool],
+    _member_ranges: &[Span],
   ) -> Option<bool> {
     None
   }
@@ -187,7 +216,12 @@ pub trait JavascriptParserPlugin {
     None
   }
 
-  fn new_expression(&self, _parser: &mut JavascriptParser, _expr: &NewExpr) -> Option<bool> {
+  fn new_expression(
+    &self,
+    _parser: &mut JavascriptParser,
+    _expr: &NewExpr,
+    _for_name: &str,
+  ) -> Option<bool> {
     None
   }
 
@@ -236,8 +270,8 @@ pub trait JavascriptParserPlugin {
     _parser: &mut JavascriptParser,
     _statement: &ImportDecl,
     _source: &Atom,
-    _export_name: Option<&str>,
-    _identifier_name: &str,
+    _export_name: Option<&Atom>,
+    _identifier_name: &Atom,
   ) -> Option<bool> {
     None
   }
@@ -296,6 +330,10 @@ pub trait JavascriptParserPlugin {
 
   // TODO: remove `named_export`
   fn named_export(&self, _parser: &mut JavascriptParser, _expr: &NamedExport) -> Option<bool> {
+    None
+  }
+
+  fn finish(&self, _parser: &mut JavascriptParser) -> Option<bool> {
     None
   }
 }

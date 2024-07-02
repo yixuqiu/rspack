@@ -1,5 +1,6 @@
-import { AsyncSeriesBailHook, HookMap, SyncHook } from "tapable";
 import util from "util";
+import { AsyncSeriesBailHook, HookMap, SyncHook } from "tapable";
+
 import { Compilation } from "./Compilation";
 import { LoaderContext } from "./config";
 
@@ -61,10 +62,8 @@ const deprecateAllProperties = <O extends object>(
 	}
 	return newObj;
 };
-// Actually it is just a NormalModule proxy, used for hooks api alignment
-// Maybe we can 1:1 align to webpack NormalModule once we found a better way to reduce communicate overhead between rust and js
+
 export class NormalModule {
-	constructor() {}
 	static getCompilationHooks(compilation: Compilation) {
 		if (!(compilation instanceof Compilation)) {
 			throw new TypeError(
@@ -75,9 +74,6 @@ export class NormalModule {
 		if (hooks === undefined) {
 			hooks = {
 				loader: new SyncHook(["loaderContext"]),
-				// beforeLoaders: new SyncHook(["loaders", "module", "loaderContext"]),
-				// beforeParse: new SyncHook(["module"]),
-				// beforeSnapshot: new SyncHook(["module"]),
 				// TODO webpack 6 deprecate
 				readResourceForScheme: new HookMap(scheme => {
 					const hook = hooks!.readResource.for(scheme);
@@ -101,7 +97,6 @@ export class NormalModule {
 				readResource: new HookMap(
 					() => new AsyncSeriesBailHook(["loaderContext"])
 				)
-				// needBuild: new AsyncSeriesBailHook(["module", "context"])
 			};
 			compilationHooksMap.set(compilation, hooks);
 		}

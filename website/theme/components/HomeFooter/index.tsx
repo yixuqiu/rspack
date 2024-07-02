@@ -1,5 +1,5 @@
-import { Link } from 'rspress/theme';
 import { useLang } from 'rspress/runtime';
+import { Link } from 'rspress/theme';
 import { useI18n } from '../../i18n/index';
 
 function useFooterData() {
@@ -25,7 +25,7 @@ function useFooterData() {
         },
         {
           title: t('compatibility'),
-          link: getLink('/guide/compatibility/loader'),
+          link: getLink('/guide/compatibility/plugin'),
         },
       ],
     },
@@ -43,6 +43,10 @@ function useFooterData() {
         {
           title: 'Loader API',
           link: getLink('/api/loader-api/index'),
+        },
+        {
+          title: 'JavaScript API',
+          link: getLink('/api/javascript-api'),
         },
       ],
     },
@@ -76,11 +80,15 @@ function useFooterData() {
         },
         {
           title: 'Discord',
-          link: 'https://discord.gg/ab2Rv4BXwf',
+          link: 'https://discord.gg/sYK4QjyZ4V',
         },
         {
-          title: 'X',
+          title: 'Twitter (X)',
           link: 'https://twitter.com/rspack_dev',
+        },
+        {
+          title: 'Awesome Rspack',
+          link: 'https://github.com/web-infra-dev/awesome-rspack',
         },
       ],
     },
@@ -111,7 +119,7 @@ export function HomeFooter() {
         ))}
       </div>
       <div className="flex flex-center">
-        <h2 className="font-normal text-sm text-gray-600 dark:text-light-600 py-4">
+        <h2 className="font-normal text-sm text-gray-400 dark:text-light-600 pt-6 pb-10">
           © 2022-present ByteDance Inc. All Rights Reserved.
         </h2>
       </div>

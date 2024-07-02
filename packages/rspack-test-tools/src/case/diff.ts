@@ -1,17 +1,21 @@
 import path from "path";
 import fs from "fs-extra";
 import rimraf from "rimraf";
+
 import createLazyTestEnv from "../helper/legacy/createLazyTestEnv";
 import { DiffProcessor, IDiffProcessorOptions } from "../processor";
-import { ECompareResultType, TModuleCompareResult } from "../type";
 import { Tester } from "../test/tester";
+import { ECompareResultType, TModuleCompareResult } from "../type";
+
+export type TDiffCaseConfig = IDiffProcessorOptions;
 
 const DEFAULT_CASE_CONFIG: Partial<IDiffProcessorOptions> = {
 	webpackPath: require.resolve("webpack"),
 	rspackPath: require.resolve("@rspack/core"),
 	files: ["bundle.js"],
 	bootstrap: true,
-	detail: true
+	detail: true,
+	errors: false
 };
 
 type TFileCompareResult = {
@@ -38,61 +42,55 @@ export function createDiffCase(name: string, src: string, dist: string) {
 		steps: [processor]
 	});
 
-	describe(name, () => {
-		beforeAll(async () => {
-			rimraf.sync(dist);
-			await tester.prepare();
-		});
+	beforeAll(async () => {
+		rimraf.sync(dist);
+		await tester.prepare();
+	});
 
-		do {
-			const prefix = `[${name}][${tester.step + 1}]:`;
-			describe(`${prefix}build`, () => {
-				beforeAll(async () => {
-					await tester.compile();
-				});
-				checkBundleFiles(
-					"webpack",
-					path.join(dist, "webpack"),
-					caseConfig.files!
-				);
-				checkBundleFiles(
-					"rspack",
-					path.join(dist, "rspack"),
-					caseConfig.files!
-				);
+	do {
+		const prefix = path.basename(name);
+		describe(`${prefix}:build`, () => {
+			beforeAll(async () => {
+				await tester.compile();
 			});
-			describe(`${prefix}check`, () => {
-				beforeAll(async () => {
-					compareMap.clear();
-					await tester.check(env);
-				});
-				for (let file of caseConfig.files!) {
-					describe(`Comparing "${file}"`, () => {
-						let moduleResults: TModuleCompareResult[] = [];
-						let runtimeResults: TModuleCompareResult[] = [];
-						beforeAll(() => {
-							const fileResult = compareMap.get(file);
-							if (!fileResult) {
-								throw new Error(`File ${file} has no results`);
-							}
-							moduleResults = fileResult.modules;
-							runtimeResults = fileResult.runtimeModules;
-						});
-						if (caseConfig.modules) {
-							checkCompareResults("modules", () => moduleResults);
+			checkBundleFiles(
+				"webpack",
+				path.join(dist, "webpack"),
+				caseConfig.files!
+			);
+			checkBundleFiles("rspack", path.join(dist, "rspack"), caseConfig.files!);
+		});
+		describe(`${prefix}:check`, () => {
+			beforeAll(async () => {
+				compareMap.clear();
+				await tester.check(env);
+			});
+			for (let file of caseConfig.files!) {
+				describe(`Comparing "${file}"`, () => {
+					let moduleResults: TModuleCompareResult[] = [];
+					let runtimeResults: TModuleCompareResult[] = [];
+					beforeAll(() => {
+						const fileResult = compareMap.get(file);
+						if (!fileResult) {
+							throw new Error(`File ${file} has no results`);
 						}
-						if (caseConfig.runtimeModules) {
-							checkCompareResults("runtime modules", () => runtimeResults);
-						}
+						moduleResults = fileResult.modules;
+						runtimeResults = fileResult.runtimeModules;
 					});
-				}
-				const env = createLazyTestEnv(1000);
-			});
-		} while (tester.next());
-
-		afterAll(async () => {
-			await tester.resume();
+					if (caseConfig.modules) {
+						checkCompareResults("modules", () => moduleResults);
+					}
+					if (caseConfig.runtimeModules) {
+						checkCompareResults("runtime modules", () => runtimeResults);
+					}
+				});
+			}
+			const env = createLazyTestEnv(1000);
 		});
+	} while (tester.next());
+
+	afterAll(async () => {
+		await tester.resume();
 	});
 }
 
@@ -126,7 +124,9 @@ function createDiffProcessor(config: IDiffProcessorOptions) {
 		onCompareModules: createCompareResultHandler("modules"),
 		onCompareRuntimeModules: createCompareResultHandler("runtimeModules"),
 		bootstrap: config.bootstrap ?? true,
-		detail: config.detail ?? true
+		detail: config.detail ?? true,
+		errors: config.errors ?? false,
+		replacements: config.replacements
 	});
 
 	return [processor, fileCompareMap] as [
@@ -157,7 +157,7 @@ function checkCompareResults(
 					.map(i => i.name)
 			).toEqual([]);
 		});
-		it("should not have any respack-only module", () => {
+		it("should not have any rspack-only module", () => {
 			expect(
 				getResults()
 					.filter(i => i.type === ECompareResultType.OnlySource)

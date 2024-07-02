@@ -29,10 +29,6 @@ impl CommonJsSelfReferenceDependency {
 }
 
 impl Dependency for CommonJsSelfReferenceDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "CommonJsSelfReferenceDependency"
-  }
-
   fn id(&self) -> &DependencyId {
     &self.id
   }
@@ -44,9 +40,11 @@ impl Dependency for CommonJsSelfReferenceDependency {
   fn dependency_type(&self) -> &DependencyType {
     &DependencyType::CjsSelfReference
   }
-}
 
-impl ModuleDependency for CommonJsSelfReferenceDependency {
+  fn resource_identifier(&self) -> Option<&str> {
+    Some("self")
+  }
+
   fn get_referenced_exports(
     &self,
     _module_graph: &ModuleGraph,
@@ -64,7 +62,9 @@ impl ModuleDependency for CommonJsSelfReferenceDependency {
       vec![ExtendedReferencedExport::Array(self.names.clone())]
     }
   }
+}
 
+impl ModuleDependency for CommonJsSelfReferenceDependency {
   fn request(&self) -> &str {
     "self"
   }

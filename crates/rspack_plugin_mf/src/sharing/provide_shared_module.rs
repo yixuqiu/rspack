@@ -65,7 +65,7 @@ impl ProvideSharedModule {
       factory_meta: None,
       build_info: None,
       build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      source_map_kind: SourceMapKind::empty(),
     }
   }
 }
@@ -98,7 +98,7 @@ impl DependenciesBlock for ProvideSharedModule {
 impl Module for ProvideSharedModule {
   impl_module_meta_info!();
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>, _compilation: &Compilation) -> f64 {
     42.0
   }
 
@@ -141,7 +141,7 @@ impl Module for ProvideSharedModule {
     if self.eager {
       dependencies.push(dep as BoxDependency);
     } else {
-      let block = AsyncDependenciesBlock::new(self.identifier, None, None, vec![dep]);
+      let block = AsyncDependenciesBlock::new(self.identifier, None, None, vec![dep], None);
       blocks.push(block);
     }
 

@@ -4,14 +4,14 @@ use std::{
   hash::{BuildHasherDefault, Hash},
   sync::{
     atomic::{AtomicUsize, Ordering},
-    Mutex,
+    Arc, Mutex,
   },
 };
 
 use bitflags::bitflags;
 use dashmap::DashMap;
 use derivative::Derivative;
-use rspack_error::{error, Diagnosable, Diagnostic, DiagnosticExt, MietteExt, Result, Severity};
+use rspack_error::{error, Diagnosable, Diagnostic, DiagnosticExt, Result, Severity};
 use rspack_hash::RspackHash;
 use rspack_hook::define_hook;
 use rspack_identifier::Identifiable;
@@ -30,11 +30,11 @@ use crate::{
   add_connection_states, contextify, diagnostics::ModuleBuildError, get_context,
   impl_module_meta_info, AsyncDependenciesBlockIdentifier, BoxLoader, BoxModule, BuildContext,
   BuildInfo, BuildMeta, BuildResult, ChunkGraph, CodeGenerationResult, Compilation,
-  CompilerContext, ConcatenationScope, ConnectionState, Context, DependenciesBlock, DependencyId,
+  ConcatenationScope, ConnectionState, Context, DependenciesBlock, DependencyId,
   DependencyTemplate, FactoryMeta, GenerateContext, GeneratorOptions, LibIdentOptions, Module,
   ModuleDependency, ModuleGraph, ModuleIdentifier, ModuleType, ParseContext, ParseResult,
-  ParserAndGenerator, ParserOptions, Resolve, RspackLoaderRunnerPlugin, RuntimeGlobals,
-  RuntimeSpec, SourceType,
+  ParserAndGenerator, ParserOptions, Resolve, RspackLoaderRunnerPlugin, RunnerContext,
+  RuntimeGlobals, RuntimeSpec, SourceType,
 };
 
 bitflags! {
@@ -78,8 +78,10 @@ impl ModuleIssuer {
   }
 }
 
-define_hook!(NormalModuleReadResource: AsyncSeriesBail(resource_data: &mut ResourceData) -> Content);
-define_hook!(NormalModuleLoader: SyncSeries(loader_context: &mut LoaderContext<CompilerContext>));
+define_hook!(NormalModuleReadResource: AsyncSeriesBail(resource_data: &ResourceData) -> Content);
+define_hook!(NormalModuleLoader: SyncSeries(loader_context: &mut LoaderContext<RunnerContext>));
+define_hook!(NormalModuleLoaderShouldYield: SyncSeriesBail(loader_context: &LoaderContext<RunnerContext>) -> bool);
+define_hook!(NormalModuleLoaderStartYielding: AsyncSeries(loader_context: &mut LoaderContext<RunnerContext>));
 define_hook!(NormalModuleBeforeLoaders: SyncSeries(module: &mut NormalModule));
 define_hook!(NormalModuleAdditionalData: AsyncSeries(additional_data: &mut AdditionalData));
 
@@ -87,6 +89,8 @@ define_hook!(NormalModuleAdditionalData: AsyncSeries(additional_data: &mut Addit
 pub struct NormalModuleHooks {
   pub read_resource: NormalModuleReadResourceHook,
   pub loader: NormalModuleLoaderHook,
+  pub loader_should_yield: NormalModuleLoaderShouldYieldHook,
+  pub loader_yield: NormalModuleLoaderStartYieldingHook,
   pub before_loaders: NormalModuleBeforeLoadersHook,
   pub additional_data: NormalModuleAdditionalDataHook,
 }
@@ -114,12 +118,10 @@ pub struct NormalModule {
   /// Resource matched with inline match resource, (`!=!` syntax)
   match_resource: Option<ResourceData>,
   /// Resource data (path, query, fragment etc.)
-  resource_data: ResourceData,
+  resource_data: Arc<ResourceData>,
   /// Loaders for the module
   #[derivative(Debug = "ignore")]
   loaders: Vec<BoxLoader>,
-  /// Whether loaders list contains inline loader
-  contains_inline_loader: bool,
 
   /// Original content of this module, will be available after module build
   original_source: Option<BoxSource>,
@@ -145,6 +147,7 @@ pub struct NormalModule {
   build_info: Option<BuildInfo>,
   build_meta: Option<BuildMeta>,
   parsed: bool,
+  last_successful_build_meta: BuildMeta,
 }
 
 #[derive(Debug, Clone)]
@@ -171,7 +174,7 @@ static DEBUG_ID: AtomicUsize = AtomicUsize::new(1);
 
 impl NormalModule {
   fn create_id(module_type: &ModuleType, request: &str) -> String {
-    if *module_type == ModuleType::Js {
+    if *module_type == ModuleType::JsAuto {
       request.to_string()
     } else {
       format!("{module_type}|{request}")
@@ -188,10 +191,9 @@ impl NormalModule {
     parser_options: Option<ParserOptions>,
     generator_options: Option<GeneratorOptions>,
     match_resource: Option<ResourceData>,
-    resource_data: ResourceData,
+    resource_data: Arc<ResourceData>,
     resolve_options: Option<Box<Resolve>>,
     loaders: Vec<BoxLoader>,
-    contains_inline_loader: bool,
   ) -> Self {
     let module_type = module_type.into();
     let id = Self::create_id(&module_type, &request);
@@ -211,7 +213,6 @@ impl NormalModule {
       resource_data,
       resolve_options,
       loaders,
-      contains_inline_loader,
       original_source: None,
       source: NormalModuleSource::Unbuild,
       debug_id: DEBUG_ID.fetch_add(1, Ordering::Relaxed),
@@ -225,7 +226,8 @@ impl NormalModule {
       build_meta: None,
       parsed: false,
 
-      source_map_kind: SourceMapKind::None,
+      source_map_kind: SourceMapKind::empty(),
+      last_successful_build_meta: BuildMeta::default(),
     }
   }
 
@@ -263,14 +265,6 @@ impl NormalModule {
 
   pub fn loaders(&self) -> &[BoxLoader] {
     &self.loaders
-  }
-
-  pub fn loaders_mut_vec(&mut self) -> &mut Vec<BoxLoader> {
-    &mut self.loaders
-  }
-
-  pub fn contains_inline_loader(&self) -> bool {
-    self.contains_inline_loader
   }
 
   pub fn parser_and_generator(&self) -> &dyn ParserAndGenerator {
@@ -331,9 +325,6 @@ impl DependenciesBlock for NormalModule {
   }
 }
 
-// to tell builtin:swc-loader to give content instead of ast only even if its index is 0
-pub struct LoadersShouldAlwaysGiveContent;
-
 #[async_trait::async_trait]
 impl Module for NormalModule {
   impl_module_meta_info!();
@@ -359,12 +350,12 @@ impl Module for NormalModule {
     Cow::Owned(context.shorten(&self.user_request))
   }
 
-  fn size(&self, source_type: &SourceType) -> f64 {
-    if let Some(size_ref) = self.cached_source_sizes.get(source_type) {
+  fn size(&self, source_type: Option<&SourceType>, _compilation: &Compilation) -> f64 {
+    if let Some(size_ref) = source_type.and_then(|st| self.cached_source_sizes.get(st)) {
       *size_ref
     } else {
       let size = f64::max(1.0, self.parser_and_generator.size(self, source_type));
-      self.cached_source_sizes.insert(*source_type, size);
+      source_type.and_then(|st| self.cached_source_sizes.insert(*st, size));
       size
     }
   }
@@ -394,38 +385,25 @@ impl Module for NormalModule {
       .before_loaders
       .call(self)?;
 
-    let plugin = RspackLoaderRunnerPlugin {
+    let plugin = Arc::new(RspackLoaderRunnerPlugin {
       plugin_driver: build_context.plugin_driver.clone(),
       current_loader: Default::default(),
-    };
+    });
 
-    let mut additional_data = AdditionalData::default();
-
-    if no_parse {
-      additional_data.insert(&LoadersShouldAlwaysGiveContent {});
-    }
+    let additional_data = AdditionalData::default();
 
     let loader_result = run_loaders(
-      &self.loaders,
-      &mut self.resource_data,
-      &[&plugin],
-      build_context.compiler_context,
+      self.loaders.clone(),
+      self.resource_data.clone(),
+      Some(plugin.clone()),
+      build_context.runner_context,
       additional_data,
     )
     .await;
     let (mut loader_result, ds) = match loader_result {
       Ok(r) => r.split_into_parts(),
       Err(e) => {
-        let mut e = ModuleBuildError(e).boxed();
-        {
-          let mut current = plugin
-            .current_loader
-            .lock()
-            .expect("should be able to lock");
-          if let Some(current) = current.take() {
-            e = e.with_help(format!("File was processed with this loader: '{current}'"));
-          }
-        };
+        let e = ModuleBuildError(e).boxed();
         let d = Diagnostic::from(e);
         self.source = NormalModuleSource::BuiltFailed(d.clone());
         self.add_diagnostic(d);
@@ -438,7 +416,6 @@ impl Module for NormalModule {
           build_meta: Default::default(),
           dependencies: Vec::new(),
           blocks: Vec::new(),
-          analyze_result: Default::default(),
           optimization_bailouts: vec![],
         });
       }
@@ -482,12 +459,16 @@ impl Module for NormalModule {
         build_meta,
         dependencies: Vec::new(),
         blocks: Vec::new(),
-        analyze_result: Default::default(),
         optimization_bailouts: Vec::new(),
       });
     }
 
-    let mut code_generation_dependencies: Vec<Box<dyn ModuleDependency>> = Vec::new();
+    build_info.cacheable = loader_result.cacheable;
+    build_info.file_dependencies = loader_result.file_dependencies;
+    build_info.context_dependencies = loader_result.context_dependencies;
+    build_info.missing_dependencies = loader_result.missing_dependencies;
+    build_info.build_dependencies = loader_result.build_dependencies;
+    build_info.asset_filenames = loader_result.asset_filenames;
 
     let (
       ParseResult {
@@ -495,10 +476,10 @@ impl Module for NormalModule {
         dependencies,
         blocks,
         presentational_dependencies,
-        analyze_result,
+        code_generation_dependencies,
         side_effects_bailout,
       },
-      ds,
+      diagnostics,
     ) = self
       .parser_and_generator
       .parse(ParseContext {
@@ -508,17 +489,21 @@ impl Module for NormalModule {
         module_parser_options: self.parser_options.as_ref(),
         module_type: &self.module_type,
         module_user_request: &self.user_request,
-        module_source_map_kind: self.get_source_map_kind().clone(),
+        module_source_map_kind: *self.get_source_map_kind(),
         loaders: &self.loaders,
         resource_data: &self.resource_data,
         compiler_options: build_context.compiler_options,
         additional_data: loader_result.additional_data,
-        code_generation_dependencies: &mut code_generation_dependencies,
         build_info: &mut build_info,
         build_meta: &mut build_meta,
       })?
       .split_into_parts();
-    self.add_diagnostics(ds);
+    if !diagnostics.is_empty() {
+      self.add_diagnostics(diagnostics);
+      build_meta = self.last_successful_build_meta.clone();
+    } else {
+      self.last_successful_build_meta = build_meta.clone();
+    }
     let optimization_bailouts = if let Some(side_effects_bailout) = side_effects_bailout {
       let short_id = self.readable_identifier(&build_context.compiler_options.context);
       vec![format!(
@@ -540,19 +525,12 @@ impl Module for NormalModule {
     build_meta.hash(&mut hasher);
 
     build_info.hash = Some(hasher.digest(&build_context.compiler_options.output.hash_digest));
-    build_info.cacheable = loader_result.cacheable;
-    build_info.file_dependencies = loader_result.file_dependencies;
-    build_info.context_dependencies = loader_result.context_dependencies;
-    build_info.missing_dependencies = loader_result.missing_dependencies;
-    build_info.build_dependencies = loader_result.build_dependencies;
-    build_info.asset_filenames = loader_result.asset_filenames;
 
     Ok(BuildResult {
       build_info,
       build_meta,
       dependencies,
       blocks,
-      analyze_result,
       optimization_bailouts,
     })
   }
@@ -755,7 +733,7 @@ impl NormalModule {
       return Ok(RawSource::Buffer(content.into_bytes()).boxed());
     }
     let source_map_kind = self.get_source_map_kind();
-    if !matches!(source_map_kind, SourceMapKind::None)
+    if source_map_kind.enabled()
       && let Some(source_map) = source_map
     {
       let content = content.into_string_lossy();
@@ -768,7 +746,7 @@ impl NormalModule {
         .boxed(),
       );
     }
-    if !matches!(source_map_kind, SourceMapKind::None)
+    if source_map_kind.enabled()
       && let Content::String(content) = content
     {
       return Ok(OriginalSource::new(content, self.request()).boxed());

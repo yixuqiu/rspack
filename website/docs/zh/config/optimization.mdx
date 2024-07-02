@@ -10,10 +10,11 @@ import WebpackLicense from '@components/webpack-license';
 
 ## optimization.moduleIds
 
-<PropertyType.CN type="'named' | 'deterministic'" />
+<PropertyType.CN type="'natural' | 'named' | 'deterministic'" />
 
 | 选项            | 描述                                                                                    |
 | --------------- | --------------------------------------------------------------------------------------- |
+| `natural`       | 根据模块加载的顺序使用自增数字作为模块 id。                                             |
 | `named`         | 使用有意义、方便调试的内容当作模块 id。此选项会在开发环境下默认开启。                   |
 | `deterministic` | 使用对模块标识符哈希后的数字当作模块 id，有益于长期缓存。此选项会在生产环境下默认开启。 |
 
@@ -34,6 +35,7 @@ import WebpackLicense from '@components/webpack-license';
 
 :::info
 当前该优化可能会对性能有很大的影响。
+
 如果你正遇到性能问题，并且你在使用 `optimization.splitChunks`，而且将 `optimization.splitChunks.chunks` 设置为了 'all'，就可以关掉 `optimization.mergeDuplicateChunks`。
 :::
 
@@ -56,13 +58,13 @@ import WebpackLicense from '@components/webpack-license';
   defaultValueList={[
     {
       defaultValue:
-        '[new SwcJsMinimizerRspackPlugin(), new SwcCssMinimizerRspackPlugin()]',
+        '[new SwcJsMinimizerRspackPlugin(), new LightningCssMinimizerRspackPlugin()]',
     },
   ]}
 />
 
 自定义压缩器。默认使用 [`rspack.SwcJsMinimizerRspackPlugin`](/plugins/rspack/swc-js-minimizer-rspack-plugin)
-和 [`rspack.SwcCssMinimizerRspackPlugin`](/plugins/rspack/swc-css-minimizer-rspack-plugin)。当声明了 `optimization.minimizer`，默认压缩器会被禁用。
+和 [`rspack.LightningCssMinimizerRspackPlugin`](/plugins/rspack/swc-css-minimizer-rspack-plugin)。当声明了 `optimization.minimizer`，默认压缩器会被禁用。
 
 ```js title=rspack.config.js
 const minifyPlugin = require('@rspack/plugin-minify');
@@ -187,13 +189,13 @@ module.exports = {
 
 ## optimization.splitChunks
 
-<PropertyType type="false | object" />
+- **类型：** `false | object`
 
 Rspack 支持通过 `optimization.splitChunks` 配置项来对 Chunk 进行拆分。
 
 该优化选项默认情况下是开启的，你可以将其设为 `false` 来关闭它。
 
-点击 [SplitChunksPlugin](/plugins/webpack/split-chunks-plugin) 查看可用配置项
+有关配置此行为的可用选项，请参见 [SplitChunksPlugin](/plugins/webpack/split-chunks-plugin) 页面。
 
 ## optimization.usedExports
 
@@ -205,7 +207,7 @@ Rspack 支持通过 `optimization.splitChunks` 配置项来对 Chunk 进行拆�
   ]}
 />
 
-告诉 rspack 对每个模块确定使用的导出。这取决于 `optimization.providedExports`。
+告诉 Rspack 对每个模块确定使用的导出。这取决于 `optimization.providedExports`。
 `optimization.usedExports` 收集的信息被其他优化或代码生成使用，即不会为未使用的导出生成导出信息，当所有用法兼容时，导出名称会被缩短为单个字符标识符。压缩器中的死代码消除将受益于此，并且可以删除未使用的导出。
 
 ```js title=rspack.config.js
@@ -237,7 +239,7 @@ module.exports = {
     { defaultValue: 'false', mode: 'development' },
   ]}
 />
-`optimization.innerGraph` 告诉 rspack 是否进行未使用导出的内部图分析。
+`optimization.innerGraph` 告诉 Rspack 是否进行未使用导出的内部图分析。
 
 ```js title=rspack.config.js
 module.exports = {
@@ -283,3 +285,29 @@ module.exports = {
 | 'deterministic' | 使用哈希模块标识符作为标识符，以便从长期缓存中受益。在生产模式下，默认启用此选项。 |
 | true            | 与 'deterministic' 相同。                                                          |
 | false           | 保留原始名称。适用于可读性和调试。                                                 |
+
+## optimization.nodeEnv
+
+- **类型：** `boolean | string`
+- **默认值：** `false`
+
+Rspack 将 `process.env.NODE_ENV` 设置为给定的字符串。除非该值被明确设置为 `false`，否则 `optimization.nodeEnv` 将使用 [DefinePlugin](/plugins/webpack/define-plugin)。
+`optimization.nodeEnv` 的**默认值**为 [mode](/config/mode)，否则将设置为 `'production'`。
+
+可能的值：
+
+- 任意字符串：设置 `process.env.NODE_ENV` 的值。
+- false：不设置 `process.env.NODE_ENV` 的值。
+
+```js title=rspack.config.js
+module.exports = {
+  //...
+  optimization: {
+    nodeEnv: 'production',
+  },
+};
+```
+
+:::tip
+当 [mode](/config/mode) 被设置为 `'none'` 时，`optimization.nodeEnv` 默认为 `false`。
+:::

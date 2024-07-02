@@ -52,7 +52,7 @@ impl FallbackModule {
       factory_meta: None,
       build_info: None,
       build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      source_map_kind: SourceMapKind::empty(),
     }
   }
 }
@@ -85,7 +85,7 @@ impl DependenciesBlock for FallbackModule {
 impl Module for FallbackModule {
   impl_module_meta_info!();
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>, _compilation: &Compilation) -> f64 {
     self.requests.len() as f64 * 5.0 + 42.0
   }
 
@@ -141,7 +141,6 @@ impl Module for FallbackModule {
       build_meta: Default::default(),
       dependencies,
       blocks: Vec::new(),
-      analyze_result: Default::default(),
       optimization_bailouts: vec![],
     })
   }

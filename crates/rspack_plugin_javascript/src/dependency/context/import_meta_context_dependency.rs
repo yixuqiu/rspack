@@ -13,10 +13,17 @@ pub struct ImportMetaContextDependency {
   options: ContextOptions,
   span: Option<ErrorSpan>,
   resource_identifier: String,
+  optional: bool,
 }
 
 impl ImportMetaContextDependency {
-  pub fn new(start: u32, end: u32, options: ContextOptions, span: Option<ErrorSpan>) -> Self {
+  pub fn new(
+    start: u32,
+    end: u32,
+    options: ContextOptions,
+    span: Option<ErrorSpan>,
+    optional: bool,
+  ) -> Self {
     let resource_identifier = create_resource_identifier_for_context_dependency(None, &options);
     Self {
       start,
@@ -25,6 +32,7 @@ impl ImportMetaContextDependency {
       span,
       id: DependencyId::new(),
       resource_identifier,
+      optional,
     }
   }
 }
@@ -44,10 +52,6 @@ impl Dependency for ImportMetaContextDependency {
 
   fn span(&self) -> Option<ErrorSpan> {
     self.span
-  }
-
-  fn dependency_debug_name(&self) -> &'static str {
-    "ImportMetaContextDependency"
   }
 }
 
@@ -70,6 +74,14 @@ impl ContextDependency for ImportMetaContextDependency {
 
   fn set_request(&mut self, request: String) {
     self.options.request = request;
+  }
+
+  fn get_optional(&self) -> bool {
+    self.optional
+  }
+
+  fn type_prefix(&self) -> rspack_core::ContextTypePrefix {
+    rspack_core::ContextTypePrefix::Normal
   }
 }
 

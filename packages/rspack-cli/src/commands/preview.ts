@@ -1,13 +1,14 @@
-import type { RspackCLI } from "../rspack-cli";
-import { RspackCommand, RspackPreviewCLIOptions } from "../types";
-import { previewOptions } from "../utils/options";
+import path from "path";
 import {
 	DevServer,
-	rspack,
+	MultiRspackOptions,
 	RspackOptions,
-	MultiRspackOptions
+	rspack
 } from "@rspack/core";
-import path from "path";
+
+import type { RspackCLI } from "../cli";
+import { RspackCommand, RspackPreviewCLIOptions } from "../types";
+import { previewOptions } from "../utils/options";
 
 const defaultRoot = "dist";
 export class PreviewCommand implements RspackCommand {

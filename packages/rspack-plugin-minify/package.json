@@ -1,6 +1,6 @@
 {
   "name": "@rspack/plugin-minify",
-  "version": "0.6.3",
+  "version": "1.0.0-alpha.0",
   "license": "MIT",
   "description": "Minify plugin for rspack",
   "main": "src/index.js",
@@ -22,7 +22,8 @@
     "directory": "packages/rspack-plugin-minify"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   },
   "dependencies": {
     "esbuild": "0.16.3",

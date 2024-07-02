@@ -7,6 +7,8 @@ export type JsFilename =
 	| ((pathData: JsPathData, assetInfo?: JsAssetInfo) => string);
 
 export type LocalJsFilename = JsFilename;
+
+export type RawLazyCompilationTest = RegExp | ((m: JsModule) => boolean);
 /* -- banner.d.ts end -- */
 
 /* -- napi-rs generated below -- */
@@ -39,9 +41,11 @@ export class JsCompilation {
   getContextDependencies(): Array<string>
   getMissingDependencies(): Array<string>
   getBuildDependencies(): Array<string>
-  pushDiagnostic(severity: "error" | "warning", title: string, message: string): void
+  pushDiagnostic(diagnostic: JsDiagnostic): void
   spliceDiagnostic(start: number, end: number, replaceWith: Array<JsDiagnostic>): void
   pushNativeDiagnostics(diagnostics: ExternalObject<'Diagnostic[]'>): void
+  getErrors(): Array<JsRspackError>
+  getWarnings(): Array<JsRspackError>
   getStats(): JsStats
   getAssetPath(filename: LocalJsFilename, data: JsPathData): string
   getAssetPathWithInfo(filename: LocalJsFilename, data: JsPathData): PathWithInfo
@@ -59,8 +63,8 @@ export class JsStats {
   getAssets(): JsStatsGetAssets
   getModules(reasons: boolean, moduleAssets: boolean, nestedModules: boolean, source: boolean, usedExports: boolean, providedExports: boolean): Array<JsStatsModule>
   getChunks(chunkModules: boolean, chunksRelations: boolean, reasons: boolean, moduleAssets: boolean, nestedModules: boolean, source: boolean, usedExports: boolean, providedExports: boolean): Array<JsStatsChunk>
-  getEntrypoints(): Array<JsStatsChunkGroup>
-  getNamedChunkGroups(): Array<JsStatsChunkGroup>
+  getEntrypoints(chunkGroupAuxiliary: boolean, chunkGroupChildren: boolean): Array<JsStatsChunkGroup>
+  getNamedChunkGroups(chunkGroupAuxiliary: boolean, chunkGroupChildren: boolean): Array<JsStatsChunkGroup>
   getErrors(): Array<JsStatsError>
   getWarnings(): Array<JsStatsWarning>
   getLogging(acceptedTypes: number): Array<JsStatsLogging>
@@ -120,6 +124,7 @@ export enum BuiltinPluginName {
   EnableChunkLoadingPlugin = 'EnableChunkLoadingPlugin',
   EnableLibraryPlugin = 'EnableLibraryPlugin',
   EnableWasmLoadingPlugin = 'EnableWasmLoadingPlugin',
+  FetchCompileAsyncWasmPlugin = 'FetchCompileAsyncWasmPlugin',
   ChunkPrefetchPreloadPlugin = 'ChunkPrefetchPreloadPlugin',
   CommonJsChunkFormatPlugin = 'CommonJsChunkFormatPlugin',
   ArrayPushCallbackChunkFormatPlugin = 'ArrayPushCallbackChunkFormatPlugin',
@@ -137,7 +142,9 @@ export enum BuiltinPluginName {
   ConsumeSharedPlugin = 'ConsumeSharedPlugin',
   ModuleFederationRuntimePlugin = 'ModuleFederationRuntimePlugin',
   NamedModuleIdsPlugin = 'NamedModuleIdsPlugin',
+  NaturalModuleIdsPlugin = 'NaturalModuleIdsPlugin',
   DeterministicModuleIdsPlugin = 'DeterministicModuleIdsPlugin',
+  NaturalChunkIdsPlugin = 'NaturalChunkIdsPlugin',
   NamedChunkIdsPlugin = 'NamedChunkIdsPlugin',
   DeterministicChunkIdsPlugin = 'DeterministicChunkIdsPlugin',
   RealContentHashPlugin = 'RealContentHashPlugin',
@@ -163,21 +170,34 @@ export enum BuiltinPluginName {
   CssModulesPlugin = 'CssModulesPlugin',
   APIPlugin = 'APIPlugin',
   RuntimeChunkPlugin = 'RuntimeChunkPlugin',
+  SizeLimitsPlugin = 'SizeLimitsPlugin',
   HttpExternalsRspackPlugin = 'HttpExternalsRspackPlugin',
   CopyRspackPlugin = 'CopyRspackPlugin',
   HtmlRspackPlugin = 'HtmlRspackPlugin',
   SwcJsMinimizerRspackPlugin = 'SwcJsMinimizerRspackPlugin',
   SwcCssMinimizerRspackPlugin = 'SwcCssMinimizerRspackPlugin',
+  LightningCssMinimizerRspackPlugin = 'LightningCssMinimizerRspackPlugin',
   BundlerInfoRspackPlugin = 'BundlerInfoRspackPlugin',
   CssExtractRspackPlugin = 'CssExtractRspackPlugin',
-  JsLoaderRspackPlugin = 'JsLoaderRspackPlugin'
+  JsLoaderRspackPlugin = 'JsLoaderRspackPlugin',
+  LazyCompilationPlugin = 'LazyCompilationPlugin'
 }
 
 export function cleanupGlobalTrace(): void
 
+export interface JsAdditionalTreeRuntimeRequirementsArg {
+  chunk: JsChunk
+  runtimeRequirements: JsRuntimeGlobals
+}
+
+export interface JsAdditionalTreeRuntimeRequirementsResult {
+  runtimeRequirements: JsRuntimeGlobals
+}
+
 export interface JsAfterResolveData {
   request: string
   context: string
+  issuer: string
   fileDependencies: Array<string>
   contextDependencies: Array<string>
   missingDependencies: Array<string>
@@ -222,6 +242,15 @@ export interface JsAssetInfo {
   javascriptModule?: boolean
   /** related object to other assets, keyed by type of relation (only points from parent to child) */
   related: JsAssetInfoRelated
+  /** unused css local ident for the css chunk */
+  cssUnusedIdents?: Array<string>
+  /**
+   * Webpack: AssetInfo = KnownAssetInfo & Record<string, any>
+   * But Napi.rs does not support Intersectiont types. This is a hack to store the additional fields
+   * in the rust struct and have the Js side to reshape and align with webpack
+   * Related: packages/rspack/src/Compilation.ts
+   */
+  extras: Record<string, any>
 }
 
 export interface JsAssetInfoRelated {
@@ -231,6 +260,7 @@ export interface JsAssetInfoRelated {
 export interface JsBeforeResolveArgs {
   request: string
   context: string
+  issuer: string
 }
 
 export interface JsBuildTimeExecutionOption {
@@ -252,7 +282,7 @@ export interface JsChunk {
   hash?: string
   contentHash: Record<string, string>
   renderedHash?: string
-  chunkReasons: Array<string>
+  chunkReason?: string
   auxiliaryFiles: Array<string>
 }
 
@@ -293,6 +323,18 @@ export interface JsCompatSource {
   map?: Buffer
 }
 
+export interface JsContextModuleFactoryAfterResolveData {
+  resource: string
+  context: string
+  request: string
+  regExp?: RawRegex
+}
+
+export interface JsContextModuleFactoryBeforeResolveData {
+  context: string
+  request?: string
+}
+
 export interface JsCreateData {
   request: string
   userRequest: string
@@ -300,9 +342,8 @@ export interface JsCreateData {
 }
 
 export interface JsDiagnostic {
-  severity: 'error' | 'warning'
-  title: string
-  message: string
+  severity: JsRspackSeverity
+  error: JsRspackError
 }
 
 export interface JsExecuteModuleArg {
@@ -317,69 +358,53 @@ export interface JsExecuteModuleResult {
   contextDependencies: Array<string>
   buildDependencies: Array<string>
   missingDependencies: Array<string>
+  cacheable: boolean
   assets: Array<string>
   id: number
 }
 
+export interface JsFactorizeArgs {
+  request: string
+  context: string
+  issuer: string
+}
+
+export interface JsFactoryMeta {
+  sideEffectFree?: boolean
+}
+
 export interface JsLoaderContext {
+  resourceData: Readonly<JsResourceData>
+  /** Will be deprecated. Use module.module_identifier instead */
+  _moduleIdentifier: Readonly<string>
+  _module: JsModule
+  hot: Readonly<boolean>
   /** Content maybe empty in pitching stage */
   content: null | Buffer
   additionalData?: any
   sourceMap?: Buffer
-  resource: string
-  resourcePath: string
-  resourceQuery?: string
-  resourceFragment?: string
   cacheable: boolean
   fileDependencies: Array<string>
   contextDependencies: Array<string>
   missingDependencies: Array<string>
   buildDependencies: Array<string>
   assetFilenames: Array<string>
-  currentLoader: string
-  isPitching: boolean
-  /**
-   * Loader index from JS.
-   * If loaders are dispatched by JS loader runner,
-   * then, this field is correspondence with loader index in JS side.
-   * It is useful when loader dispatched on JS side has an builtin loader, for example: builtin:swc-loader,
-   * Then this field will be used as an hack to test whether it should return an AST or string.
-   */
-  loaderIndexFromJs?: number
-  /**
-   * Internal additional data, contains more than `String`
-   * @internal
-   */
-  additionalDataExternal: ExternalObject<'AdditionalData'>
-  /**
-   * Internal loader context
-   * @internal
-   */
-  contextExternal: ExternalObject<'LoaderRunnerContext'>
-  /**
-   * Internal loader diagnostic
-   * @internal
-   */
-  diagnosticsExternal: ExternalObject<'Diagnostic[]'>
-  _moduleIdentifier: string
-  hot: boolean
+  loaderItems: Array<JsLoaderItem>
+  loaderIndex: number
+  loaderState: Readonly<JsLoaderState>
 }
 
-/** Only for dts generation */
-export interface JsLoaderResult {
-  /** Content in pitching stage can be empty */
-  content?: Buffer
-  fileDependencies: Array<string>
-  contextDependencies: Array<string>
-  missingDependencies: Array<string>
-  buildDependencies: Array<string>
-  assetFilenames: Array<string>
-  sourceMap?: Buffer
-  additionalData?: Buffer
-  additionalDataExternal: ExternalObject<'AdditionalData'>
-  cacheable: boolean
-  /** Used to instruct how rust loaders should execute */
-  isPitching: boolean
+export interface JsLoaderItem {
+  request: string
+  type: string
+  data: any
+  normalExecuted: boolean
+  pitchExecuted: boolean
+}
+
+export enum JsLoaderState {
+  Pitching = 'Pitching',
+  Normal = 'Normal'
 }
 
 export interface JsModule {
@@ -388,7 +413,10 @@ export interface JsModule {
   resource?: string
   moduleIdentifier: string
   nameForCondition?: string
+  request?: string
+  userRequest?: string
   rawRequest?: string
+  factoryMeta?: JsFactoryMeta
 }
 
 export interface JsNormalModuleFactoryCreateModuleArgs {
@@ -399,6 +427,15 @@ export interface JsNormalModuleFactoryCreateModuleArgs {
   matchResource?: string
 }
 
+export interface JsOriginRecord {
+  module: string
+  moduleId: string
+  moduleIdentifier: string
+  moduleName: string
+  loc: string
+  request: string
+}
+
 export interface JsPathData {
   filename?: string
   hash?: string
@@ -407,6 +444,12 @@ export interface JsPathData {
   url?: string
   id?: string
   chunk?: JsChunkPathData
+}
+
+export interface JsResolveArgs {
+  request: string
+  context: string
+  issuer: string
 }
 
 export interface JsResolveForSchemeArgs {
@@ -423,6 +466,22 @@ export interface JsResourceData {
   query?: string
   /** Resource fragment with `#` prefix */
   fragment?: string
+}
+
+export interface JsRspackError {
+  name: string
+  message: string
+  moduleIdentifier?: string
+  file?: string
+}
+
+export enum JsRspackSeverity {
+  Error = 'Error',
+  Warn = 'Warn'
+}
+
+export interface JsRuntimeGlobals {
+  value: Array<string>
 }
 
 export interface JsRuntimeModule {
@@ -448,9 +507,20 @@ export interface JsStatsAsset {
 }
 
 export interface JsStatsAssetInfo {
+  minimized: boolean
   development: boolean
   hotModuleReplacement: boolean
   sourceFilename?: string
+  immutable: boolean
+  javascriptModule?: boolean
+  chunkHash: Array<string>
+  contentHash: Array<string>
+  related: Array<JsStatsAssetInfoRelated>
+}
+
+export interface JsStatsAssetInfoRelated {
+  name: string
+  value: Array<string>
 }
 
 export interface JsStatsAssetsByChunkName {
@@ -463,6 +533,8 @@ export interface JsStatsChunk {
   files: Array<string>
   auxiliaryFiles: Array<string>
   id?: string
+  idHints: Array<string>
+  hash?: string
   entry: boolean
   initial: boolean
   names: Array<string>
@@ -472,13 +544,21 @@ export interface JsStatsChunk {
   children?: Array<string>
   siblings?: Array<string>
   childrenByOrder: Record<string, Array<string>>
+  runtime: Array<string>
+  sizes: Array<JsStatsSize>
+  reason?: string
+  rendered: boolean
+  origins: Array<JsOriginRecord>
 }
 
 export interface JsStatsChunkGroup {
   name: string
-  assets: Array<JsStatsChunkGroupAsset>
   chunks: Array<string | undefined | null>
+  assets: Array<JsStatsChunkGroupAsset>
   assetsSize: number
+  auxiliaryAssets?: Array<JsStatsChunkGroupAsset>
+  auxiliaryAssetsSize?: number
+  children?: JsStatsChunkGroupChildren
 }
 
 export interface JsStatsChunkGroupAsset {
@@ -486,12 +566,17 @@ export interface JsStatsChunkGroupAsset {
   size: number
 }
 
+export interface JsStatsChunkGroupChildren {
+  preload?: Array<JsStatsChunkGroup>
+  prefetch?: Array<JsStatsChunkGroup>
+}
+
 export interface JsStatsError {
   message: string
-  formatted: string
   moduleIdentifier?: string
   moduleName?: string
   moduleId?: string
+  file?: string
 }
 
 export interface JsStatsGetAssets {
@@ -519,10 +604,14 @@ export interface JsStatsModule {
   id?: string
   chunks: Array<string | undefined | null>
   size: number
+  sizes: Array<JsStatsSize>
+  depth?: number
+  dependent?: boolean
   issuer?: string
   issuerName?: string
   issuerId?: string
   issuerPath: Array<JsStatsModuleIssuer>
+  modules?: Array<JsStatsModule>
   nameForCondition?: string
   reasons?: Array<JsStatsModuleReason>
   assets?: Array<string>
@@ -532,6 +621,17 @@ export interface JsStatsModule {
   providedExports?: Array<string>
   usedExports?: string | Array<string>
   optimizationBailout?: Array<string>
+  preOrderIndex?: number
+  postOrderIndex?: number
+  built: boolean
+  codeGenerated: boolean
+  buildTimeExecuted: boolean
+  cached: boolean
+  cacheable: boolean
+  optional: boolean
+  failed: boolean
+  errors: number
+  warnings: number
 }
 
 export interface JsStatsModuleIssuer {
@@ -542,7 +642,6 @@ export interface JsStatsModuleIssuer {
 
 export interface JsStatsModuleProfile {
   factory: JsStatsMillisecond
-  integration: JsStatsMillisecond
   building: JsStatsMillisecond
 }
 
@@ -558,12 +657,17 @@ export interface JsStatsOptimizationBailout {
   inner: string
 }
 
+export interface JsStatsSize {
+  sourceType: string
+  size: number
+}
+
 export interface JsStatsWarning {
   message: string
-  formatted: string
   moduleIdentifier?: string
   moduleName?: string
   moduleId?: string
+  file?: string
 }
 
 export interface JsTap {
@@ -639,6 +743,7 @@ export interface RawBannerPluginOptions {
   entryOnly?: boolean
   footer?: boolean
   raw?: boolean
+  stage?: number
   test?: string | RegExp | (string | RegExp)[]
   include?: string | RegExp | (string | RegExp)[]
   exclude?: string | RegExp | (string | RegExp)[]
@@ -650,6 +755,7 @@ export interface RawBuiltins {
 
 export interface RawBundlerInfoPluginOptions {
   version: string
+  bundler: string
   force: boolean | string[]
 }
 
@@ -691,6 +797,8 @@ export interface RawCacheOptions {
 
 export interface RawChunkOptionNameCtx {
   module: JsModule
+  chunks: Array<JsChunk>
+  cacheGroupKey: string
 }
 
 export interface RawConsumeOptions {
@@ -736,7 +844,7 @@ export interface RawCopyGlobOptions {
 
 export interface RawCopyPattern {
   from: string
-  to?: string
+  to?: string | ((pathData: { context: string; absoluteFilename?: string }) => string)
   context?: string
   toType?: string
   noErrorOnMissing: boolean
@@ -744,7 +852,7 @@ export interface RawCopyPattern {
   priority: number
   globOptions: RawCopyGlobOptions
   info?: RawInfo
-  transform?: (input: string | Buffer, absoluteFilename: string) => string | Buffer
+  transform?: (input: Buffer, absoluteFilename: string) => string | Buffer | Promise<string> | Promise<Buffer>
 }
 
 export interface RawCopyRspackPluginOptions {
@@ -761,6 +869,7 @@ export interface RawCssAutoGeneratorOptions {
   exportsConvention?: "as-is" | "camel-case" | "camel-case-only" | "dashes" | "dashes-only"
   exportsOnly?: boolean
   localIdentName?: string
+  esModule?: boolean
 }
 
 export interface RawCssAutoParserOptions {
@@ -779,14 +888,15 @@ export interface RawCssExtractPluginOption {
 }
 
 export interface RawCssGeneratorOptions {
-  exportsConvention?: "as-is" | "camel-case" | "camel-case-only" | "dashes" | "dashes-only"
   exportsOnly?: boolean
+  esModule?: boolean
 }
 
 export interface RawCssModuleGeneratorOptions {
   exportsConvention?: "as-is" | "camel-case" | "camel-case-only" | "dashes" | "dashes-only"
   exportsOnly?: boolean
   localIdentName?: string
+  esModule?: boolean
 }
 
 export interface RawCssModuleParserOptions {
@@ -825,6 +935,11 @@ export interface RawEntryPluginOptions {
   options: RawEntryOptions
 }
 
+export interface RawEnvironment {
+  const?: boolean
+  arrowFunction?: boolean
+}
+
 export interface RawEvalDevToolModulePluginOptions {
   namespace?: string
   moduleFilenameTemplate?: string | ((info: RawModuleFilenameTemplateFnCtx) => string)
@@ -832,7 +947,6 @@ export interface RawEvalDevToolModulePluginOptions {
 }
 
 export interface RawExperiments {
-  newSplitChunks: boolean
   topLevelAwait: boolean
   rspackFuture: RawRspackFuture
 }
@@ -951,6 +1065,19 @@ export interface RawJavascriptParserOptions {
   url: string
   exprContextCritical: boolean
   wrappedContextCritical: boolean
+  exportsPresence?: string
+  importExportsPresence?: string
+  reexportExportsPresence?: string
+  strictExportPresence: boolean
+  worker: Array<string>
+}
+
+export interface RawLazyCompilationOption {
+  module: (err: Error | null, arg: RawModuleArg) => any
+  test?: RawLazyCompilationTest
+  entries: boolean
+  imports: boolean
+  cacheable: boolean
 }
 
 export interface RawLibraryAuxiliaryComment {
@@ -982,10 +1109,22 @@ export interface RawLibraryOptions {
   amdContainer?: string
 }
 
+export interface RawLightningCssMinimizerRspackPluginOptions {
+  errorRecovery: boolean
+  unusedSymbols: Array<string>
+  removeUnusedLocalIdents: boolean
+  browserslist: Array<string>
+}
+
 export interface RawLimitChunkCountPluginOptions {
   chunkOverhead?: number
   entryChunkMultiplicator?: number
   maxChunks: number
+}
+
+export interface RawModuleArg {
+  module: string
+  path: string
 }
 
 export interface RawModuleFilenameTemplateFnCtx {
@@ -1000,6 +1139,12 @@ export interface RawModuleFilenameTemplateFnCtx {
   moduleId: string
   hash: string
   namespace: string
+}
+
+export interface RawModuleInfo {
+  active: boolean
+  client: string
+  data: string
 }
 
 export interface RawModuleOptions {
@@ -1028,7 +1173,7 @@ export interface RawModuleRule {
   resourceFragment?: RawRuleSetCondition
   descriptionData?: Record<string, RawRuleSetCondition>
   sideEffects?: boolean
-  use?: RawModuleRuleUses
+  use?: RawModuleRuleUse[] | ((arg: RawFuncUseCtx) => RawModuleRuleUse[])
   type?: string
   parser?: RawParserOptions
   generator?: RawGeneratorOptions
@@ -1055,12 +1200,6 @@ export interface RawModuleRule {
 export interface RawModuleRuleUse {
   loader: string
   options?: string
-}
-
-export interface RawModuleRuleUses {
-  type: "array" | "function"
-  arrayUse?: Array<RawModuleRuleUse>
-  funcUse?: (arg: RawFuncUseCtx) => RawModuleRuleUse[]
 }
 
 export interface RawNodeOption {
@@ -1096,7 +1235,7 @@ export interface RawOptions {
   node?: RawNodeOption
   profile: boolean
   bail: boolean
-  builtins: RawBuiltins
+  __references: Record<string, any>
 }
 
 export interface RawOutputOptions {
@@ -1138,6 +1277,7 @@ export interface RawOutputOptions {
   workerWasmLoading: string
   workerPublicPath: string
   scriptType: "module" | "text/javascript" | "false"
+  environment: RawEnvironment
 }
 
 export interface RawParserOptions {
@@ -1170,6 +1310,9 @@ export interface RawPluginImportConfig {
 export interface RawProgressPluginOptions {
   prefix: string
   profile: boolean
+  template: string
+  tick?: string | Array<string>
+  progressChars: string
 }
 
 export interface RawProvideOptions {
@@ -1192,18 +1335,13 @@ export interface RawReactOptions {
   refresh?: boolean
 }
 
-export interface RawRegexMatcher {
+export interface RawRegex {
   source: string
   flags: string
 }
 
 export interface RawRelated {
   sourceMap?: string
-}
-
-export interface RawRelayConfig {
-  artifactDirectory?: string
-  language: 'javascript' | 'typescript' | 'flow'
 }
 
 export interface RawRemoteOptions {
@@ -1227,6 +1365,9 @@ export interface RawResolveOptions {
   byDependency?: Record<string, RawResolveOptions>
   fullySpecified?: boolean
   exportsFields?: Array<string>
+  descriptionFiles?: Array<string>
+  enforceExtension?: boolean
+  importsFields?: Array<string>
   extensionAlias?: Record<string, Array<string>>
   aliasFields?: Array<string>
   restrictions?: Array<string>
@@ -1240,13 +1381,13 @@ export interface RawResolveTsconfigOptions {
 }
 
 export interface RawRspackFuture {
-  newTreeshaking: boolean
+
 }
 
 export interface RawRuleSetCondition {
   type: "string" | "regexp" | "logical" | "array" | "function"
   stringMatcher?: string
-  regexpMatcher?: RawRegexMatcher
+  regexpMatcher?: RawRegex
   logicalMatcher?: Array<RawRuleSetLogicalConditions>
   arrayMatcher?: Array<RawRuleSetCondition>
   funcMatcher?: (value: string) => boolean
@@ -1266,14 +1407,15 @@ export interface RawRuntimeChunkOptions {
   name: string | ((entrypoint: { name: string }) => string)
 }
 
-export interface RawSnapshotOptions {
-  resolve: RawSnapshotStrategy
-  module: RawSnapshotStrategy
+export interface RawSizeLimitsPluginOptions {
+  assetFilter?: (assetFilename: string) => boolean
+  hints?: "error" | "warning"
+  maxAssetSize?: number
+  maxEntrypointSize?: number
 }
 
-export interface RawSnapshotStrategy {
-  hash: boolean
-  timestamp: boolean
+export interface RawSnapshotOptions {
+
 }
 
 export interface RawSourceMapDevToolPluginOptions {
@@ -1324,13 +1466,18 @@ export interface RawStyleConfig {
 
 export interface RawSwcJsMinimizerRspackPluginOptions {
   extractComments?: RawExtractComments
-  compress: boolean | string
-  mangle: boolean | string
-  format: string
+  compress: any
+  mangle: any
+  format: any
   module?: boolean
   test?: string | RegExp | (string | RegExp)[]
   include?: string | RegExp | (string | RegExp)[]
   exclude?: string | RegExp | (string | RegExp)[]
+}
+
+export interface RawToOptions {
+  context: string
+  absoluteFilename?: string
 }
 
 export interface RawTrustedTypes {
@@ -1364,17 +1511,22 @@ export enum RegisterJsTapKind {
   CompilationAfterOptimizeModules = 14,
   CompilationOptimizeTree = 15,
   CompilationOptimizeChunkModules = 16,
-  CompilationRuntimeModule = 17,
-  CompilationChunkAsset = 18,
-  CompilationProcessAssets = 19,
-  CompilationAfterProcessAssets = 20,
-  CompilationAfterSeal = 21,
-  NormalModuleFactoryBeforeResolve = 22,
-  NormalModuleFactoryAfterResolve = 23,
-  NormalModuleFactoryCreateModule = 24,
-  NormalModuleFactoryResolveForScheme = 25,
-  ContextModuleFactoryBeforeResolve = 26,
-  ContextModuleFactoryAfterResolve = 27
+  CompilationAdditionalTreeRuntimeRequirements = 17,
+  CompilationRuntimeModule = 18,
+  CompilationChunkHash = 19,
+  CompilationChunkAsset = 20,
+  CompilationProcessAssets = 21,
+  CompilationAfterProcessAssets = 22,
+  CompilationAfterSeal = 23,
+  NormalModuleFactoryBeforeResolve = 24,
+  NormalModuleFactoryFactorize = 25,
+  NormalModuleFactoryResolve = 26,
+  NormalModuleFactoryAfterResolve = 27,
+  NormalModuleFactoryCreateModule = 28,
+  NormalModuleFactoryResolveForScheme = 29,
+  ContextModuleFactoryBeforeResolve = 30,
+  ContextModuleFactoryAfterResolve = 31,
+  JavascriptModulesChunkHash = 32
 }
 
 export interface RegisterJsTaps {
@@ -1390,32 +1542,34 @@ export interface RegisterJsTaps {
   registerCompilationStillValidModuleTaps: (stages: Array<number>) => Array<{ function: ((arg: JsModule) => void); stage: number; }>
   registerCompilationSucceedModuleTaps: (stages: Array<number>) => Array<{ function: ((arg: JsModule) => void); stage: number; }>
   registerCompilationExecuteModuleTaps: (stages: Array<number>) => Array<{ function: ((arg: JsExecuteModuleArg) => void); stage: number; }>
+  registerCompilationAdditionalTreeRuntimeRequirements: (stages: Array<number>) => Array<{ function: ((arg: JsAdditionalTreeRuntimeRequirementsArg) => JsAdditionalTreeRuntimeRequirementsResult | undefined); stage: number; }>
   registerCompilationRuntimeModuleTaps: (stages: Array<number>) => Array<{ function: ((arg: JsRuntimeModuleArg) => JsRuntimeModule | undefined); stage: number; }>
   registerCompilationFinishModulesTaps: (stages: Array<number>) => Array<{ function: ((arg: JsCompilation) => Promise<void>); stage: number; }>
   registerCompilationOptimizeModulesTaps: (stages: Array<number>) => Array<{ function: (() => boolean | undefined); stage: number; }>
   registerCompilationAfterOptimizeModulesTaps: (stages: Array<number>) => Array<{ function: (() => void); stage: number; }>
   registerCompilationOptimizeTreeTaps: (stages: Array<number>) => Array<{ function: (() => Promise<void>); stage: number; }>
   registerCompilationOptimizeChunkModulesTaps: (stages: Array<number>) => Array<{ function: (() => Promise<boolean | undefined>); stage: number; }>
+  registerCompilationChunkHashTaps: (stages: Array<number>) => Array<{ function: ((arg: JsChunk) => Buffer); stage: number; }>
   registerCompilationChunkAssetTaps: (stages: Array<number>) => Array<{ function: ((arg: JsChunkAssetArgs) => void); stage: number; }>
   registerCompilationProcessAssetsTaps: (stages: Array<number>) => Array<{ function: ((arg: JsCompilation) => Promise<void>); stage: number; }>
   registerCompilationAfterProcessAssetsTaps: (stages: Array<number>) => Array<{ function: ((arg: JsCompilation) => void); stage: number; }>
   registerCompilationAfterSealTaps: (stages: Array<number>) => Array<{ function: (() => Promise<void>); stage: number; }>
   registerNormalModuleFactoryBeforeResolveTaps: (stages: Array<number>) => Array<{ function: ((arg: JsBeforeResolveArgs) => Promise<[boolean | undefined, JsBeforeResolveArgs]>); stage: number; }>
+  registerNormalModuleFactoryFactorizeTaps: (stages: Array<number>) => Array<{ function: ((arg: JsFactorizeArgs) => Promise<JsFactorizeArgs>); stage: number; }>
+  registerNormalModuleFactoryResolveTaps: (stages: Array<number>) => Array<{ function: ((arg: JsResolveArgs) => Promise<JsResolveArgs>); stage: number; }>
   registerNormalModuleFactoryResolveForSchemeTaps: (stages: Array<number>) => Array<{ function: ((arg: JsResolveForSchemeArgs) => Promise<[boolean | undefined, JsResolveForSchemeArgs]>); stage: number; }>
   registerNormalModuleFactoryAfterResolveTaps: (stages: Array<number>) => Array<{ function: ((arg: JsAfterResolveData) => Promise<[boolean | undefined, JsCreateData | undefined]>); stage: number; }>
   registerNormalModuleFactoryCreateModuleTaps: (stages: Array<number>) => Array<{ function: ((arg: JsNormalModuleFactoryCreateModuleArgs) => Promise<void>); stage: number; }>
-  registerContextModuleFactoryBeforeResolveTaps: (stages: Array<number>) => Array<{ function: ((arg: JsBeforeResolveArgs) => Promise<[boolean | undefined, JsBeforeResolveArgs]>); stage: number; }>
-  registerContextModuleFactoryAfterResolveTaps: (stages: Array<number>) => Array<{ function: ((arg: JsAfterResolveData) => Promise<boolean | undefined>); stage: number; }>
+  registerContextModuleFactoryBeforeResolveTaps: (stages: Array<number>) => Array<{ function: ((arg: false | JsContextModuleFactoryBeforeResolveData) => Promise<false | JsContextModuleFactoryBeforeResolveData>); stage: number; }>
+  registerContextModuleFactoryAfterResolveTaps: (stages: Array<number>) => Array<{ function: ((arg: false | JsContextModuleFactoryAfterResolveData) => Promise<false | JsContextModuleFactoryAfterResolveData>); stage: number; }>
+  registerJavascriptModulesChunkHashTaps: (stages: Array<number>) => Array<{ function: ((arg: JsChunk) => Buffer); stage: number; }>
 }
 
-/** Builtin loader runner */
-export function runBuiltinLoader(builtin: string, options: string | undefined | null, loaderContext: JsLoaderContext): Promise<JsLoaderContext>
-
 export interface ThreadsafeNodeFS {
-  writeFile: (name: string, content: Buffer) => void
-  removeFile: (name: string) => void
-  mkdir: (name: string) => void
-  mkdirp: (name: string) => string | void
-  removeDirAll: (name: string) => string | void
+  writeFile: (name: string, content: Buffer) => Promise<void> | void
+  removeFile: (name: string) => Promise<void> | void
+  mkdir: (name: string) => Promise<void> | void
+  mkdirp: (name: string) => Promise<string | void> | string | void
+  removeDirAll: (name: string) => Promise<string | void> | string | void
 }
 

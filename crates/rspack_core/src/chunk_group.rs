@@ -1,16 +1,36 @@
+use std::cmp::Ordering;
 use std::fmt::{self, Display};
 
 use itertools::Itertools;
 use rspack_database::DatabaseItem;
 use rspack_error::{error, Result};
 use rspack_identifier::IdentifierMap;
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
-  get_chunk_from_ukey, Chunk, ChunkByUkey, ChunkGroupByUkey, ChunkGroupUkey, FilenameTemplate,
+  compare_chunk_group, get_chunk_from_ukey, get_chunk_group_from_ukey, Chunk, ChunkByUkey,
+  ChunkGroupByUkey, ChunkGroupUkey, DependencyLocation, FilenameTemplate,
 };
 use crate::{ChunkLoading, ChunkUkey, Compilation};
 use crate::{LibraryOptions, ModuleIdentifier, PublicPath};
+
+#[derive(Debug, Clone)]
+pub struct SyntheticDependencyLocation {
+  pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum OriginLocation {
+  Real(DependencyLocation),
+  Synthetic(SyntheticDependencyLocation),
+}
+
+#[derive(Debug, Clone)]
+pub struct OriginRecord {
+  pub module_id: Option<ModuleIdentifier>,
+  pub loc: Option<OriginLocation>,
+  pub request: Option<String>,
+}
 
 impl DatabaseItem for ChunkGroup {
   fn ukey(&self) -> rspack_database::Ukey<Self> {
@@ -35,6 +55,7 @@ pub struct ChunkGroup {
   // Entrypoint
   pub(crate) runtime_chunk: Option<ChunkUkey>,
   pub(crate) entry_point_chunk: Option<ChunkUkey>,
+  origins: Vec<OriginRecord>,
 }
 
 impl ChunkGroup {
@@ -53,6 +74,7 @@ impl ChunkGroup {
       runtime_chunk: None,
       entry_point_chunk: None,
       index: None,
+      origins: vec![],
     }
   }
 
@@ -281,6 +303,65 @@ impl ChunkGroup {
       self.parents.insert(parent_group);
       true
     }
+  }
+
+  pub fn add_origin(
+    &mut self,
+    module_id: Option<ModuleIdentifier>,
+    loc: Option<OriginLocation>,
+    request: Option<String>,
+  ) {
+    self.origins.push(OriginRecord {
+      module_id,
+      loc,
+      request,
+    });
+  }
+
+  pub fn origins(&self) -> &Vec<OriginRecord> {
+    &self.origins
+  }
+
+  pub fn get_children_by_orders(
+    &self,
+    compilation: &Compilation,
+  ) -> HashMap<ChunkGroupOrderKey, Vec<ChunkGroupUkey>> {
+    let mut children_by_orders = HashMap::<ChunkGroupOrderKey, Vec<ChunkGroupUkey>>::default();
+
+    let orders = vec![ChunkGroupOrderKey::Preload, ChunkGroupOrderKey::Prefetch];
+
+    for order_key in orders {
+      let mut list = vec![];
+      for child_ukey in &self.children {
+        let Some(child_group) =
+          get_chunk_group_from_ukey(child_ukey, &compilation.chunk_group_by_ukey)
+        else {
+          continue;
+        };
+        if let Some(order) = child_group
+          .kind
+          .get_normal_options()
+          .and_then(|o| match order_key {
+            ChunkGroupOrderKey::Prefetch => o.prefetch_order,
+            ChunkGroupOrderKey::Preload => o.preload_order,
+          })
+        {
+          list.push((order, child_group.ukey));
+        }
+      }
+
+      list.sort_by(|a, b| {
+        let cmp = b.0.cmp(&a.0);
+        match cmp {
+          Ordering::Equal => compare_chunk_group(&a.1, &b.1, compilation),
+          _ => cmp,
+        }
+      });
+
+      children_by_orders.insert(order_key, list.iter().map(|i| i.1).collect_vec());
+    }
+
+    children_by_orders
   }
 }
 

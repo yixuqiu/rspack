@@ -6,7 +6,7 @@
     "name": "modules",
     "label": "Modules"
   },
-  "node-api",
+  "javascript-api",
   "hmr",
   {
     "type": "dir",
@@ -17,5 +17,6 @@
     "type": "dir",
     "name": "plugin-api",
     "label": "Plugin API"
-  }
+  },
+  "stats"
 ]

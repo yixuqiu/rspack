@@ -1,12 +1,13 @@
 import * as fs from "fs";
-import type { RspackCLI } from "../rspack-cli";
+import { MultiStats, Stats } from "@rspack/core";
+
+import type { RspackCLI } from "../cli";
 import { RspackCommand } from "../types";
 import {
 	commonOptions,
 	ensureEnvObject,
 	setBuiltinEnvArg
 } from "../utils/options";
-import { MultiStats, Stats } from "@rspack/core";
 
 export class BuildCommand implements RspackCommand {
 	async apply(cli: RspackCLI): Promise<void> {
@@ -22,6 +23,11 @@ export class BuildCommand implements RspackCommand {
 					},
 					json: {
 						describe: "emit stats json"
+					},
+					profile: {
+						type: "boolean",
+						default: false,
+						describe: "capture timing information for each module"
 					}
 				}),
 			async options => {
@@ -104,12 +110,26 @@ export class BuildCommand implements RspackCommand {
 					errorHandler
 				);
 
-				if (!compiler) return;
-				if (cli.isWatch(compiler)) {
+				if (!compiler || cli.isWatch(compiler)) {
 					return;
-				} else {
-					compiler.run(errorHandler);
 				}
+
+				compiler.run(
+					(error: Error | null, stats: Stats | MultiStats | undefined) => {
+						// If there is a compilation error, the close method should not be called,
+						// Otherwise Rspack may generate invalid caches.
+						if (error || stats?.hasErrors()) {
+							errorHandler(error, stats);
+						} else {
+							compiler.close(closeErr => {
+								if (closeErr) {
+									logger.error(closeErr);
+								}
+								errorHandler(error, stats);
+							});
+						}
+					}
+				);
 			}
 		);
 	}

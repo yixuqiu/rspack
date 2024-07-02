@@ -2,10 +2,13 @@ import {
 	JsCodegenerationResult,
 	JsCodegenerationResults,
 	JsCreateData,
+	JsFactoryMeta,
 	JsModule
 } from "@rspack/binding";
 import { Source } from "webpack-sources";
-import { createSourceFromRaw } from "./util/createSource";
+
+import { Compilation } from "./Compilation";
+import { JsSource } from "./util/source";
 
 export type ResourceData = {
 	resource: string;
@@ -17,7 +20,11 @@ export type ResourceDataWithData = ResourceData & {
 	data?: Record<string, any>;
 };
 export type CreateData = Partial<JsCreateData>;
+export type ContextInfo = {
+	issuer: string;
+};
 export type ResolveData = {
+	contextInfo: ContextInfo;
 	context: string;
 	request: string;
 	fileDependencies: string[];
@@ -26,34 +33,75 @@ export type ResolveData = {
 	createData?: CreateData;
 };
 
+export type ContextModuleFactoryBeforeResolveResult =
+	| false
+	| {
+			context: string;
+			request?: string;
+	  };
+
+export type ContextModuleFactoryAfterResolveResult =
+	| false
+	| {
+			resource: string;
+			context: string;
+			request: string;
+			regExp?: RegExp;
+			dependencies: Array<any>;
+	  };
+
 export class Module {
 	#inner: JsModule;
-	_originalSource?: Source;
+	#originalSource?: Source;
 
-	rawRequest?: string;
+	context?: Readonly<string>;
+	resource?: Readonly<string>;
+	request?: Readonly<string>;
+	userRequest?: Readonly<string>;
+	rawRequest?: Readonly<string>;
 
-	static __from_binding(module: JsModule) {
-		return new Module(module);
+	factoryMeta?: Readonly<JsFactoryMeta>;
+	/**
+	 * Records the dynamically added fields for Module on the JavaScript side.
+	 * These fields are generally used within a plugin, so they do not need to be passed back to the Rust side.
+	 * @see {@link Compilation#customModules}
+	 */
+	buildInfo: Record<string, any>;
+
+	/**
+	 * Records the dynamically added fields for Module on the JavaScript side.
+	 * These fields are generally used within a plugin, so they do not need to be passed back to the Rust side.
+	 * @see {@link Compilation#customModules}
+	 */
+	buildMeta: Record<string, any>;
+
+	static __from_binding(module: JsModule, compilation?: Compilation) {
+		return new Module(module, compilation);
 	}
 
-	constructor(module: JsModule) {
+	constructor(module: JsModule, compilation?: Compilation) {
 		this.#inner = module;
+		this.context = module.context;
+		this.resource = module.resource;
+		this.request = module.request;
+		this.userRequest = module.userRequest;
 		this.rawRequest = module.rawRequest;
+
+		this.factoryMeta = module.factoryMeta;
+		const customModule = compilation?.__internal__getCustomModule(
+			module.moduleIdentifier
+		);
+		this.buildInfo = customModule?.buildInfo || {};
+		this.buildMeta = customModule?.buildMeta || {};
 	}
 
-	get context(): string | undefined {
-		return this.#inner.context;
-	}
-
-	get resource(): string | undefined {
-		return this.#inner.resource;
-	}
-
-	get originalSource(): Source | null {
-		if (this._originalSource) return this._originalSource;
+	originalSource(): Source | null {
+		if (this.#originalSource) return this.#originalSource;
 		if (this.#inner.originalSource) {
-			this._originalSource = createSourceFromRaw(this.#inner.originalSource);
-			return this._originalSource;
+			this.#originalSource = JsSource.__from_binding(
+				this.#inner.originalSource
+			);
+			return this.#originalSource;
 		} else {
 			return null;
 		}

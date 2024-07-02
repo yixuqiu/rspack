@@ -7,67 +7,72 @@
  * Copyright (c) JS Foundation and other contributors
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
-import {
-	RspackOptionsNormalized,
-	Compiler,
-	OptimizationRuntimeChunkNormalized,
-	RspackPluginFunction
-} from ".";
+import assert from "assert";
 import fs from "graceful-fs";
 
-import { DefaultStatsFactoryPlugin } from "./stats/DefaultStatsFactoryPlugin";
-import { DefaultStatsPrinterPlugin } from "./stats/DefaultStatsPrinterPlugin";
-import { cleverMerge } from "./util/cleverMerge";
-import assert from "assert";
-import IgnoreWarningsPlugin from "./lib/ignoreWarningsPlugin";
-import EntryOptionPlugin from "./lib/EntryOptionPlugin";
 import {
+	Compiler,
+	OptimizationRuntimeChunkNormalized,
+	RspackOptionsNormalized,
+	RspackPluginFunction
+} from ".";
+import { Module } from "./Module";
+import {
+	APIPlugin,
 	ArrayPushCallbackChunkFormatPlugin,
+	AssetModulesPlugin,
+	AsyncWebAssemblyModulesPlugin,
+	BundlerInfoRspackPlugin,
+	ChunkPrefetchPreloadPlugin,
 	CommonJsChunkFormatPlugin,
+	CssModulesPlugin,
+	DataUriPlugin,
+	DefinePlugin,
+	DeterministicChunkIdsPlugin,
+	DeterministicModuleIdsPlugin,
 	ElectronTargetPlugin,
 	EnableChunkLoadingPlugin,
 	EnableLibraryPlugin,
 	EnableWasmLoadingPlugin,
-	ExternalsPlugin,
-	HttpExternalsRspackPlugin,
-	ModuleChunkFormatPlugin,
-	NodeTargetPlugin,
-	DefinePlugin,
-	MergeDuplicateChunksPlugin,
-	SplitChunksPlugin,
-	ChunkPrefetchPreloadPlugin,
-	NamedModuleIdsPlugin,
-	DeterministicModuleIdsPlugin,
-	NamedChunkIdsPlugin,
-	DeterministicChunkIdsPlugin,
-	RealContentHashPlugin,
-	RemoveEmptyChunksPlugin,
 	EnsureChunkConditionsPlugin,
-	WarnCaseSensitiveModulesPlugin,
-	DataUriPlugin,
-	FileUriPlugin,
-	JavascriptModulesPlugin,
-	JsonModulesPlugin,
-	AsyncWebAssemblyModulesPlugin,
-	RuntimePlugin,
-	InferAsyncModulesPlugin,
-	WorkerPlugin,
+	EvalDevToolModulePlugin,
 	EvalSourceMapDevToolPlugin,
-	SourceMapDevToolPlugin,
-	AssetModulesPlugin,
-	MangleExportsPlugin,
+	ExternalsPlugin,
+	FileUriPlugin,
 	FlagDependencyExportsPlugin,
 	FlagDependencyUsagePlugin,
-	SideEffectsFlagPlugin,
-	BundlerInfoRspackPlugin,
+	HttpExternalsRspackPlugin,
+	InferAsyncModulesPlugin,
+	JavascriptModulesPlugin,
+	JsonModulesPlugin,
+	LazyCompilationPlugin,
+	MangleExportsPlugin,
+	MergeDuplicateChunksPlugin,
+	ModuleChunkFormatPlugin,
 	ModuleConcatenationPlugin,
-	EvalDevToolModulePlugin,
-	JsLoaderRspackPlugin,
-	CssModulesPlugin,
-	APIPlugin,
-	RuntimeChunkPlugin
+	NamedChunkIdsPlugin,
+	NamedModuleIdsPlugin,
+	NaturalChunkIdsPlugin,
+	NaturalModuleIdsPlugin,
+	NodeTargetPlugin,
+	RealContentHashPlugin,
+	RemoveEmptyChunksPlugin,
+	RuntimeChunkPlugin,
+	RuntimePlugin,
+	SideEffectsFlagPlugin,
+	SizeLimitsPlugin,
+	SourceMapDevToolPlugin,
+	SplitChunksPlugin,
+	WarnCaseSensitiveModulesPlugin,
+	WorkerPlugin
 } from "./builtin-plugin";
+import EntryOptionPlugin from "./lib/EntryOptionPlugin";
+import IgnoreWarningsPlugin from "./lib/ignoreWarningsPlugin";
+import { DefaultStatsFactoryPlugin } from "./stats/DefaultStatsFactoryPlugin";
+import { DefaultStatsPresetPlugin } from "./stats/DefaultStatsPresetPlugin";
+import { DefaultStatsPrinterPlugin } from "./stats/DefaultStatsPrinterPlugin";
 import { assertNotNill } from "./util/assertNotNil";
+import { cleverMerge } from "./util/cleverMerge";
 
 export class RspackOptionsApply {
 	constructor() {}
@@ -109,6 +114,9 @@ export class RspackOptionsApply {
 			!options.externalsPresets.electronRenderer
 		) {
 			new ElectronTargetPlugin().apply(compiler);
+		}
+		if (options.externalsPresets.nwjs) {
+			new ExternalsPlugin("node-commonjs", "nw.gui").apply(compiler);
 		}
 		if (
 			options.externalsPresets.web ||
@@ -231,28 +239,53 @@ export class RspackOptionsApply {
 			new MergeDuplicateChunksPlugin().apply(compiler);
 		}
 
-		if (options.experiments.rspackFuture?.newTreeshaking) {
-			if (options.optimization.sideEffects) {
-				new SideEffectsFlagPlugin(/* options.optimization.sideEffects === true */).apply(
-					compiler
-				);
-			}
-			if (options.optimization.providedExports) {
-				new FlagDependencyExportsPlugin().apply(compiler);
-			}
-			if (options.optimization.usedExports) {
-				new FlagDependencyUsagePlugin(
-					options.optimization.usedExports === "global"
-				).apply(compiler);
-			}
-			if (options.optimization.concatenateModules) {
-				new ModuleConcatenationPlugin().apply(compiler);
-			}
-			if (options.optimization.mangleExports) {
-				new MangleExportsPlugin(
-					options.optimization.mangleExports !== "size"
-				).apply(compiler);
-			}
+		if (options.optimization.sideEffects) {
+			new SideEffectsFlagPlugin(/* options.optimization.sideEffects === true */).apply(
+				compiler
+			);
+		}
+		if (options.optimization.providedExports) {
+			new FlagDependencyExportsPlugin().apply(compiler);
+		}
+		if (options.optimization.usedExports) {
+			new FlagDependencyUsagePlugin(
+				options.optimization.usedExports === "global"
+			).apply(compiler);
+		}
+		if (options.optimization.concatenateModules) {
+			new ModuleConcatenationPlugin().apply(compiler);
+		}
+		if (options.optimization.mangleExports) {
+			new MangleExportsPlugin(
+				options.optimization.mangleExports !== "size"
+			).apply(compiler);
+		}
+
+		if (options.experiments.lazyCompilation) {
+			const lazyOptions = options.experiments.lazyCompilation;
+
+			new LazyCompilationPlugin(
+				// this is only for test
+				// @ts-expect-error cacheable is hide
+				lazyOptions.cacheable ?? true,
+				lazyOptions.entries ?? true,
+				lazyOptions.imports ?? true,
+				typeof lazyOptions.test === "function"
+					? function (jsModule) {
+							return (lazyOptions.test as (jsModule: Module) => boolean)!.call(
+								lazyOptions,
+								new Module(jsModule)
+							);
+						}
+					: lazyOptions.test
+						? {
+								source: lazyOptions.test.source,
+								flags: lazyOptions.test.flags
+							}
+						: undefined,
+				// @ts-expect-error backend is hide
+				lazyOptions.backend
+			).apply(compiler);
 		}
 
 		if (
@@ -280,6 +313,10 @@ export class RspackOptionsApply {
 					new NamedModuleIdsPlugin().apply(compiler);
 					break;
 				}
+				case "natural": {
+					new NaturalModuleIdsPlugin().apply(compiler);
+					break;
+				}
 				case "deterministic": {
 					new DeterministicModuleIdsPlugin().apply(compiler);
 					break;
@@ -291,6 +328,9 @@ export class RspackOptionsApply {
 		const chunkIds = options.optimization.chunkIds;
 		if (chunkIds) {
 			switch (chunkIds) {
+				case "natural": {
+					new NaturalChunkIdsPlugin().apply(compiler);
+				}
 				case "named": {
 					new NamedChunkIdsPlugin().apply(compiler);
 					break;
@@ -319,6 +359,10 @@ export class RspackOptionsApply {
 			}
 		}
 
+		if (options.performance) {
+			new SizeLimitsPlugin(options.performance).apply(compiler);
+		}
+
 		new WarnCaseSensitiveModulesPlugin().apply(compiler);
 
 		new WorkerPlugin(
@@ -329,6 +373,7 @@ export class RspackOptionsApply {
 		).apply(compiler);
 
 		new DefaultStatsFactoryPlugin().apply(compiler);
+		new DefaultStatsPresetPlugin().apply(compiler);
 		new DefaultStatsPrinterPlugin().apply(compiler);
 
 		if (options.ignoreWarnings && options.ignoreWarnings.length > 0) {

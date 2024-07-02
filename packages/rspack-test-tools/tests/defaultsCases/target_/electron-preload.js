@@ -1,3 +1,4 @@
+/** @type {import('../../..').TDefaultsCaseConfig} */
 module.exports = {
 	description: "target electron-preload",
 	options: () => ({ target: "electron-preload" }),
@@ -16,14 +17,11 @@ module.exports = {
 		-     "node": false,
 		+     "node": true,
 		@@ ... @@
-		-         "exportsOnly": false,
-		+         "exportsOnly": true,
+		-       "document": true,
+		+       "document": false,
 		@@ ... @@
-		-         "exportsOnly": false,
-		+         "exportsOnly": true,
-		@@ ... @@
-		-         "exportsOnly": false,
-		+         "exportsOnly": true,
+		-     "target": "web",
+		+     "target": "electron-preload",
 		@@ ... @@
 		-     "__dirname": "warn-mock",
 		-     "__filename": "warn-mock",
@@ -43,6 +41,9 @@ module.exports = {
 		@@ ... @@
 		-       "fetch",
 		+       "async-node",
+		@@ ... @@
+		-       "document": true,
+		+       "document": false,
 		@@ ... @@
 		-     "globalObject": "self",
 		+     "globalObject": "global",
