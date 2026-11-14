@@ -1,0 +1,124 @@
+use std::sync::Arc;
+
+use rspack_fs::{IntermediateFileSystem, WritableFileSystem};
+use rspack_tasks::CURRENT_COMPILER_CONTEXT;
+use rustc_hash::FxHashMap as HashMap;
+
+use super::BuildModuleGraphArtifact;
+use crate::{
+  BuildContext, Compilation, CompilerPlatform, DependencyTemplate, DependencyTemplateType,
+  DependencyType, ExportsInfoArtifact, ModuleFactory, ResolverFactory, RuntimeTemplate,
+  SharedPluginDriver, compilation::build_module_graph::module_build_cache::ModuleBuildCache,
+  incremental::Incremental, module_graph::ModuleGraph, new_cache::CompilerCache,
+};
+
+#[derive(Debug)]
+pub struct TaskContext {
+  pub build_context: Arc<BuildContext>,
+  pub buildtime_plugin_driver: SharedPluginDriver,
+  pub intermediate_fs: Arc<dyn IntermediateFileSystem>,
+  pub output_fs: Arc<dyn WritableFileSystem>,
+  pub platform: Arc<CompilerPlatform>,
+  pub loader_resolver_factory: Arc<ResolverFactory>,
+  pub dependency_factories: HashMap<DependencyType, Arc<dyn ModuleFactory>>,
+  pub dependency_templates: HashMap<DependencyTemplateType, Arc<dyn DependencyTemplate>>,
+  pub(crate) cache: CompilerCache,
+  pub(crate) module_build_cache: Option<ModuleBuildCache>,
+
+  pub artifact: BuildModuleGraphArtifact,
+  pub exports_info_artifact: ExportsInfoArtifact,
+}
+
+impl TaskContext {
+  pub fn new(
+    compilation: &Compilation,
+    artifact: BuildModuleGraphArtifact,
+    exports_info_artifact: ExportsInfoArtifact,
+  ) -> Self {
+    Self {
+      build_context: Arc::new(BuildContext {
+        compiler_id: compilation.compiler_id(),
+        compilation_id: compilation.id(),
+        compiler_options: compilation.options.clone(),
+        loader_cache: compilation.loader_cache(),
+        loader_cache_counters: compilation.loader_cache_counters(),
+        value_cache_versions: compilation.value_cache_versions.clone(),
+        file_system_info: compilation.file_system_info.clone(),
+        resolver_factory: compilation.resolver_factory.clone(),
+        runtime_template: RuntimeTemplate::new(compilation.options.clone())
+          .create_module_code_template(),
+        plugin_driver: compilation.plugin_driver.clone(),
+        fs: compilation.input_filesystem.clone(),
+      }),
+      buildtime_plugin_driver: compilation.buildtime_plugin_driver.clone(),
+      platform: compilation.platform.clone(),
+      loader_resolver_factory: compilation.loader_resolver_factory.clone(),
+      dependency_factories: compilation.dependency_factories.clone(),
+      dependency_templates: compilation.dependency_templates.clone(),
+      intermediate_fs: compilation.intermediate_filesystem.clone(),
+      output_fs: compilation.output_filesystem.clone(),
+      module_build_cache: artifact.module_build_cache.clone(),
+      cache: compilation.cache.clone(),
+      artifact,
+      exports_info_artifact,
+    }
+  }
+}
+
+impl TaskContext {
+  // TODO use module graph with make artifact
+  pub fn get_module_graph_mut(artifact: &mut BuildModuleGraphArtifact) -> &mut ModuleGraph {
+    artifact.get_module_graph_mut()
+  }
+
+  // TODO remove it after incremental rebuild cover all stage
+  pub fn transform_to_temp_compilation(&mut self) -> Compilation {
+    let compiler_context = CURRENT_COMPILER_CONTEXT.get();
+    let mut compilation = Compilation::new(
+      self.build_context.compiler_id,
+      self.build_context.compiler_options.clone(),
+      self.platform.clone(),
+      self.build_context.plugin_driver.clone(),
+      self.buildtime_plugin_driver.clone(),
+      self.build_context.resolver_factory.clone(),
+      self.loader_resolver_factory.clone(),
+      None,
+      Incremental::new_cold(self.build_context.compiler_options.incremental),
+      None,
+      Default::default(),
+      self.cache.clone(),
+      self.build_context.loader_cache.clone(),
+      Default::default(),
+      Default::default(),
+      self.build_context.fs.clone(),
+      self.intermediate_fs.clone(),
+      self.output_fs.clone(),
+      false,
+      compiler_context,
+    );
+    compilation.runtime_template =
+      RuntimeTemplate::for_module_execution(self.build_context.compiler_options.clone());
+    compilation.dependency_factories = self.dependency_factories.clone();
+    compilation.dependency_templates = self.dependency_templates.clone();
+    std::mem::swap(
+      &mut *compilation.build_module_graph_artifact,
+      &mut self.artifact,
+    );
+    std::mem::swap(
+      &mut *compilation.exports_info_artifact,
+      &mut self.exports_info_artifact,
+    );
+    compilation
+  }
+
+  pub fn recovery_from_temp_compilation(&mut self, mut compilation: Compilation) {
+    std::mem::swap(
+      &mut *compilation.build_module_graph_artifact,
+      &mut self.artifact,
+    );
+    std::mem::swap(
+      &mut *compilation.exports_info_artifact,
+      &mut self.exports_info_artifact,
+    );
+  }
+}

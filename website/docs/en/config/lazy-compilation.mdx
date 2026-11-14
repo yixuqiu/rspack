@@ -1,0 +1,192 @@
+---
+description: 'Lazy Compilation is an optimization technique that delays the compilation of modules until they are actually requested'
+---
+
+import Attribution from '@components/Attribution';
+import { ApiMeta } from '@components/ApiMeta';
+
+# LazyCompilation
+
+<ApiMeta addedVersion="1.5.0" />
+
+Lazy Compilation is an optimization technique that delays the compilation of modules until they are actually requested. **Modules are only built when they are actually accessed.**
+
+Enable lazy compilation, which can greatly improve the dev startup performance of multi-page applications (MPA) or large single-page applications (SPA).
+
+:::tip
+Check out the [guide](/guide/advanced/lazy-compilation) for a quick start.
+:::
+
+- **Type:**
+
+```ts
+type LazyCompilationOptions =
+  | boolean
+  | {
+      /**
+       * Enable lazy compilation for entries.
+       */
+      entries?: boolean;
+      /**
+       * Enable lazy compilation for dynamic imports.
+       */
+      imports?: boolean;
+      /**
+       * Specify which imported modules should be lazily compiled.
+       */
+      test?: RegExp | ((m: Module) => boolean);
+      /**
+       * The path to a custom runtime code that overrides the default lazy
+       * compilation client.
+       */
+      client?: string;
+      /**
+       * Tells the client the server path that needs to be requested.
+       */
+      serverUrl?: string;
+      /**
+       * Customize the prefix used for lazy compilation endpoint.
+       * @default "/_rspack/lazy/trigger"
+       */
+      prefix?: string;
+    };
+```
+
+## Default behavior
+
+- **JavaScript API:** Lazy compilation is disabled by default. After enabling `lazyCompilation`, register the lazy compilation middleware with your development server. See [Integrating with custom server](/guide/advanced/lazy-compilation#integrating-with-custom-server).
+- **Rspack CLI:** `rspack dev` registers the middleware automatically. When [`target`](/config/target) is limited to a browser environment and `lazyCompilation` is not explicitly configured, it also uses `{ entries: false, imports: true }`. When the option is omitted in other cases, lazy compilation remains disabled.
+
+## Compilation scope
+
+Lazy compilation can be applied to two groups of modules: entry modules and modules loaded through dynamic `import()`. Once enabled, Rspack defers building these modules until they are actually accessed.
+
+For example, if an application has twenty entries, Rspack builds only the entries that are accessed. The remaining entries are built when they are accessed. Modules loaded through dynamic `import()` follow the same behavior.
+
+Setting `lazyCompilation` to `true` enables lazy compilation for both groups:
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: true,
+};
+```
+
+This is equivalent to:
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    entries: true,
+    imports: true,
+  },
+};
+```
+
+To enable lazy compilation for only one group, use an object and configure [`entries`](#entries) and [`imports`](#imports) separately. `entries` controls entry modules, while `imports` controls modules loaded through dynamic `import()`.
+
+To narrow the scope further, use [`test`](#test) to filter modules. It accepts a regular expression or a function that receives a `Module` and returns a `boolean`.
+
+## Options
+
+### entries
+
+- **Type:** `boolean`
+- **Default:** When `entries` is omitted from the configuration object, it defaults to `true`.
+
+Controls whether entry modules are lazily compiled.
+
+When set to `false`, entry modules are built during the initial compilation.
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    entries: false,
+  },
+};
+```
+
+### imports
+
+- **Type:** `boolean`
+- **Default:** When `imports` is omitted from the configuration object, it defaults to `true`.
+
+Controls whether modules loaded through dynamic `import()` are lazily compiled.
+
+When set to `false`, dynamically imported modules are built during the initial compilation.
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    imports: false,
+  },
+};
+```
+
+### test
+
+- **Type:** `RegExp | ((module: Module) => boolean)`
+- **Default:** `undefined`
+
+Further filters the entry and dynamically imported modules selected by `entries` and `imports`. When neither option is specified, both default to `true`, so `test` filters both groups. A regular expression is tested against `module.nameForCondition()`, while a function receives the `Module` instance directly. A match or a return value of `true` enables lazy compilation for the module; otherwise, the module is built normally.
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    test: /src/,
+  },
+};
+```
+
+See [Filtering modules](/guide/advanced/lazy-compilation#filtering-modules) for configuration examples.
+
+### client
+
+- **Type:** `string`
+- **Default:** Built-in web or Node.js client, selected automatically
+
+The path to custom runtime code that overrides the default lazy compilation client. By default, Rspack uses the built-in Node.js client when [`externalsPresets.node`](/config/externals#externalspresetsnode) is enabled, and the built-in web client otherwise.
+
+- [Client for web](https://github.com/web-infra-dev/rspack/blob/699229b9e7c33b7db7968c2f803f750e0367fe8a/packages/rspack/hot/lazy-compilation-web.js)
+- [Client for node](https://github.com/web-infra-dev/rspack/blob/699229b9e7c33b7db7968c2f803f750e0367fe8a/packages/rspack/hot/lazy-compilation-node.js)
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  lazyCompilation: {
+    client: path.resolve('custom-client.js'),
+  },
+};
+```
+
+### serverUrl
+
+- **Type:** `string`
+- **Default:** `''`
+
+Sets the base URL requested by the lazy compilation client. Rspack appends [`lazyCompilation.prefix`](#prefix) to this value. When omitted, the web client sends requests to the current origin; in a Node.js environment, specify the development server URL explicitly.
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    serverUrl: 'http://localhost:3000',
+  },
+};
+```
+
+### prefix
+
+- **Type:** `string`
+- **Default:** `'/_rspack/lazy/trigger'`
+
+Customize the prefix used for lazy compilation endpoint. By default, the lazy compilation middleware uses the `/_rspack/lazy/trigger` prefix for handling requests.
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    prefix: '/custom-lazy-endpoint-',
+  },
+};
+```
+
+<Attribution url="https://webpack.js.org/configuration/experiments/#experimentslazycompilation" />

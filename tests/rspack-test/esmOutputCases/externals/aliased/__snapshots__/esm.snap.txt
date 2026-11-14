@@ -1,0 +1,18 @@
+```mjs title=main.mjs
+import * as __rspack_external_path from "path";
+
+// external
+
+// ./index.js
+
+
+it('should have correct exports', async () => {
+  const { resolve } = await import(/*webpackIgnore: true*/'./main.mjs')
+
+	const { resolve: nodeResolve } = await import(/* webpackIgnore: true */ 'node:path')
+	expect(resolve).toBe(nodeResolve)
+});
+
+export * from "path";
+
+```

@@ -1,0 +1,10 @@
+ERROR in ./b.js
+  × Module parse failed:
+  ╰─▶   × JavaScript parse error: 'return' statement is only valid inside a function
+         ╭────
+       1 │ return
+         · ──────
+         ╰────
+      
+  help: 
+        You may need an appropriate loader to handle this file type.

@@ -1,0 +1,411 @@
+use std::{borrow::Cow, sync::Arc};
+
+use rspack_cacheable::{cacheable, cacheable_dyn, with::AsVec};
+use rspack_collections::Identifiable;
+use rspack_core::{
+  AsyncDependenciesBlock, BoxDependency, BoxModule, BuildContext, BuildInfo, BuildMeta, ChunkGraph,
+  CodeGenerationResultBuilder, Compilation, Context, DependenciesBlock, DependenciesBlockData,
+  DependencyRange, FactoryMetaStore, FreezeLock, ImportPhase, LibIdentOptions, Module,
+  ModuleArgument, ModuleCodeGenerationContext, ModuleFactoryCreateData, ModuleGraph,
+  ModuleIdentifier, ModuleLayer, ModuleType, NeedBuildContext, OutputOptions, RuntimeGlobals,
+  RuntimeSpec, SourceType, ValueCacheVersions, impl_module_meta_info, module_update_hash,
+  rspack_sources::{BoxSource, RawStringSource},
+};
+use rspack_error::{Result, impl_empty_diagnosable_trait};
+use rspack_hash::{RspackHash, RspackHashDigest, RspackHasher};
+use rspack_plugin_javascript::dependency::CommonJsRequireDependency;
+use rspack_util::{
+  json_stringify,
+  source_map::{ModuleSourceMapConfig, SourceMapKind},
+};
+
+use crate::{
+  dependency::{DependencyOptions, LazyCompilationDependency, ReservedExternalDependency},
+  utils::calc_value_dependency_key,
+};
+
+static MODULE_TYPE: ModuleType = ModuleType::JsAuto;
+static SOURCE_TYPE: [SourceType; 1] = [SourceType::JavaScript];
+
+#[cacheable]
+#[derive(Debug)]
+pub(crate) struct ReservedLayerExternals {
+  pub layer: ModuleLayer,
+  #[cacheable(with=AsVec)]
+  pub requests: Arc<[String]>,
+}
+
+// Library types whose wrappers pass externals as closure arguments baked into the entry chunk.
+const CLOSURE_LIBRARY_TYPES: [&str; 5] = ["umd", "umd2", "amd", "amd-require", "system"];
+
+pub(crate) fn has_closure_library(output: &OutputOptions) -> bool {
+  if let Some(enabled) = &output.enabled_library_types
+    && enabled
+      .iter()
+      .any(|library_type| CLOSURE_LIBRARY_TYPES.contains(&library_type.as_str()))
+  {
+    return true;
+  }
+  output
+    .library
+    .as_ref()
+    .is_some_and(|library| CLOSURE_LIBRARY_TYPES.contains(&library.library_type.as_str()))
+}
+
+#[cacheable]
+#[derive(Debug)]
+pub(crate) struct LazyCompilationProxyModule {
+  build_info: FreezeLock<BuildInfo>,
+  build_meta: FreezeLock<BuildMeta>,
+  factory_meta: FactoryMetaStore,
+
+  readable_identifier: String,
+  identifier: ModuleIdentifier,
+  lib_ident: Option<String>,
+
+  dependencies_block: DependenciesBlockData,
+
+  source_map_kind: SourceMapKind,
+
+  context: Box<Context>,
+  layer: Option<ModuleLayer>,
+  dep_options: DependencyOptions,
+  resource: String,
+  active: bool,
+  client: String,
+  // Immutable once collected for a layer; shared across its proxy modules as a
+  // slice so each clones the `Arc`, not the whole list.
+  #[cacheable(with=AsVec)]
+  reserved_externals: Arc<[String]>,
+  #[cacheable(with=AsVec)]
+  reserved_layer_externals: Arc<[ReservedLayerExternals]>,
+  #[cacheable(with=rspack_cacheable::rkyv::with::AtomicLoad<rspack_cacheable::rkyv::with::Relaxed>)]
+  need_build: std::sync::atomic::AtomicBool,
+}
+
+impl ModuleSourceMapConfig for LazyCompilationProxyModule {
+  fn get_source_map_kind(&self) -> &SourceMapKind {
+    &self.source_map_kind
+  }
+
+  fn set_source_map_kind(&mut self, source_map: SourceMapKind) {
+    self.source_map_kind = source_map;
+  }
+}
+
+impl LazyCompilationProxyModule {
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn new(
+    identifier: ModuleIdentifier,
+    readable_identifier: String,
+    lib_ident: Option<String>,
+    create_data: &ModuleFactoryCreateData,
+    resource: String,
+    active: bool,
+    client: String,
+    layer: Option<ModuleLayer>,
+    reserved_externals: Arc<[String]>,
+    reserved_layer_externals: Arc<[ReservedLayerExternals]>,
+  ) -> Self {
+    let lib_ident = lib_ident.map(|s| format!("{s}!lazy-compilation-proxy"));
+
+    let original_dependency = &create_data.dependencies[0];
+    let dep_options = DependencyOptions {
+      request: create_data.request.clone(),
+      phase: original_dependency.get_phase(),
+      attributes: original_dependency.get_attributes().cloned(),
+      issuer: create_data.issuer.clone(),
+      issuer_layer: create_data.issuer_layer.clone(),
+      resolve_options: create_data.resolve_options.clone(),
+      file_dependencies: create_data.file_dependencies.clone(),
+      context_dependencies: create_data.context_dependencies.clone(),
+      missing_dependencies: create_data.missing_dependencies.clone(),
+      diagnostics: create_data.diagnostics.clone(),
+    };
+
+    Self {
+      build_info: Default::default(),
+      build_meta: Default::default(),
+      factory_meta: Default::default(),
+      readable_identifier,
+      lib_ident,
+      identifier,
+      source_map_kind: SourceMapKind::empty(),
+      dependencies_block: Default::default(),
+      context: Box::new(create_data.context.clone()),
+      layer,
+      dep_options,
+      resource,
+      active,
+      client,
+      reserved_externals,
+      reserved_layer_externals,
+      need_build: false.into(),
+    }
+  }
+
+  pub fn invalid(&self) {
+    self
+      .need_build
+      .store(true, std::sync::atomic::Ordering::Relaxed);
+  }
+
+  pub fn is_active(&self) -> bool {
+    self.active
+  }
+}
+
+impl_empty_diagnosable_trait!(LazyCompilationProxyModule);
+
+#[cacheable_dyn]
+#[async_trait::async_trait]
+impl Module for LazyCompilationProxyModule {
+  impl_module_meta_info!();
+
+  fn source_types(&self, _module_graph: &ModuleGraph) -> &[SourceType] {
+    &SOURCE_TYPE
+  }
+
+  fn module_type(&self) -> &ModuleType {
+    &MODULE_TYPE
+  }
+
+  fn get_context(&self) -> Option<Box<Context>> {
+    Some(self.context.clone())
+  }
+
+  fn get_layer(&self) -> Option<&ModuleLayer> {
+    self.layer.as_ref()
+  }
+
+  fn size(&self, _source_type: Option<&SourceType>) -> f64 {
+    200f64
+  }
+
+  fn source(&self) -> Option<&BoxSource> {
+    None
+  }
+
+  fn readable_identifier(&self, _context: &Context) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Borrowed(&self.readable_identifier)
+  }
+
+  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<'_, str>> {
+    self.lib_ident.as_ref().map(|s| Cow::Borrowed(s.as_str()))
+  }
+
+  fn need_build_for_incremental(&self, value_cache_versions: &ValueCacheVersions) -> bool {
+    if self.need_build.load(std::sync::atomic::Ordering::Relaxed) {
+      return true;
+    }
+    // check client changes
+    let cache_key = calc_value_dependency_key("client");
+    if let Some(client) = value_cache_versions.get(&cache_key)
+      && client == &self.client
+    {
+      false
+    } else {
+      true
+    }
+  }
+
+  async fn need_build(&self, context: &NeedBuildContext<'_>) -> Result<bool> {
+    Ok(self.need_build_for_incremental(context.value_cache_versions))
+  }
+
+  async fn build(
+    mut self: Box<Self>,
+    build_context: Arc<BuildContext>,
+    _compilation: Option<&Compilation>,
+  ) -> Result<BoxModule> {
+    let client_dep = CommonJsRequireDependency::new(
+      self.client.clone(),
+      DependencyRange::new(0, 0),
+      None,
+      false,
+      None,
+    );
+    let mut dependencies = vec![];
+    let mut blocks = vec![];
+
+    dependencies.push(BoxDependency::new(client_dep));
+
+    if self.active {
+      let dep = LazyCompilationDependency::new(self.dep_options.clone());
+
+      blocks.push(Box::new(AsyncDependenciesBlock::new(
+        self.identifier,
+        None,
+        None,
+        vec![BoxDependency::new(dep)],
+        None,
+      )));
+    } else if has_closure_library(&build_context.compiler_options.output) {
+      // Reserve statically-declared externals on the inactive proxy so the
+      // initial entry chunk's library wrapper already exposes their closure
+      // identifiers. Once the proxy activates and the lazily-built module
+      // references those externals, the identifiers resolve instead of throwing.
+      for request in self.reserved_externals.iter() {
+        dependencies.push(BoxDependency::new(ReservedExternalDependency::new(
+          request.clone(),
+          self.layer.clone(),
+        )));
+      }
+      for externals in self.reserved_layer_externals.iter() {
+        if self.layer.as_ref() == Some(&externals.layer) {
+          continue;
+        }
+        for request in externals.requests.iter() {
+          dependencies.push(BoxDependency::new(ReservedExternalDependency::new(
+            request.clone(),
+            Some(externals.layer.clone()),
+          )));
+        }
+      }
+    }
+
+    Ok(BoxModule::new(self).with_dependencies(
+      dependencies.into_iter().map(Into::into).collect(),
+      blocks.into_iter().map(Into::into).collect(),
+    ))
+  }
+
+  // #[tracing::instrument("LazyCompilationProxyModule::code_generation", skip_all, fields(identifier = ?self.identifier()))]
+  async fn code_generation(
+    &self,
+    code_generation_context: &mut ModuleCodeGenerationContext,
+  ) -> Result<CodeGenerationResultBuilder> {
+    let ModuleCodeGenerationContext {
+      compilation,
+      runtime_template,
+      ..
+    } = code_generation_context;
+
+    let client_dep_id = self
+      .get_dependency_ids()
+      .next()
+      .expect("should have client dependency");
+    let module_graph = &compilation.get_module_graph();
+
+    let client_module = module_graph
+      .module_identifier_by_dependency_id(client_dep_id)
+      .expect("should have module");
+
+    let block = self.get_blocks().first();
+
+    let client = format!(
+      "var client = {}(\"{}\");\nvar data = {};",
+      runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+      ChunkGraph::get_module_id(&compilation.module_ids_artifact, *client_module)
+        .expect("should have module id"),
+      simd_json::to_string(&self.identifier).expect("should serialize identifier")
+    );
+
+    let module_argument = runtime_template.render_module_argument(ModuleArgument::Module);
+
+    let keep_active = format!(
+      "var dispose = client.activate({{ data: data, active: {}, module: {module_argument}, onError: onError }})",
+      block.is_some()
+    );
+
+    let source = if let Some(block_id) = block {
+      let block = module_graph
+        .block_by_id(block_id)
+        .expect("should have block");
+
+      let dep_id = block
+        .get_dependency_ids()
+        .next()
+        .expect("should have dependency");
+      let module = module_graph
+        .module_identifier_by_dependency_id(dep_id)
+        .expect("should have module");
+
+      RawStringSource::from(format!(
+        "{client}
+        var load = function() {{ return {}; }};
+        var pending = load().then(
+          function(namespace) {{ pending = undefined; return namespace; }},
+          function(error) {{ pending = undefined; throw error; }}
+        );
+        {module_argument}.exports = {{
+          then: function(onFulfilled, onRejected) {{ return (pending || load()).then(onFulfilled, onRejected); }}
+        }};
+        if ({module_argument}.hot) {{
+          {module_argument}.hot.accept();
+          {module_argument}.hot.accept({}, function() {{ {module_argument}.hot.invalidate(); }});
+          {module_argument}.hot.dispose(function(data) {{ delete data.resolveSelf; }});
+          if ({module_argument}.hot.data && {module_argument}.hot.data.resolveSelf)
+            {module_argument}.hot.data.resolveSelf({module_argument}.exports);
+        }}
+        ",
+        runtime_template.module_namespace_promise(
+          compilation,
+          *module,
+          dep_id,
+          Some(block_id),
+          &self.resource,
+          "import()",
+          false,
+          ImportPhase::Evaluation,
+        ),
+        json_stringify(
+          ChunkGraph::get_module_id(&compilation.module_ids_artifact, *module)
+            .expect("should have module id")
+        ),
+      ))
+    } else {
+      // This promise can only settle through a hot update. Reject it if HMR
+      // reaches a terminal status before the proxy is activated.
+      RawStringSource::from(format!(
+        "{client}
+        var resolveSelf, onError;
+        {module_argument}.exports = new Promise(function(resolve, reject) {{ resolveSelf = resolve; onError = reject; }});
+        if ({module_argument}.hot) {{
+          {module_argument}.hot.accept();
+          if ({module_argument}.hot.data && {module_argument}.hot.data.resolveSelf) {module_argument}.hot.data.resolveSelf({module_argument}.exports);
+          var onStatus = function(status) {{
+            if (status === \"abort\" || status === \"fail\") onError(new Error(\"Lazy compilation of \" + data + \" cannot finish because hot module replacement is in \" + status + \" status. Reload the page.\"));
+          }};
+          onStatus({module_argument}.hot.status());
+          {module_argument}.hot.addStatusHandler(onStatus);
+          {module_argument}.hot.dispose(function(data) {{ {module_argument}.hot.removeStatusHandler(onStatus); data.resolveSelf = resolveSelf; dispose(data); }});
+        }}
+        {keep_active}
+      "
+      ))
+    };
+
+    let mut code_generation_result = CodeGenerationResultBuilder::default();
+    code_generation_result.add(SourceType::JavaScript, Arc::new(source));
+    Ok(code_generation_result)
+  }
+
+  async fn get_runtime_hash(
+    &self,
+    compilation: &Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    let mut hasher = RspackHasher::from(&compilation.options.output);
+    module_update_hash(self, &mut hasher, compilation, runtime);
+    self.active.hash(&mut hasher);
+    self.identifier.hash(&mut hasher);
+    Ok(hasher.digest(&compilation.options.output.hash_digest))
+  }
+}
+
+impl Identifiable for LazyCompilationProxyModule {
+  fn identifier(&self) -> rspack_collections::Identifier {
+    self.identifier
+  }
+}
+
+impl DependenciesBlock for LazyCompilationProxyModule {
+  fn dependencies_block(&self) -> &DependenciesBlockData {
+    &self.dependencies_block
+  }
+
+  fn dependencies_block_mut(&mut self) -> &mut DependenciesBlockData {
+    &mut self.dependencies_block
+  }
+}

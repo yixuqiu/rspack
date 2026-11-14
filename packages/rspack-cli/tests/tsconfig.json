@@ -1,9 +1,9 @@
 {
   "extends": "../tsconfig.json",
   "compilerOptions": {
-    "strict": false,
     "checkJs": false,
-    "rootDir": "."
+    "rootDir": ".",
+    "types": ["rstack/test/globals"]
   },
   "include": ["."],
   "references": []

@@ -1,0 +1,5 @@
+<% if (_trusted_types) { %>
+<%- define(CREATE_SCRIPT) %> = <%- returningFunction(GET_TRUSTED_TYPES_POLICY + "().createScript(script)", "script" ) %>
+<% } else { %>
+<%- define(CREATE_SCRIPT) %> = <%- returningFunction("script", "script" ) %>
+<% } %>

@@ -1,8 +1,15 @@
-import { BuiltinPluginName } from "@rspack/binding";
-import { create } from "./base";
+import { type BuiltinPlugin, BuiltinPluginName } from '@rspack/binding';
+import { createBuiltinPlugin, RspackBuiltinPlugin } from './base';
 
-export const MangleExportsPlugin = create(
-	BuiltinPluginName.MangleExportsPlugin,
-	(deterministic: boolean) => deterministic,
-	"compilation"
-);
+export class MangleExportsPlugin extends RspackBuiltinPlugin {
+  name = BuiltinPluginName.MangleExportsPlugin;
+  affectedHooks = 'compilation' as const;
+
+  constructor(private deterministic: boolean) {
+    super();
+  }
+
+  raw(): BuiltinPlugin {
+    return createBuiltinPlugin(this.name, this.deterministic);
+  }
+}

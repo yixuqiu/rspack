@@ -1,28 +1,100 @@
 #![allow(clippy::unwrap_used)]
 
 mod legacy_case;
+mod template;
 mod visit;
 
 use std::fmt::Debug;
 
-use handlebars::{Context, Helper, HelperResult, Output, RenderContext, Template};
+use cow_utils::CowUtils;
 use heck::{ToKebabCase, ToLowerCamelCase, ToSnakeCase};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::Deserialize;
 use swc_core::{
-  common::{errors::HANDLER, util::take::Take, BytePos, Span, SyntaxContext, DUMMY_SP},
+  atoms::Wtf8Atom,
+  common::{BytePos, DUMMY_SP, Span, SyntaxContext, errors::HANDLER, util::take::Take},
   ecma::{
     ast::{
       Ident, ImportDecl, ImportDefaultSpecifier, ImportNamedSpecifier, ImportPhase,
       ImportSpecifier, Module, ModuleDecl, ModuleExportName, ModuleItem, Str,
     },
     atoms::Atom,
-    visit::{as_folder, Fold, VisitMut, VisitWith},
+    visit::{VisitMut, VisitWith, visit_mut_pass},
   },
 };
 
-use crate::legacy_case::{identifier_to_legacy_kebab_case, identifier_to_legacy_snake_case};
-use crate::visit::IdentComponent;
+use crate::{
+  legacy_case::{identifier_to_legacy_kebab_case, identifier_to_legacy_snake_case},
+  template::{Template, TemplateEngine},
+  visit::IdentComponent,
+};
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RawStyleConfig {
+  pub style_library_directory: Option<String>,
+  pub custom: Option<String>,
+  pub css: Option<String>,
+  pub bool: Option<bool>,
+}
+
+impl From<RawStyleConfig> for StyleConfig {
+  fn from(raw_style_config: RawStyleConfig) -> Self {
+    if let Some(style_library_directory) = raw_style_config.style_library_directory {
+      Self::StyleLibraryDirectory(style_library_directory)
+    } else if let Some(custom) = raw_style_config.custom {
+      Self::Custom(CustomTransform::Tpl(custom))
+    } else if raw_style_config.css.is_some() {
+      Self::Css
+    } else if let Some(bool) = raw_style_config.bool {
+      Self::Bool(bool)
+    } else {
+      Self::None
+    }
+  }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RawImportOptions {
+  pub library_name: String,
+  pub library_directory: Option<String>, // default to `lib`
+  pub custom_name: Option<String>,
+  pub custom_style_name: Option<String>, // If this is set, `style` option will be ignored
+  pub style: Option<RawStyleConfig>,
+  pub camel_to_dash_component_name: Option<bool>, // default to true
+  pub transform_to_default_import: Option<bool>,
+  pub ignore_es_component: Option<Vec<String>>,
+  pub ignore_style_component: Option<Vec<String>>,
+}
+
+impl From<RawImportOptions> for ImportOptions {
+  fn from(plugin_import: RawImportOptions) -> Self {
+    let RawImportOptions {
+      library_name,
+      library_directory,
+      custom_name,
+      custom_style_name,
+      style,
+      camel_to_dash_component_name,
+      transform_to_default_import,
+      ignore_es_component,
+      ignore_style_component,
+    } = plugin_import;
+
+    Self {
+      library_name,
+      library_directory,
+      custom_name: custom_name.map(CustomTransform::Tpl),
+      custom_style_name: custom_style_name.map(CustomTransform::Tpl),
+      style: style.map(Into::into),
+      camel_to_dash_component_name,
+      transform_to_default_import,
+      ignore_es_component,
+      ignore_style_component,
+    }
+  }
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub enum StyleConfig {
@@ -60,7 +132,7 @@ impl Debug for CustomTransform {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
-pub struct PluginImportConfig {
+pub struct ImportOptions {
   pub library_name: String,
   pub library_directory: Option<String>, // default to `lib`
   #[serde(skip)]
@@ -83,166 +155,81 @@ const CUSTOM_STYLE_NAME: &str = "CUSTOM_STYLE_NAME";
 /// Panic:
 ///
 /// Panics in sometimes if [swc_core::common::errors::HANDLER] is not provided.
-pub fn plugin_import(config: &Vec<PluginImportConfig>) -> impl Fold + '_ {
-  let mut renderer = handlebars::Handlebars::new();
+pub fn plugin_import(
+  config: &Vec<ImportOptions>,
+) -> swc_core::ecma::visit::VisitMutPass<ImportPlugin<'_>> {
+  let mut renderer = TemplateEngine::new();
 
-  renderer.register_helper(
-    "kebabCase",
-    Box::new(
-      |helper: &Helper<'_>,
-       _: &'_ handlebars::Handlebars<'_>,
-       _: &'_ Context,
-       _: &mut RenderContext<'_, '_>,
-       out: &mut dyn Output|
-       -> HelperResult {
-        let param = helper
-          .param(0)
-          .and_then(|v| v.value().as_str())
-          .unwrap_or("");
-        out.write(param.to_kebab_case().as_ref())?;
-        Ok(())
-      },
-    ),
-  );
+  renderer.register_helper("kebabCase", |value| value.to_kebab_case());
+  renderer.register_helper("legacyKebabCase", |value| {
+    identifier_to_legacy_kebab_case(value)
+  });
+  renderer.register_helper("camelCase", |value| value.to_lower_camel_case());
+  renderer.register_helper("snakeCase", |value| value.to_snake_case());
+  renderer.register_helper("legacySnakeCase", |value| {
+    identifier_to_legacy_snake_case(value)
+  });
+  renderer.register_helper("upperCase", |value| {
+    value.cow_to_ascii_uppercase().into_owned()
+  });
+  renderer.register_helper("lowerCase", |value| {
+    value.cow_to_ascii_lowercase().into_owned()
+  });
 
-  renderer.register_helper(
-    "legacyKebabCase",
-    Box::new(
-      |helper: &Helper<'_>,
-       _: &'_ handlebars::Handlebars<'_>,
-       _: &'_ Context,
-       _: &mut RenderContext<'_, '_>,
-       out: &mut dyn Output|
-       -> HelperResult {
-        let param = helper
-          .param(0)
-          .and_then(|v| v.value().as_str())
-          .unwrap_or("");
-        out.write(identifier_to_legacy_kebab_case(param).as_ref())?;
-        Ok(())
-      },
-    ),
-  );
-
-  renderer.register_helper(
-    "camelCase",
-    Box::new(
-      |helper: &Helper<'_>,
-       _: &'_ handlebars::Handlebars<'_>,
-       _: &'_ Context,
-       _: &mut RenderContext<'_, '_>,
-       out: &mut dyn Output|
-       -> HelperResult {
-        let param = helper
-          .param(0)
-          .and_then(|v| v.value().as_str())
-          .unwrap_or("");
-        out.write(param.to_lower_camel_case().as_ref())?;
-        Ok(())
-      },
-    ),
-  );
-
-  renderer.register_helper(
-    "snakeCase",
-    Box::new(
-      |helper: &Helper<'_>,
-       _: &'_ handlebars::Handlebars<'_>,
-       _: &'_ Context,
-       _: &mut RenderContext<'_, '_>,
-       out: &mut dyn Output|
-       -> HelperResult {
-        let param = helper
-          .param(0)
-          .and_then(|v| v.value().as_str())
-          .unwrap_or("");
-        out.write(param.to_snake_case().as_ref())?;
-        Ok(())
-      },
-    ),
-  );
-
-  renderer.register_helper(
-    "legacySnakeCase",
-    Box::new(
-      |helper: &Helper<'_>,
-       _: &'_ handlebars::Handlebars<'_>,
-       _: &'_ Context,
-       _: &mut RenderContext<'_, '_>,
-       out: &mut dyn Output|
-       -> HelperResult {
-        let param = helper
-          .param(0)
-          .and_then(|v| v.value().as_str())
-          .unwrap_or("");
-        out.write(identifier_to_legacy_snake_case(param).as_ref())?;
-        Ok(())
-      },
-    ),
-  );
-
-  renderer.register_helper(
-    "upperCase",
-    Box::new(
-      |helper: &Helper<'_>,
-       _: &'_ handlebars::Handlebars<'_>,
-       _: &'_ Context,
-       _: &mut RenderContext<'_, '_>,
-       out: &mut dyn Output|
-       -> HelperResult {
-        let param = helper
-          .param(0)
-          .and_then(|v| v.value().as_str())
-          .unwrap_or("");
-        out.write(param.to_uppercase().as_ref())?;
-        Ok(())
-      },
-    ),
-  );
-
-  renderer.register_helper(
-    "lowerCase",
-    Box::new(
-      |helper: &Helper<'_>,
-       _: &'_ handlebars::Handlebars<'_>,
-       _: &'_ Context,
-       _: &mut RenderContext<'_, '_>,
-       out: &mut dyn Output|
-       -> HelperResult {
-        let param = helper
-          .param(0)
-          .and_then(|v| v.value().as_str())
-          .unwrap_or("");
-        out.write(param.to_lowercase().as_ref())?;
-        Ok(())
-      },
-    ),
-  );
-
-  config.iter().for_each(|cfg| {
-    if let Some(CustomTransform::Tpl(tpl)) = &cfg.custom_name {
-      renderer.register_template(
-        &(cfg.library_name.clone() + CUSTOM_JS),
-        Template::compile(tpl).unwrap(),
-      )
+  config.iter().enumerate().for_each(|(index, item)| {
+    if let Some(CustomTransform::Tpl(tpl)) = &item.custom_name {
+      match Template::parse(tpl) {
+        Ok(template) => {
+          renderer.register_template(item.library_name.clone() + CUSTOM_JS, template);
+        }
+        Err(e) => {
+          HANDLER.with(|handler| {
+            handler.err(&format!(
+              "[builtin:swc-loader] Failed to parse option \"transformImport[{}].customName\".\nReason: {}",
+              index,
+              &e.to_string()
+            ))
+          });
+        }
+      }
     }
 
-    if let Some(CustomTransform::Tpl(tpl)) = &cfg.custom_style_name {
-      renderer.register_template(
-        &(cfg.library_name.clone() + CUSTOM_STYLE_NAME),
-        Template::compile(tpl).unwrap(),
-      )
+    if let Some(CustomTransform::Tpl(tpl)) = &item.custom_style_name {
+      match Template::parse(tpl) {
+        Ok(template) => {
+          renderer.register_template(item.library_name.clone() + CUSTOM_STYLE_NAME, template);
+        }
+        Err(e) => {
+          HANDLER.with(|handler| {
+            handler.err(&format!(
+              "[builtin:swc-loader] Failed to parse option \"transformImport[{}].customStyleName\".\nReason: {}",
+              index,
+              &e.to_string()
+            ))
+          });
+        }
+      }
     }
 
-    if let Some(StyleConfig::Custom(CustomTransform::Tpl(tpl))) = &cfg.style {
-      renderer.register_template(
-        &(cfg.library_name.clone() + CUSTOM_STYLE),
-        Template::compile(tpl).unwrap(),
-      )
+    if let Some(StyleConfig::Custom(CustomTransform::Tpl(tpl))) = &item.style {
+      match Template::parse(tpl) {
+        Ok(template) => {
+          renderer.register_template(item.library_name.clone() + CUSTOM_STYLE, template);
+        }
+        Err(e) => {
+          HANDLER.with(|handler| {
+            handler.err(&format!(
+              "[builtin:swc-loader] Failed to parse option \"transformImport[{}].style\".\nReason: {}",
+              index,
+              &e.to_string()
+            ))
+          });
+        }
+      }
     }
   });
 
-  as_folder(ImportPlugin { config, renderer })
+  visit_mut_pass(ImportPlugin { config, renderer })
 }
 
 #[derive(Debug)]
@@ -255,22 +242,17 @@ struct EsSpec {
 }
 
 pub struct ImportPlugin<'a> {
-  pub config: &'a Vec<PluginImportConfig>,
-  pub renderer: handlebars::Handlebars<'a>,
+  pub config: &'a Vec<ImportOptions>,
+  pub renderer: TemplateEngine<'a>,
 }
 
-impl<'a> ImportPlugin<'a> {
+impl ImportPlugin<'_> {
   // return (import_es, import_css)
-  fn transform(
-    &self,
-    name: String,
-    config: &PluginImportConfig,
-  ) -> (Option<String>, Option<String>) {
+  fn transform(&self, name: String, config: &ImportOptions) -> (Option<String>, Option<String>) {
     let should_ignore = &config
       .ignore_es_component
       .as_ref()
-      .map(|list| list.iter().any(|c| c == &name))
-      .unwrap_or(false);
+      .is_some_and(|list| list.iter().any(|c| c == &name));
 
     if *should_ignore {
       return (None, None);
@@ -279,8 +261,7 @@ impl<'a> ImportPlugin<'a> {
     let should_ignore_css = &config
       .ignore_style_component
       .as_ref()
-      .map(|list| list.iter().any(|c| c == &name))
-      .unwrap_or(false);
+      .is_some_and(|list| list.iter().any(|c| c == &name));
 
     let transformed_name = if config.camel_to_dash_component_name.unwrap_or(true) {
       name.to_kebab_case()
@@ -303,44 +284,48 @@ impl<'a> ImportPlugin<'a> {
       Ok(Some(format!(
         "{}/{}/{}",
         &config.library_name,
-        config
-          .library_directory
-          .as_ref()
-          .unwrap_or(&"lib".to_string()),
+        config.library_directory.as_deref().unwrap_or("lib"),
         transformed_name
       )))
     };
 
-    let path = match path {
-      Ok(p) => p,
-      Err(e) => {
-        HANDLER.with(|handler| {
-          handler.err(&e.to_string());
-        });
-        None
-      }
-    };
+    let path = path.unwrap_or_else(|err| {
+      HANDLER.with(|handler| {
+        handler.err(&format!(
+          "[builtin:swc-loader] Failed to parse option \
+       \"transformImport[i].customName\".\nReason: {err}"
+        ));
+      });
+      None
+    });
 
-    if path.is_none() {
+    let Some(js_source) = path else {
       return (None, None);
-    }
-
-    let js_source = path.unwrap();
+    };
 
     let css = if *should_ignore_css {
       None
     } else if let Some(custom) = &config.custom_style_name {
       match custom {
         CustomTransform::Fn(f) => f(name),
-        CustomTransform::Tpl(_) => Some(
-          self
-            .renderer
-            .render(
-              &format!("{}{}", &config.library_name, CUSTOM_STYLE_NAME),
-              &render_context(name),
-            )
-            .unwrap(),
-        ),
+        CustomTransform::Tpl(_) => self
+          .renderer
+          .render(
+            &format!("{}{}", &config.library_name, CUSTOM_STYLE_NAME),
+            &render_context(name),
+          )
+          .map_or_else(
+            |err| {
+              HANDLER.with(|handler| {
+                handler.err(&format!(
+                  "[builtin:swc-loader] Failed to parse option \
+                  \"transformImport[i].customStyleName\".\nReason: {err}"
+                ));
+              });
+              None
+            },
+            Some,
+          ),
       }
     } else if let Some(style) = &config.style {
       match style {
@@ -350,15 +335,24 @@ impl<'a> ImportPlugin<'a> {
         )),
         StyleConfig::Custom(custom) => match custom {
           CustomTransform::Fn(f) => f(js_source.clone()),
-          CustomTransform::Tpl(_) => Some(
-            self
-              .renderer
-              .render(
-                &format!("{}{}", config.library_name, CUSTOM_STYLE),
-                &render_context(js_source.clone()),
-              )
-              .expect("Should success"),
-          ),
+          CustomTransform::Tpl(_) => self
+            .renderer
+            .render(
+              &format!("{}{}", config.library_name, CUSTOM_STYLE),
+              &render_context(js_source.clone()),
+            )
+            .map_or_else(
+              |err| {
+                HANDLER.with(|handler| {
+                  handler.err(&format!(
+                    "[builtin:swc-loader] Failed to parse option \
+                     \"transformImport[i].style\".\nReason: {err}"
+                  ));
+                });
+                None
+              },
+              Some,
+            ),
         },
         StyleConfig::Css => Some(format!("{js_source}/style/css")),
         StyleConfig::Bool(should_transform) => {
@@ -378,7 +372,7 @@ impl<'a> ImportPlugin<'a> {
   }
 }
 
-impl<'a> VisitMut for ImportPlugin<'a> {
+impl VisitMut for ImportPlugin<'_> {
   fn visit_mut_module(&mut self, module: &mut Module) {
     // use visitor to collect all ident reference, and then remove imported component and type that is never referenced
     let mut visitor = IdentComponent {
@@ -402,21 +396,24 @@ impl<'a> VisitMut for ImportPlugin<'a> {
       if let ModuleItem::ModuleDecl(ModuleDecl::Import(var)) = item {
         let source = &*var.src.value;
 
-        if let Some(child_config) = config.iter().find(|&c| c.library_name == source) {
+        if let Some(child_config) = config
+          .iter()
+          .find(|&c| c.library_name == source.to_string_lossy())
+        {
           let mut rm_specifier = HashSet::default();
 
           for (specifier_idx, specifier) in var.specifiers.iter().enumerate() {
             match specifier {
-              ImportSpecifier::Named(ref s) => {
+              ImportSpecifier::Named(s) => {
                 let imported = s.imported.as_ref().map(|imported| match imported {
                   ModuleExportName::Ident(ident) => ident.sym.to_string(),
-                  ModuleExportName::Str(str) => str.value.to_string(),
+                  ModuleExportName::Str(str) => str.value.to_string_lossy().to_string(),
                 });
 
                 let as_name: Option<String> = imported.is_some().then(|| s.local.sym.to_string());
                 let ident: String = imported.unwrap_or_else(|| s.local.sym.to_string());
 
-                let mark = s.local.span.ctxt.as_u32();
+                let mark = s.local.ctxt.as_u32();
 
                 if ident_referenced(&s.local) {
                   let use_default_import = child_config.transform_to_default_import.unwrap_or(true);
@@ -440,14 +437,13 @@ impl<'a> VisitMut for ImportPlugin<'a> {
                   }
                 } else if type_ident_referenced(&s.local) {
                   // type referenced
-                  continue;
                 } else {
                   // not referenced, should tree shaking
                   rm_specifier.insert(specifier_idx);
                 }
               }
-              ImportSpecifier::Default(ref _s) => {}
-              ImportSpecifier::Namespace(ref _ns) => {}
+              ImportSpecifier::Default(_s) => {}
+              ImportSpecifier::Namespace(_ns) => {}
             }
           }
           if rm_specifier.len() == var.specifiers.len() {
@@ -485,11 +481,8 @@ impl<'a> VisitMut for ImportPlugin<'a> {
           vec![ImportSpecifier::Default(ImportDefaultSpecifier {
             span: DUMMY_SP,
             local: Ident {
-              span: Span::new(
-                BytePos::DUMMY,
-                BytePos::DUMMY,
-                SyntaxContext::from_u32(js_source.mark),
-              ),
+              ctxt: SyntaxContext::from_u32(js_source.mark),
+              span: Span::new(BytePos::DUMMY, BytePos::DUMMY),
               sym: Atom::from(js_source.as_name.unwrap_or(js_source.default_spec).as_str()),
               optional: false,
             },
@@ -500,6 +493,7 @@ impl<'a> VisitMut for ImportPlugin<'a> {
             imported: if js_source.as_name.is_some() {
               Some(ModuleExportName::Ident(Ident {
                 span: DUMMY_SP,
+                ctxt: Default::default(),
                 sym: Atom::from(js_source.default_spec.as_str()),
                 optional: false,
               }))
@@ -507,11 +501,8 @@ impl<'a> VisitMut for ImportPlugin<'a> {
               None
             },
             local: Ident {
-              span: Span::new(
-                BytePos::DUMMY,
-                BytePos::DUMMY,
-                SyntaxContext::from_u32(js_source.mark),
-              ),
+              ctxt: SyntaxContext::from_u32(js_source.mark),
+              span: Span::new(BytePos::DUMMY, BytePos::DUMMY),
               sym: Atom::from(js_source.as_name.unwrap_or(js_source.default_spec).as_str()),
               optional: false,
             },
@@ -520,7 +511,7 @@ impl<'a> VisitMut for ImportPlugin<'a> {
         },
         src: Box::new(Str {
           span: DUMMY_SP,
-          value: Atom::from(js_source_ref),
+          value: Wtf8Atom::from(js_source_ref),
           raw: None,
         }),
         type_only: false,
@@ -536,7 +527,7 @@ impl<'a> VisitMut for ImportPlugin<'a> {
         specifiers: vec![],
         src: Box::new(Str {
           span: DUMMY_SP,
-          value: Atom::from(css_source),
+          value: Wtf8Atom::from(css_source),
           raw: None,
         }),
         type_only: false,

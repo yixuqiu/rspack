@@ -1,0 +1,96 @@
+---
+description: 'Rspack releases are automated through GitHub Actions'
+---
+
+# Releasing
+
+Rspack releases are automated through GitHub Actions.
+
+You can view all released versions on the npm version pages of [@rspack/core](https://www.npmjs.com/package/@rspack/core?activeTab=versions) and [@rspack/cli](https://www.npmjs.com/package/@rspack/cli?activeTab=versions).
+
+## Latest release
+
+The latest stable release follows the Semantic Versioning specification (x.y.z).
+
+The [full release workflow](https://github.com/web-infra-dev/rspack/actions/workflows/release.yml?query=is%3Asuccess) is triggered manually by Rspack maintainers on Tuesday with the complete release notes.
+
+During the release, the binary artifacts below are built, grouped by the support tier that the [Node.js platform list](https://github.com/nodejs/node/blob/main/BUILDING.md#platform-list) gives to the platform they run on:
+
+**Tier 1**
+
+- x86_64-unknown-linux-gnu
+- aarch64-unknown-linux-gnu
+- x86_64-pc-windows-msvc
+- aarch64-apple-darwin
+
+**Tier 2**
+
+- powerpc64le-unknown-linux-gnu
+- s390x-unknown-linux-gnu
+- aarch64-pc-windows-msvc
+- x86_64-apple-darwin
+
+**Experimental**
+
+- x86_64-unknown-linux-musl
+- riscv64gc-unknown-linux-gnu
+
+**Others**
+
+- aarch64-unknown-linux-musl
+- riscv64gc-unknown-linux-musl
+- i686-pc-windows-msvc
+
+:::warning Platforms below Tier 1
+
+For these platforms Rspack only guarantees that the binding is built successfully. CI verifies the build only and never runs the test suite on them, so a green CI run is not a guarantee that Rspack behaves correctly there.
+
+:::
+
+### Release steps
+
+1. Create a new branch, for example `release/v1.0.0`.
+2. Update the version using the `pnpm x version` command on the branch.
+
+```bash
+# Release a patch version
+pnpm x version patch
+
+# Release a minor version
+pnpm x version minor
+
+# Release a major version
+pnpm x version major
+
+# Release an alpha version
+pnpm x version patch --pre alpha
+
+# Release a beta version
+pnpm x version patch --pre beta
+
+# Release a rc version
+pnpm x version patch --pre rc
+```
+
+3. Commit the code and push to the remote branch.
+
+```bash
+git add .
+git commit -m "chore: release v1.0.0"
+git push origin release/vx.y.z
+```
+
+4. Create a PR with the title `chore: release v1.0.0`.
+5. Run the [Ecosystem CI workflow](https://github.com/web-infra-dev/rspack/actions/workflows/ecosystem-ci.yml) to ensure all ecosystem projects are working properly.
+6. Run the [Release Full workflow](https://github.com/web-infra-dev/rspack/actions/workflows/release.yml) on the release branch. These options control what it publishes, and both are enabled by default:
+   - `release_npm`: Publish npm packages to registry
+   - `release_crates`: Publish Rust crates to crates.io
+7. After the release, merge the PR to the `main` branch.
+8. Use the `create-draft-release-notes` skill to create a draft [GitHub release note](https://github.com/web-infra-dev/rspack/releases).
+9. Review the draft release note, optionally add release highlights, and publish it.
+
+## Canary release
+
+Canary is the pre-release version for testing and verifying new features.
+
+Releasing a canary version does not require manually creating a branch or updating the version, it only requires Rspack maintainers to trigger the [Canary release workflow](https://github.com/web-infra-dev/rspack/actions/workflows/release-canary.yml).

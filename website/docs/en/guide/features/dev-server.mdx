@@ -1,13 +1,27 @@
-# DevServer
+---
+description: '@rspack/dev-server provides local development server support for Rspack CLI, including HMR and proxying.'
+---
 
-Rspack CLI comes with a built-in `@rspack/dev-server` for development and debugging. Its capabilities are similar to `webpack-dev-server`, including features like Hot Module Replacement (HMR), proxy server and more.
+import { PackageManagerTabs } from '@theme';
 
-### HMR
+# Dev server
 
-By default, Rspack enables HMR in dev mode. You can disable HMR by configuring the `devServer.hot` option in `rspack.config.js`.
+The `rspack dev` and `rspack serve` commands run a local development server through [@rspack/dev-server](https://npmjs.com/package/@rspack/dev-server). It provides hot module replacement (HMR), static file serving, proxying, and related development features.
 
-```js
-module.exports = {
+## Install dev server
+
+`@rspack/dev-server` is an optional peer dependency of `@rspack/cli`.
+
+Install it before using `rspack dev`, `rspack serve`, or `rspack preview`:
+
+<PackageManagerTabs command="add @rspack/dev-server -D" />
+
+## HMR
+
+By default, Rspack enables HMR in dev mode. You can disable HMR by configuring the `devServer.hot` option in Rspack configuration.
+
+```js title="rspack.config.mjs"
+export default {
   devServer: {
     hot: false,
   },
@@ -15,24 +29,25 @@ module.exports = {
 ```
 
 :::warning
-HMR is not working for css when `output.cssFilename` contains `[hash]` or `[contenthash]`
+Do not include `[hash]` or `[contenthash]` in [output.cssFilename](/config/output#outputcssfilename), otherwise CSS HMR may not work.
 :::
 
-### Proxy
+## Proxy
 
-Rspack has a built-in simple proxy server. You can enable the proxy server by configuring the `devServer.proxy` option in `rspack.config.js`. The devServer internally uses [http-proxy-middleware](https://github.com/chimurai/http-proxy-middleware) to implement the proxy function. For example, you can proxy `/api` to `http://localhost:3000` as follows:
+The dev server includes proxy support. Configure the `devServer.proxy` option to proxy matching requests. This feature is powered by [http-proxy-middleware](https://github.com/chimurai/http-proxy-middleware). For example, you can proxy `/api` to `http://localhost:3000` as follows:
 
-```js
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   devServer: {
-    proxy: {
-      '/api': {
+    proxy: [
+      {
+        context: ['/api'],
         target: 'http://localhost:3000',
         changeOrigin: true,
       },
-    },
+    ],
   },
 };
 ```
 
-For more devServer configuration options, please refer to [devServer](/config/dev-server.html).
+For more devServer configuration options, please refer to [devServer](/config/dev-server).

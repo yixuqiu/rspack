@@ -1,49 +1,53 @@
 use rspack_core::{
+  Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext, RuntimeTemplate,
   impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  ChunkUkey, Compilation, RuntimeGlobals, RuntimeModule,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
-pub struct ChunkNameRuntimeModule {
-  id: Identifier,
-  chunk: Option<ChunkUkey>,
+#[derive(Debug)]
+pub struct ChunkNameRuntimeModule {}
+
+impl ChunkNameRuntimeModule {
+  pub fn new(runtime_template: &RuntimeTemplate) -> Self {
+    Self::with_default(runtime_template)
+  }
 }
 
-impl Default for ChunkNameRuntimeModule {
-  fn default() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/chunk_name"),
-      chunk: None,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
+#[async_trait::async_trait]
+impl RuntimeModule for ChunkNameRuntimeModule {
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
+  }
+
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define: { RuntimeGlobals::CHUNK_NAME },
+      ..Default::default()
     }
   }
-}
 
-impl RuntimeModule for ChunkNameRuntimeModule {
-  fn attach(&mut self, chunk: ChunkUkey) {
-    self.chunk = Some(chunk);
-  }
-
-  fn name(&self) -> Identifier {
-    self.id
-  }
-
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    if let Some(chunk_ukey) = self.chunk {
-      let chunk = compilation.chunk_by_ukey.expect_get(&chunk_ukey);
-      Ok(
-        RawSource::from(format!(
-          "{} = {};",
-          RuntimeGlobals::CHUNK_NAME,
-          serde_json::to_string(&chunk.name).expect("Invalid json string")
-        ))
-        .boxed(),
-      )
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
+    if let Some(chunk_ukey) = self.chunk() {
+      let chunk = compilation
+        .build_chunk_graph_artifact
+        .chunk_by_ukey
+        .expect_get(&chunk_ukey);
+      Ok(format!(
+        "{} = {};",
+        context
+          .runtime_template
+          .render_runtime_global_definition(&RuntimeGlobals::CHUNK_NAME),
+        chunk
+          .name()
+          .map_or_else(|| "null".to_string(), rspack_util::json_stringify_str)
+      ))
     } else {
       unreachable!("should attach chunk for css_loading")
     }

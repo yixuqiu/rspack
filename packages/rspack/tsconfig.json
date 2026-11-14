@@ -3,22 +3,16 @@
   "compilerOptions": {
     "outDir": "dist",
     "rootDir": "src",
-    "resolveJsonModule": true,
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["es2022", "dom"],
+    "emitDeclarationOnly": true,
     "paths": {
-      "zod": ["../compiled/zod"],
-      "neo-async": ["../compiled/neo-async"],
-      "watchpack": ["../compiled/watchpack"],
-      "graceful-fs": ["../compiled/graceful-fs"],
-      "browserslist": ["../compiled/browserslist"],
-      "zod-validation-error": ["../compiled/zod-validation-error"],
-      "json-parse-even-better-errors": [
-        "../compiled/json-parse-even-better-errors"
-      ]
+      "watchpack": ["./compiled/watchpack"],
+      "@swc/types": ["./compiled/@swc/types"],
+      "webpack-sources": ["./compiled/webpack-sources"],
+      "tinypool": ["./compiled/tinypool"]
     }
   },
-  "include": ["src", "src/**/*.json"],
-  "exclude": ["src/config/schema.check.js"],
-  "ts-node": {
-    "transpileOnly": true
-  }
+  "include": ["src"]
 }

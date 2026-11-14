@@ -1,0 +1,10 @@
+Array [
+  Object {
+    moduleIdentifier: <TEST_ROOT>/diagnosticsCases/module-build-failed/loader-emit-diagnostic/basic.mjs!,
+    moduleName: ./basic.mjs!,
+  },
+  Object {
+    moduleIdentifier: <TEST_ROOT>/diagnosticsCases/module-build-failed/loader-emit-diagnostic/basic.mjs!<TEST_ROOT>/diagnosticsCases/module-build-failed/loader-emit-diagnostic/lib.js,
+    moduleName: ./basic.mjs!./lib.js,
+  },
+]

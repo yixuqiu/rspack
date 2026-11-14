@@ -1,55 +1,64 @@
+use rspack_cacheable::{cacheable, cacheable_dyn};
 use rspack_core::{
-  AsContextDependency, Dependency, DependencyId, DependencyTemplate, DependencyType,
-  ExtendedReferencedExport, ModuleDependency, ModuleGraph, RuntimeSpec, TemplateContext,
-  TemplateReplaceSource,
+  AsContextDependency, Dependency, DependencyCodeGeneration, DependencyId, DependencyRange,
+  DependencyTemplate, DependencyTemplateType, DependencyType, ExportsInfoArtifact,
+  ModuleDependency, ModuleGraph, ModuleGraphCacheArtifact, ReferencedExport, RuntimeSpec,
+  TemplateContext, TemplateReplaceSource,
 };
 
-#[derive(Debug, Clone)]
-pub struct WebpackIsIncludedDependency {
-  pub start: u32,
-  pub end: u32,
+#[cacheable]
+#[derive(Debug)]
+pub struct IsIncludeDependency {
+  pub range: DependencyRange,
   pub id: DependencyId,
   pub request: String,
 }
 
-impl WebpackIsIncludedDependency {
-  pub fn new(start: u32, end: u32, request: String) -> Self {
+impl IsIncludeDependency {
+  pub fn new(range: DependencyRange, request: String) -> Self {
     Self {
-      start,
-      end,
+      range,
       id: DependencyId::default(),
       request,
     }
   }
 }
 
-impl AsContextDependency for WebpackIsIncludedDependency {}
+impl AsContextDependency for IsIncludeDependency {}
 
-impl Dependency for WebpackIsIncludedDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "WebpackIsIncludedDependency"
+#[cacheable_dyn]
+impl Dependency for IsIncludeDependency {
+  fn dependency_type(&self) -> &DependencyType {
+    &DependencyType::IsIncluded
   }
 
-  fn dependency_type(&self) -> &DependencyType {
-    &DependencyType::WebpackIsIncluded
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
   }
 
   fn id(&self) -> &DependencyId {
     &self.id
   }
-}
-
-impl ModuleDependency for WebpackIsIncludedDependency {
-  fn weak(&self) -> bool {
-    true
-  }
 
   fn get_referenced_exports(
     &self,
     _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
     _runtime: Option<&RuntimeSpec>,
-  ) -> Vec<ExtendedReferencedExport> {
+  ) -> Vec<ReferencedExport> {
     vec![]
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
+  }
+}
+
+#[cacheable_dyn]
+impl ModuleDependency for IsIncludeDependency {
+  fn weak(&self) -> bool {
+    true
   }
 
   fn request(&self) -> &str {
@@ -57,29 +66,52 @@ impl ModuleDependency for WebpackIsIncludedDependency {
   }
 }
 
-impl DependencyTemplate for WebpackIsIncludedDependency {
-  fn apply(
+#[cacheable_dyn]
+impl DependencyCodeGeneration for IsIncludeDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(IsIncludedDependencyTemplate::template_type())
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct IsIncludedDependencyTemplate;
+
+impl IsIncludedDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::IsIncluded)
+  }
+}
+
+impl DependencyTemplate for IsIncludedDependencyTemplate {
+  fn render(
     &self,
+    dep: &dyn DependencyCodeGeneration,
     source: &mut TemplateReplaceSource,
     code_generatable_context: &mut TemplateContext,
   ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<IsIncludeDependency>()
+      .expect("IsIncludedDependencyTemplate should be used for IsIncludeDependency");
     let TemplateContext { compilation, .. } = code_generatable_context;
 
     let included = compilation
       .get_module_graph()
-      .connection_by_dependency(&self.id)
-      .map(|connection| {
+      .connection_by_dependency_id(&dep.id)
+      .is_some_and(|connection| {
         compilation
+          .build_chunk_graph_artifact
           .chunk_graph
           .get_number_of_module_chunks(*connection.module_identifier())
           > 0
-      })
-      .unwrap_or(false);
+      });
 
-    source.replace(self.start, self.end, included.to_string().as_str(), None);
-  }
-
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+    source.replace_static(
+      dep.range.start,
+      dep.range.end,
+      if included { "true" } else { "false" },
+      None,
+    );
   }
 }

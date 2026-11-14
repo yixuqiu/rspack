@@ -1,0 +1,328 @@
+---
+description: 'Inspect build results with Stats and MultiStats, check errors and warnings, and export JSON or formatted text.'
+---
+
+import Columns from '@components/Columns';
+import { Collapse, CollapsePanel } from '@components/Collapse';
+import CompilationType from '../../types/compilation.mdx';
+import { Badge } from '@theme';
+
+# Stats
+
+The `stats` object that is passed as a second argument of the [`rspack()`](/api/javascript-api/#rspack) callback, is a good source of information about the code compilation process. It includes:
+
+- Errors and Warnings (if any)
+- Timings
+- Module and Chunk information
+
+The `Stats` object provides two important methods:
+
+- `toJson()`: Output information in the form of a [Stats JSON](/api/javascript-api/stats-json) object, which is often used in analysis tools.
+- `toString()`: Output information in the form of a string, which is often used in the CLI tools.
+
+Rspack also provides `StatsFactory` and `StatsPrinter` to fine-grained control the output object or string.
+
+```txt title=Stats Output
+Compilation ===============> Stats JSON =================> Stats Output
+           ╰─ StatsFactory ─╯           ╰─ StatsPrinter ─╯
+╰─────────── stats.toJson() ───────────╯
+╰───────────────────────── stats.toString() ──────────────────────────╯
+```
+
+Create a stats object related to a compilation through [`compilation.getStats()`](/api/javascript-api/compilation#getstats) or `new Stats(compilation)`.
+
+:::warning Timing matters
+
+`stats.toJson()` and `stats.toString()` rely on compilation artifacts that are finalized in `compiler.hooks.done`. If they are called at other times (for example, on stale `Stats` objects captured earlier), some stats fields can be incomplete.
+
+For complete and stable stats output, call these methods in `compiler.hooks.done`:
+
+```js
+compiler.hooks.done.tap('MyPlugin', (stats) => {
+  const statsJson = stats.toJson({ all: false, errors: true, warnings: true });
+  const statsText = stats.toString({ preset: 'errors-warnings' });
+  console.log(statsJson.errors);
+  console.log(statsText);
+});
+```
+
+:::
+
+## Stats methods
+
+### hasErrors
+
+Can be used to check if there were errors while compiling.
+
+**Type:**
+
+```ts
+hasErrors(): boolean;
+```
+
+Use the return value to handle compilation errors:
+
+```js
+if (stats.hasErrors()) {
+  console.error('Compilation failed');
+}
+```
+
+### hasWarnings
+
+Can be used to check if there were warnings while compiling.
+
+**Type:**
+
+```ts
+hasWarnings(): boolean;
+```
+
+Use the return value to handle compilation warnings:
+
+```js
+if (stats.hasWarnings()) {
+  console.warn('Compilation completed with warnings');
+}
+```
+
+### toJson
+
+Return compilation information as a [Stats JSON](/api/javascript-api/stats-json) object. Pass a [stats preset or options object](/config/stats) to choose what to include.
+
+For the structure and field descriptions of objects in `assets`, see [Asset object](/api/javascript-api/stats-json#asset-object).
+
+**Type:**
+
+```ts
+toJson(options?: StatsValue): StatsCompilation;
+```
+
+Use the `'minimal'` preset and print the number of errors:
+
+```js
+const statsJson = stats.toJson('minimal');
+console.log(statsJson.errorsCount);
+```
+
+Use an options object to select the fields to include, then print the compilation hash:
+
+```js
+const statsJson = stats.toJson({
+  assets: false,
+  hash: true,
+});
+console.log(statsJson.hash);
+```
+
+### toString
+
+Return the compilation information in the form of a formatted string (similar to the output of [CLI](/api/cli)).
+
+**Type:**
+
+```ts
+toString(opts?: StatsValue): string;
+```
+
+Use [Stats configuration](/config/stats) to select what to display, and `colors` to control text colors:
+
+```js
+stats.toString({
+  // Add console colors
+  colors: true,
+});
+```
+
+Here's an example of `stats.toString()` usage:
+
+```js
+import { rspack } from '@rspack/core';
+
+rspack(
+  {
+    // ...
+  },
+  (err, stats) => {
+    if (err) {
+      console.error(err);
+      return;
+    }
+
+    console.log(
+      stats.toString({
+        chunks: false, // Makes the build much quieter
+        colors: true, // Shows colors in the console
+      }),
+    );
+  },
+);
+```
+
+## Stats properties
+
+### compilation
+
+**Type:** `Compilation`
+
+Get the related compilation object.
+
+<Collapse>
+  <CollapsePanel className="collapse-code-panel" header="Stats.ts" key="stats">
+    <CompilationType />
+  </CollapsePanel>
+</Collapse>
+
+### hash
+
+**Type:** `string | null`
+
+Get the hash of this compilation, same as [`Compilation.hash`](/api/javascript-api/compilation#hashfullhash).
+
+When using it as a string, check for `null` first:
+
+```js
+if (stats.hash !== null) {
+  console.log(stats.hash);
+}
+```
+
+## MultiStats
+
+When using `MultiCompiler` to run multiple compilation tasks, their results are packaged as a `MultiStats` object. It provides a combined hash and methods for checking, serializing, and formatting all child compilation results.
+
+### hash
+
+<Badge text="ReadOnly" type="info" />
+
+**Type:** `string`
+
+Get the hash formed by concatenating the hashes of all child compilations.
+
+Print the concatenated hash:
+
+```js
+console.log(multiStats.hash);
+```
+
+### hasErrors
+
+Returns `true` if any child compilation has errors.
+
+**Type:**
+
+```ts
+hasErrors(): boolean;
+```
+
+Use the return value to handle errors across all child compilations:
+
+```js
+if (multiStats.hasErrors()) {
+  console.error('At least one compilation failed');
+}
+```
+
+### hasWarnings
+
+Returns `true` if any child compilation has warnings.
+
+**Type:**
+
+```ts
+hasWarnings(): boolean;
+```
+
+Use the return value to handle warnings across all child compilations:
+
+```js
+if (multiStats.hasWarnings()) {
+  console.warn('At least one compilation completed with warnings');
+}
+```
+
+### toJson
+
+Returns a `StatsCompilation` whose `children` array contains the [Stats JSON](/api/javascript-api/stats-json) for each child compilation. Fields enabled for every child, such as `errors` and `warnings`, are also aggregated at the top level.
+
+**Type:**
+
+```ts
+toJson(options: boolean | StatsPresets | MultiStatsOptions): StatsCompilation;
+```
+
+Use one preset for every child compilation and inspect the number of results:
+
+```js
+const statsJson = multiStats.toJson('minimal');
+console.log(statsJson.children?.length);
+```
+
+`MultiStatsOptions` also supports a `children` option for configuring each child compilation individually. The following example prints the errors from the first child compilation:
+
+```js
+const statsJson = multiStats.toJson({
+  children: [
+    { all: false, errors: true },
+    { all: false, assets: true },
+  ],
+});
+console.log(statsJson.children?.[0]?.errors);
+```
+
+### toString
+
+Format each child compilation according to the [stats configuration](/config/stats), then concatenate the results into one string.
+
+**Type:**
+
+```ts
+toString(options: boolean | StatsPresets | MultiStatsOptions): string;
+```
+
+Use one preset for every child compilation and print the combined output:
+
+```js
+const statsText = multiStats.toString('minimal');
+console.log(statsText);
+```
+
+## Stats factory
+
+Used to generate the stats json object from the Compilation, and provides hooks for fine-grained control during the generation process.
+
+It can be got through [`compilation.hooks.statsFactory`](/api/plugin-api/compilation-hooks#statsfactory). Or create a new one by `new StatsFactory()`.
+
+### Hooks
+
+See [StatsFactory hooks](/api/plugin-api/stats-hooks#statsfactory) for more details.
+
+### create
+
+The core method of `StatsFactory`, according to the `type` to specify the current data structure, find and run the corresponding generator to generate the stats json item.
+
+```ts
+stats = statsFactory.create('compilation', compilation, {});
+```
+
+> The `StatsFactory` object only handles the calling of hooks, and the processing code of the corresponding type can be found in [`DefaultStatsFactoryPlugin`](https://github.com/web-infra-dev/rspack/blob/main/packages/rspack/src/stats/DefaultStatsFactoryPlugin.ts).
+
+## Stats printer
+
+Used to generate the output string from the stats json object, and provides hooks for fine-grained control during the generation process.
+
+It can be got through [`compilation.hooks.statsPrinter`](/api/plugin-api/compilation-hooks#statsprinter). Or create a new one by `new StatsPrinter()`.
+
+### Hooks
+
+See [StatsPrinter hooks](/api/plugin-api/stats-hooks#statsprinter) for more details.
+
+### print
+
+The core method of `StatsPrinter`, according to the type to specify the current data structure, find and run the corresponding generator to generate the output string of the stats item.
+
+```ts
+stats = statsPrinter.print('compilation', stats, {});
+```
+
+> The `StatsPrinter` object only handles the calling of hooks, and the processing code of the corresponding type can be found in [`DefaultStatsPrinterPlugin`](https://github.com/web-infra-dev/rspack/blob/main/packages/rspack/src/stats/DefaultStatsPrinterPlugin.ts).

@@ -1,12 +1,21 @@
-use rspack_core::{
-  property_access, AsContextDependency, AsModuleDependency, Dependency, DependencyCategory,
-  DependencyId, DependencyTemplate, DependencyType, ExportNameOrSpec, ExportSpec,
-  ExportsOfExportsSpec, ExportsSpec, InitFragmentExt, InitFragmentKey, InitFragmentStage,
-  ModuleGraph, NormalInitFragment, RuntimeGlobals, TemplateContext, TemplateReplaceSource,
-  UsedName,
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsPreset, AsVec},
 };
-use swc_core::atoms::Atom;
+use rspack_collections::{IdentifierMap, IdentifierSet};
+use rspack_core::{
+  AsContextDependency, AsModuleDependency, ConnectionState, Dependency, DependencyCategory,
+  DependencyCodeGeneration, DependencyId, DependencyRange, DependencyTemplate,
+  DependencyTemplateType, DependencyType, ExportNameOrSpec, ExportSpec, ExportsInfoArtifact,
+  ExportsOfExportsSpec, ExportsSpec, InitFragmentExt, InitFragmentKey, InitFragmentStage,
+  ModuleGraph, ModuleGraphCacheArtifact, NormalInitFragment, SideEffectsStateArtifact,
+  TemplateContext, TemplateReplaceSource, UsedName, property_access,
+};
+use rspack_util::json_stringify_str;
 
+use crate::{Atom, dependency::commonjs::OBJECT_PROTOTYPE_METHODS};
+
+#[cacheable]
 #[derive(Debug, Clone, Copy)]
 pub enum ExportsBase {
   Exports,
@@ -45,19 +54,21 @@ impl ExportsBase {
   }
 }
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct CommonJsExportsDependency {
   id: DependencyId,
-  range: (u32, u32),
-  value_range: Option<(u32, u32)>,
+  range: DependencyRange,
+  value_range: Option<DependencyRange>,
   base: ExportsBase,
+  #[cacheable(with=AsVec<AsPreset>)]
   names: Vec<Atom>,
 }
 
 impl CommonJsExportsDependency {
   pub fn new(
-    range: (u32, u32),
-    value_range: Option<(u32, u32)>,
+    range: DependencyRange,
+    value_range: Option<DependencyRange>,
     base: ExportsBase,
     names: Vec<Atom>,
   ) -> Self {
@@ -71,13 +82,14 @@ impl CommonJsExportsDependency {
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for CommonJsExportsDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "CommonJsExportsDependency"
-  }
-
   fn id(&self) -> &DependencyId {
     &self.id
+  }
+
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
   }
 
   fn category(&self) -> &DependencyCategory {
@@ -88,136 +100,183 @@ impl Dependency for CommonJsExportsDependency {
     &DependencyType::CjsExports
   }
 
-  fn get_exports(&self, _mg: &ModuleGraph) -> Option<ExportsSpec> {
+  fn get_exports(
+    &self,
+    _mg: &ModuleGraph,
+    _mg_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
+  ) -> Option<ExportsSpec> {
+    let name = self.names[0].clone();
     let vec = vec![ExportNameOrSpec::ExportSpec(ExportSpec {
-      name: self.names[0].clone(),
-      can_mangle: Some(false), // in webpack, object own property may not be mangled
+      // We can't mangle names that are in an empty object because one could access the prototype property
+      // when export isn't set yet. It's different for different targets. so here we only list common properties.
+      // Check out test case `configCases/mangle/mangle-with-object-prop`
+      can_mangle: Some(!OBJECT_PROTOTYPE_METHODS.contains(&name.as_str())),
+      name,
       ..Default::default()
     })];
     Some(ExportsSpec {
-      exports: ExportsOfExportsSpec::Array(vec),
+      exports: ExportsOfExportsSpec::Names(vec),
       ..Default::default()
     })
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::False
+  }
+
+  // A CommonJS export write (`exports.foo = ...`) points back at this same
+  // module; it does not evaluate another module, so it must not contribute
+  // `Active(true)` to the module-evaluation side-effect state on its own.
+  // Actual RHS side effects are still captured by the parser side-effects
+  // bailout (see SideEffectsParserPlugin). Without this, a module whose body is
+  // only export assignments could never be tree-shaken even when unused.
+  fn get_module_evaluation_side_effects_state(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _side_effects_state_artifact: &SideEffectsStateArtifact,
+    _module_chain: &mut IdentifierSet,
+    _connection_state_cache: &mut IdentifierMap<ConnectionState>,
+  ) -> ConnectionState {
+    ConnectionState::Active(false)
   }
 }
 
 impl AsModuleDependency for CommonJsExportsDependency {}
 
-impl DependencyTemplate for CommonJsExportsDependency {
-  fn apply(
+#[cacheable_dyn]
+impl DependencyCodeGeneration for CommonJsExportsDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(CommonJsExportsDependencyTemplate::template_type())
+  }
+}
+
+impl AsContextDependency for CommonJsExportsDependency {}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct CommonJsExportsDependencyTemplate;
+
+impl CommonJsExportsDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::CjsExports)
+  }
+}
+
+impl DependencyTemplate for CommonJsExportsDependencyTemplate {
+  fn render(
     &self,
+    dep: &dyn DependencyCodeGeneration,
     source: &mut TemplateReplaceSource,
     code_generatable_context: &mut TemplateContext,
   ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<CommonJsExportsDependency>()
+      .expect(
+        "CommonJsExportsDependencyTemplate should only be used for CommonJsExportsDependency",
+      );
+
     let TemplateContext {
       compilation,
       module,
       runtime,
       init_fragments,
-      runtime_requirements,
+      runtime_template,
       ..
     } = code_generatable_context;
 
-    let module_graph = compilation.get_module_graph();
-    let module = module_graph
-      .module_by_identifier(&module.identifier())
-      .expect("should have mgm");
-
-    let used = module_graph
-      .get_exports_info(&module.identifier())
-      .id
-      .get_used_name(&module_graph, *runtime, UsedName::Vec(self.names.clone()));
+    let exports_info = compilation
+      .exports_info_artifact
+      .get_exports_info_data(&module.identifier());
+    let used = exports_info.get_used_name(&compilation.exports_info_artifact, *runtime, &dep.names);
 
     let exports_argument = module.get_exports_argument();
     let module_argument = module.get_module_argument();
 
-    let base = if self.base.is_exports() {
-      runtime_requirements.insert(RuntimeGlobals::EXPORTS);
-      exports_argument.to_string()
-    } else if self.base.is_module_exports() {
-      runtime_requirements.insert(RuntimeGlobals::MODULE);
-      format!("{}.exports", module_argument)
-    } else if self.base.is_this() {
-      runtime_requirements.insert(RuntimeGlobals::THIS_AS_EXPORTS);
-      "this".to_string()
+    let base = if dep.base.is_exports() {
+      runtime_template.render_exports_argument(exports_argument)
+    } else if dep.base.is_module_exports() {
+      format!(
+        "{}.exports",
+        runtime_template.render_module_argument(module_argument)
+      )
+    } else if dep.base.is_this() {
+      runtime_template.render_this_exports()
     } else {
       panic!("Unexpected base type");
     };
 
-    if self.base.is_expression() {
-      if let Some(used) = used {
+    if dep.base.is_expression() {
+      if let Some(UsedName::Normal(used)) = used {
         source.replace(
-          self.range.0,
-          self.range.1,
-          &format!(
-            "{}{}",
-            base,
-            property_access(
-              match used {
-                UsedName::Str(name) => vec![name].into_iter(),
-                UsedName::Vec(names) => names.into_iter(),
-              },
-              0
-            )
-          ),
+          dep.range.start,
+          dep.range.end,
+          format!("{}{}", base, property_access(used, 0)),
           None,
-        )
+        );
       } else {
+        // Export a inlinable const from cjs is not possible for now but we compat it here
+        let is_inlined = matches!(used, Some(UsedName::Inlined(_)));
+        let placeholder_var = format!(
+          "__rspack_{}_export",
+          if is_inlined { "inlined" } else { "unused" }
+        );
+        source.replace(
+          dep.range.start,
+          dep.range.end,
+          placeholder_var.clone(),
+          None,
+        );
         init_fragments.push(
           NormalInitFragment::new(
-            "var __webpack_unused_export__;\n".to_string(),
+            format!("var {placeholder_var};\n"),
             InitFragmentStage::StageConstants,
             0,
-            InitFragmentKey::CommonJsExports("__webpack_unused_export__".to_owned()),
+            InitFragmentKey::CommonJsExports(placeholder_var),
             None,
           )
           .boxed(),
         );
-        source.replace(
-          self.range.0,
-          self.range.1,
-          "__webpack_unused_export__",
-          None,
-        );
       }
-    } else if self.base.is_define_property() {
-      if let Some(value_range) = self.value_range {
-        if let Some(used) = used {
-          if let UsedName::Vec(used) = used {
+    } else if dep.base.is_define_property() {
+      if let Some(value_range) = &dep.value_range {
+        if let Some(UsedName::Normal(used)) = used {
+          if !used.is_empty() {
             source.replace(
-              self.range.0,
-              value_range.0,
-              &format!(
+              dep.range.start,
+              value_range.start,
+              format!(
                 "Object.defineProperty({}{}, {}, (",
                 base,
                 property_access(used[0..used.len() - 1].iter(), 0),
-                serde_json::to_string(&used.last())
-                  .expect("Unexpected render define property base")
+                json_stringify_str(used.last().expect("Unexpected render define property base"))
               ),
               None,
             );
-            source.replace(value_range.1, self.range.1, "))", None);
+            source.replace_static(value_range.end, dep.range.end, "))", None);
           } else {
             panic!("Unexpected base type");
           }
         } else {
           init_fragments.push(
             NormalInitFragment::new(
-              "var __webpack_unused_export__;\n".to_string(),
+              "var __rspack_unused_export;\n".to_string(),
               InitFragmentStage::StageConstants,
               0,
-              InitFragmentKey::CommonJsExports("__webpack_unused_export__".to_owned()),
+              InitFragmentKey::CommonJsExports("__rspack_unused_export".to_owned()),
               None,
             )
             .boxed(),
           );
-          source.replace(
-            self.range.0,
-            value_range.0,
-            "__webpack_unused_export__ = (",
+          source.replace_static(
+            dep.range.start,
+            value_range.start,
+            "__rspack_unused_export = (",
             None,
           );
-          source.replace(value_range.1, self.range.1, ")", None);
+          source.replace_static(value_range.end, dep.range.end, ")", None);
         }
       } else {
         panic!("Define property need value range");
@@ -226,10 +285,4 @@ impl DependencyTemplate for CommonJsExportsDependency {
       panic!("Unexpected base type");
     }
   }
-
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
-  }
 }
-
-impl AsContextDependency for CommonJsExportsDependency {}

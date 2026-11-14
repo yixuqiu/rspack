@@ -1,13 +1,13 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::LazyLock};
 
-use once_cell::sync::Lazy;
 use regex::Regex;
-use rspack_error::{error, Result};
+use rspack_error::Result;
+use rspack_util::json_stringify_str;
 use rustc_hash::FxHashSet as HashSet;
 
-pub static SAFE_IDENTIFIER: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^[_a-zA-Z$][_a-zA-Z$0-9]*$").expect("Invalid regexp"));
-pub static RESERVED_IDENTIFIER: Lazy<HashSet<&str>> = Lazy::new(|| {
+pub static SAFE_IDENTIFIER: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"^[_a-zA-Z$][_a-zA-Z$0-9]*$").expect("Invalid regexp"));
+pub static RESERVED_IDENTIFIER: LazyLock<HashSet<&str>> = LazyLock::new(|| {
   HashSet::from_iter([
     "break",
     "case",
@@ -52,7 +52,6 @@ pub static RESERVED_IDENTIFIER: Lazy<HashSet<&str>> = Lazy::new(|| {
     "public",
     "static",
     "yield",
-    "yield",
     // module code
     "await",
     // skip future reserved keywords defined under ES1 till ES3
@@ -63,12 +62,22 @@ pub static RESERVED_IDENTIFIER: Lazy<HashSet<&str>> = Lazy::new(|| {
   ])
 });
 
-pub fn property_name(prop: &str) -> Result<Cow<str>> {
+pub fn property_name(prop: &str) -> Result<Cow<'_, str>> {
   if SAFE_IDENTIFIER.is_match(prop) && !RESERVED_IDENTIFIER.contains(prop) {
     Ok(Cow::from(prop))
   } else {
-    serde_json::to_string(prop)
-      .map_err(|e| error!(e.to_string()))
-      .map(Cow::from)
+    Ok(Cow::from(json_stringify_str(prop)))
+  }
+}
+
+/// Returns the name quoted for ESM export/import specifiers.
+/// Unlike `property_name`, this function allows reserved words like "default"
+/// since they are valid in export/import context (e.g., `export { foo as default }`).
+/// Only quotes names that are not valid JavaScript identifiers (e.g., "a.b" -> "\"a.b\"").
+pub fn export_name(name: &str) -> Result<Cow<'_, str>> {
+  if SAFE_IDENTIFIER.is_match(name) {
+    Ok(Cow::from(name))
+  } else {
+    Ok(Cow::from(json_stringify_str(name)))
   }
 }

@@ -1,0 +1,14 @@
+# Case async-chunks: Step 0
+
+## Changed Files
+
+
+## Asset Files
+- Bundle: async-module_js.chunk.mjs
+- Bundle: lazy-module_js.chunk.mjs
+- Bundle: main.mjs
+
+## Manifest
+
+
+## Update

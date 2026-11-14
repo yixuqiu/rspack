@@ -1,86 +1,184 @@
+---
+description: 'Rspack 配置总览，涵盖核心选项、产物行为、构建优化、开发调试、工具链设置与常见配置入口，帮助快速定位相关信息。'
+---
+
+import { PackageManagerTabs } from '@theme';
+import { Tabs, Tab } from '@theme';
+
 # 配置 Rspack
 
 Rspack 提供了与 webpack 相似的配置项，通过本章节，你可以了解 Rspack 配置的使用方式。
 
+:::tip
+
+如果你不想从头编写 Rspack 配置，可以根据项目类型选择：
+
+- [Rsbuild](https://rsbuild.rs/zh/)：提供构建 Web 应用的默认配置，详见 [Rsbuild 配置指南](https://rsbuild.rs/zh/guide/configuration/rsbuild)。
+- [Rslib](https://rslib.rs/zh/)：提供构建 JavaScript 库的默认配置，详见 [Rslib 配置指南](https://rslib.rs/zh/guide/basic/configure-rslib)。
+
+:::
+
 ## 配置文件
 
-当你运行 Rspack 的命令行工具时，Rspack 会自动读取当前路径下的 `rspack.config.js` 文件。
+当你运行 Rspack 的命令行工具时，Rspack 会自动读取当前路径下的 `rspack.config.*` 文件。
 
 一个基础的 Rspack 配置文件如下所示：
 
-```ts title="rspack.config.js"
-module.exports = {
+<Tabs>
+  <Tab label="ESM">
+
+```js title="rspack.config.mjs"
+import { defineConfig } from '@rspack/cli';
+
+export default defineConfig({
   entry: {
     main: './src/index.js',
   },
-};
+});
 ```
 
-### 支持的配置文件格式
+  </Tab>
+  <Tab label="CJS">
 
-Rspack 支持四种配置文件，支持`.js`，`.ts`，`.cjs` 和 `.mjs` 格式:
+```js title="rspack.config.cjs"
+const { defineConfig } = require('@rspack/cli');
 
-- `rspack.config.js`: 默认为 `CommonJS` 格式，如果所在 package.json 的 type 为 module 则变成 `ES Module` 格式。
-- `rspack.config.ts`: `TypeScript`格式，内部会使用 `ts-node` 将其编译为 `.js` 格式。
+module.exports = defineConfig({
+  entry: {
+    main: './src/index.js',
+  },
+});
+```
+
+  </Tab>
+  <Tab label="TypeScript">
+
+```ts title="rspack.config.ts"
+import { defineConfig } from '@rspack/cli';
+
+export default defineConfig({
+  entry: {
+    main: './src/index.js',
+  },
+});
+```
+
+  </Tab>
+</Tabs>
+
+## 配置文件格式
+
+Rspack 支持以下配置文件格式：
+
+- `rspack.config.ts`: `TypeScript` 格式，参考 [TypeScript 配置文件](#typescript-配置文件) 了解更多。
+- `rspack.config.js`: 默认为 `CommonJS` 格式，如果所在 package.json 的 type 为 "module" 则变成 `ES modules` 格式。
+- `rspack.config.mts`: 强制为 `ES modules` + `TypeScript` 格式。
+- `rspack.config.mjs`: 强制为 `ES modules` 格式。
+- `rspack.config.cts`: 强制为 `CommonJS` + `TypeScript` 格式。
 - `rspack.config.cjs`: 强制为 `CommonJS` 格式。
-- `rspack.config.mjs`: 强制为 `ES module` 格式。
 
-`CommonJS` 和 `ES Module`的区别请参考 [ES Module](https://nodejs.org/api/esm.html#modules-ecmascript-modules) 和 [CommonJS](https://nodejs.org/api/modules.html)
+Rspack 默认会按以下顺序解析配置文件：
+
+`rspack.config.ts` > `rspack.config.js` > `rspack.config.mts` > `rspack.config.mjs` > `rspack.config.cts` > `rspack.config.cjs`
+
+> `CommonJS` 和 `ES modules`的区别请参考 [ES modules](https://nodejs.org/api/esm.html#modules-ecmascript-modules) 和 [CommonJS](https://nodejs.org/api/modules.html)。
+
+## 扩展配置
+
+参考[扩展配置](/config/extends)了解如何从其他文件或包中扩展配置。
+
+## TypeScript 配置文件
+
+在使用 `rspack.config.ts` 时，你可以选择以下任意一种方式：
+
+### 默认行为
+
+Rspack CLI 从 1.5.0 版本开始内置对 TypeScript 配置的支持。
+
+默认情况下，Rspack CLI 使用 `--configLoader=auto`：
+
+- JavaScript 配置文件使用运行时原生加载器。
+- 当运行时原生支持 TypeScript 时，会优先尝试原生加载，失败后回退到 [Jiti](https://github.com/unjs/jiti)。
+- 当运行时不支持原生 TypeScript 时，会直接使用 Jiti 加载 TypeScript 配置文件。
+
+如果你使用的 Rspack CLI 版本小于 1.5.0，建议升级到最新版本。
+
+### 原生支持
+
+如果你使用的 JavaScript 运行时已经原生支持 TypeScript，你可以强制使用原生加载器来加载配置文件，确保模块解析行为与原生行为一致。
+
+例如，Node.js 已经原生支持 TypeScript，你可以使用以下命令来使用 Node.js 原生加载器来加载配置文件：
+
+- 对于原生支持 TypeScript 的 Node.js v22.18+ 和 v24.3+，你可以运行以下命令来加载 TS 配置：
+
+```json title="package.json"
+{
+  "scripts": {
+    "build": "rspack build --configLoader=native"
+  }
+}
+```
+
+详见 [Node.js - Running TypeScript Natively](https://nodejs.org/en/learn/typescript/run-natively#running-typescript-natively)。
+
+### Jiti 加载器
+
+你也可以强制使用 Jiti 来加载 TypeScript 配置文件：
+
+```json title="package.json"
+{
+  "scripts": {
+    "build": "rspack build --configLoader=jiti"
+  }
+}
+```
 
 ### 配置类型检查
 
-`rspack.config.js` 是一个 JavaScript 文件，你可以通过 JSDoc 来启用 IDE 的智能补全和 TypeScript 类型检查。
+使用 `defineConfig` 工具函数来启用智能补全。对于 JavaScript 配置文件，你可以使用 `// @ts-check` 注释来启用类型检查。
 
-```js title="rspack.config.js"
+<Tabs>
+  <Tab label="TypeScript">
+
+```ts title="rspack.config.ts"
+import { defineConfig } from '@rspack/cli';
+
+export default defineConfig({
+  entry: {
+    main: './src/index.js',
+  },
+});
+```
+
+  </Tab>
+  <Tab label="JavaScript">
+
+```js title="rspack.config.mjs"
 // @ts-check
+import { defineConfig } from '@rspack/cli';
 
+export default defineConfig({
+  entry: {
+    main: './src/index.js',
+  },
+});
+```
+
+  </Tab>
+</Tabs>
+
+你也可以使用 [JSDoc](https://jsdoc.app/) 来启用类型检查。
+
+```js title="rspack.config.mjs"
+// @ts-check
 /** @type {import('@rspack/cli').Configuration} */
 const config = {
   entry: {
     main: './src/index.js',
   },
 };
-module.exports = config;
+export default config;
 ```
-
-你也可以使用 `defineConfig` 工具函数，它提供了针对配置的自动补全：
-
-```js title="rspack.config.js"
-// @ts-check
-
-const { defineConfig } = require('@rspack/cli');
-
-const config = defineConfig({
-  entry: {
-    main: './src/index.js',
-  },
-});
-module.exports = config;
-```
-
-另外，你也可以使用 TypeScript 作为配置文件。默认的 TypeScript 配置文件名称是 `rspack.config.ts`。
-
-```ts title="rspack.config.ts"
-import { Configuration } from '@rspack/cli';
-const config: Configuration = {
-  entry: {
-    main: './src/index.js',
-  },
-};
-export = config;
-```
-
-你需要把 `ts-node` 安装为 `devDependencies`，这样 Rspack 才能解析 `ts` 扩展。
-
-```json title="package.json"
-{
-  "devDependencies": {
-    "ts-node": "^10.9.1"
-  }
-}
-```
-
-注意，如果 JS 文件不存在，Rspack 将首先搜索 JavaScript，然后才是 TypeScript。
 
 ## 指定配置文件
 
@@ -97,7 +195,7 @@ Rspack 命令行支持通过 `--config` 选项来指定配置文件的名称。
 }
 ```
 
-你也可以将 `--config` 选项缩写为 `-c`：
+也可以将 `--config` 选项缩写为 `-c`：
 
 ```bash
 $ rspack build -c rspack.prod.config.js
@@ -105,14 +203,14 @@ $ rspack build -c rspack.prod.config.js
 
 ## 导出配置函数
 
-Rspack 支持在 `rspack.config.js` 中导出一个函数，你可以在函数中动态计算配置，并返回给 Rspack。
+Rspack 支持在 Rspack 配置文件中导出一个函数，你可以在函数中动态计算配置，并返回给 Rspack。
 
-```js title="rspack.config.js"
-module.exports = function (env, argv) {
+```js title="rspack.config.mjs"
+export default function (env, argv) {
   return {
     devtool: env.production ? 'source-map' : 'eval',
   };
-};
+}
 ```
 
 从上述示例中可以看到，该函数接受两个入参：
@@ -124,11 +222,90 @@ module.exports = function (env, argv) {
 
 除了通过 `env` 参数，通过 `process.env.NODE_ENV` 来判断当前环境是更常见的方式：
 
-```js title="rspack.config.js"
-module.exports = function (env, argv) {
+```js title="rspack.config.mjs"
+export default function (env, argv) {
   const isProduction = process.env.NODE_ENV === 'production';
   return {
     devtool: isProduction ? 'source-map' : 'eval',
   };
+}
+```
+
+## 合并配置
+
+使用 Rspack 的 [extends](/config/extends) 选项或者 [rspack-merge](https://github.com/rstackjs/rspack-merge) 包来合并多个 Rspack 配置。
+
+### extends 选项
+
+在使用 [@rspack/cli](/api/cli) 时，Rspack 提供了 `extends` 选项，允许你从其他文件或包中扩展配置。
+
+```js title="rspack.config.mjs"
+export default {
+  extends: './base.rspack.config.mjs',
+  output: {
+    filename: '[name].bundle.js',
+  },
 };
 ```
+
+> 该选项仅在 `@rspack/cli` 中有效，查看 [extends](/config/extends) 了解更多用法。
+
+### rspack-merge
+
+`rspack-merge` 是一个库，用于合并多个 Rspack 配置。
+
+首先安装 `rspack-merge`：
+
+<PackageManagerTabs command="add rspack-merge -D" />
+
+然后你就可以使用它的 `merge` 函数来合并配置：
+
+```js title="rspack.config.mjs"
+import { merge } from 'rspack-merge';
+
+const isDev = process.env.NODE_ENV === 'development';
+const base = {};
+const dev = {
+  plugins: [new SomeDevPlugin()],
+};
+
+export default isDev ? merge(base, dev) : base;
+```
+
+> 查看 [rspack-merge 文档](https://github.com/rstackjs/rspack-merge) 了解更多。
+
+## rspack-chain
+
+[rspack-chain](https://github.com/rstackjs/rspack-chain) 是一个通过链式 API 创建和修改 Rspack 配置的库。你可以为规则、loader 和插件指定名称，后续通过名称访问和修改它们，无需遍历配置数组来查找对应的配置项。
+
+当配置由 Rsbuild 这类构建工具生成，或在多个项目间共享时，这种基于名称的访问方式可以为配置扩展提供统一的约定。例如，构建工具将 HTML 插件命名为 `html`，使用方就可以通过这个名称修改插件选项，而不必了解它在 `plugins` 数组中的位置。
+
+首先安装 `rspack-chain`：
+
+<PackageManagerTabs command="add rspack-chain -D" />
+
+以下示例添加一个 HTML 插件，然后通过名称 `html` 修改它的选项：
+
+```js title="rspack.config.mjs"
+import { rspack } from '@rspack/core';
+import { RspackChain } from 'rspack-chain';
+
+const config = new RspackChain();
+
+config.entry('main').add('./src/index.js');
+
+// 在共享配置中添加一个具名插件
+config.plugin('html').use(rspack.HtmlRspackPlugin, [{ title: 'My app' }]);
+
+// 根据项目需要修改已有插件的选项
+config.plugin('html').tap((args) => {
+  args[0].title = 'My project';
+  return args;
+});
+
+export default config.toConfig();
+```
+
+完成所有修改后，调用 `toConfig()` 生成供 Rspack 使用的配置对象。`html` 这样的名称用于在 `rspack-chain` 中定位配置项。
+
+> 查看 [rspack-chain 文档](https://github.com/rstackjs/rspack-chain) 了解更多。

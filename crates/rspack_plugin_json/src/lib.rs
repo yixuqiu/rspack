@@ -1,134 +1,170 @@
-#![feature(let_chains)]
 use std::borrow::Cow;
 
+use cow_utils::CowUtils;
 use json::{
-  number::Number,
-  object::Object,
-  stringify,
   Error::{
     ExceededDepthLimit, FailedUtf8Parsing, UnexpectedCharacter, UnexpectedEndOfJson, WrongType,
   },
   JsonValue,
+  number::Number,
+  object::Object,
 };
+use rspack_cacheable::{cacheable, cacheable_dyn};
 use rspack_core::{
+  BoxDependency, BuildMetaDefaultObject, BuildMetaExportsType, ChunkGraph, ExportsInfoArtifact,
+  ExportsInfoData, GenerateContext, GeneratorOptions, Module, ModuleArgument, ModuleGraph,
+  NAMESPACE_OBJECT_EXPORT, ParseOption, ParserAndGenerator, ParserOptions, Plugin, RuntimeSpec,
+  SourceType, UsageState, UsedNameItem,
   diagnostics::ModuleParseError,
-  rspack_sources::{BoxSource, RawSource, Source, SourceExt},
-  BuildMetaDefaultObject, BuildMetaExportsType, ChunkGraph, CompilerOptions, ExportsInfo,
-  GenerateContext, Module, ModuleGraph, ParserAndGenerator, Plugin, RuntimeGlobals, RuntimeSpec,
-  SourceType, UsageState, NAMESPACE_OBJECT_EXPORT,
+  rspack_sources::{BoxSource, RawStringSource, Source, SourceExt},
 };
-use rspack_error::{
-  miette::diagnostic, DiagnosticExt, DiagnosticKind, IntoTWithDiagnosticArray, Result,
-  TWithDiagnosticArray, TraceableError,
-};
+use rspack_error::{Error, IntoTWithDiagnosticArray, Result, TWithDiagnosticArray, error};
+use rspack_util::{itoa, location::byte_line_column_to_offset};
 
 use crate::json_exports_dependency::JsonExportsDependency;
 
 mod json_exports_dependency;
 mod utils;
 
+#[cacheable]
 #[derive(Debug)]
-struct JsonParserAndGenerator;
+struct JsonParserAndGenerator {
+  pub exports_depth: u32,
+  pub json_parse: bool,
+}
 
+#[cacheable_dyn]
+#[async_trait::async_trait]
 impl ParserAndGenerator for JsonParserAndGenerator {
-  fn source_types(&self) -> &[SourceType] {
+  fn source_types(&self, _module: &dyn Module, _module_graph: &ModuleGraph) -> &[SourceType] {
     &[SourceType::JavaScript]
   }
 
-  fn size(&self, module: &dyn Module, _source_type: &SourceType) -> f64 {
-    module.original_source().map_or(0, |source| source.size()) as f64
+  fn size(&self, module: &dyn Module, _source_type: Option<&SourceType>) -> f64 {
+    module
+      .build_info()
+      .json_data
+      .as_ref()
+      .map_or(0.0, |data| data.dump().len() as f64)
   }
 
-  fn parse(
+  async fn parse<'a>(
     &mut self,
-    parse_context: rspack_core::ParseContext,
+    parse_context: rspack_core::ParseContext<'a>,
   ) -> Result<TWithDiagnosticArray<rspack_core::ParseResult>> {
     let rspack_core::ParseContext {
       source: box_source,
       build_info,
       build_meta,
       loaders,
+      module_parser_options,
       ..
     } = parse_context;
-    build_info.strict = true;
-    build_meta.exports_type = BuildMetaExportsType::Default;
-    // TODO default_object is not align with webpack
-    build_meta.default_object = BuildMetaDefaultObject::RedirectWarn;
-    let source = box_source.source();
+    let source = box_source.source().into_string_lossy();
     let strip_bom_source = source.strip_prefix('\u{feff}');
     let need_strip_bom = strip_bom_source.is_some();
+    let strip_bom_source = strip_bom_source.unwrap_or(&source);
 
-    let parse_result = json::parse(strip_bom_source.unwrap_or(&source)).map_err(|e| {
-      match e {
-        UnexpectedCharacter { ch, line, column } => {
-          let rope = ropey::Rope::from_str(&source);
-          let line_offset = rope.try_line_to_byte(line - 1).expect("TODO:");
-          let start_offset = source[line_offset..]
-            .chars()
-            .take(column)
-            .fold(line_offset, |acc, cur| acc + cur.len_utf8());
-          let start_offset = if need_strip_bom {
-            start_offset + 1
-          } else {
-            start_offset
-          };
-          TraceableError::from_file(
-            source.into_owned(),
-            // one character offset
-            start_offset,
-            start_offset + 1,
-            "Json parsing error".to_string(),
-            format!("Unexpected character {ch}"),
-          )
-          .with_kind(DiagnosticKind::Json)
-          .boxed()
+    // If there is a custom parse, execute it to obtain the returned string.
+    let parse_result_str = if let Some(p) = module_parser_options.and_then(|p| p.get_json()) {
+      match &p.parse {
+        ParseOption::Func(f) => {
+          let parse_result = f(strip_bom_source.to_string()).await;
+          parse_result.ok()
         }
-        ExceededDepthLimit | WrongType(_) | FailedUtf8Parsing => diagnostic!("{e}").boxed(),
-        UnexpectedEndOfJson => {
-          // End offset of json file
-          let offset = source.len() - 1;
-          TraceableError::from_file(
-            source.into_owned(),
-            offset,
-            offset,
-            "Json parsing error".to_string(),
-            format!("{e}"),
-          )
-          .with_kind(DiagnosticKind::Json)
-          .boxed()
-        }
+        _ => None,
       }
-    });
-
-    let (diagnostics, data) = match parse_result {
-      Ok(data) => (vec![], Some(data)),
-      Err(err) => (
-        vec![ModuleParseError::new(err, loaders).boxed().into()],
-        None,
-      ),
+    } else {
+      None
     };
-    build_info.json_data = data.clone();
+
+    let parse_result = json::parse(parse_result_str.as_deref().unwrap_or(strip_bom_source))
+      .map_err(|e| {
+        match e {
+          UnexpectedCharacter { ch, line, column } => {
+            let line_offset = byte_line_column_to_offset(source.as_ref(), line, 0)
+              .expect("Failed to convert line number to byte offset in JSON source");
+            let start_offset = source[line_offset..]
+              .chars()
+              .take(column)
+              .fold(line_offset, |acc, cur| acc + cur.len_utf8());
+            let start_offset = if need_strip_bom {
+              start_offset + 1
+            } else {
+              start_offset
+            };
+            Error::from_string(
+              Some(source.into_owned()),
+              // one character offset
+              start_offset,
+              start_offset + 1,
+              "JSON parse error".to_string(),
+              format!("Unexpected character {ch}"),
+            )
+          }
+          ExceededDepthLimit | WrongType(_) | FailedUtf8Parsing => error!("{}", e),
+          UnexpectedEndOfJson => {
+            // End offset of json file
+            let length = source.len();
+            let offset = if length > 0 { length - 1 } else { length };
+            Error::from_string(
+              Some(source.into_owned()),
+              offset,
+              offset,
+              "JSON parse error".to_string(),
+              format!("{e}"),
+            )
+          }
+        }
+      });
+
+    let data = match parse_result {
+      Ok(data) => data,
+      Err(err) => {
+        return Ok(
+          rspack_core::ParseResult {
+            presentational_dependencies: vec![],
+            dependencies: vec![],
+            blocks: vec![],
+            code_generation_dependencies: vec![],
+            source: box_source,
+            side_effects_bailout: None,
+          }
+          .with_diagnostic(vec![
+            Error::from(ModuleParseError::new(err, loaders)).into(),
+          ]),
+        );
+      }
+    };
+
+    let is_default_object = data.is_object() || data.is_array();
+    build_info.json_data = Some(data);
+    build_info.strict = true;
+    build_meta.set_exports_type(BuildMetaExportsType::Default);
+    build_meta.set_default_object(if is_default_object {
+      BuildMetaDefaultObject::RedirectWarn
+    } else {
+      BuildMetaDefaultObject::False
+    });
 
     Ok(
       rspack_core::ParseResult {
         presentational_dependencies: vec![],
-        dependencies: if let Some(data) = data {
-          vec![Box::new(JsonExportsDependency::new(data))]
-        } else {
-          vec![]
-        },
+        dependencies: vec![BoxDependency::new(JsonExportsDependency::new(
+          self.exports_depth,
+        ))],
         blocks: vec![],
+        code_generation_dependencies: vec![],
         source: box_source,
-        analyze_result: Default::default(),
         side_effects_bailout: None,
       }
-      .with_diagnostic(diagnostics),
+      .with_diagnostic(vec![]),
     )
   }
 
   // Safety: `ast_and_source` is available in code generation.
   #[allow(clippy::unwrap_in_result)]
-  fn generate(
+  async fn generate(
     &self,
     _source: &BoxSource,
     module: &dyn rspack_core::Module,
@@ -140,52 +176,56 @@ impl ParserAndGenerator for JsonParserAndGenerator {
       concatenation_scope,
       ..
     } = generate_context;
-    let module_graph = compilation.get_module_graph();
     match generate_context.requested_source_type {
       SourceType::JavaScript => {
-        generate_context
-          .runtime_requirements
-          .insert(RuntimeGlobals::MODULE);
-        let module = module_graph
-          .module_by_identifier(&module.identifier())
-          .expect("should have module identifier");
-        let json_data = module
-          .build_info()
+        let build_info = module.build_info();
+        let json_data = build_info
+          .json_data
           .as_ref()
-          .and_then(|info| info.json_data.as_ref())
           .expect("should have json data");
-        let exports_info = module_graph.get_exports_info(&module.identifier());
+        let exports_info = compilation
+          .exports_info_artifact
+          .get_exports_info_data(&module.identifier());
 
         let final_json = match json_data {
           json::JsonValue::Object(_) | json::JsonValue::Array(_)
-            if exports_info
-              .other_exports_info
-              .get_export_info(&module_graph)
-              .get_used(*runtime)
-              == UsageState::Unused =>
+            if matches!(
+              exports_info.other_exports_info().get_used(*runtime),
+              UsageState::Unused
+            ) =>
           {
-            create_object_for_exports_info(json_data.clone(), exports_info, *runtime, &module_graph)
+            Cow::Owned(create_object_for_exports_info(
+              json_data.clone(),
+              exports_info,
+              *runtime,
+              &compilation.exports_info_artifact,
+            ))
           }
-          _ => json_data.clone(),
+          _ => Cow::Borrowed(json_data),
         };
         let is_js_object = final_json.is_object() || final_json.is_array();
-        let final_json_string = stringify(final_json);
+        let final_json_string = final_json.dump();
         let json_str = utils::escape_json(&final_json_string);
-        let json_expr = if is_js_object && json_str.len() > 20 {
+        let json_expr = if self.json_parse && is_js_object && json_str.len() > 20 {
           Cow::Owned(format!(
-            "JSON.parse('{}')",
-            json_str.replace('\\', r"\\").replace('\'', r"\'")
+            "/*#__PURE__*/JSON.parse('{}')",
+            json_str.cow_replace('\\', r"\\").cow_replace('\'', r"\'")
           ))
         } else {
-          json_str
+          json_str.cow_replace("\"__proto__\":", "[\"__proto__\"]:")
         };
-        let content = if let Some(ref mut scope) = concatenation_scope {
+        let content = if let Some(scope) = concatenation_scope {
           scope.register_namespace_export(NAMESPACE_OBJECT_EXPORT);
           format!("var {NAMESPACE_OBJECT_EXPORT} = {json_expr}")
         } else {
-          format!(r#"module.exports = {}"#, json_expr)
+          format!(
+            r#"{}.exports = {json_expr}"#,
+            generate_context
+              .runtime_template
+              .render_module_argument(ModuleArgument::Module)
+          )
         };
-        Ok(RawSource::from(content).boxed())
+        Ok(RawStringSource::from(content).boxed())
       }
       _ => panic!(
         "Unsupported source type: {:?}",
@@ -199,7 +239,7 @@ impl ParserAndGenerator for JsonParserAndGenerator {
     _module: &dyn Module,
     _mg: &ModuleGraph,
     _cg: &ChunkGraph,
-  ) -> Option<String> {
+  ) -> Option<Cow<'static, str>> {
     None
   }
 }
@@ -212,27 +252,36 @@ impl Plugin for JsonPlugin {
     "json"
   }
 
-  fn apply(
-    &self,
-    ctx: rspack_core::PluginContext<&mut rspack_core::ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
-    ctx.context.register_parser_and_generator_builder(
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.register_parser_and_generator_builder(
       rspack_core::ModuleType::Json,
-      Box::new(|_, _| Box::new(JsonParserAndGenerator {})),
+      Box::new(|options| {
+        let p = options
+          .parser_options_computed(ParserOptions::get_json)
+          .expect("should have JsonParserOptions");
+
+        let g = options
+          .generator_options_computed(GeneratorOptions::get_json)
+          .expect("should have JsonGeneratorOptions");
+
+        Box::new(JsonParserAndGenerator {
+          exports_depth: p.exports_depth.expect("should have exports_depth"),
+          json_parse: g.json_parse.expect("should have json_parse"),
+        })
+      }),
     );
 
     Ok(())
   }
 }
 
-fn create_object_for_exports_info(
+pub fn create_object_for_exports_info(
   data: JsonValue,
-  exports_info: &ExportsInfo,
+  exports_info: &ExportsInfoData,
   runtime: Option<&RuntimeSpec>,
-  mg: &ModuleGraph,
+  exports_info_artifact: &ExportsInfoArtifact,
 ) -> JsonValue {
-  if exports_info.other_exports_info.get_used(mg, runtime) != UsageState::Unused {
+  if exports_info.other_exports_info().get_used(runtime) != UsageState::Unused {
     return data;
   }
 
@@ -245,24 +294,27 @@ fn create_object_for_exports_info(
     JsonValue::Object(mut obj) => {
       let mut used_pair = vec![];
       for (key, value) in obj.iter_mut() {
-        let export_info = exports_info.id.get_read_only_export_info(&key.into(), mg);
+        let export_info = exports_info.get_read_only_export_info(&key.into());
         let used = export_info.get_used(runtime);
         if used == UsageState::Unused {
           continue;
         }
         let new_value = if used == UsageState::OnlyPropertiesUsed
-          && let Some(exports_info_id) = export_info.exports_info
+          && let Some(exports_info) = export_info.exports_info()
         {
-          let exports_info = mg.get_exports_info_by_id(&exports_info_id);
           // avoid clone
           let temp = std::mem::replace(value, JsonValue::Null);
-          create_object_for_exports_info(temp, exports_info, runtime, mg)
+          let exports_info = exports_info.as_data(exports_info_artifact);
+          create_object_for_exports_info(temp, exports_info, runtime, exports_info_artifact)
         } else {
           std::mem::replace(value, JsonValue::Null)
         };
-        let used_name = export_info
+        let UsedNameItem::Str(used_name) = export_info
           .get_used_name(Some(&(key.into())), runtime)
-          .expect("should have used name");
+          .expect("should have used name")
+        else {
+          continue;
+        };
         used_pair.push((used_name, new_value));
       }
       let mut new_obj = Object::new();
@@ -278,23 +330,23 @@ fn create_object_for_exports_info(
         .into_iter()
         .enumerate()
         .map(|(i, item)| {
-          let export_info = exports_info
-            .id
-            .get_read_only_export_info(&format!("{i}").into(), mg);
+          let mut i_buffer = itoa::Buffer::new();
+          let i_str = i_buffer.format(i);
+          let export_info = exports_info.get_read_only_export_info(&i_str.into());
           let used = export_info.get_used(runtime);
           if used == UsageState::Unused {
             return None;
           }
           max_used_index = max_used_index.max(i);
           if used == UsageState::OnlyPropertiesUsed
-            && let Some(exports_info_id) = export_info.exports_info
+            && let Some(exports_info) = export_info.exports_info()
           {
-            let exports_info = mg.get_exports_info_by_id(&exports_info_id);
+            let exports_info = exports_info.as_data(exports_info_artifact);
             Some(create_object_for_exports_info(
               item,
               exports_info,
               runtime,
-              mg,
+              exports_info_artifact,
             ))
           } else {
             Some(item)
@@ -302,8 +354,7 @@ fn create_object_for_exports_info(
         })
         .collect::<Vec<_>>();
       let arr_length_used = exports_info
-        .id
-        .get_read_only_export_info(&"length".into(), mg)
+        .get_read_only_export_info(&"length".into())
         .get_used(runtime);
       let array_length_when_used = match arr_length_used {
         UsageState::Unused => None,

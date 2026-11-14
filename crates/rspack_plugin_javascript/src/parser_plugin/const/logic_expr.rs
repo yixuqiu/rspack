@@ -1,75 +1,62 @@
+use std::sync::Arc;
+
 use rspack_core::ConstDependency;
-use rspack_core::SpanExt;
-use swc_core::common::Spanned;
-use swc_core::ecma::ast::{BinExpr, BinaryOp};
+use rspack_util::SpanExt;
+use swc_next_ecma_ast::{GetSpan, LogicalExpression, LogicalOperator};
 
 use crate::visitors::JavascriptParser;
 
-pub fn is_logic_op(op: BinaryOp) -> bool {
-  matches!(
-    op,
-    BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing
-  )
-}
-
-pub fn expression_logic_operator(scanner: &mut JavascriptParser, expr: &BinExpr) -> Option<bool> {
-  if expr.op == BinaryOp::LogicalAnd || expr.op == BinaryOp::LogicalOr {
-    let param = scanner.evaluate_expression(&expr.left);
+pub fn expression_logic_operator(
+  scanner: &mut JavascriptParser,
+  expr: LogicalExpression,
+) -> Option<bool> {
+  let ast = scanner.ast.ast;
+  let operator = expr.operator(ast);
+  if matches!(operator, LogicalOperator::And | LogicalOperator::Or) {
+    let param = scanner.evaluate_expression(expr.left(ast));
     let boolean = param.as_bool();
-    let Some(boolean) = boolean else {
-      return None;
-    };
+    let boolean = boolean?;
     let keep_right = if boolean {
-      expr.op == BinaryOp::LogicalAnd
+      operator == LogicalOperator::And
     } else {
-      expr.op == BinaryOp::LogicalOr
+      operator == LogicalOperator::Or
     };
     if !param.could_have_side_effects() && (keep_right || param.is_bool()) {
-      scanner
-        .presentational_dependencies
-        .push(Box::new(ConstDependency::new(
-          param.range().0,
-          param.range().1 - 1,
-          format!(" {boolean}").into(),
-          None,
-        )));
+      scanner.add_presentational_dependency(Arc::new(ConstDependency::new(
+        param.range().into(),
+        format!(" {boolean}").into(),
+      )));
     } else {
-      scanner.walk_expression(&expr.left);
+      scanner.walk_expression(expr.left(ast));
     }
 
     if !keep_right {
-      scanner
-        .presentational_dependencies
-        .push(Box::new(ConstDependency::new(
-          expr.right.span().real_lo(),
-          expr.right.span().hi().0 - 1,
-          "0".into(),
-          None,
-        )));
+      scanner.add_presentational_dependency(Arc::new(ConstDependency::new(
+        {
+          let span = expr.right(ast).span(ast);
+          (span.real_lo(), span.real_hi()).into()
+        },
+        "0".into(),
+      )));
     }
     Some(keep_right)
-  } else if expr.op == BinaryOp::NullishCoalescing {
-    let param = scanner.evaluate_expression(&expr.left);
+  } else if operator == LogicalOperator::NullishCoalescing {
+    let param = scanner.evaluate_expression(expr.left(ast));
     if let Some(keep_right) = param.as_nullish() {
       if !param.could_have_side_effects() && keep_right {
-        scanner
-          .presentational_dependencies
-          .push(Box::new(ConstDependency::new(
-            param.range().0,
-            param.range().1 - 1,
-            " null".into(),
-            None,
-          )));
+        scanner.add_presentational_dependency(Arc::new(ConstDependency::new(
+          param.range().into(),
+          " null".into(),
+        )));
       } else {
-        scanner
-          .presentational_dependencies
-          .push(Box::new(ConstDependency::new(
-            expr.right.span().real_lo(),
-            expr.right.span().hi().0 - 1,
-            "0".into(),
-            None,
-          )));
-        scanner.walk_expression(&expr.left);
+        scanner.add_presentational_dependency(Arc::new(ConstDependency::new(
+          {
+            let span = expr.right(ast).span(ast);
+            (span.real_lo(), span.real_hi()).into()
+          },
+          "0".into(),
+        )));
+        scanner.walk_expression(expr.left(ast));
       }
       Some(keep_right)
     } else {

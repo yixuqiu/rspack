@@ -1,0 +1,26 @@
+```mjs title=main.mjs
+// fs?f23b
+
+// ./module.js
+
+
+console.log.bind(console);
+
+// fs?771d
+
+// ./index.js
+
+
+it('should handle aliased external', async () => {
+	const {f, w} = await import(/*webpackIgnore: true*/'./main.mjs')
+	const fs = await import(/* webpackIgnore: true */ 'node:fs')
+
+	expect(f).toBe(fs.readFile)
+	expect(w).toBe(fs.writeFile)
+});
+
+
+
+export { readFile as f, writeFile as w } from "fs";
+
+```

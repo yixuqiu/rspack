@@ -1,103 +1,108 @@
+use std::sync::LazyLock;
+
 use itertools::Itertools;
 use rspack_core::{
-  impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  ChunkUkey, Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleStage,
+  ChunkUkey, Compilation, RuntimeModule, RuntimeModuleGenerateContext,
+  RuntimeModuleRuntimeRequirements, RuntimeModuleStage, RuntimeTemplate, impl_runtime_module,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
+
+use crate::extract_runtime_globals_from_ejs;
+
+static CHUNK_PREFETCH_STARTUP_TEMPLATE: &str = include_str!("runtime/chunk_prefetch_startup.ejs");
+static CHUNK_PREFETCH_STARTUP_RUNTIME_REQUIREMENTS: LazyLock<RuntimeModuleRuntimeRequirements> =
+  LazyLock::new(|| extract_runtime_globals_from_ejs(CHUNK_PREFETCH_STARTUP_TEMPLATE));
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
+#[derive(Debug)]
 pub struct ChunkPrefetchStartupRuntimeModule {
-  id: Identifier,
   startup_chunks: Vec<(Vec<ChunkUkey>, Vec<ChunkUkey>)>,
-  chunk: Option<ChunkUkey>,
 }
 
 impl ChunkPrefetchStartupRuntimeModule {
-  pub fn new(startup_chunks: Vec<(Vec<ChunkUkey>, Vec<ChunkUkey>)>) -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/chunk_prefetch_startup"),
-      startup_chunks,
-      chunk: None,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
-    }
+  pub fn new(
+    runtime_template: &RuntimeTemplate,
+    startup_chunks: Vec<(Vec<ChunkUkey>, Vec<ChunkUkey>)>,
+  ) -> Self {
+    Self::with_default(runtime_template, startup_chunks)
   }
 }
 
+#[async_trait::async_trait]
 impl RuntimeModule for ChunkPrefetchStartupRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
   }
 
-  fn attach(&mut self, chunk: ChunkUkey) {
-    self.chunk = Some(chunk);
+  fn template(&self) -> Vec<(String, String)> {
+    vec![(
+      self.id().to_string(),
+      CHUNK_PREFETCH_STARTUP_TEMPLATE.to_string(),
+    )]
   }
 
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    let chunk_ukey = self.chunk.expect("chunk do not attached");
-    Ok(
-      RawSource::from(
-        self
-          .startup_chunks
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
+    let chunk_ukey = self.chunk().expect("chunk do not attached");
+
+    let source = self
+      .startup_chunks
+      .iter()
+      .map(|(group_chunks, child_chunks)| {
+        let group_chunk_ids = group_chunks
           .iter()
-          .map(|(group_chunks, child_chunks)| {
-            let group_chunk_ids = group_chunks
-              .iter()
-              .filter_map(|c| {
-                if c.to_owned().eq(&chunk_ukey) {
-                  compilation.chunk_by_ukey.expect_get(c).id.to_owned()
-                } else {
-                  None
-                }
-              })
-              .collect_vec();
-
-            let child_chunk_ids = child_chunks
-              .iter()
-              .filter_map(|c| compilation.chunk_by_ukey.expect_get(c).id.to_owned())
-              .collect_vec();
-
-            let body = match child_chunks.len() {
-              x if x < 3 => child_chunk_ids
-                .iter()
-                .map(|id| {
-                  format!(
-                    "{}({});",
-                    RuntimeGlobals::PREFETCH_CHUNK,
-                    serde_json::to_string(&id).expect("invalid json tostring")
-                  )
-                })
-                .join("\n"),
-              _ => {
-                format!(
-                  "{}.map({})",
-                  serde_json::to_string(&child_chunk_ids).expect("invalid json tostring"),
-                  RuntimeGlobals::PREFETCH_CHUNK
-                )
-              }
-            };
-
-            format!(
-              r#"
-            {}(0, {}, function() {{
-              {}
-            }}, 5);
-            "#,
-              RuntimeGlobals::ON_CHUNKS_LOADED,
-              serde_json::to_string(&group_chunk_ids).expect("invalid json tostring"),
-              body
-            )
+          .filter_map(|c| {
+            if c.to_owned().eq(&chunk_ukey) {
+              compilation
+                .build_chunk_graph_artifact
+                .chunk_by_ukey
+                .expect_get(c)
+                .id()
+            } else {
+              None
+            }
           })
-          .join("\n"),
-      )
-      .boxed(),
-    )
+          .collect_vec();
+
+        let child_chunk_ids = child_chunks
+          .iter()
+          .filter_map(|c| {
+            compilation
+              .build_chunk_graph_artifact
+              .chunk_by_ukey
+              .expect_get(c)
+              .id()
+          })
+          .collect_vec();
+
+        let source = context.runtime_template.render(
+          self.id(),
+          Some(serde_json::json!({
+            "_chunk_ids": simd_json::to_string(&group_chunk_ids).expect("invalid json to_string"),
+            "_child_chunk_ids": simd_json::to_string(&child_chunk_ids).expect("invalid json to_string"),
+          })),
+        )?;
+
+        Ok(source)
+      })
+      .collect::<rspack_error::Result<Vec<String>>>()?
+      .join("\n");
+
+    Ok(source)
   }
 
   fn stage(&self) -> RuntimeModuleStage {
     RuntimeModuleStage::Trigger
+  }
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      dependencies: CHUNK_PREFETCH_STARTUP_RUNTIME_REQUIREMENTS.dependencies,
+      ..Default::default()
+    }
   }
 }

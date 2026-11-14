@@ -1,0 +1,27 @@
+[package]
+description       = "remove duplicate modules"
+edition.workspace = true
+license           = "MIT"
+name              = "rspack_plugin_remove_duplicate_modules"
+repository        = "https://github.com/web-infra-dev/rspack"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-shear]
+ignored = ["tracing"]
+
+[dependencies]
+rayon   = { workspace = true }
+tracing = { workspace = true }
+
+rspack_collections = { workspace = true }
+rspack_core        = { workspace = true }
+rspack_error       = { workspace = true }
+rspack_hook        = { workspace = true }
+rspack_util        = { workspace = true }
+
+[lib]
+doctest = false
+test    = false

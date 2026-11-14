@@ -1,0 +1,8 @@
+<%- PREFETCH_CHUNK_HANDLERS %>.j = <%- basicFunction("chunkId") %> {
+    <% if (_is_neutral_platform) { %>if (typeof document === 'undefined') return;<% } %>
+    if((!<%- HAS_OWN_PROPERTY %>(moduleInstalledChunks, chunkId) || moduleInstalledChunks[chunkId] === undefined) && <%- _js_matcher %>) {
+        moduleInstalledChunks[chunkId] = null;
+        <%- _link_prefetch %>
+        document.head.appendChild(link);
+    }
+};

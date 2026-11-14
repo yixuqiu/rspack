@@ -17,27 +17,12 @@ impl From<&str> for SideEffectOption {
 }
 
 impl SideEffectOption {
-  /// Returns `true` if the side effect option is [`False`].
-  ///
-  /// [`False`]: SideEffectOption::False
-  #[must_use]
-  pub fn is_false(&self) -> bool {
-    matches!(self, Self::False)
-  }
-
   /// Returns `true` if the side effect option is [`True`].
   ///
   /// [`True`]: SideEffectOption::True
   #[must_use]
   pub fn is_true(&self) -> bool {
     matches!(self, Self::True)
-  }
-
-  /// Returns `true` if the side effect option is [`Flag`].
-  ///
-  /// [`Flag`]: SideEffectOption::Flag
-  pub fn is_flag(&self) -> bool {
-    matches!(self, Self::Flag)
   }
 
   pub fn is_enable(&self) -> bool {
@@ -68,22 +53,6 @@ impl UsedExportsOption {
     matches!(self, Self::Global | Self::True)
   }
 
-  /// Returns `true` if the used exports is [`False`].
-  ///
-  /// [`False`]: UsedExports::False
-  #[must_use]
-  pub fn is_false(&self) -> bool {
-    matches!(self, Self::False)
-  }
-
-  /// Returns `true` if the used exports is [`True`].
-  ///
-  /// [`True`]: UsedExports::True
-  #[must_use]
-  pub fn is_true(&self) -> bool {
-    matches!(self, Self::True)
-  }
-
   /// Returns `true` if the used exports is [`Global`].
   ///
   /// [`Global`]: UsedExports::Global
@@ -93,7 +62,7 @@ impl UsedExportsOption {
   }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MangleExportsOption {
   #[default]
   False,
@@ -119,15 +88,20 @@ impl From<&str> for MangleExportsOption {
   }
 }
 
-#[derive(Debug)]
+// BE CAREFUL:
+// Add more fields to this struct should result in adding new fields to options builder.
+// `impl From<Optimization> for OptimizationBuilder` should be updated.
+#[derive(Debug, Default)]
 pub struct Optimization {
-  pub remove_available_modules: bool,
   pub side_effects: SideEffectOption,
   pub provided_exports: bool,
   pub used_exports: UsedExportsOption,
   pub inner_graph: bool,
+  pub inline_exports: bool,
   pub mangle_exports: MangleExportsOption,
   pub concatenate_modules: bool,
+  pub avoid_entry_iife: bool,
+  pub real_content_hash: bool,
 }
 
 pub static DEFAULT_DELIMITER: &str = "~";

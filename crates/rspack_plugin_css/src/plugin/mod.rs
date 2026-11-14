@@ -1,11 +1,14 @@
 #![allow(clippy::comparison_chain)]
+mod drive;
 mod impl_plugin_for_css_plugin;
 use std::cmp::{self, Reverse};
 
-use rspack_core::{Chunk, ChunkGraph, Compilation, Module, ModuleGraph, SourceType};
-use rspack_core::{ChunkUkey, ModuleIdentifier};
+pub use drive::*;
+use rspack_collections::IdentifierSet;
+use rspack_core::{
+  Chunk, ChunkUkey, Compilation, Module, ModuleIdentifier, compare_modules_by_identifier,
+};
 use rspack_hook::plugin;
-use rspack_identifier::IdentifierSet;
 
 #[plugin]
 #[derive(Debug, Default)]
@@ -19,31 +22,18 @@ pub struct CssOrderConflicts {
 }
 
 impl CssPlugin {
-  pub(crate) fn get_ordered_chunk_css_modules<'chunk_graph>(
+  pub(crate) fn get_ordered_chunk_css_modules<'a>(
     chunk: &Chunk,
-    chunk_graph: &'chunk_graph ChunkGraph,
-    module_graph: &'chunk_graph ModuleGraph,
     compilation: &Compilation,
-  ) -> (
-    Vec<&'chunk_graph dyn Module>,
-    Option<Vec<CssOrderConflicts>>,
-  ) {
+    mut css_import_modules: Vec<&'a dyn Module>,
+    mut css_modules: Vec<&'a dyn Module>,
+  ) -> (Vec<&'a dyn Module>, Option<Vec<CssOrderConflicts>>) {
+    css_import_modules.sort_unstable_by_key(|module| module.identifier());
     let (mut external_css_modules, conflicts_external) =
-      Self::get_ordered_chunk_css_modules_by_type(
-        chunk,
-        chunk_graph,
-        module_graph,
-        compilation,
-        SourceType::CssImport,
-      );
+      Self::get_modules_in_order(chunk, css_import_modules, compilation);
 
-    let (mut css_modules, conflicts) = Self::get_ordered_chunk_css_modules_by_type(
-      chunk,
-      chunk_graph,
-      module_graph,
-      compilation,
-      SourceType::Css,
-    );
+    css_modules.sort_unstable_by_key(|module| module.identifier());
+    let (mut css_modules, conflicts) = Self::get_modules_in_order(chunk, css_modules, compilation);
 
     external_css_modules.append(&mut css_modules);
 
@@ -60,27 +50,6 @@ impl CssPlugin {
     (external_css_modules, conflicts)
   }
 
-  fn get_ordered_chunk_css_modules_by_type<'chunk_graph>(
-    chunk: &Chunk,
-    chunk_graph: &'chunk_graph ChunkGraph,
-    module_graph: &'chunk_graph ModuleGraph,
-    compilation: &Compilation,
-    source_type: SourceType,
-  ) -> (
-    Vec<&'chunk_graph dyn Module>,
-    Option<Vec<CssOrderConflicts>>,
-  ) {
-    // Align with https://github.com/webpack/webpack/blob/8241da7f1e75c5581ba535d127fa66aeb9eb2ac8/lib/css/CssModulesPlugin.js#L368
-    let mut css_modules = chunk_graph
-      .get_chunk_modules_iterable_by_source_type(&chunk.ukey, source_type, module_graph)
-      .collect::<Vec<_>>();
-    css_modules.sort_unstable_by_key(|module| module.identifier());
-
-    let (css_modules, conflicts) = Self::get_modules_in_order(chunk, css_modules, compilation);
-
-    (css_modules, conflicts)
-  }
-
   pub fn get_modules_in_order<'module>(
     chunk: &Chunk,
     modules: Vec<&'module dyn Module>,
@@ -91,18 +60,21 @@ impl CssPlugin {
       return (vec![], None);
     };
 
-    let modules_list = modules.clone();
-
     // Get ordered list of modules per chunk group
 
     let mut modules_by_chunk_group = chunk
-      .groups
+      .groups()
       .iter()
-      .map(|group| group.as_ref(&compilation.chunk_group_by_ukey))
+      .map(|group| {
+        compilation
+          .build_chunk_graph_artifact
+          .chunk_group_by_ukey
+          .expect_get(group)
+      })
       .map(|chunk_group| {
-        let mut indexed_modules = modules_list
-          .clone()
-          .into_iter()
+        let mut indexed_modules = modules
+          .iter()
+          .copied()
           .filter_map(|module| {
             // ->: import
             // For A -> B -> C, the pre order is A: 0, B: 1, C: 2.
@@ -147,20 +119,22 @@ impl CssPlugin {
 
     loop {
       let mut failed_modules: IdentifierSet = Default::default();
-      let list = modules_by_chunk_group[0].list.clone();
-      if list.is_empty() {
+      if modules_by_chunk_group[0].list.is_empty() {
         // done, everything empty
         break;
       }
-      let mut selected_module = *list.last().expect("TODO:");
+      let mut selected_module = *modules_by_chunk_group[0]
+        .list
+        .last()
+        .expect("list should not be empty");
       let mut has_failed = None;
       'outer: loop {
         for SortedModules { set, list } in &modules_by_chunk_group {
           if list.is_empty() {
             continue;
           }
-          let last_module = *list.last().expect("TODO:");
-          if last_module == selected_module {
+          let last_module = *list.last().expect("list should not be empty");
+          if last_module.identifier() == selected_module.identifier() {
             continue;
           }
           if !set.contains(&selected_module.identifier()) {
@@ -183,7 +157,7 @@ impl CssPlugin {
         // TODO(hyf0): we should emit a warning here
         tracing::warn!("Conflicting order between");
         let conflict = CssOrderConflicts {
-          chunk: chunk.ukey,
+          chunk: chunk.ukey(),
           failed_module: has_failed.identifier(),
           selected_module: selected_module.identifier(),
         };
@@ -214,11 +188,15 @@ impl CssPlugin {
       // Remove the selected module from all lists
       for SortedModules { set, list } in &mut modules_by_chunk_group {
         let last_module = list.last();
-        if last_module.map_or(false, |last_module| last_module == &selected_module) {
+        if last_module
+          .is_some_and(|last_module| last_module.identifier() == selected_module.identifier())
+        {
           list.pop();
           set.remove(&selected_module.identifier());
         } else if has_failed.is_some() && set.contains(&selected_module.identifier()) {
-          let idx = list.iter().position(|m| m == &selected_module);
+          let idx = list
+            .iter()
+            .position(|m| m.identifier() == selected_module.identifier());
           if let Some(idx) = idx {
             list.remove(idx);
           }
@@ -253,15 +231,5 @@ fn compare_module_lists(a: &SortedModules, b: &SortedModules) -> cmp::Ordering {
       &a.last().expect("Must have a module").identifier(),
       &b.last().expect("Must have a module").identifier(),
     )
-  }
-}
-
-fn compare_modules_by_identifier(a_id: &str, b_id: &str) -> cmp::Ordering {
-  if a_id < b_id {
-    cmp::Ordering::Less
-  } else if a_id > b_id {
-    cmp::Ordering::Greater
-  } else {
-    cmp::Ordering::Equal
   }
 }

@@ -1,49 +1,50 @@
-use std::{
-  borrow::Cow,
-  fs,
-  hash::Hash,
-  path::{Path, PathBuf},
-  sync::Arc,
-};
+use std::{borrow::Cow, fmt::Write, hash::Hash, sync::Arc};
 
-use derivative::Derivative;
+use concat_string::concat_string;
+use cow_utils::CowUtils;
+use derive_more::Debug;
+use futures::future::BoxFuture;
 use indoc::formatdoc;
 use itertools::Itertools;
-use once_cell::sync::Lazy;
-use regex::{Captures, Regex};
-use rspack_error::{impl_empty_diagnosable_trait, miette::IntoDiagnostic, Diagnostic, Result};
-use rspack_hash::RspackHash;
-use rspack_identifier::{Identifiable, Identifier};
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsCacheable, AsOption, AsPreset, AsVec, Skip},
+};
+use rspack_collections::{Identifiable, Identifier};
+use rspack_error::{Result, impl_empty_diagnosable_trait};
+use rspack_hash::{RspackHashDigest, RspackHasher};
 use rspack_macros::impl_source_map_config;
+use rspack_paths::{InternedPathSet, Utf8PathBuf};
 use rspack_regex::RspackRegex;
-use rspack_sources::{BoxSource, ConcatSource, RawSource, SourceExt};
-use rspack_util::{fx_hash::FxIndexMap, json_stringify, source_map::SourceMapKind};
+use rspack_sources::{BoxSource, OriginalSource, RawStringSource, SourceExt};
+use rspack_util::{
+  fx_hash::FxIndexMap,
+  identifier::make_paths_relative,
+  itoa, json_stringify, json_stringify_pretty,
+  source_map::{ModuleSourceMapConfig, SourceMapKind},
+};
 use rustc_hash::FxHashMap as HashMap;
-use rustc_hash::FxHashSet as HashSet;
 
 use crate::{
-  block_promise, contextify, get_exports_type_with_strict, impl_module_meta_info,
-  returning_function, to_path, AsyncDependenciesBlock, AsyncDependenciesBlockIdentifier,
-  BoxDependency, BuildContext, BuildInfo, BuildMeta, BuildMetaDefaultObject, BuildMetaExportsType,
-  BuildResult, ChunkGraph, ChunkGroupOptions, CodeGenerationResult, Compilation,
-  ConcatenationScope, ContextElementDependency, DependenciesBlock, Dependency, DependencyCategory,
-  DependencyId, DynamicImportMode, ExportsType, FactoryMeta, FakeNamespaceObjectMode, GroupOptions,
-  LibIdentOptions, Module, ModuleType, Resolve, ResolveInnerOptions,
-  ResolveOptionsWithDependencyType, ResolverFactory, RuntimeGlobals, RuntimeSpec, SourceType,
+  AsyncDependenciesBlock, AsyncDependenciesBlockIdentifier, BoxDependency, BoxModule, BuildContext,
+  BuildInfo, BuildMeta, BuildMetaDefaultObject, BuildMetaExportsType, ChunkGraph,
+  ChunkGroupOptions, CodeGenerationResultBuilder, Compilation, Context, ContextElementDependency,
+  DependenciesBlock, DependenciesBlockData, DependencyCategory, DependencyId, DependencyLocation,
+  DependencyRef, DynamicImportMode, ExportsType, FactoryMetaStore, FakeNamespaceObjectMode,
+  FreezeLock, GroupOptions, ImportAttributes, ImportPhase, LibIdentOptions, Module, ModuleArgument,
+  ModuleCodeGenerationContext, ModuleCodeTemplate, ModuleGraph, ModuleId, ModuleIdsArtifact,
+  ModuleLayer, ModuleType, NeedBuildContext, RealDependencyLocation, ReferencedSpecifier, Resolve,
+  RuntimeGlobals, RuntimeGlobalsRenderMode, RuntimeSpec, SourceType, contextify,
+  get_exports_type_with_strict, get_outgoing_async_modules, impl_module_meta_info,
+  module_update_hash,
+  new_cache::{FileSystemInfo, Snapshot, SnapshotValidationResult},
+  property_access, to_path,
 };
 
-#[derive(Debug, Clone)]
-pub struct AlternativeRequest {
-  pub context: String,
-  pub request: String,
-}
+static CHUNK_NAME_INDEX_PLACEHOLDER: &str = "[index]";
+static CHUNK_NAME_REQUEST_PLACEHOLDER: &str = "[request]";
 
-impl AlternativeRequest {
-  pub fn new(context: String, request: String) -> Self {
-    Self { context, request }
-  }
-}
-
+#[cacheable]
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum ContextMode {
   Sync,
@@ -67,16 +68,6 @@ impl ContextMode {
   }
 }
 
-impl From<&str> for ContextMode {
-  fn from(value: &str) -> Self {
-    match try_convert_str_to_context_mode(value) {
-      Some(m) => m,
-      // TODO should give warning
-      _ => panic!("unknown context mode"),
-    }
-  }
-}
-
 impl From<DynamicImportMode> for ContextMode {
   fn from(value: DynamicImportMode) -> Self {
     match value {
@@ -88,6 +79,8 @@ impl From<DynamicImportMode> for ContextMode {
   }
 }
 
+/// Returns `None` for unknown context modes, callers are expected to emit a
+/// diagnostic (and pick a fallback) when this happens.
 pub fn try_convert_str_to_context_mode(s: &str) -> Option<ContextMode> {
   match s {
     "sync" => Some(ContextMode::Sync),
@@ -96,11 +89,11 @@ pub fn try_convert_str_to_context_mode(s: &str) -> Option<ContextMode> {
     "lazy" => Some(ContextMode::Lazy),
     "lazy-once" => Some(ContextMode::LazyOnce),
     "async-weak" => Some(ContextMode::AsyncWeak),
-    // TODO should give warning
     _ => None,
   }
 }
 
+#[cacheable]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContextNameSpaceObject {
   Bool(bool),
@@ -115,104 +108,244 @@ impl ContextNameSpaceObject {
   }
 }
 
-pub fn context_reg_exp(expr: &str, flags: &str) -> Option<RspackRegex> {
-  if expr.is_empty() {
-    return None;
-  }
-  let regexp = RspackRegex::with_flags(expr, flags).expect("reg failed");
-  clean_regexp_in_context_module(regexp)
+#[cacheable]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, PartialOrd, Ord, Eq)]
+pub enum ContextTypePrefix {
+  Import,
+  Normal,
 }
 
-pub fn clean_regexp_in_context_module(regexp: RspackRegex) -> Option<RspackRegex> {
-  if regexp.sticky() || regexp.global() {
-    // TODO: warning
-    None
-  } else {
-    Some(regexp)
+#[cacheable]
+#[derive(Debug, Clone)]
+pub enum ContextModulePattern {
+  None,
+  RegExp(RspackRegex),
+  Glob(Vec<String>),
+}
+
+impl ContextModulePattern {
+  pub fn reg_exp(&self) -> Option<&RspackRegex> {
+    match self {
+      Self::RegExp(reg_exp) => Some(reg_exp),
+      Self::None | Self::Glob(_) => None,
+    }
+  }
+
+  pub fn glob_patterns(&self) -> Option<&[String]> {
+    match self {
+      Self::None | Self::RegExp(_) => None,
+      Self::Glob(glob_patterns) => Some(glob_patterns),
+    }
+  }
+
+  pub fn is_empty(&self) -> bool {
+    matches!(self, Self::None)
+  }
+
+  pub fn glob_patterns_to_string(glob_patterns: &[String]) -> String {
+    glob_patterns.iter().join(", ")
+  }
+
+  pub fn to_pretty_string(&self, source: bool) -> Option<String> {
+    match self {
+      Self::None => None,
+      Self::RegExp(reg_exp) => Some(reg_exp.to_pretty_string(source)),
+      Self::Glob(glob_patterns) => Some(Self::glob_patterns_to_string(glob_patterns)),
+    }
   }
 }
 
-#[derive(Derivative, Debug, Clone)]
-#[derivative(Hash, PartialEq)]
+impl From<Option<RspackRegex>> for ContextModulePattern {
+  fn from(reg_exp: Option<RspackRegex>) -> Self {
+    match reg_exp {
+      Some(reg_exp) => Self::RegExp(reg_exp),
+      None => Self::None,
+    }
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Clone)]
 pub struct ContextOptions {
   pub mode: ContextMode,
   pub recursive: bool,
-  #[derivative(Hash = "ignore", PartialEq = "ignore")]
-  pub reg_exp: Option<RspackRegex>,
-  pub include: Option<String>,
-  pub exclude: Option<String>,
+  pub pattern: ContextModulePattern,
+  pub include: Option<RspackRegex>,
+  pub exclude: Option<RspackRegex>,
   pub category: DependencyCategory,
+  /// The context request passed to the resolver.
   pub request: String,
+  /// The base directory used to resolve relative context requests. For glob patterns, this is the
+  /// parser-derived request context (the importer directory or the explicit `base`) and remains
+  /// the matching coordinate even when context module factory hooks relocate the scan request.
   pub context: String,
+  /// The compiler `options.context`. Root-relative glob patterns are resolved from this directory.
+  /// This value is stable for the lifetime of a compilation and must not be changed by context
+  /// module factory hooks.
+  pub compiler_context: Context,
   pub namespace_object: ContextNameSpaceObject,
   pub group_options: Option<GroupOptions>,
   pub replaces: Vec<(String, u32, u32)>,
   pub start: u32,
   pub end: u32,
+  #[cacheable(with=AsOption<AsVec<AsCacheable>>)]
+  pub referenced_specifiers: Option<Vec<ReferencedSpecifier>>,
+  pub glob_import: Option<String>,
+  pub glob_exhaustive: bool,
+  pub glob_case_sensitive: bool,
+  pub attributes: Option<ImportAttributes>,
+  pub phase: Option<ImportPhase>,
 }
 
-#[derive(Debug, PartialEq)]
+impl Default for ContextOptions {
+  fn default() -> Self {
+    Self {
+      mode: ContextMode::Sync,
+      recursive: false,
+      pattern: ContextModulePattern::None,
+      include: None,
+      exclude: None,
+      category: DependencyCategory::Unknown,
+      request: String::new(),
+      context: String::new(),
+      compiler_context: Context::default(),
+      namespace_object: ContextNameSpaceObject::Unset,
+      group_options: None,
+      replaces: Vec::new(),
+      start: 0,
+      end: 0,
+      referenced_specifiers: None,
+      glob_import: None,
+      glob_exhaustive: false,
+      glob_case_sensitive: true,
+      attributes: None,
+      phase: None,
+    }
+  }
+}
+
+/// Returns the compiler-context-relative form of a context when it needs to be part of an
+/// identifier. The compiler context itself is implicit, so encoding it as `./.` would only change
+/// existing identifiers without distinguishing different resolution behavior.
+pub fn context_identifier(compiler_context: &str, context: &str) -> Option<String> {
+  if context.is_empty() {
+    return None;
+  }
+
+  let context = contextify(compiler_context, context);
+  (context != "./.").then_some(context)
+}
+
+#[cacheable]
+#[derive(Debug, Clone)]
 pub struct ContextModuleOptions {
   pub addon: String,
-  pub resource: String,
+  #[cacheable(with=AsPreset)]
+  pub resource: Utf8PathBuf,
   pub resource_query: String,
   pub resource_fragment: String,
   pub context_options: ContextOptions,
-  pub resolve_options: Option<Box<Resolve>>,
+  pub layer: Option<ModuleLayer>,
+  pub resolve_options: Option<Arc<Resolve>>,
+  pub type_prefix: ContextTypePrefix,
 }
 
+#[derive(Debug)]
 pub enum FakeMapValue {
   Bit(FakeNamespaceObjectMode),
   Map(HashMap<String, FakeNamespaceObjectMode>),
 }
 
+struct ContextBlockInfo {
+  user_request: String,
+  dep_id: DependencyId,
+  block_id: AsyncDependenciesBlockIdentifier,
+}
+
+pub type ResolveContextModuleDependencies = Arc<
+  dyn Fn(ContextModuleOptions) -> BoxFuture<'static, Result<Vec<ContextElementDependency>>>
+    + Send
+    + Sync,
+>;
+
 #[impl_source_map_config]
+#[cacheable]
 #[derive(Debug)]
 pub struct ContextModule {
-  dependencies: Vec<DependencyId>,
-  blocks: Vec<AsyncDependenciesBlockIdentifier>,
+  dependencies_block: DependenciesBlockData,
   identifier: Identifier,
   options: ContextModuleOptions,
-  resolve_factory: Arc<ResolverFactory>,
-  factory_meta: Option<FactoryMeta>,
-  build_info: Option<BuildInfo>,
-  build_meta: Option<BuildMeta>,
+  factory_meta: FactoryMetaStore,
+  build_info: FreezeLock<BuildInfo>,
+  build_meta: FreezeLock<BuildMeta>,
+  force_build: bool,
+  // Only needed before building. Cache misses build a fresh module from the factory.
+  #[debug(skip)]
+  #[cacheable(with=Skip)]
+  resolve_dependencies: Option<ResolveContextModuleDependencies>,
 }
-
-impl PartialEq for ContextModule {
-  fn eq(&self, other: &Self) -> bool {
-    self.identifier == other.identifier
-  }
-}
-
-impl Eq for ContextModule {}
 
 impl ContextModule {
-  pub fn new(options: ContextModuleOptions, resolve_factory: Arc<ResolverFactory>) -> Self {
+  pub(crate) fn new_with_strict(
+    resolve_dependencies: ResolveContextModuleDependencies,
+    options: ContextModuleOptions,
+    strict: Option<bool>,
+  ) -> Self {
+    let mut build_info = BuildInfo::default();
+    if let Some(strict) = strict {
+      build_info.strict = strict;
+    }
+
     Self {
-      dependencies: Vec::new(),
-      blocks: Vec::new(),
-      identifier: create_identifier(&options),
+      dependencies_block: Default::default(),
+      identifier: create_identifier(&options, None),
       options,
-      resolve_factory,
-      factory_meta: None,
-      build_info: None,
-      build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      factory_meta: Default::default(),
+      build_info: build_info.into(),
+      build_meta: BuildMeta::default()
+        .with_exports_type(BuildMetaExportsType::Default)
+        .with_default_object(BuildMetaDefaultObject::RedirectWarn)
+        .into(),
+      force_build: true,
+      source_map_kind: SourceMapKind::empty(),
+      resolve_dependencies: Some(resolve_dependencies),
     }
   }
 
-  pub fn id<'chunk_graph>(&self, chunk_graph: &'chunk_graph ChunkGraph) -> &'chunk_graph str {
-    chunk_graph
-      .get_module_id(self.identifier)
-      .as_ref()
-      .expect("module id not found")
-      .as_str()
+  async fn create_cache_snapshot(
+    &self,
+    file_system_info: &FileSystemInfo,
+    build_start_time: u64,
+  ) -> Result<Option<Snapshot>> {
+    let build_info = self.build_info.read();
+    if !build_info.cacheable || self.options.resource.as_str().is_empty() {
+      return Ok(None);
+    }
+
+    Ok(Some(
+      file_system_info
+        .create_snapshot(
+          Some(build_start_time),
+          &build_info.dependencies.file,
+          &build_info.dependencies.context,
+          &build_info.dependencies.missing,
+          file_system_info.context_module_strategy(),
+        )
+        .await?,
+    ))
   }
 
-  fn get_fake_map(
+  fn get_module_id<'a>(&self, module_ids: &'a ModuleIdsArtifact) -> &'a ModuleId {
+    ChunkGraph::get_module_id(module_ids, self.identifier).expect("module id not found")
+  }
+
+  pub fn get_context_options(&self) -> &ContextOptions {
+    &self.options.context_options
+  }
+
+  fn get_fake_map<'a>(
     &self,
-    dependencies: impl IntoIterator<Item = &DependencyId>,
+    dependencies: impl IntoIterator<Item = &'a DependencyId>,
     compilation: &Compilation,
   ) -> FakeMapValue {
     let dependencies = dependencies.into_iter();
@@ -229,16 +362,15 @@ impl ContextModule {
           .map(|m| (m, dep_id))
       })
       .filter_map(|(m, dep)| {
-        compilation
-          .chunk_graph
-          .get_module_id(*m)
-          .clone()
-          .map(|id| (id, dep))
+        ChunkGraph::get_module_id(&compilation.module_ids_artifact, *m)
+          .map(|id| (id.to_string(), dep))
       })
-      .sorted_unstable_by_key(|(module_id, _)| module_id.to_string());
+      .sorted_unstable_by_key(|(module_id, _)| module_id.clone());
     for (module_id, dep) in sorted_modules {
       let exports_type = get_exports_type_with_strict(
-        &compilation.get_module_graph(),
+        module_graph,
+        &compilation.module_graph_cache_artifact,
+        &compilation.exports_info_artifact,
         dep,
         matches!(
           self.options.context_options.namespace_object,
@@ -276,8 +408,39 @@ impl ContextModule {
 
   fn get_fake_map_init_statement(&self, fake_map: &FakeMapValue) -> String {
     match fake_map {
-      FakeMapValue::Bit(_) => "".to_string(),
-      FakeMapValue::Map(map) => format!("var fakeMap = {}", json_stringify(map)),
+      FakeMapValue::Bit(_) => String::new(),
+      FakeMapValue::Map(map) => format!("var fakeMap = {}", json_stringify_pretty(map)),
+    }
+  }
+
+  fn get_module_deferred_async_deps_map<'a>(
+    &self,
+    dependencies: impl IntoIterator<Item = &'a DependencyId>,
+    compilation: &Compilation,
+  ) -> HashMap<String, Vec<ModuleId>> {
+    let module_graph = compilation.get_module_graph();
+    let mut map: HashMap<String, Vec<ModuleId>> = HashMap::default();
+    for dep_id in dependencies {
+      if let Some(module) = module_graph.get_module_by_dependency_id(dep_id)
+        && !module.build_meta().has_top_level_await()
+      {
+        let id = ChunkGraph::get_module_id(&compilation.module_ids_artifact, module.identifier());
+        if let Some(id) = id {
+          let async_deps = get_outgoing_async_modules(compilation, module.as_ref());
+          map.insert(id.to_string(), async_deps.into_iter().collect());
+        }
+      }
+    }
+    map
+  }
+
+  fn get_module_deferred_async_deps_map_init_statement(
+    &self,
+    async_deps_map: Option<&HashMap<String, Vec<ModuleId>>>,
+  ) -> String {
+    match async_deps_map {
+      Some(map) => format!("var asyncDepsMap = {};", json_stringify_pretty(map)),
+      None => String::new(),
     }
   }
 
@@ -285,50 +448,88 @@ impl ContextModule {
     &self,
     fake_map: &FakeMapValue,
     async_module: bool,
+    async_deps: Option<String>,
     fake_map_data_expr: &str,
+    runtime_template: &mut ModuleCodeTemplate,
   ) -> String {
-    if let FakeMapValue::Bit(bit) = fake_map {
-      return self.get_return(bit, async_module);
+    let source = if let FakeMapValue::Bit(bit) = fake_map {
+      if *bit == FakeNamespaceObjectMode::NAMESPACE {
+        format!(
+          "{}(id)",
+          runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE)
+        )
+      } else {
+        Self::render_create_fake_namespace_object(
+          runtime_template,
+          format!("{bit}{}", if async_module { " | 16" } else { "" }),
+        )
+      }
+    } else {
+      Self::render_create_fake_namespace_object(
+        runtime_template,
+        format!(
+          "{fake_map_data_expr}{}",
+          if async_module { " | 16" } else { "" }
+        ),
+      )
+    };
+
+    if let Some(async_deps) = async_deps {
+      if !async_module {
+        panic!("Must be async when module is deferred");
+      }
+      let mode = if let FakeMapValue::Bit(bit) = fake_map {
+        Cow::Owned(bit.bits().to_string())
+      } else {
+        fake_map_data_expr.into()
+      };
+      let make_deferred =
+        runtime_template.render_runtime_globals(&RuntimeGlobals::MAKE_DEFERRED_NAMESPACE_OBJECT);
+      let async_transitive = runtime_template
+        .render_runtime_globals(&RuntimeGlobals::DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES);
+      let require = runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE);
+      return format!(
+        "{async_deps} ? {async_deps}.length ? {async_transitive}({async_deps}).then({make_deferred}.bind({require}, id, {mode} ^ 1 | 16)) : {make_deferred}(id, {mode} ^ 1 | 16) : {source}"
+      );
     }
-    format!(
-      "return {}(id, {}{});",
-      RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT,
-      fake_map_data_expr,
-      if async_module { " | 16" } else { "" },
-    )
+
+    source
   }
 
-  fn get_return(&self, fake_map_bit: &FakeNamespaceObjectMode, async_module: bool) -> String {
-    if *fake_map_bit == FakeNamespaceObjectMode::NAMESPACE {
-      return format!("return {}(id);", RuntimeGlobals::REQUIRE);
+  fn render_create_fake_namespace_object(
+    runtime_template: &mut ModuleCodeTemplate,
+    mode: String,
+  ) -> String {
+    let create_fake_namespace_object =
+      runtime_template.render_runtime_globals(&RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT);
+    if runtime_template.render_mode() == RuntimeGlobalsRenderMode::RspackExport {
+      let require = runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE);
+      format!("{create_fake_namespace_object}.call({require}, id, {mode})")
+    } else {
+      format!("{create_fake_namespace_object}(id, {mode})")
     }
-    format!(
-      "return {}(id, {}{});",
-      RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT,
-      fake_map_bit,
-      if async_module { " | 16" } else { "" },
-    )
   }
 
   fn get_user_request_map(
     &self,
-    dependencies: impl IntoIterator<Item = &DependencyId>,
+    dependencies: &[DependencyRef],
     compilation: &Compilation,
   ) -> FxIndexMap<String, Option<String>> {
     let module_graph = compilation.get_module_graph();
-    let dependencies = dependencies.into_iter();
     dependencies
-      .filter_map(|dep_id| {
-        let dep = module_graph.dependency_by_id(dep_id).and_then(|dep| {
-          if let Some(d) = dep.as_module_dependency() {
-            Some(d.user_request().to_string())
-          } else {
-            dep.as_context_dependency().map(|d| d.request().to_string())
-          }
-        });
+      .iter()
+      .filter_map(|dependency| {
+        let dep = if let Some(d) = dependency.as_module_dependency() {
+          Some(d.user_request().to_string())
+        } else {
+          dependency
+            .as_context_dependency()
+            .map(|d| d.request().to_string())
+        };
         let module_id = module_graph
-          .module_identifier_by_dependency_id(dep_id)
-          .and_then(|module| compilation.chunk_graph.get_module_id(*module).clone());
+          .module_identifier_by_dependency_id(dependency.id())
+          .and_then(|module| ChunkGraph::get_module_id(&compilation.module_ids_artifact, *module))
+          .map(|s| s.to_string());
         // module_id could be None in weak mode
         dep.map(|dep| (dep, module_id))
       })
@@ -336,9 +537,13 @@ impl ContextModule {
       .collect()
   }
 
-  fn get_source_for_empty_async_context(&self, compilation: &Compilation) -> BoxSource {
-    RawSource::from(formatdoc! {r#"
-      function webpackEmptyAsyncContext(req) {{
+  fn get_source_for_empty_async_context(
+    &self,
+    compilation: &Compilation,
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
+    formatdoc! {r#"
+      function __rspack_empty_async_context(req) {{
         // Here Promise.resolve().then() is used instead of new Promise() to prevent
         // uncaught exception popping up in devtools
         return Promise.resolve().then(function() {{
@@ -347,88 +552,256 @@ impl ContextModule {
           throw e;
         }});
       }}
-      webpackEmptyAsyncContext.keys = {keys};
-      webpackEmptyAsyncContext.resolve = webpackEmptyAsyncContext;
-      webpackEmptyAsyncContext.id = {id};
-      module.exports = webpackEmptyAsyncContext;
+      __rspack_empty_async_context.keys = {keys};
+      __rspack_empty_async_context.resolve = __rspack_empty_async_context;
+      __rspack_empty_async_context.id = {id};
+      {module}.exports = __rspack_empty_async_context;
       "#,
-      keys = returning_function("[]", ""),
-      id = json_stringify(self.id(&compilation.chunk_graph))
-    })
-    .boxed()
+      module = runtime_template.render_module_argument(ModuleArgument::Module),
+      keys = runtime_template.returning_function("[]", ""),
+      id = json_stringify(self.get_module_id(&compilation.module_ids_artifact))
+    }
   }
 
-  fn get_source_for_empty_context(&self, compilation: &Compilation) -> BoxSource {
-    RawSource::from(formatdoc! {r#"
-      function webpackEmptyContext(req) {{
+  fn get_source_for_empty_context(
+    &self,
+    compilation: &Compilation,
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
+    formatdoc! {r#"
+      function __rspack_empty_context(req) {{
         var e = new Error("Cannot find module '" + req + "'");
         e.code = 'MODULE_NOT_FOUND';
         throw e;
       }}
-      webpackEmptyContext.keys = {keys};
-      webpackEmptyContext.resolve = webpackEmptyContext;
-      webpackEmptyContext.id = {id};
-      module.exports = webpackEmptyContext;
+      __rspack_empty_context.keys = {keys};
+      __rspack_empty_context.resolve = __rspack_empty_context;
+      __rspack_empty_context.id = {id};
+      {module}.exports = __rspack_empty_context;
       "#,
-      keys = returning_function("[]", ""),
-      id = json_stringify(self.id(&compilation.chunk_graph))
-    })
-    .boxed()
+      module = runtime_template.render_module_argument(ModuleArgument::Module),
+      keys = runtime_template.returning_function("[]", ""),
+      id = json_stringify(self.get_module_id(&compilation.module_ids_artifact))
+    }
+  }
+
+  fn get_empty_object_export_source(&self, runtime_template: &mut ModuleCodeTemplate) -> String {
+    concat_string!(
+      "\n",
+      runtime_template.render_module_argument(ModuleArgument::Module),
+      ".exports = {};\n"
+    )
+  }
+
+  fn append_glob_map_entry(entries: &mut String, index: usize, user_request: &str, value: &str) {
+    if index > 0 {
+      entries.push_str(",\n");
+    }
+    entries.push_str("\n  ");
+    entries.push_str(&json_stringify(user_request));
+    entries.push_str(": ");
+    entries.push_str(value);
+  }
+
+  fn get_glob_object_export_source(
+    &self,
+    runtime_template: &mut ModuleCodeTemplate,
+    entries: String,
+  ) -> String {
+    concat_string!(
+      "\n",
+      runtime_template.render_module_argument(ModuleArgument::Module),
+      ".exports = {\n",
+      entries,
+      "\n};\n"
+    )
+  }
+
+  fn get_glob_import_property_access(&self) -> Option<String> {
+    self
+      .options
+      .context_options
+      .glob_import
+      .as_deref()
+      .filter(|import| *import != "*")
+      .map(|import| property_access([import], 0))
+  }
+
+  fn get_sorted_context_block_info(&self, compilation: &Compilation) -> Vec<ContextBlockInfo> {
+    let module_graph = compilation.get_module_graph();
+    let mut block_info: Vec<_> = self
+      .get_blocks()
+      .iter()
+      .filter_map(|b| {
+        let block = module_graph.block_by_id(b)?;
+        let dependency = block.get_dependencies().first()?;
+        let user_request = dependency
+          .as_module_dependency()
+          .map(|d| d.user_request().to_string())
+          .or_else(|| {
+            dependency
+              .as_context_dependency()
+              .map(|d| d.request().to_string())
+          })?;
+        Some(ContextBlockInfo {
+          user_request,
+          dep_id: *dependency.id(),
+          block_id: block.identifier(),
+        })
+      })
+      .collect();
+    block_info.sort_unstable_by(|a, b| a.user_request.cmp(&b.user_request));
+    block_info
+  }
+
+  fn get_glob_source(
+    &self,
+    compilation: &Compilation,
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
+    match &self.options.context_options.mode {
+      ContextMode::Lazy => {
+        if self.get_blocks().is_empty() {
+          return self.get_empty_object_export_source(runtime_template);
+        }
+        let block_info = self.get_sorted_context_block_info(compilation);
+
+        let mut entries = String::with_capacity(block_info.len() * 96);
+        for (i, info) in block_info.iter().enumerate() {
+          let mut import_promise = runtime_template.module_namespace_promise(
+            compilation,
+            self.identifier,
+            &info.dep_id,
+            Some(&info.block_id),
+            &info.user_request,
+            DependencyCategory::Esm.as_str(),
+            false,
+            self.options.context_options.phase.unwrap_or_default(),
+          );
+          if let Some(access) = self.get_glob_import_property_access() {
+            import_promise = concat_string!(
+              import_promise,
+              ".then(function(m) { return m",
+              access,
+              "; })"
+            );
+          }
+          Self::append_glob_map_entry(
+            &mut entries,
+            i,
+            &info.user_request,
+            &concat_string!("function() { return ", import_promise, "; }"),
+          );
+        }
+
+        self.get_glob_object_export_source(runtime_template, entries)
+      }
+      _ => {
+        if self.get_dependencies().is_empty() {
+          return self.get_empty_object_export_source(runtime_template);
+        }
+        let map = self.get_user_request_map(self.get_dependencies(), compilation);
+        let fake_map = self.get_fake_map(self.get_dependency_ids(), compilation);
+        let return_module_object = self.get_return_module_object_source(
+          &fake_map,
+          false,
+          None,
+          "fakeMap[id]",
+          runtime_template,
+        );
+
+        let mut entries = String::with_capacity(map.len() * 64);
+        let glob_import_access = self.get_glob_import_property_access();
+        for (i, (user_request, module_id)) in map.iter().enumerate() {
+          let module_id_expr = if let Some(id) = module_id {
+            let mut module_expr = format!(
+              "function() {{ var id = {}; return {return_module_object}; }}()",
+              json_stringify(id)
+            );
+            if let Some(access) = &glob_import_access {
+              module_expr.push_str(access);
+            }
+            module_expr
+          } else {
+            concat_string!("undefined /* ", json_stringify(user_request), " */")
+          };
+          Self::append_glob_map_entry(&mut entries, i, user_request, &module_id_expr);
+        }
+
+        concat_string!(
+          "\n",
+          self.get_fake_map_init_statement(&fake_map),
+          "\n",
+          runtime_template.render_module_argument(ModuleArgument::Module),
+          ".exports = {\n",
+          entries,
+          "\n};\n"
+        )
+      }
+    }
   }
 
   #[inline]
   fn get_source_string(
     &self,
     compilation: &Compilation,
-    code_gen_result: &mut CodeGenerationResult,
-  ) -> BoxSource {
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
+    if let ContextModulePattern::Glob(_) = &self.options.context_options.pattern {
+      return self.get_glob_source(compilation, runtime_template);
+    }
+
     match self.options.context_options.mode {
       ContextMode::Lazy => {
         if !self.get_blocks().is_empty() {
-          self.get_lazy_source(compilation)
+          self.get_lazy_source(compilation, runtime_template)
         } else {
-          self.get_source_for_empty_async_context(compilation)
+          self.get_source_for_empty_async_context(compilation, runtime_template)
         }
       }
       ContextMode::Eager => {
         if !self.get_dependencies().is_empty() {
-          self.get_eager_source(compilation)
+          self.get_eager_source(compilation, runtime_template)
         } else {
-          self.get_source_for_empty_async_context(compilation)
+          self.get_source_for_empty_async_context(compilation, runtime_template)
         }
       }
       ContextMode::LazyOnce => {
         if let Some(block) = self.get_blocks().first() {
-          self.get_lazy_once_source(compilation, block, code_gen_result)
+          self.get_lazy_once_source(compilation, block, runtime_template)
         } else {
-          self.get_source_for_empty_async_context(compilation)
+          self.get_source_for_empty_async_context(compilation, runtime_template)
         }
       }
       ContextMode::AsyncWeak => {
         if !self.get_dependencies().is_empty() {
-          self.get_async_weak_source(compilation)
+          self.get_async_weak_source(compilation, runtime_template)
         } else {
-          self.get_source_for_empty_async_context(compilation)
+          self.get_source_for_empty_async_context(compilation, runtime_template)
         }
       }
       ContextMode::Weak => {
         if !self.get_dependencies().is_empty() {
-          self.get_sync_weak_source(compilation)
+          self.get_sync_weak_source(compilation, runtime_template)
         } else {
-          self.get_source_for_empty_context(compilation)
+          self.get_source_for_empty_context(compilation, runtime_template)
         }
       }
       ContextMode::Sync => {
         if !self.get_dependencies().is_empty() {
-          self.get_sync_source(compilation)
+          self.get_sync_source(compilation, runtime_template)
         } else {
-          self.get_source_for_empty_context(compilation)
+          self.get_source_for_empty_context(compilation, runtime_template)
         }
       }
     }
   }
 
-  fn get_lazy_source(&self, compilation: &Compilation) -> BoxSource {
+  fn get_lazy_source(
+    &self,
+    compilation: &Compilation,
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
     let module_graph = compilation.get_module_graph();
     let blocks = self
       .get_blocks()
@@ -437,278 +810,370 @@ impl ContextModule {
     let block_and_first_dependency_list = blocks
       .clone()
       .filter_map(|b| b.get_dependencies().first().map(|d| (b, d)));
-    let first_dependencies = block_and_first_dependency_list.clone().map(|(_, d)| d);
+    let first_dependencies = block_and_first_dependency_list.clone().map(|(_, d)| d.id());
     let mut has_multiple_or_no_chunks = false;
     let mut has_no_chunk = true;
-    let fake_map = self.get_fake_map(first_dependencies, compilation);
+    let mut has_no_module_deferred = true;
+    let fake_map = self.get_fake_map(first_dependencies.clone(), compilation);
     let has_fake_map = matches!(fake_map, FakeMapValue::Map(_));
+
     let mut items = block_and_first_dependency_list
-      .filter_map(|(b, d)| {
-        let chunks = compilation
+      .filter_map(|(b, dependency)| {
+        let graph = &compilation.build_chunk_graph_artifact;
+        let group = graph
           .chunk_graph
-          .get_block_chunk_group(&b.identifier(), &compilation.chunk_group_by_ukey)
-          .map(|chunk_group| {
-            let chunks = &chunk_group.chunks;
-            if !chunks.is_empty() {
-              has_no_chunk = false;
-            }
-            if chunks.len() != 1 {
-              has_multiple_or_no_chunks = true;
-            }
-            chunks
-          });
-        let user_request = compilation
-          .get_module_graph()
-          .dependency_by_id(d)
-          .and_then(|dep| {
-            dep
-              .as_module_dependency()
-              .map(|d| d.user_request().to_string())
-              .or_else(|| dep.as_context_dependency().map(|d| d.request().to_string()))
+          .get_block_chunk_group(&b.identifier(), &graph.chunk_group_by_ukey)
+          .expect("should have block chunk group");
+        let chunks: Vec<_> = if compilation.hot
+          && let Some(chunk) = group.get_hmr_loading_chunk(compilation)
+        {
+          vec![chunk.expect_id()]
+        } else {
+          group
+            .chunks
+            .iter()
+            .map(|c| graph.chunk_by_ukey.expect_get(c).expect_id())
+            .collect()
+        };
+        if !chunks.is_empty() {
+          has_no_chunk = false;
+        }
+        if chunks.len() != 1 {
+          has_multiple_or_no_chunks = true;
+        }
+        let user_request = dependency
+          .as_module_dependency()
+          .map(|d| d.user_request().to_string())
+          .or_else(|| {
+            dependency
+              .as_context_dependency()
+              .map(|d| d.request().to_string())
           })?;
-        let module_id = module_graph
-          .module_identifier_by_dependency_id(d)
-          .and_then(|m| compilation.chunk_graph.get_module_id(*m).as_ref())?;
-        Some((chunks, user_request, module_id.to_string()))
+        let module = module_graph.get_module_by_dependency_id(dependency.id())?;
+        let module_id =
+          ChunkGraph::get_module_id(&compilation.module_ids_artifact, module.identifier())?;
+        let async_deps = (self
+          .options
+          .context_options
+          .phase
+          .unwrap_or_default()
+          .is_defer()
+          && !module.build_meta().has_top_level_await())
+        .then(|| {
+          has_no_module_deferred = false;
+          get_outgoing_async_modules(compilation, module.as_ref())
+        });
+        Some((user_request, module_id.to_string(), chunks, async_deps))
       })
       .collect::<Vec<_>>();
-    let short_mode = has_no_chunk && !has_fake_map;
-    items.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    let short_mode = has_no_chunk && has_no_module_deferred && !has_fake_map;
+    items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let map = items
       .into_iter()
-      .map(|(chunks, user_request, module_id)| {
+      .map(|(user_request, module_id, chunks, async_deps)| {
         let value = if short_mode {
           serde_json::Value::String(module_id)
         } else {
-          let second = if let FakeMapValue::Map(fake_map) = &fake_map {
-            Some(fake_map[&module_id])
-          } else {
-            None
-          };
-          let mut array_start = vec![serde_json::json!(module_id)];
-          if let Some(second) = second {
-            array_start.push(serde_json::json!(second.bits()));
+          let mut array = vec![serde_json::json!(module_id)];
+          if let FakeMapValue::Map(fake_map) = &fake_map {
+            array.push(serde_json::json!(fake_map[&module_id].bits()));
           }
-          if let Some(chunks) = chunks {
-            array_start.extend(chunks.iter().map(|c| {
-              let chunk_id = compilation
-                .chunk_by_ukey
-                .expect_get(c)
-                .id
-                .as_ref()
-                .expect("should have chunk id in code generation");
-              serde_json::json!(chunk_id)
-            }))
+          if !has_no_chunk {
+            array.push(serde_json::json!(chunks));
           }
-          serde_json::json!(array_start)
+          if !has_no_module_deferred {
+            array.push(serde_json::json!(async_deps))
+          }
+          serde_json::json!(array)
         };
         (user_request, value)
       })
       .collect::<HashMap<_, _>>();
-    let chunks_start_position = if has_fake_map { 2 } else { 1 };
+
+    let chunks_position = if has_fake_map { 2 } else { 1 };
+    let async_deps_position = chunks_position + 1;
+    let fetch_priority = match &self.options.context_options.group_options {
+      Some(GroupOptions::ChunkGroup(group)) => group.fetch_priority,
+      _ => None,
+    };
+    let fetch_priority_arg = fetch_priority
+      .map(|x| format!(r#", "{x}""#))
+      .unwrap_or_default();
+    if fetch_priority.is_some() {
+      runtime_template
+        .runtime_requirements_mut()
+        .insert(RuntimeGlobals::HAS_FETCH_PRIORITY);
+    }
+
     let request_prefix = if has_no_chunk {
       "Promise.resolve()".to_string()
     } else if has_multiple_or_no_chunks {
-      format!(
-        "Promise.all(ids.slice({chunks_start_position}).map({}))",
-        RuntimeGlobals::ENSURE_CHUNK
-      )
+      let ensure_chunk = runtime_template.render_runtime_globals(&RuntimeGlobals::ENSURE_CHUNK);
+      if fetch_priority.is_some() {
+        format!(
+          r#"Promise.all(ids[{chunks_position}].map(function(chunkId) {{ return {ensure_chunk}(chunkId{fetch_priority_arg}); }}))"#
+        )
+      } else {
+        format!(
+          "Promise.all(ids[{chunks_position}].map(function(chunkId) {{ return {ensure_chunk}(chunkId); }}))"
+        )
+      }
     } else {
+      let mut chunks_position_buffer = itoa::Buffer::new();
+      let chunks_position_str = chunks_position_buffer.format(chunks_position);
       format!(
-        "{}(ids[{}])",
-        RuntimeGlobals::ENSURE_CHUNK,
-        chunks_start_position
+        "{}(ids[{}][0]{})",
+        runtime_template.render_runtime_globals(&RuntimeGlobals::ENSURE_CHUNK),
+        chunks_position_str,
+        fetch_priority_arg
       )
     };
     let return_module_object = self.get_return_module_object_source(
       &fake_map,
       true,
+      if has_no_module_deferred {
+        None
+      } else {
+        Some(format!("ids[{async_deps_position}]"))
+      },
       if short_mode { "invalid" } else { "ids[1]" },
+      runtime_template,
     );
-    let mut source = ConcatSource::default();
-    let webpack_async_context = if has_no_chunk {
-      formatdoc! {r#"
-        function webpackAsyncContext(req) {{
-          return Promise.resolve().then(function() {{
-            if(!{}(map, req)) {{
-              var e = new Error("Cannot find module '" + req + "'");
-              e.code = 'MODULE_NOT_FOUND';
-              throw e;
-            }}
 
-            {}
-            {return_module_object}
-          }});
-        }}
-        "#,
-        RuntimeGlobals::HAS_OWN_PROPERTY,
-        if short_mode {
-          "var id = map[req];"
-        } else {
-          "var ids = map[req], id = ids[0];"
-        }
-      }
-    } else {
+    let has_own_property =
+      runtime_template.render_runtime_globals(&RuntimeGlobals::HAS_OWN_PROPERTY);
+    let async_context = if has_no_chunk {
+      let then_function = runtime_template.basic_function(
+        "",
+        &formatdoc! {
+          r#"if(!{has_own_property}(map, req)) {{
+            var e = new Error("Cannot find module '" + req + "'");
+            e.code = 'MODULE_NOT_FOUND';
+            throw e;
+          }}
+
+          {}
+          return {return_module_object};"#,
+          if short_mode {
+            "var id = map[req];"
+          } else {
+            "var ids = map[req], id = ids[0];"
+          }
+        },
+      );
       formatdoc! {r#"
-        function webpackAsyncContext(req) {{
+        function __rspack_async_context(req) {{
+          return Promise.resolve().then({then_function});
+        }}
+      "#}
+    } else {
+      let then_function = runtime_template.returning_function(&return_module_object, "");
+      let module_not_found = runtime_template.basic_function(
+        "",
+        &formatdoc! {
+          r#"var e = new Error("Cannot find module '" + req + "'");
+            e.code = 'MODULE_NOT_FOUND';
+            throw e;"#
+        },
+      );
+      formatdoc! {r#"
+        function __rspack_async_context(req) {{
           if(!{}(map, req)) {{
-            return Promise.resolve().then(function() {{
-              var e = new Error("Cannot find module '" + req + "'");
-              e.code = 'MODULE_NOT_FOUND';
-              throw e;
-            }});
+            return Promise.resolve().then({module_not_found});
           }}
 
           var ids = map[req], id = ids[0];
-          return {request_prefix}.then(function() {{
-            {return_module_object}
-          }});
+          return {request_prefix}.then({then_function});
         }}
         "#,
-        RuntimeGlobals::HAS_OWN_PROPERTY,
+        runtime_template.render_runtime_globals(&RuntimeGlobals::HAS_OWN_PROPERTY),
       }
     };
-    source.add(RawSource::from(formatdoc! {r#"
+
+    formatdoc! {r#"
       var map = {map};
-      {webpack_async_context}
-      webpackAsyncContext.keys = {keys};
-      webpackAsyncContext.id = {id};
-      module.exports = webpackAsyncContext;
+      {async_context}
+      __rspack_async_context.keys = {keys};
+      __rspack_async_context.id = {id};
+      {module}.exports = __rspack_async_context;
       "#,
-      map = json_stringify(&map),
-      keys = returning_function("Object.keys(map)", ""),
-      id = json_stringify(self.id(&compilation.chunk_graph))
-    }));
-    source.boxed()
+      module = runtime_template.render_module_argument(ModuleArgument::Module),
+      map = json_stringify_pretty(&map),
+      keys = runtime_template.returning_function("Object.keys(map)", ""),
+      id = json_stringify(self.get_module_id(&compilation.module_ids_artifact))
+    }
   }
 
   fn get_lazy_once_source(
     &self,
     compilation: &Compilation,
     block_id: &AsyncDependenciesBlockIdentifier,
-    code_gen_result: &mut CodeGenerationResult,
-  ) -> BoxSource {
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
     let mg = compilation.get_module_graph();
     let block = mg.block_by_id_expect(block_id);
-    let dependencies = block.get_dependencies();
-    let promise = block_promise(
-      Some(block_id),
-      &mut code_gen_result.runtime_requirements,
-      compilation,
-      "lazy-once context",
+    let promise = runtime_template.block_promise(Some(block_id), compilation, "lazy-once context");
+    let map = self.get_user_request_map(block.get_dependencies(), compilation);
+    let fake_map = self.get_fake_map(block.get_dependency_ids(), compilation);
+    let async_deps_map = self
+      .options
+      .context_options
+      .phase
+      .unwrap_or_default()
+      .is_defer()
+      .then(|| self.get_module_deferred_async_deps_map(block.get_dependency_ids(), compilation));
+
+    let return_module_object_source = self.get_return_module_object_source(
+      &fake_map,
+      true,
+      async_deps_map
+        .is_some()
+        .then(|| "asyncDepsMap[id]".to_string()),
+      "fakeMap[id]",
+      runtime_template,
     );
-    let map = self.get_user_request_map(dependencies, compilation);
-    let fake_map = self.get_fake_map(dependencies, compilation);
-    let then_function = if !matches!(
-      fake_map,
-      FakeMapValue::Bit(FakeNamespaceObjectMode::NAMESPACE)
-    ) {
-      formatdoc! {r#"
-        function(id) {{
-          {}
+    let then_function = runtime_template.returning_function(&return_module_object_source, "id");
+
+    let has_own_property =
+      runtime_template.render_runtime_globals(&RuntimeGlobals::HAS_OWN_PROPERTY);
+    let module_not_found = runtime_template.basic_function(
+      "",
+      &formatdoc! {
+        r#"if(!{has_own_property}(map, req)) {{
+          var e = new Error("Cannot find module '" + req + "'");
+          e.code = 'MODULE_NOT_FOUND';
+          throw e;
         }}
-        "#,
-        self.get_return_module_object_source(&fake_map, true, "fakeMap[id]"),
-      }
-    } else {
-      RuntimeGlobals::REQUIRE.name().to_string()
-    };
-    let source = formatdoc! {r#"
+        return map[req];"#
+      },
+    );
+
+    formatdoc! {r#"
       var map = {map};
       {fake_map_init_statement}
+      {async_deps_map_init_statement}
 
-      function webpackAsyncContext(req) {{
-        return webpackAsyncContextResolve(req).then({then_function});
+      function __rspack_async_context(req) {{
+        return __rspack_async_context_resolve(req).then({then_function});
       }}
-      function webpackAsyncContextResolve(req) {{
-        return {promise}.then(function() {{
-          if(!{has_own_property}(map, req)) {{
-            var e = new Error("Cannot find module '" + req + "'");
-            e.code = 'MODULE_NOT_FOUND';
-            throw e;
-          }}
-          return map[req];
-        }})
+      function __rspack_async_context_resolve(req) {{
+        return {promise}.then({module_not_found});
       }}
-      webpackAsyncContext.keys = {keys};
-      webpackAsyncContext.resolve = webpackAsyncContextResolve;
-      webpackAsyncContext.id = {id};
-      module.exports = webpackAsyncContext;
+      __rspack_async_context.keys = {keys};
+      __rspack_async_context.resolve = __rspack_async_context_resolve;
+      __rspack_async_context.id = {id};
+      {module}.exports = __rspack_async_context;
       "#,
-      map = json_stringify(&map),
+      module = runtime_template.render_module_argument(ModuleArgument::Module),
+      map = json_stringify_pretty(&map),
       fake_map_init_statement = self.get_fake_map_init_statement(&fake_map),
-      has_own_property = RuntimeGlobals::HAS_OWN_PROPERTY,
-      keys = returning_function("Object.keys(map)", ""),
-      id = json_stringify(self.id(&compilation.chunk_graph))
-    };
-    RawSource::from(source).boxed()
+      async_deps_map_init_statement = self.get_module_deferred_async_deps_map_init_statement(async_deps_map.as_ref()),
+      keys = runtime_template.returning_function("Object.keys(map)", ""),
+      id = json_stringify(self.get_module_id(&compilation.module_ids_artifact))
+    }
   }
 
-  fn get_async_weak_source(&self, compilation: &Compilation) -> BoxSource {
-    let dependencies = self.get_dependencies();
-    let map = self.get_user_request_map(dependencies, compilation);
-    let fake_map = self.get_fake_map(dependencies, compilation);
-    let return_module_object = self.get_return_module_object_source(&fake_map, true, "fakeMap[id]");
-    let source = formatdoc! {r#"
+  fn get_async_weak_source(
+    &self,
+    compilation: &Compilation,
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
+    let map = self.get_user_request_map(self.get_dependencies(), compilation);
+    let fake_map = self.get_fake_map(self.get_dependency_ids(), compilation);
+    let async_deps_map = self
+      .options
+      .context_options
+      .phase
+      .unwrap_or_default()
+      .is_defer()
+      .then(|| self.get_module_deferred_async_deps_map(self.get_dependency_ids(), compilation));
+
+    let return_module_object = self.get_return_module_object_source(
+      &fake_map,
+      true,
+      async_deps_map
+        .is_some()
+        .then(|| "asyncDepsMap[id]".to_string()),
+      "fakeMap[id]",
+      runtime_template,
+    );
+    let module_factories =
+      runtime_template.render_runtime_globals(&RuntimeGlobals::MODULE_FACTORIES);
+    let then_function = runtime_template.basic_function(
+      "id",
+      &formatdoc! {
+        r#"if(!{module_factories}[id]) {{
+          var e = new Error("Module '" + req + "' ('" + id + "') is not available (weak dependency)");
+          e.code = 'MODULE_NOT_FOUND';
+          throw e;
+        }}
+        return {return_module_object};"#
+      },
+    );
+    let has_own_property =
+      runtime_template.render_runtime_globals(&RuntimeGlobals::HAS_OWN_PROPERTY);
+    let module_not_found = runtime_template.basic_function(
+      "",
+      &formatdoc! {
+        r#"if(!{has_own_property}(map, req)) {{
+          var e = new Error("Cannot find module '" + req + "'");
+          e.code = 'MODULE_NOT_FOUND';
+          throw e;
+        }}
+        return map[req];"#
+      },
+    );
+
+    formatdoc! {r#"
       var map = {map};
       {fake_map_init_statement}
+      {async_deps_map_init_statement}
 
-      function webpackAsyncContext(req) {{
-        return webpackAsyncContextResolve(req).then(function(id) {{
-          if(!{module_factories}[id]) {{
-            var e = new Error("Module '" + req + "' ('" + id + "') is not available (weak dependency)");
-            e.code = 'MODULE_NOT_FOUND';
-            throw e;
-          }}
-          {return_module_object}
-        }});
+      function __rspack_async_context(req) {{
+        return __rspack_async_context_resolve(req).then({then_function});
       }}
-      function webpackAsyncContextResolve(req) {{
+      function __rspack_async_context_resolve(req) {{
         // Here Promise.resolve().then() is used instead of new Promise() to prevent
         // uncaught exception popping up in devtools
-        return Promise.resolve().then(function() {{
-          if(!{has_own_property}(map, req)) {{
-            var e = new Error("Cannot find module '" + req + "'");
-            e.code = 'MODULE_NOT_FOUND';
-            throw e;
-          }}
-          return map[req];
-        }})
+        return Promise.resolve().then({module_not_found});
       }}
-      webpackAsyncContext.keys = {keys};
-      webpackAsyncContext.resolve = webpackAsyncContextResolve;
-      webpackAsyncContext.id = {id};
-      module.exports = webpackAsyncContext;
+      __rspack_async_context.keys = {keys};
+      __rspack_async_context.resolve = __rspack_async_context_resolve;
+      __rspack_async_context.id = {id};
+      {module}.exports = __rspack_async_context;
       "#,
-      map = json_stringify(&map),
+      module = runtime_template.render_module_argument(ModuleArgument::Module),
+      map = json_stringify_pretty(&map),
       fake_map_init_statement = self.get_fake_map_init_statement(&fake_map),
-      module_factories = RuntimeGlobals::MODULE_FACTORIES,
-      has_own_property = RuntimeGlobals::HAS_OWN_PROPERTY,
-      keys = returning_function("Object.keys(map)", ""),
-      id = json_stringify(self.id(&compilation.chunk_graph))
-    };
-    RawSource::from(source).boxed()
+      async_deps_map_init_statement = self.get_module_deferred_async_deps_map_init_statement(async_deps_map.as_ref()),
+      keys = runtime_template.returning_function("Object.keys(map)", ""),
+      id = json_stringify(self.get_module_id(&compilation.module_ids_artifact))
+    }
   }
 
-  fn get_sync_weak_source(&self, compilation: &Compilation) -> BoxSource {
-    let dependencies = self.get_dependencies();
-    let map = self.get_user_request_map(dependencies, compilation);
-    let fake_map = self.get_fake_map(dependencies, compilation);
-    let return_module_object = self.get_return_module_object_source(&fake_map, true, "fakeMap[id]");
-    let source = formatdoc! {r#"
+  fn get_sync_weak_source(
+    &self,
+    compilation: &Compilation,
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
+    let map = self.get_user_request_map(self.get_dependencies(), compilation);
+    let fake_map = self.get_fake_map(self.get_dependency_ids(), compilation);
+    let return_module_object =
+      self.get_return_module_object_source(&fake_map, true, None, "fakeMap[id]", runtime_template);
+    formatdoc! {r#"
       var map = {map};
       {fake_map_init_statement}
 
-      function webpackContext(req) {{
-        var id = webpackContextResolve(req);
+      function __rspack_context_module(req) {{
+        var id = __rspack_context_module_resolve(req);
         if(!{module_factories}[id]) {{
           var e = new Error("Module '" + req + "' ('" + id + "') is not available (weak dependency)");
           e.code = 'MODULE_NOT_FOUND';
           throw e;
         }}
-        {return_module_object}
+        return {return_module_object};
       }}
-      function webpackContextResolve(req) {{
+      function __rspack_context_module_resolve(req) {{
         if(!{has_own_property}(map, req)) {{
           var e = new Error("Cannot find module '" + req + "'");
           e.code = 'MODULE_NOT_FOUND';
@@ -716,87 +1181,104 @@ impl ContextModule {
         }}
         return map[req];
       }}
-      webpackContext.keys = {keys};
-      webpackContext.resolve = webpackContextResolve;
-      webpackContext.id = {id};
-      module.exports = webpackContext;
+      __rspack_context_module.keys = {keys};
+      __rspack_context_module.resolve = __rspack_context_module_resolve;
+      __rspack_context_module.id = {id};
+      {module}.exports = __rspack_context_module;
       "#,
-      map = json_stringify(&map),
+      module = runtime_template.render_module_argument(ModuleArgument::Module),
+      map = json_stringify_pretty(&map),
       fake_map_init_statement = self.get_fake_map_init_statement(&fake_map),
-      module_factories = RuntimeGlobals::MODULE_FACTORIES,
-      has_own_property = RuntimeGlobals::HAS_OWN_PROPERTY,
-      keys = returning_function("Object.keys(map)", ""),
-      id = json_stringify(self.id(&compilation.chunk_graph))
-    };
-    RawSource::from(source).boxed()
+      module_factories = runtime_template.render_runtime_globals(&RuntimeGlobals::MODULE_FACTORIES),
+      has_own_property = runtime_template.render_runtime_globals(&RuntimeGlobals::HAS_OWN_PROPERTY),
+      keys = runtime_template.returning_function("Object.keys(map)", ""),
+      id = json_stringify(self.get_module_id(&compilation.module_ids_artifact))
+    }
   }
 
-  fn get_eager_source(&self, compilation: &Compilation) -> BoxSource {
-    let dependencies = self.get_dependencies();
-    let map = self.get_user_request_map(dependencies, compilation);
-    let fake_map = self.get_fake_map(dependencies, compilation);
-    let then_function = if !matches!(
-      fake_map,
-      FakeMapValue::Bit(FakeNamespaceObjectMode::NAMESPACE)
-    ) {
-      formatdoc! {r#"
-        function(id) {{
-          {}
+  fn get_eager_source(
+    &self,
+    compilation: &Compilation,
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
+    let map = self.get_user_request_map(self.get_dependencies(), compilation);
+    let fake_map = self.get_fake_map(self.get_dependency_ids(), compilation);
+    let async_deps_map = self
+      .options
+      .context_options
+      .phase
+      .unwrap_or_default()
+      .is_defer()
+      .then(|| self.get_module_deferred_async_deps_map(self.get_dependency_ids(), compilation));
+    let return_module_object_source = self.get_return_module_object_source(
+      &fake_map,
+      true,
+      async_deps_map
+        .is_some()
+        .then(|| "asyncDepsMap[id]".to_string()),
+      "fakeMap[id]",
+      runtime_template,
+    );
+    let then_function = runtime_template.returning_function(&return_module_object_source, "id");
+    let has_own_property =
+      runtime_template.render_runtime_globals(&RuntimeGlobals::HAS_OWN_PROPERTY);
+    let module_not_found = runtime_template.basic_function(
+      "",
+      &formatdoc! {
+        r#"if(!{has_own_property}(map, req)) {{
+          var e = new Error("Cannot find module '" + req + "'");
+          e.code = 'MODULE_NOT_FOUND';
+          throw e;
         }}
-        "#,
-        self.get_return_module_object_source(&fake_map, false, "fakeMap[id]"),
-      }
-    } else {
-      RuntimeGlobals::REQUIRE.name().to_string()
-    };
-    let source = formatdoc! {r#"
+        return map[req];"#
+      },
+    );
+
+    formatdoc! {r#"
       var map = {map};
       {fake_map_init_statement}
+      {async_deps_map_init_statement}
 
-      function webpackAsyncContext(req) {{
-        return webpackAsyncContextResolve(req).then({then_function});
+      function __rspack_async_context(req) {{
+        return __rspack_async_context_resolve(req).then({then_function});
       }}
-      function webpackAsyncContextResolve(req) {{
+      function __rspack_async_context_resolve(req) {{
         // Here Promise.resolve().then() is used instead of new Promise() to prevent
         // uncaught exception popping up in devtools
-        return Promise.resolve().then(function() {{
-          if(!{has_own_property}(map, req)) {{
-            var e = new Error("Cannot find module '" + req + "'");
-            e.code = 'MODULE_NOT_FOUND';
-            throw e;
-          }}
-          return map[req];
-        }})
+        return Promise.resolve().then({module_not_found});
       }}
-      webpackAsyncContext.keys = {keys};
-      webpackAsyncContext.resolve = webpackAsyncContextResolve;
-      webpackAsyncContext.id = {id};
-      module.exports = webpackAsyncContext;
+      __rspack_async_context.keys = {keys};
+      __rspack_async_context.resolve = __rspack_async_context_resolve;
+      __rspack_async_context.id = {id};
+      {module}.exports = __rspack_async_context;
       "#,
-      map = json_stringify(&map),
+      module = runtime_template.render_module_argument(ModuleArgument::Module),
+      map = json_stringify_pretty(&map),
       fake_map_init_statement = self.get_fake_map_init_statement(&fake_map),
-      has_own_property = RuntimeGlobals::HAS_OWN_PROPERTY,
-      keys = returning_function("Object.keys(map)", ""),
-      id = json_stringify(self.id(&compilation.chunk_graph))
-    };
-    RawSource::from(source).boxed()
+      async_deps_map_init_statement = self.get_module_deferred_async_deps_map_init_statement(async_deps_map.as_ref()),
+      keys = runtime_template.returning_function("Object.keys(map)", ""),
+      id = json_stringify(self.get_module_id(&compilation.module_ids_artifact))
+    }
   }
 
-  fn get_sync_source(&self, compilation: &Compilation) -> BoxSource {
-    let dependencies = self.get_dependencies();
-    let map = self.get_user_request_map(dependencies, compilation);
-    let fake_map = self.get_fake_map(dependencies, compilation);
+  fn get_sync_source(
+    &self,
+    compilation: &Compilation,
+    runtime_template: &mut ModuleCodeTemplate,
+  ) -> String {
+    let map = self.get_user_request_map(self.get_dependencies(), compilation);
+    let fake_map = self.get_fake_map(self.get_dependency_ids(), compilation);
     let return_module_object =
-      self.get_return_module_object_source(&fake_map, false, "fakeMap[id]");
-    let source = formatdoc! {r#"
+      self.get_return_module_object_source(&fake_map, false, None, "fakeMap[id]", runtime_template);
+    formatdoc! {r#"
       var map = {map};
       {fake_map_init_statement}
 
-      function webpackContext(req) {{
-        var id = webpackContextResolve(req);
-        {return_module_object}
+      function __rspack_context_module(req) {{
+        var id = __rspack_context_module_resolve(req);
+        return {return_module_object};
       }}
-      function webpackContextResolve(req) {{
+      function __rspack_context_module_resolve(req) {{
         if(!{has_own_property}(map, req)) {{
           var e = new Error("Cannot find module '" + req + "'");
           e.code = 'MODULE_NOT_FOUND';
@@ -804,321 +1286,225 @@ impl ContextModule {
         }}
         return map[req];
       }}
-      webpackContext.keys = function webpackContextKeys() {{
-        return Object.keys(map);
-      }};
-      webpackContext.resolve = webpackContextResolve;
-      module.exports = webpackContext;
-      webpackContext.id = {id};
+      __rspack_context_module.keys = {keys};
+      __rspack_context_module.resolve = __rspack_context_module_resolve;
+      {module}.exports = __rspack_context_module;
+      __rspack_context_module.id = {id};
       "#,
-      map = json_stringify(&map),
+      module = runtime_template.render_module_argument(ModuleArgument::Module),
+      map = json_stringify_pretty(&map),
       fake_map_init_statement = self.get_fake_map_init_statement(&fake_map),
-      has_own_property = RuntimeGlobals::HAS_OWN_PROPERTY,
-      id = json_stringify(self.id(&compilation.chunk_graph))
-    };
-    RawSource::from(source).boxed()
+      has_own_property = runtime_template.render_runtime_globals(&RuntimeGlobals::HAS_OWN_PROPERTY),
+      keys = runtime_template.returning_function("Object.keys(map)", ""),
+      id = json_stringify(self.get_module_id(&compilation.module_ids_artifact))
+    }
+  }
+
+  fn get_source(&self, source_string: String, compilation: &Compilation) -> BoxSource {
+    let source_map_kind = self.get_source_map_kind();
+    if source_map_kind.enabled() {
+      let source_protocol = compilation.options.experiments.runtime_mode.to_string();
+      OriginalSource::new(
+        source_string,
+        format!(
+          "{source_protocol}://{}",
+          make_paths_relative(&compilation.options.context, self.identifier.as_str(),)
+        ),
+      )
+      .boxed()
+    } else {
+      RawStringSource::from(source_string).boxed()
+    }
   }
 }
 
 impl DependenciesBlock for ContextModule {
-  fn add_block_id(&mut self, block: AsyncDependenciesBlockIdentifier) {
-    self.blocks.push(block)
+  fn dependencies_block(&self) -> &DependenciesBlockData {
+    &self.dependencies_block
   }
 
-  fn get_blocks(&self) -> &[AsyncDependenciesBlockIdentifier] {
-    &self.blocks
-  }
-
-  fn add_dependency_id(&mut self, dependency: DependencyId) {
-    self.dependencies.push(dependency)
-  }
-
-  fn get_dependencies(&self) -> &[DependencyId] {
-    &self.dependencies
+  fn dependencies_block_mut(&mut self) -> &mut DependenciesBlockData {
+    &mut self.dependencies_block
   }
 }
 
+#[cacheable_dyn]
 #[async_trait::async_trait]
 impl Module for ContextModule {
   impl_module_meta_info!();
 
   fn module_type(&self) -> &ModuleType {
-    &ModuleType::Js
+    &ModuleType::JsAuto
   }
 
-  fn source_types(&self) -> &[SourceType] {
+  fn source_types(&self, _module_graph: &ModuleGraph) -> &[SourceType] {
     &[SourceType::JavaScript]
   }
 
-  fn get_diagnostics(&self) -> Vec<Diagnostic> {
-    vec![]
-  }
-  fn original_source(&self) -> Option<&dyn rspack_sources::Source> {
+  fn source(&self) -> Option<&rspack_sources::BoxSource> {
     None
   }
 
-  fn readable_identifier(&self, _context: &crate::Context) -> std::borrow::Cow<str> {
-    self.identifier.as_str().into()
+  fn readable_identifier(&self, context: &crate::Context) -> std::borrow::Cow<'_, str> {
+    let identifier = contextify(
+      context,
+      if self.options.resource.as_str().is_empty() {
+        "false"
+      } else {
+        self.options.resource.as_str()
+      },
+    );
+    create_identifier(&self.options, Some(identifier.as_str()))
+      .to_string()
+      .into()
   }
 
-  fn size(&self, _source_type: &crate::SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&crate::SourceType>) -> f64 {
     160.0
   }
 
-  fn lib_ident(&self, options: LibIdentOptions) -> Option<Cow<str>> {
-    let mut id = contextify(options.context, &self.options.resource);
-    id.push(' ');
-    id.push_str(self.options.context_options.mode.as_str());
-    if self.options.context_options.recursive {
-      id.push_str(" recursive");
+  fn lib_ident(&self, options: LibIdentOptions) -> Option<Cow<'_, str>> {
+    let mut id = String::new();
+    if let Some(layer) = &self.options.layer {
+      id += "(";
+      id += layer;
+      id += ")/";
     }
-    if let Some(regexp) = &self.options.context_options.reg_exp {
-      id.push(' ');
-      id.push_str(&regexp.to_pretty_string(true));
+    id += &contextify(
+      options.context,
+      if self.options.resource.as_str().is_empty() {
+        "false"
+      } else {
+        self.options.resource.as_str()
+      },
+    );
+    id += " ";
+    id += self.options.context_options.mode.as_str();
+    if self.options.context_options.recursive {
+      id += " recursive";
+    }
+    if !self.options.addon.is_empty() {
+      id += " ";
+      id += &self.options.addon;
+    }
+    if let Some(regexp) = self.options.context_options.pattern.to_pretty_string(true) {
+      id += " ";
+      id += &regexp;
+    }
+    if let Some(include) = &self.options.context_options.include {
+      id += " include: ";
+      id += &include.to_pretty_string(true);
+    }
+    if let Some(exclude) = &self.options.context_options.exclude {
+      id += " exclude: ";
+      id += &exclude.to_pretty_string(true);
+    }
+    if let Some(specifiers) = &self.options.context_options.referenced_specifiers {
+      id += " referencedExports: ";
+      id += &specifiers
+        .iter()
+        .map(ReferencedSpecifier::to_identifier_string)
+        .join(", ");
+    }
+    if let Some(import) = &self.options.context_options.glob_import {
+      id += " globImport: ";
+      id += import;
+    }
+    if self.options.context_options.glob_exhaustive {
+      id += " globExhaustive";
+    }
+    append_context_identifier(&mut id, &self.options.context_options, " context: ");
+    if !self.options.context_options.glob_case_sensitive {
+      id += " globCaseInsensitive";
     }
     Some(Cow::Owned(id))
   }
 
-  async fn build(
-    &mut self,
-    build_context: BuildContext<'_>,
-    _: Option<&Compilation>,
-  ) -> Result<BuildResult> {
-    let (dependencies, blocks) = self.resolve_dependencies()?;
+  async fn need_build(&self, context: &NeedBuildContext<'_>) -> Result<bool> {
+    if self.force_build {
+      return Ok(true);
+    }
 
-    let mut hasher = RspackHash::from(&build_context.compiler_options.output);
-    self.update_hash(&mut hasher);
+    let Some(build_info) = self.build_info.frozen() else {
+      return Ok(true);
+    };
+    if !build_info.cacheable {
+      return Ok(true);
+    }
 
-    let mut context_dependencies: HashSet<PathBuf> = Default::default();
-    context_dependencies.insert(PathBuf::from(&self.options.resource));
-
-    let build_info = BuildInfo {
-      hash: Some(hasher.digest(&build_context.compiler_options.output.hash_digest)),
-      context_dependencies,
-      ..Default::default()
+    let Some(snapshot) = &build_info.snapshot else {
+      return Ok(!self.options.resource.as_str().is_empty());
     };
 
-    Ok(BuildResult {
-      build_info,
-      build_meta: BuildMeta {
-        exports_type: BuildMetaExportsType::Default,
-        default_object: BuildMetaDefaultObject::RedirectWarn,
-        ..Default::default()
-      },
-      dependencies,
-      blocks,
-      analyze_result: Default::default(),
-      optimization_bailouts: vec![],
-    })
+    if context
+      .value_cache_versions
+      .has_diff(&build_info.value_dependencies)
+    {
+      return Ok(true);
+    }
+
+    Ok(matches!(
+      context
+        .file_system_info
+        .check_snapshot_valid(snapshot)
+        .await?,
+      SnapshotValidationResult::Invalid { .. }
+    ))
   }
 
-  fn code_generation(
+  async fn prepare_for_cache(
     &self,
-    compilation: &Compilation,
-    _runtime: Option<&RuntimeSpec>,
-    _: Option<ConcatenationScope>,
-  ) -> Result<CodeGenerationResult> {
-    let mut code_generation_result = CodeGenerationResult::default();
-    let source = self.get_source_string(compilation, &mut code_generation_result);
-    code_generation_result.add(SourceType::JavaScript, source);
-    let mut all_deps = self.get_dependencies().to_vec();
-    let module_graph = compilation.get_module_graph();
-    for block in self.get_blocks() {
-      let block = module_graph
-        .block_by_id(block)
-        .expect("should have block in ContextModule code_generation");
-      all_deps.extend(block.get_dependencies());
-    }
-    code_generation_result
-      .runtime_requirements
-      .insert(RuntimeGlobals::MODULE);
-    code_generation_result
-      .runtime_requirements
-      .insert(RuntimeGlobals::HAS_OWN_PROPERTY);
-    if !all_deps.is_empty() {
-      code_generation_result
-        .runtime_requirements
-        .insert(RuntimeGlobals::REQUIRE);
-      match self.options.context_options.mode {
-        ContextMode::Weak => {
-          code_generation_result
-            .runtime_requirements
-            .insert(RuntimeGlobals::MODULE_FACTORIES);
-        }
-        ContextMode::AsyncWeak => {
-          code_generation_result
-            .runtime_requirements
-            .insert(RuntimeGlobals::MODULE_FACTORIES);
-          code_generation_result
-            .runtime_requirements
-            .insert(RuntimeGlobals::ENSURE_CHUNK);
-        }
-        ContextMode::Lazy | ContextMode::LazyOnce => {
-          code_generation_result
-            .runtime_requirements
-            .insert(RuntimeGlobals::ENSURE_CHUNK);
-        }
-        _ => {}
-      }
-      let fake_map = self.get_fake_map(all_deps.iter(), compilation);
-      if !matches!(fake_map, FakeMapValue::Bit(bit) if bit == FakeNamespaceObjectMode::NAMESPACE) {
-        code_generation_result
-          .runtime_requirements
-          .insert(RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT);
-      }
-    }
-    code_generation_result.set_hash(
-      &compilation.options.output.hash_function,
-      &compilation.options.output.hash_digest,
-      &compilation.options.output.hash_salt,
-    );
-    Ok(code_generation_result)
-  }
-}
-
-impl_empty_diagnosable_trait!(ContextModule);
-
-impl Identifiable for ContextModule {
-  fn identifier(&self) -> Identifier {
-    self.identifier
-  }
-}
-
-impl Hash for ContextModule {
-  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    "__rspack_internal__ContextModule".hash(state);
-    self.identifier.hash(state);
-  }
-}
-
-static WEBPACK_CHUNK_NAME_PLACEHOLDER: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"\[index|request\]").expect("regexp init failed"));
-static WEBPACK_CHUNK_NAME_INDEX_PLACEHOLDER: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"\[index\]").expect("regexp init failed"));
-static WEBPACK_CHUNK_NAME_REQUEST_PLACEHOLDER: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"\[request\]").expect("regexp init failed"));
-
-impl ContextModule {
-  fn visit_dirs(
-    ctx: &str,
-    dir: &Path,
-    dependencies: &mut Vec<ContextElementDependency>,
-    options: &ContextModuleOptions,
-    resolve_options: &ResolveInnerOptions,
+    file_system_info: &FileSystemInfo,
+    build_start_time: u64,
   ) -> Result<()> {
-    if !dir.is_dir() {
-      return Ok(());
-    }
-    for entry in fs::read_dir(dir).into_diagnostic()? {
-      let path = entry.into_diagnostic()?.path();
-      if path.is_dir() {
-        if options.context_options.recursive {
-          Self::visit_dirs(ctx, &path, dependencies, options, resolve_options)?;
-        }
-      } else if path
-        .file_name()
-        .map_or(false, |name| name.to_string_lossy().starts_with('.'))
-      {
-        // ignore hidden files
-        continue;
-      } else {
-        // FIXME: nodejs resolver return path of context, sometimes is '/a/b', sometimes is '/a/b/'
-        let relative_path = {
-          let p = path
-            .to_string_lossy()
-            .to_string()
-            .drain(ctx.len()..)
-            .collect::<String>()
-            .replace('\\', "/");
-          if p.starts_with('/') {
-            format!(".{p}")
-          } else {
-            format!("./{p}")
-          }
-        };
-        let requests = alternative_requests(
-          resolve_options,
-          vec![AlternativeRequest::new(ctx.to_string(), relative_path)],
-        );
-
-        let Some(reg_exp) = &options.context_options.reg_exp else {
-          return Ok(());
-        };
-
-        requests.iter().for_each(|r| {
-          if !reg_exp.test(&r.request) {
-            return;
-          }
-          dependencies.push(ContextElementDependency {
-            id: DependencyId::new(),
-            request: format!(
-              "{}{}{}{}",
-              options.addon,
-              r.request,
-              options.resource_query.clone(),
-              options.resource_fragment.clone(),
-            ),
-            user_request: r.request.to_string(),
-            category: options.context_options.category,
-            context: options.resource.clone().into(),
-            options: options.context_options.clone(),
-            resource_identifier: format!("context{}|{}", &options.resource, path.to_string_lossy()),
-            referenced_exports: None,
-          });
-        })
-      }
-    }
+    let snapshot = self
+      .create_cache_snapshot(file_system_info, build_start_time)
+      .await?;
+    self
+      .build_info
+      .update(|build_info| build_info.snapshot = snapshot);
     Ok(())
   }
 
-  fn resolve_dependencies(&self) -> Result<(Vec<BoxDependency>, Vec<AsyncDependenciesBlock>)> {
-    tracing::trace!("resolving context module path {}", self.options.resource);
-
-    let resolver = &self.resolve_factory.get(ResolveOptionsWithDependencyType {
-      resolve_options: self.options.resolve_options.clone(),
-      resolve_to_context: false,
-      dependency_category: self.options.context_options.category,
-    });
-
-    let mut context_element_dependencies = vec![];
-    Self::visit_dirs(
-      &self.options.resource,
-      Path::new(&self.options.resource),
-      &mut context_element_dependencies,
-      &self.options,
-      &resolver.options(),
-    )?;
-    context_element_dependencies.sort_by_cached_key(|d| d.user_request.to_string());
-
-    tracing::trace!(
-      "resolving dependencies for {:?}",
-      context_element_dependencies
-    );
+  async fn build(
+    mut self: Box<Self>,
+    _build_context: Arc<BuildContext>,
+    _: Option<&Compilation>,
+  ) -> Result<BoxModule> {
+    self.build_info.get_mut().snapshot = None;
+    let resolve_dependencies = self
+      .resolve_dependencies
+      .take()
+      .expect("context module should have a resolver before building");
+    let context_element_dependencies = resolve_dependencies(self.options.clone()).await?;
 
     let mut dependencies: Vec<BoxDependency> = vec![];
     let mut blocks = vec![];
     if matches!(self.options.context_options.mode, ContextMode::LazyOnce)
       && !context_element_dependencies.is_empty()
     {
+      let loc = DependencyLocation::Real(RealDependencyLocation::new(
+        (
+          self.options.context_options.start,
+          self.options.context_options.end,
+        )
+          .into(),
+        None,
+      ));
       let mut block = AsyncDependenciesBlock::new(
-        self.identifier,
-        Some(
-          (
-            self.options.context_options.start,
-            self.options.context_options.end,
-          )
-            .into(),
-        ),
+        (*self.identifier).into(),
+        Some(loc),
         None,
         context_element_dependencies
           .into_iter()
-          .map(|dep| Box::new(dep) as Box<dyn Dependency>)
+          .map(BoxDependency::new)
           .collect(),
+        None,
       );
       if let Some(group_options) = &self.options.context_options.group_options {
         block.set_group_options(group_options.clone());
       }
-      blocks.push(block);
+      blocks.push(Box::new(block));
     } else if matches!(self.options.context_options.mode, ContextMode::Lazy) {
       let mut index = 0;
       for context_element_dependency in context_element_dependencies {
@@ -1131,53 +1517,108 @@ impl ContextModule {
         let name = group_options
           .and_then(|group_options| group_options.name.as_ref())
           .map(|name| {
-            let name = if !WEBPACK_CHUNK_NAME_PLACEHOLDER.is_match(name) {
-              Cow::Owned(format!("{name}[index]"))
+            let name = if !(name.contains(CHUNK_NAME_INDEX_PLACEHOLDER)
+              || name.contains(CHUNK_NAME_REQUEST_PLACEHOLDER))
+            {
+              Cow::Owned(format!("{name}{CHUNK_NAME_INDEX_PLACEHOLDER}"))
             } else {
               Cow::Borrowed(name)
             };
-            let name = WEBPACK_CHUNK_NAME_INDEX_PLACEHOLDER
-              .replace_all(&name, |_: &Captures| index.to_string());
+
+            let name = name.cow_replace(CHUNK_NAME_INDEX_PLACEHOLDER, &index.to_string());
+            let name = name.cow_replace(
+              CHUNK_NAME_REQUEST_PLACEHOLDER,
+              &to_path(&context_element_dependency.user_request),
+            );
+
             index += 1;
-            let name = WEBPACK_CHUNK_NAME_REQUEST_PLACEHOLDER.replace_all(&name, |_: &Captures| {
-              to_path(&context_element_dependency.user_request)
-            });
             name.into_owned()
           });
         let preload_order = group_options.and_then(|o| o.preload_order);
         let prefetch_order = group_options.and_then(|o| o.prefetch_order);
+        let fetch_priority = group_options.and_then(|o| o.fetch_priority);
         let mut block = AsyncDependenciesBlock::new(
-          self.identifier,
-          Some(
-            (
-              self.options.context_options.start,
-              self.options.context_options.end,
-            )
-              .into(),
-          ),
+          (*self.identifier).into(),
+          None,
           Some(&context_element_dependency.user_request.clone()),
-          vec![Box::new(context_element_dependency)],
+          vec![BoxDependency::new(context_element_dependency)],
+          Some(self.options.context_options.request.clone()),
         );
         block.set_group_options(GroupOptions::ChunkGroup(ChunkGroupOptions::new(
           name,
           preload_order,
           prefetch_order,
+          fetch_priority,
         )));
-        blocks.push(block);
+        blocks.push(Box::new(block));
       }
     } else {
       dependencies = context_element_dependencies
         .into_iter()
-        .map(|d| Box::new(d) as BoxDependency)
+        .map(BoxDependency::new)
         .collect();
     }
 
-    Ok((dependencies, blocks))
+    if !self.options.resource.as_str().is_empty() {
+      let mut context_dependencies: InternedPathSet = Default::default();
+      context_dependencies.insert(self.options.resource.as_std_path().into());
+      self.build_info.get_mut().dependencies.context = context_dependencies;
+    }
+
+    self.force_build = false;
+    Ok(BoxModule::new(self).with_dependencies(
+      dependencies.into_iter().map(Into::into).collect(),
+      blocks.into_iter().map(Into::into).collect(),
+    ))
+  }
+
+  // #[tracing::instrument("ContextModule::code_generation", skip_all, fields(identifier = ?self.identifier()))]
+  async fn code_generation(
+    &self,
+    code_generation_context: &mut ModuleCodeGenerationContext,
+  ) -> Result<CodeGenerationResultBuilder> {
+    let ModuleCodeGenerationContext {
+      compilation,
+      runtime_template,
+      ..
+    } = code_generation_context;
+    let mut code_generation_result = CodeGenerationResultBuilder::default();
+    let source = self.get_source(
+      self.get_source_string(compilation, runtime_template),
+      compilation,
+    );
+    code_generation_result.add(SourceType::JavaScript, source);
+
+    Ok(code_generation_result)
+  }
+
+  async fn get_runtime_hash(
+    &self,
+    compilation: &Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    let mut hasher = RspackHasher::from(&compilation.options.output);
+    module_update_hash(self, &mut hasher, compilation, runtime);
+    Ok(hasher.digest(&compilation.options.output.hash_digest))
   }
 }
 
-fn create_identifier(options: &ContextModuleOptions) -> Identifier {
-  let mut id = String::from(&options.resource);
+impl_empty_diagnosable_trait!(ContextModule);
+
+impl Identifiable for ContextModule {
+  fn identifier(&self) -> Identifier {
+    self.identifier
+  }
+}
+
+fn create_identifier(options: &ContextModuleOptions, resource: Option<&str>) -> Identifier {
+  let mut id = resource
+    .unwrap_or(if options.resource.as_str().is_empty() {
+      "false"
+    } else {
+      options.resource.as_str()
+    })
+    .to_owned();
   if !options.resource_query.is_empty() {
     id += "|";
     id += &options.resource_query;
@@ -1195,18 +1636,37 @@ fn create_identifier(options: &ContextModuleOptions) -> Identifier {
     id += "|";
     id += &options.addon;
   }
-  if let Some(regexp) = &options.context_options.reg_exp {
+  if let Some(pattern) = options.context_options.pattern.to_pretty_string(false) {
     id += "|";
-    id += &regexp.to_pretty_string(false);
+    id += &pattern;
   }
   if let Some(include) = &options.context_options.include {
     id += "|include: ";
-    id += &include;
+    id += &include.to_source_string();
   }
   if let Some(exclude) = &options.context_options.exclude {
     id += "|exclude: ";
-    id += &exclude;
+    id += &exclude.to_source_string();
   }
+  if let Some(specifiers) = &options.context_options.referenced_specifiers {
+    id += "|referencedExports: ";
+    id += &specifiers
+      .iter()
+      .map(ReferencedSpecifier::to_identifier_string)
+      .join(", ");
+  }
+  if let Some(import) = &options.context_options.glob_import {
+    id += "|globImport: ";
+    id += import;
+  }
+  if options.context_options.glob_exhaustive {
+    id += "|globExhaustive";
+  }
+  append_context_identifier(&mut id, &options.context_options, "|context: ");
+  if !options.context_options.glob_case_sensitive {
+    id += "|globCaseInsensitive";
+  }
+
   if let Some(GroupOptions::ChunkGroup(group)) = &options.context_options.group_options {
     if let Some(chunk_name) = &group.name {
       id += "|chunkName: ";
@@ -1214,12 +1674,13 @@ fn create_identifier(options: &ContextModuleOptions) -> Identifier {
     }
     id += "|groupOptions: {";
     if let Some(o) = group.prefetch_order {
-      id += "prefetchOrder: ";
-      id += &o.to_string();
+      write!(id, "prefetchOrder: {o},").expect("infallible write to String");
     }
     if let Some(o) = group.preload_order {
-      id += "preloadOrder: ";
-      id += &o.to_string();
+      write!(id, "preloadOrder: {o},").expect("infallible write to String");
+    }
+    if let Some(o) = group.fetch_priority {
+      write!(id, "fetchPriority: {o},").expect("infallible write to String");
     }
     id += "}";
   }
@@ -1228,68 +1689,28 @@ fn create_identifier(options: &ContextModuleOptions) -> Identifier {
     ContextNameSpaceObject::Bool(true) => "|namespace object",
     _ => "",
   };
+  if let Some(attributes) = &options.context_options.attributes {
+    id += "|importAttributes: ";
+    id += &simd_json::to_string(attributes).expect("json stringify failed");
+  }
+  if let Some(phase) = &options.context_options.phase {
+    id += "|importPhase: ";
+    id += phase.as_str();
+  }
+  if let Some(layer) = &options.layer {
+    id += "|layer: ";
+    id += layer;
+  }
   id.into()
 }
 
-pub fn normalize_context(str: &str) -> String {
-  if str == "./" || str == "." {
-    return "".to_string();
+fn append_context_identifier(id: &mut String, options: &ContextOptions, prefix: &str) {
+  if !matches!(options.pattern, ContextModulePattern::Glob(_)) {
+    return;
   }
-  if str.ends_with('/') {
-    return str.to_string();
-  }
-  str.to_string() + "/"
-}
-
-fn alternative_requests(
-  resolve_options: &ResolveInnerOptions,
-  mut items: Vec<AlternativeRequest>,
-) -> Vec<AlternativeRequest> {
-  // TODO: should respect fullySpecified resolve options
-  for item in std::mem::take(&mut items) {
-    if !resolve_options.is_enforce_extension_enabled() {
-      items.push(item.clone());
-    }
-    for ext in resolve_options.extensions() {
-      if item.request.ends_with(ext) {
-        items.push(AlternativeRequest::new(
-          item.context.clone(),
-          item.request[..(item.request.len() - ext.len())].to_string(),
-        ));
-      }
-    }
-  }
-
-  for item in std::mem::take(&mut items) {
-    items.push(item.clone());
-    for main_file in resolve_options.main_files() {
-      if item.request.ends_with(&format!("/{main_file}")) {
-        items.push(AlternativeRequest::new(
-          item.context.clone(),
-          item.request[..(item.request.len() - main_file.len())].to_string(),
-        ));
-        items.push(AlternativeRequest::new(
-          item.context.clone(),
-          item.request[..(item.request.len() - main_file.len() - 1)].to_string(),
-        ));
-      }
-    }
-  }
-
-  for item in std::mem::take(&mut items) {
-    items.push(item.clone());
-    // TODO resolveOptions.modules can be array
-    for module in resolve_options.modules() {
-      let dir = module.replace('\\', "/");
-      let full_path: String = format!("{}{}", item.context.replace('\\', "/"), &item.request[1..]);
-      if full_path.starts_with(&dir) {
-        items.push(AlternativeRequest::new(
-          item.context.clone(),
-          full_path[(dir.len() + 1)..].to_string(),
-        ));
-      }
-    }
-  }
-
-  items
+  let Some(context) = context_identifier(&options.compiler_context, &options.context) else {
+    return;
+  };
+  id.push_str(prefix);
+  id.push_str(&context);
 }

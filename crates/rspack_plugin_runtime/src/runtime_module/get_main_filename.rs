@@ -1,66 +1,107 @@
 use rspack_core::{
-  impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  ChunkUkey, Compilation, Filename, PathData, RuntimeGlobals, RuntimeModule,
+  Compilation, Filename, PathData, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext,
+  RuntimeTemplate, SourceType, impl_runtime_module,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
 #[derive(Debug)]
 pub struct GetMainFilenameRuntimeModule {
-  chunk: Option<ChunkUkey>,
-  id: Identifier,
   global: RuntimeGlobals,
   filename: Filename,
 }
 
-impl Eq for GetMainFilenameRuntimeModule {}
-
 impl GetMainFilenameRuntimeModule {
-  pub fn new(content_type: &'static str, global: RuntimeGlobals, filename: Filename) -> Self {
-    Self {
-      chunk: None,
-      id: Identifier::from(format!("webpack/runtime/get_main_filename/{content_type}")),
+  pub fn new(
+    runtime_template: &RuntimeTemplate,
+    content_type: &'static str,
+    global: RuntimeGlobals,
+    filename: Filename,
+  ) -> Self {
+    Self::with_name(
+      runtime_template,
+      &format!("get_main_filename/{content_type}"),
       global,
       filename,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
-    }
+    )
   }
 }
 
+#[async_trait::async_trait]
 impl RuntimeModule for GetMainFilenameRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
   }
 
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    if let Some(chunk_ukey) = self.chunk {
-      let chunk = compilation.chunk_by_ukey.expect_get(&chunk_ukey);
-      let filename = compilation.get_path(
-        &self.filename,
-        PathData::default()
-          .chunk(chunk)
-          .hash(format!("\" + {}() + \"", RuntimeGlobals::GET_FULL_HASH).as_str())
-          .runtime(&chunk.runtime),
-      )?;
-      Ok(
-        RawSource::from(format!(
-          "{} = function () {{
-            return \"{}\";
-         }};
-        ",
-          self.global, filename
-        ))
-        .boxed(),
-      )
-    } else {
-      unreachable!("should attach chunk for get_main_filename")
+  fn runtime_requirements(
+    &self,
+    compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      dependencies: {
+        if compilation
+          .options
+          .output
+          .hot_update_main_filename
+          .has_hash_placeholder()
+        {
+          RuntimeGlobals::GET_FULL_HASH
+        } else {
+          RuntimeGlobals::default()
+        }
+      },
+      define: { self.global },
+      ..Default::default()
     }
   }
 
-  fn attach(&mut self, chunk: ChunkUkey) {
-    self.chunk = Some(chunk);
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
+    let runtime_template = context.runtime_template;
+    if let Some(chunk_ukey) = self.chunk() {
+      let chunk = compilation
+        .build_chunk_graph_artifact
+        .chunk_by_ukey
+        .expect_get(&chunk_ukey);
+      let filename = compilation
+        .get_path(
+          &self.filename,
+          PathData::default()
+            .chunk(chunk.ukey(), compilation)
+            .chunk_id_optional(chunk.id().map(|id| id.as_str()))
+            .chunk_hash_optional(chunk.rendered_hash(
+              &compilation.chunk_hashes_artifact,
+              compilation.options.output.hash_digest_length,
+            ))
+            .chunk_name_optional(chunk.name_for_filename_template())
+            .content_hash_optional(chunk.rendered_content_hash_by_source_type(
+              &compilation.chunk_hashes_artifact,
+              &SourceType::JavaScript,
+              compilation.options.output.hash_digest_length,
+            ))
+            .hash(
+              format!(
+                "\" + {}() + \"",
+                runtime_template.render_runtime_globals(&RuntimeGlobals::GET_FULL_HASH)
+              )
+              .as_str(),
+            )
+            .runtime(chunk.runtime().as_str()),
+        )
+        .await?;
+
+      Ok(format!(
+        "{} = function () {{
+            return \"{}\";
+         }};
+        ",
+        runtime_template.render_runtime_global_definition(&self.global),
+        filename,
+      ))
+    } else {
+      unreachable!("should attach chunk for get_main_filename")
+    }
   }
 }

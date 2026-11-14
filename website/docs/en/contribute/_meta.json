@@ -1,0 +1,17 @@
+[
+  {
+    "type": "section-header",
+    "label": "Start"
+  },
+  "index",
+  {
+    "type": "dir-section-header",
+    "name": "development",
+    "label": "Development"
+  },
+  {
+    "type": "dir-section-header",
+    "name": "architecture",
+    "label": "Architecture"
+  }
+]

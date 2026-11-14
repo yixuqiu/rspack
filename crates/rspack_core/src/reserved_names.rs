@@ -1,6 +1,16 @@
-pub const RESERVED_NAMES: [&str; 188] = [
-  "__WEBPACK_DEFAULT_EXPORT__",
-  "__WEBPACK_NAMESPACE_OBJECT__",
+use std::sync::LazyLock;
+
+use rspack_intern::Atom;
+use rustc_hash::FxHashSet;
+
+pub const RESERVED_NAMES: [&str; 192] = [
+  "__rspack_default_export",
+  "__rspack_ns_object",
+  // Chunk bootstrap declarations must not be captured by concatenated modules.
+  "__webpack_modules__",
+  "__webpack_module_cache__",
+  "__rspack_modules",
+  "__rspack_module_cache",
   "abstract",
   "arguments",
   "async",
@@ -188,3 +198,21 @@ pub const RESERVED_NAMES: [&str; 188] = [
   "onmousedown",
   "onsubmit",
 ];
+
+pub static RESERVED_NAMES_ATOM_SET: LazyLock<FxHashSet<Atom>> =
+  LazyLock::new(|| RESERVED_NAMES.iter().map(|name| Atom::new(*name)).collect());
+
+#[cfg(test)]
+mod tests {
+  use rspack_intern::Atom;
+
+  use super::{RESERVED_NAMES, RESERVED_NAMES_ATOM_SET};
+
+  #[test]
+  fn reserved_names_atom_set_matches_reserved_names() {
+    assert_eq!(RESERVED_NAMES_ATOM_SET.len(), RESERVED_NAMES.len());
+    for name in RESERVED_NAMES {
+      assert!(RESERVED_NAMES_ATOM_SET.contains(&Atom::new(name)));
+    }
+  }
+}

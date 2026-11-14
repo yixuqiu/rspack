@@ -1,12 +1,14 @@
-use std::{fmt, sync::Arc};
+use std::{
+  fmt,
+  path::Path,
+  sync::{Arc, LazyLock},
+};
 
-use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use rspack_core::{
-  ApplyContext, BoxModule, Compilation, CompilationParams, CompilerCompilation, CompilerFinishMake,
-  CompilerOptions, DependencyType, EntryOptions, ModuleFactoryCreateData, NormalModuleCreateData,
-  NormalModuleFactoryModule, Plugin, PluginContext,
+  BoxDependency, BoxModule, Compilation, CompilationParams, CompilerCompilation,
+  CompilerFinishMake, DependencyType, EntryOptions, ModuleFactoryCreateData,
+  NormalModuleCreateData, NormalModuleFactoryModule, Plugin,
 };
 use rspack_error::{Diagnostic, Result};
 use rspack_hook::{plugin, plugin_hook};
@@ -15,29 +17,38 @@ use rustc_hash::FxHashMap;
 use tokio::sync::RwLock;
 
 use super::{
-  provide_shared_dependency::ProvideSharedDependency,
+  find_ancestor_description_data, provide_shared_dependency::ProvideSharedDependency,
   provide_shared_module_factory::ProvideSharedModuleFactory,
 };
+use crate::{ConsumeVersion, ShareScope};
 
-static RELATIVE_REQUEST: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^(\/|[A-Za-z]:\\|\\\\|\.\.?(\/|$))").expect("Invalid regex"));
-static ABSOLUTE_REQUEST: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^(\/|[A-Za-z]:\\|\\\\)").expect("Invalid regex"));
+static RELATIVE_REQUEST: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"^(\/|[A-Za-z]:\\|\\\\|\.\.?(\/|$))").expect("Invalid regex"));
+static ABSOLUTE_REQUEST: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"^(\/|[A-Za-z]:\\|\\\\)").expect("Invalid regex"));
 
 #[derive(Debug, Clone)]
 pub struct ProvideOptions {
   pub share_key: String,
-  pub share_scope: String,
+  pub share_scope: ShareScope,
   pub version: Option<ProvideVersion>,
   pub eager: bool,
+  pub singleton: Option<bool>,
+  pub required_version: Option<ConsumeVersion>,
+  pub strict_version: Option<bool>,
+  pub tree_shaking_mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct VersionedProvideOptions {
   pub share_key: String,
-  pub share_scope: String,
+  pub share_scope: ShareScope,
   pub version: ProvideVersion,
   pub eager: bool,
+  pub singleton: Option<bool>,
+  pub required_version: Option<ConsumeVersion>,
+  pub strict_version: Option<bool>,
+  pub tree_shaking_mode: Option<String>,
 }
 
 impl ProvideOptions {
@@ -47,10 +58,15 @@ impl ProvideOptions {
       share_scope: self.share_scope.clone(),
       version: self.version.clone().unwrap_or_default(),
       eager: self.eager,
+      singleton: self.singleton,
+      required_version: self.required_version.clone(),
+      strict_version: self.strict_version,
+      tree_shaking_mode: self.tree_shaking_mode.clone(),
     }
   }
 }
 
+#[rspack_cacheable::cacheable]
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub enum ProvideVersion {
   Version(String),
@@ -61,7 +77,7 @@ pub enum ProvideVersion {
 impl fmt::Display for ProvideVersion {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      ProvideVersion::Version(v) => write!(f, "{}", v),
+      ProvideVersion::Version(v) => write!(f, "{v}"),
       ProvideVersion::False => write!(f, "0"),
     }
   }
@@ -86,14 +102,46 @@ impl ProvideSharedPlugin {
     )
   }
 
+  /// For secondary entry points (e.g. `@mui/material/styles`) whose own
+  /// `package.json` has no `version`, walk up to the parent package and use
+  /// its version — but only when the shared key matches
+  /// `<parent_name>/<relative_path>`.
+  fn find_parent_package_version(description_path: &Path, share_key: &str) -> Option<String> {
+    let entry_dir = if description_path
+      .file_name()
+      .is_some_and(|name| name == "package.json")
+    {
+      description_path.parent()?
+    } else {
+      description_path
+    };
+
+    find_ancestor_description_data(entry_dir, |dir, parent| {
+      let parent_name = parent.get("name").and_then(|n| n.as_str())?;
+      let parent_version = parent.get("version").and_then(|v| v.as_str())?;
+      let rel = entry_dir.strip_prefix(dir).ok()?;
+      let rel_posix: String = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+      let expected_key = format!("{parent_name}/{rel_posix}");
+      (share_key == expected_key).then(|| parent_version.to_string())
+    })
+  }
+
   #[allow(clippy::too_many_arguments)]
   pub async fn provide_shared_module(
     &self,
     key: &str,
     share_key: &str,
-    share_scope: &str,
+    share_scope: &ShareScope,
     version: Option<&ProvideVersion>,
     eager: bool,
+    singleton: Option<bool>,
+    required_version: Option<ConsumeVersion>,
+    strict_version: Option<bool>,
+    tree_shaking_mode: Option<String>,
     resource: &str,
     resource_data: &ResourceData,
     mut add_diagnostic: impl FnMut(Diagnostic),
@@ -105,30 +153,54 @@ impl ProvideSharedPlugin {
         resource.to_string(),
         VersionedProvideOptions {
           share_key: share_key.to_string(),
-          share_scope: share_scope.to_string(),
+          share_scope: share_scope.clone(),
           version: version.to_owned(),
           eager,
+          singleton,
+          strict_version,
+          required_version,
+          tree_shaking_mode: tree_shaking_mode.clone(),
         },
       );
-    } else if let Some(description) = &resource_data.resource_description {
-      if let Some(description) = description.json().as_object()
-        && let Some(version) = description.get("version")
-        && let Some(version) = version.as_str()
-      {
+    } else if let Some(description) = resource_data.description() {
+      let version = description
+        .json()
+        .as_object()
+        .and_then(|d| d.get("version"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .or_else(|| Self::find_parent_package_version(description.path(), share_key));
+
+      if let Some(version) = version {
         self.resolved_provide_map.write().await.insert(
           resource.to_string(),
           VersionedProvideOptions {
             share_key: share_key.to_string(),
-            share_scope: share_scope.to_string(),
-            version: ProvideVersion::Version(version.to_string()),
+            share_scope: share_scope.clone(),
+            version: ProvideVersion::Version(version),
             eager,
+            singleton,
+            strict_version,
+            required_version,
+            tree_shaking_mode: tree_shaking_mode.clone(),
           },
         );
       } else {
-        add_diagnostic(Diagnostic::warn(title.to_string(), format!("{error_header} No version in description file (usually package.json). Add version to description file {}, or manually specify version in shared config. shared module {key} -> {resource}", description.path().display())));
+        add_diagnostic(Diagnostic::warn(
+          title.to_string(),
+          format!(
+            "{error_header} No version in description file (usually package.json). Add version to description file {}, or manually specify version in shared config. shared module {key} -> {resource}",
+            description.path().display()
+          ),
+        ));
       }
     } else {
-      add_diagnostic(Diagnostic::warn(title.to_string(), format!("{error_header} No description file (usually package.json) found. Add description file with name and version, or manually specify version in shared config. shared module {key} -> {resource}")));
+      add_diagnostic(Diagnostic::warn(
+        title.to_string(),
+        format!(
+          "{error_header} No description file (usually package.json) found. Add description file with name and version, or manually specify version in shared config. shared module {key} -> {resource}"
+        ),
+      ));
     }
   }
 }
@@ -153,11 +225,11 @@ async fn compilation(
   let mut prefix_match_provides = self.prefix_match_provides.write().await;
   for (request, config) in &self.provides {
     if RELATIVE_REQUEST.is_match(request) || ABSOLUTE_REQUEST.is_match(request) {
-      resolved_provide_map.insert(request.to_string(), config.to_versioned());
+      resolved_provide_map.insert(request.clone(), config.to_versioned());
     } else if request.ends_with('/') {
-      prefix_match_provides.insert(request.to_string(), config.clone());
+      prefix_match_provides.insert(request.clone(), config.clone());
     } else {
-      match_provides.insert(request.to_string(), config.clone());
+      match_provides.insert(request.clone(), config.clone());
     }
   }
   Ok(())
@@ -165,26 +237,32 @@ async fn compilation(
 
 #[plugin_hook(CompilerFinishMake for ProvideSharedPlugin)]
 async fn finish_make(&self, compilation: &mut Compilation) -> Result<()> {
-  for (resource, config) in self.resolved_provide_map.read().await.iter() {
-    compilation
-      .add_include(
-        Box::new(ProvideSharedDependency::new(
-          config.share_scope.to_string(),
-          config.share_key.to_string(),
+  let entries = self
+    .resolved_provide_map
+    .read()
+    .await
+    .iter()
+    .map(|(resource, config)| {
+      (
+        BoxDependency::new(ProvideSharedDependency::new(
+          config.share_scope.clone(),
+          config.share_key.clone(),
           config.version.clone(),
-          resource.to_string(),
+          resource.clone(),
           config.eager,
+          config.singleton,
+          config.required_version.clone(),
+          config.strict_version,
+          config.tree_shaking_mode.clone(),
         )),
         EntryOptions {
           name: None,
           ..Default::default()
         },
       )
-      .await?;
-  }
-  self.resolved_provide_map.write().await.clear();
-  self.match_provides.write().await.clear();
-  self.prefix_match_provides.write().await.clear();
+    })
+    .collect::<Vec<_>>();
+  compilation.add_include(entries).await?;
   Ok(())
 }
 
@@ -192,11 +270,11 @@ async fn finish_make(&self, compilation: &mut Compilation) -> Result<()> {
 async fn normal_module_factory_module(
   &self,
   data: &mut ModuleFactoryCreateData,
-  create_data: &mut NormalModuleCreateData,
+  create_data: &NormalModuleCreateData,
   _module: &mut BoxModule,
 ) -> Result<()> {
-  let resource = &create_data.resource_resolve_data.resource;
-  let resource_data = &create_data.resource_resolve_data;
+  let resource_data = create_data.resource_resolve_data();
+  let resource = resource_data.resource();
   if self
     .resolved_provide_map
     .read()
@@ -205,7 +283,7 @@ async fn normal_module_factory_module(
   {
     return Ok(());
   }
-  let request = &create_data.raw_request;
+  let request = &data.request;
   {
     let match_provides = self.match_provides.read().await;
     if let Some(config) = match_provides.get(request) {
@@ -216,6 +294,10 @@ async fn normal_module_factory_module(
           &config.share_scope,
           config.version.as_ref(),
           config.eager,
+          config.singleton,
+          config.required_version.clone(),
+          config.strict_version,
+          config.tree_shaking_mode.clone(),
           resource,
           resource_data,
           |d| data.diagnostics.push(d),
@@ -229,10 +311,14 @@ async fn normal_module_factory_module(
       self
         .provide_shared_module(
           request,
-          &(config.share_key.to_string() + remainder),
+          &(config.share_key.clone() + remainder),
           &config.share_scope,
           config.version.as_ref(),
           config.eager,
+          config.singleton,
+          config.required_version.clone(),
+          config.strict_version,
+          config.tree_shaking_mode.clone(),
           resource,
           resource_data,
           |d| data.diagnostics.push(d),
@@ -243,29 +329,15 @@ async fn normal_module_factory_module(
   Ok(())
 }
 
-#[async_trait]
 impl Plugin for ProvideSharedPlugin {
   fn name(&self) -> &'static str {
     "rspack.ProvideSharedPlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
+    ctx.compiler_hooks.finish_make.tap(finish_make::new(self));
     ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
-    ctx
-      .context
-      .compiler_hooks
-      .finish_make
-      .tap(finish_make::new(self));
-    ctx
-      .context
       .normal_module_factory_hooks
       .module
       .tap(normal_module_factory_module::new(self));

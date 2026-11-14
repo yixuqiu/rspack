@@ -1,0 +1,239 @@
+default:
+  Entrypoint main xx KiB = default/main.js
+  Entrypoint a xx KiB = default/a.js
+  Entrypoint b xx bytes = default/b.js
+  Entrypoint c xx bytes = default/c.js
+  chunk (runtime: a, main) default/async-g.js (async-g) xx bytes <{341}> <{724}> [rendered]
+    > ./g ./a.js 6:1-48
+    ./g.js xx bytes [built] [code generated]
+  chunk (runtime: a) default/a.js (a) xx bytes (javascript) xx KiB (runtime) >{138}< [entry] [rendered]
+    > ./a a
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: b) default/b.js (b) xx bytes [entry] [rendered]
+    > ./b b
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) default/async-b.js (async-b) xx bytes <{889}> [rendered]
+    > ./b ./index.js 2:1-48
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) default/async-a.js (async-a) xx bytes <{889}> >{138}< [rendered]
+    > ./a ./index.js 1:1-48
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: main) default/async-c.js (async-c) xx bytes <{889}> [rendered]
+    > ./c ./index.js 3:1-48
+    ./c.js xx bytes [built] [code generated]
+  chunk (runtime: main) default/main.js (main) xx bytes (javascript) xx KiB (runtime) >{701}< >{724}< >{742}< [entry] [rendered]
+    > ./ main
+    ./index.js xx bytes [built] [code generated]
+  chunk (runtime: c) default/c.js (c) xx bytes [entry] [rendered]
+    > ./c c
+    ./c.js xx bytes [built] [code generated]
+  default (Rspack x.x.x) compiled successfully
+
+all-chunks:
+  Entrypoint main xx KiB = all-chunks/main.js
+  Entrypoint a xx KiB = all-chunks/a.js
+  Entrypoint b xx bytes = all-chunks/b.js
+  Entrypoint c xx bytes = all-chunks/c.js
+  chunk (runtime: a, main) all-chunks/async-g.js (async-g) xx bytes <{341}> <{724}> [rendered]
+    > ./g ./a.js 6:1-48
+    ./g.js xx bytes [built] [code generated]
+  chunk (runtime: a) all-chunks/a.js (a) xx bytes (javascript) xx KiB (runtime) >{138}< [entry] [rendered]
+    > ./a a
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: b) all-chunks/b.js (b) xx bytes [entry] [rendered]
+    > ./b b
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) all-chunks/async-b.js (async-b) xx bytes <{889}> [rendered]
+    > ./b ./index.js 2:1-48
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) all-chunks/async-a.js (async-a) xx bytes <{889}> >{138}< [rendered]
+    > ./a ./index.js 1:1-48
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: main) all-chunks/async-c.js (async-c) xx bytes <{889}> [rendered]
+    > ./c ./index.js 3:1-48
+    ./c.js xx bytes [built] [code generated]
+  chunk (runtime: main) all-chunks/main.js (main) xx bytes (javascript) xx KiB (runtime) >{701}< >{724}< >{742}< [entry] [rendered]
+    > ./ main
+    ./index.js xx bytes [built] [code generated]
+  chunk (runtime: c) all-chunks/c.js (c) xx bytes [entry] [rendered]
+    > ./c c
+    ./c.js xx bytes [built] [code generated]
+  all-chunks (Rspack x.x.x) compiled successfully
+
+manual:
+  Entrypoint main xx KiB = manual/main.js
+  Entrypoint a xx KiB = manual/vendors.js xx bytes manual/a.js xx KiB
+  Entrypoint b xx KiB = manual/vendors.js xx bytes manual/b.js xx KiB
+  Entrypoint c xx KiB = manual/vendors.js xx bytes manual/c.js xx KiB
+  chunk (runtime: a, main) manual/async-g.js (async-g) xx bytes <{341}> <{545}> <{724}> [rendered]
+    > ./g ./a.js 6:1-48
+    ./g.js xx bytes [built] [code generated]
+  chunk (runtime: a) manual/a.js (a) xx bytes (javascript) xx KiB (runtime) ={545}= >{138}< [entry] [rendered]
+    > ./a a
+    > x a
+    > y a
+    > z a
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: b) manual/b.js (b) xx bytes (javascript) xx KiB (runtime) ={545}= [entry] [rendered]
+    > ./b b
+    > x b
+    > y b
+    > z b
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: a, b, c) manual/vendors.js (vendors) (id hint: vendors) xx bytes ={341}= ={364}= ={907}= >{138}< [initial] [rendered] split chunk (cache group: vendors) (name: vendors)
+    > ./a a
+    > x a
+    > y a
+    > z a
+    > ./b b
+    > x b
+    > y b
+    > z b
+    > ./c c
+    > x c
+    > y c
+    > z c
+    ./node_modules/x.js xx bytes [built] [code generated]
+    ./node_modules/y.js xx bytes [built] [code generated]
+    ./node_modules/z.js xx bytes [built] [code generated]
+  chunk (runtime: main) manual/async-b.js (async-b) xx bytes <{889}> [rendered]
+    > ./b ./index.js 2:1-48
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) manual/async-a.js (async-a) xx bytes <{889}> >{138}< [rendered]
+    > ./a ./index.js 1:1-48
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: main) manual/async-c.js (async-c) xx bytes <{889}> [rendered]
+    > ./c ./index.js 3:1-48
+    ./c.js xx bytes [built] [code generated]
+  chunk (runtime: main) manual/main.js (main) xx bytes (javascript) xx KiB (runtime) >{701}< >{724}< >{742}< [entry] [rendered]
+    > ./ main
+    ./index.js xx bytes [built] [code generated]
+  chunk (runtime: c) manual/c.js (c) xx bytes (javascript) xx KiB (runtime) ={545}= [entry] [rendered]
+    > ./c c
+    > x c
+    > y c
+    > z c
+    ./c.js xx bytes [built] [code generated]
+  manual (Rspack x.x.x) compiled successfully
+
+name-too-long:
+  Entrypoint main xx KiB = name-too-long/main.js
+  Entrypoint aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa xx KiB = name-too-long/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.js
+  Entrypoint bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb xx bytes = name-too-long/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.js
+  Entrypoint cccccccccccccccccccccccccccccc xx bytes = name-too-long/cccccccccccccccccccccccccccccc.js
+  chunk (runtime: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, main) name-too-long/async-g.js (async-g) xx bytes <{706}> <{724}> [rendered]
+    > ./g ./a.js 6:1-48
+    ./g.js xx bytes [built] [code generated]
+  chunk (runtime: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb) name-too-long/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.js (bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb) xx bytes [entry] [rendered]
+    > ./b bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) name-too-long/async-b.js (async-b) xx bytes <{889}> [rendered]
+    > ./b ./index.js 2:1-48
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) name-too-long/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.js (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) xx bytes (javascript) xx KiB (runtime) >{138}< [entry] [rendered]
+    > ./a aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: main) name-too-long/async-a.js (async-a) xx bytes <{889}> >{138}< [rendered]
+    > ./a ./index.js 1:1-48
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: main) name-too-long/async-c.js (async-c) xx bytes <{889}> [rendered]
+    > ./c ./index.js 3:1-48
+    ./c.js xx bytes [built] [code generated]
+  chunk (runtime: main) name-too-long/main.js (main) xx bytes (javascript) xx KiB (runtime) >{701}< >{724}< >{742}< [entry] [rendered]
+    > ./ main
+    ./index.js xx bytes [built] [code generated]
+  chunk (runtime: cccccccccccccccccccccccccccccc) name-too-long/cccccccccccccccccccccccccccccc.js (cccccccccccccccccccccccccccccc) xx bytes [entry] [rendered]
+    > ./c cccccccccccccccccccccccccccccc
+    ./c.js xx bytes [built] [code generated]
+  name-too-long (Rspack x.x.x) compiled successfully
+
+custom-chunks-filter:
+  Entrypoint main xx KiB = custom-chunks-filter/main.js
+  Entrypoint a xx KiB = custom-chunks-filter/a.js
+  Entrypoint b xx bytes = custom-chunks-filter/b.js
+  Entrypoint c xx bytes = custom-chunks-filter/c.js
+  chunk (runtime: a, main) custom-chunks-filter/async-g.js (async-g) xx bytes <{341}> <{724}> [rendered]
+    > ./g ./a.js 6:1-48
+    ./g.js xx bytes [built] [code generated]
+  chunk (runtime: a) custom-chunks-filter/a.js (a) xx bytes (javascript) xx KiB (runtime) >{138}< [entry] [rendered]
+    > ./a a
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: b) custom-chunks-filter/b.js (b) xx bytes [entry] [rendered]
+    > ./b b
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) custom-chunks-filter/async-b.js (async-b) xx bytes <{889}> [rendered]
+    > ./b ./index.js 2:1-48
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) custom-chunks-filter/async-a.js (async-a) xx bytes <{889}> >{138}< [rendered]
+    > ./a ./index.js 1:1-48
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: main) custom-chunks-filter/async-c.js (async-c) xx bytes <{889}> [rendered]
+    > ./c ./index.js 3:1-48
+    ./c.js xx bytes [built] [code generated]
+  chunk (runtime: main) custom-chunks-filter/main.js (main) xx bytes (javascript) xx KiB (runtime) >{701}< >{724}< >{742}< [entry] [rendered]
+    > ./ main
+    ./index.js xx bytes [built] [code generated]
+  chunk (runtime: c) custom-chunks-filter/c.js (c) xx bytes [entry] [rendered]
+    > ./c c
+    ./c.js xx bytes [built] [code generated]
+  custom-chunks-filter (Rspack x.x.x) compiled successfully
+
+custom-chunks-filter-in-cache-groups:
+  Entrypoint main xx KiB = custom-chunks-filter-in-cache-groups/main.js
+  Entrypoint a xx KiB = custom-chunks-filter-in-cache-groups/70.js xx bytes custom-chunks-filter-in-cache-groups/a.js xx KiB
+  Entrypoint b xx KiB = custom-chunks-filter-in-cache-groups/vendors.js xx bytes custom-chunks-filter-in-cache-groups/b.js xx KiB
+  Entrypoint c xx KiB = custom-chunks-filter-in-cache-groups/vendors.js xx bytes custom-chunks-filter-in-cache-groups/c.js xx KiB
+  chunk (runtime: a, main) custom-chunks-filter-in-cache-groups/async-g.js (async-g) xx bytes <{341}> <{70}> <{724}> [rendered]
+    > ./g ./a.js 6:1-48
+    ./g.js xx bytes [built] [code generated]
+  chunk (runtime: a) custom-chunks-filter-in-cache-groups/a.js (a) xx bytes (javascript) xx KiB (runtime) ={70}= >{138}< [entry] [rendered]
+    > ./a a
+    > x a
+    > y a
+    > z a
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: b) custom-chunks-filter-in-cache-groups/b.js (b) xx bytes (javascript) xx KiB (runtime) ={545}= [entry] [rendered]
+    > ./b b
+    > x b
+    > y b
+    > z b
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: b, c) custom-chunks-filter-in-cache-groups/vendors.js (vendors) (id hint: vendors) xx bytes ={364}= ={907}= [initial] [rendered] split chunk (cache group: vendors) (name: vendors)
+    > ./b b
+    > x b
+    > y b
+    > z b
+    > ./c c
+    > x c
+    > y c
+    > z c
+    ./node_modules/x.js xx bytes [built] [code generated]
+    ./node_modules/y.js xx bytes [built] [code generated]
+    ./node_modules/z.js xx bytes [built] [code generated]
+  chunk (runtime: a) custom-chunks-filter-in-cache-groups/70.js (id hint: vendors) xx bytes ={341}= >{138}< [initial] [rendered] split chunk (cache group: defaultVendors)
+    > ./a a
+    > x a
+    > y a
+    > z a
+    ./node_modules/x.js xx bytes [built] [code generated]
+    ./node_modules/y.js xx bytes [built] [code generated]
+    ./node_modules/z.js xx bytes [built] [code generated]
+  chunk (runtime: main) custom-chunks-filter-in-cache-groups/async-b.js (async-b) xx bytes <{889}> [rendered]
+    > ./b ./index.js 2:1-48
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) custom-chunks-filter-in-cache-groups/async-a.js (async-a) xx bytes <{889}> >{138}< [rendered]
+    > ./a ./index.js 1:1-48
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: main) custom-chunks-filter-in-cache-groups/async-c.js (async-c) xx bytes <{889}> [rendered]
+    > ./c ./index.js 3:1-48
+    ./c.js xx bytes [built] [code generated]
+  chunk (runtime: main) custom-chunks-filter-in-cache-groups/main.js (main) xx bytes (javascript) xx KiB (runtime) >{701}< >{724}< >{742}< [entry] [rendered]
+    > ./ main
+    ./index.js xx bytes [built] [code generated]
+  chunk (runtime: c) custom-chunks-filter-in-cache-groups/c.js (c) xx bytes (javascript) xx KiB (runtime) ={545}= [entry] [rendered]
+    > ./c c
+    > x c
+    > y c
+    > z c
+    ./c.js xx bytes [built] [code generated]
+  custom-chunks-filter-in-cache-groups (Rspack x.x.x) compiled successfully

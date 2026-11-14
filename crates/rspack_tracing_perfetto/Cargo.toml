@@ -1,0 +1,30 @@
+[package]
+authors.workspace       = true
+categories.workspace    = true
+description             = "Rspack tracing perfetto"
+documentation.workspace = true
+edition.workspace       = true
+homepage.workspace      = true
+license.workspace       = true
+name                    = "rspack_tracing_perfetto"
+repository.workspace    = true
+version.workspace       = true
+
+[features]
+allocative = ["dep:rspack-allocative"]
+
+[dependencies]
+bytes               = { workspace = true }
+micromegas-perfetto = { workspace = true }
+prost               = { workspace = true }
+rspack-allocative   = { workspace = true, optional = true }
+rustc-hash          = { workspace = true, features = ["std"] }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+test    = false

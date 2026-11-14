@@ -1,38 +1,85 @@
-use rspack_core::{
-  get_chunk_from_ukey, AsContextDependency, Dependency, DependencyCategory, DependencyId,
-  DependencyTemplate, DependencyType, ErrorSpan, ExtendedReferencedExport, ModuleDependency,
-  ModuleGraph, RuntimeGlobals, RuntimeSpec, TemplateContext, TemplateReplaceSource,
-};
+mod create_script_url_dependency;
 
-#[derive(Debug, Clone)]
+use concat_string::concat_string;
+pub use create_script_url_dependency::{
+  CreateScriptUrlDependency, CreateScriptUrlDependencyTemplate,
+};
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_core::{
+  AsContextDependency, Compilation, Dependency, DependencyCategory, DependencyCodeGeneration,
+  DependencyId, DependencyRange, DependencyTemplate, DependencyTemplateType, DependencyType,
+  ExportsInfoArtifact, JavascriptParserWorkerUrl, ModuleDependency, ModuleGraph,
+  ModuleGraphCacheArtifact, ReferencedExport, RuntimeGlobals, RuntimeSpec, TemplateContext,
+  TemplateReplaceSource, URLStaticMode,
+};
+use rspack_hash::{RspackHash, RspackHasher};
+
+#[cacheable]
+#[derive(Debug)]
 pub struct WorkerDependency {
-  start: u32,
-  end: u32,
   id: DependencyId,
   request: String,
-  span: Option<ErrorSpan>,
   public_path: String,
+  range: DependencyRange,
+  range_path: DependencyRange,
+  range_request: Option<DependencyRange>,
+  need_new_url: bool,
+  url_mode: Option<JavascriptParserWorkerUrl>,
 }
 
 impl WorkerDependency {
   pub fn new(
-    start: u32,
-    end: u32,
     request: String,
     public_path: String,
-    span: Option<ErrorSpan>,
+    range: DependencyRange,
+    range_path: DependencyRange,
+    range_request: Option<DependencyRange>,
+    need_new_url: bool,
+    url_mode: Option<JavascriptParserWorkerUrl>,
   ) -> Self {
     Self {
-      start,
-      end,
       id: DependencyId::new(),
       request,
-      span,
       public_path,
+      range,
+      range_path,
+      range_request,
+      need_new_url,
+      url_mode,
+    }
+  }
+
+  pub fn public_path(&self) -> &str {
+    &self.public_path
+  }
+
+  pub fn replace_request(&self, source: &mut TemplateReplaceSource, request: String) {
+    if let Some(range_request) = self.range_request {
+      source.replace(range_request.start, range_request.end, request, None);
+    } else if self.need_new_url {
+      source.insert(
+        self.range_path.start,
+        concat_string!("new URL(", request, ", "),
+        None,
+      );
+      source.insert_static(self.range_path.end, ")", None);
+    } else {
+      source.insert(self.range_path.start, concat_string!(request, ", "), None);
     }
   }
 }
 
+impl RspackHash for WorkerDependency {
+  fn hash(&self, state: &mut RspackHasher) {
+    rspack_hash::rspack_hash_object!(state, {
+      "publicPath" => self.public_path.as_str(),
+      "needNewUrl" => self.need_new_url,
+      "urlMode" => self.url_mode,
+    });
+  }
+}
+
+#[cacheable_dyn]
 impl Dependency for WorkerDependency {
   fn id(&self) -> &DependencyId {
     &self.id
@@ -46,15 +93,26 @@ impl Dependency for WorkerDependency {
     &DependencyType::NewWorker
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    self.span
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "WorkerDependency"
+  fn get_referenced_exports(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
+    _runtime: Option<&RuntimeSpec>,
+  ) -> Vec<ReferencedExport> {
+    vec![]
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
   }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for WorkerDependency {
   fn request(&self) -> &str {
     &self.request
@@ -63,72 +121,113 @@ impl ModuleDependency for WorkerDependency {
   fn user_request(&self) -> &str {
     &self.request
   }
-
-  fn set_request(&mut self, request: String) {
-    self.request = request;
-  }
-
-  fn get_referenced_exports(
-    &self,
-    _module_graph: &ModuleGraph,
-    _runtime: Option<&RuntimeSpec>,
-  ) -> Vec<ExtendedReferencedExport> {
-    vec![]
-  }
 }
 
-impl DependencyTemplate for WorkerDependency {
-  fn apply(
-    &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
-  ) {
-    let TemplateContext {
-      compilation,
-      runtime_requirements,
-      ..
-    } = code_generatable_context;
-    let chunk_id = compilation
-      .get_module_graph()
-      .get_parent_block(&self.id)
-      .and_then(|block| {
-        compilation
-          .chunk_graph
-          .get_block_chunk_group(block, &compilation.chunk_group_by_ukey)
-      })
-      .map(|entrypoint| entrypoint.get_entry_point_chunk())
-      .and_then(|ukey| get_chunk_from_ukey(&ukey, &compilation.chunk_by_ukey))
-      .and_then(|chunk| chunk.id.as_deref())
-      .and_then(|chunk_id| serde_json::to_string(chunk_id).ok())
-      .expect("failed to get json stringified chunk id");
-    let worker_import_base_url = if !self.public_path.is_empty() {
-      format!("\"{}\"", self.public_path)
-    } else {
-      RuntimeGlobals::PUBLIC_PATH.to_string()
-    };
-
-    runtime_requirements.insert(RuntimeGlobals::PUBLIC_PATH);
-    runtime_requirements.insert(RuntimeGlobals::BASE_URI);
-    runtime_requirements.insert(RuntimeGlobals::GET_CHUNK_SCRIPT_FILENAME);
-
-    source.replace(
-      self.start,
-      self.end,
-      format!(
-        "/* worker import */{} + {}({}), {}",
-        worker_import_base_url,
-        RuntimeGlobals::GET_CHUNK_SCRIPT_FILENAME,
-        chunk_id,
-        RuntimeGlobals::BASE_URI
-      )
-      .as_str(),
-      None,
-    );
+#[cacheable_dyn]
+impl DependencyCodeGeneration for WorkerDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(WorkerDependencyTemplate::template_type())
   }
 
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+  fn update_hash(
+    &self,
+    hasher: &mut RspackHasher,
+    _compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+  ) {
+    RspackHash::hash(self, hasher);
   }
 }
 
 impl AsContextDependency for WorkerDependency {}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct WorkerDependencyTemplate;
+
+pub static WORKER_STATIC_URL_PLACEHOLDER: &str = "RSPACK_AUTO_WORKER_STATIC_URL_PLACEHOLDER_";
+
+impl WorkerDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::NewWorker)
+  }
+}
+
+impl DependencyTemplate for WorkerDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<WorkerDependency>()
+      .expect("WorkerDependencyTemplate should be used for WorkerDependency");
+    let TemplateContext {
+      compilation,
+      runtime_template,
+      ..
+    } = code_generatable_context;
+    let chunk_id = compilation
+      .get_module_graph()
+      .get_parent_block(&dep.id)
+      .and_then(|block| {
+        compilation
+          .build_chunk_graph_artifact
+          .chunk_graph
+          .get_block_chunk_group(
+            block,
+            &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
+          )
+      })
+      .map(|entrypoint| entrypoint.get_entrypoint_chunk())
+      .and_then(|ukey| {
+        compilation
+          .build_chunk_graph_artifact
+          .chunk_by_ukey
+          .get(&ukey)
+      })
+      .and_then(|chunk| chunk.id())
+      .map(rspack_util::json_stringify)
+      .expect("failed to get json stringified chunk id");
+    let mut worker_import_str = if matches!(
+      dep.url_mode,
+      Some(JavascriptParserWorkerUrl::NewUrlRelative)
+    ) && compilation.options.output.module
+    {
+      code_generatable_context.data.insert(URLStaticMode);
+      let request = rspack_util::json_stringify_str(&concat_string!(
+        WORKER_STATIC_URL_PLACEHOLDER,
+        dep.id.as_u32().to_string()
+      ));
+      dep.replace_request(source, request);
+      return;
+    } else {
+      let worker_import_base_url = if !dep.public_path.is_empty() {
+        format!("\"{}\"", dep.public_path)
+      } else {
+        runtime_template.render_runtime_globals(&RuntimeGlobals::PUBLIC_PATH)
+      };
+
+      format!(
+        "/* worker import */{} + {}({}), {}",
+        worker_import_base_url,
+        runtime_template.render_runtime_globals(&RuntimeGlobals::GET_CHUNK_SCRIPT_FILENAME),
+        chunk_id,
+        runtime_template.render_runtime_globals(&RuntimeGlobals::BASE_URI)
+      )
+    };
+
+    if dep.need_new_url {
+      worker_import_str = concat_string!("new URL(", worker_import_str, ")");
+    }
+
+    source.replace(
+      dep.range_path.start,
+      dep.range_path.end,
+      worker_import_str,
+      None,
+    );
+  }
+}

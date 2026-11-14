@@ -1,18 +1,31 @@
 [package]
-edition    = "2021"
-license    = "MIT"
-name       = "rspack_allocator"
-repository = "https://github.com/web-infra-dev/rspack"
-version    = "0.1.0"
+description       = "rspack allocator"
+edition.workspace = true
+license           = "MIT"
+name              = "rspack_allocator"
+repository        = "https://github.com/web-infra-dev/rspack"
+version.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+system-allocator = []
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+sftrace-setup = { workspace = true, optional = true }
+tracy-client  = { workspace = true, optional = true }
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-mimalloc-rust = { workspace = true }
+[target.'cfg(target_os = "linux")'.dependencies]
+# Turned on `local_dynamic_tls` to avoid issue: https://github.com/microsoft/mimalloc/issues/147
+mimalloc = { workspace = true, features = ["local_dynamic_tls", "v3"] }
 
-[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
-mimalloc-rust = { workspace = true, features = ["local-dynamic-tls"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+mimalloc = { workspace = true, features = ["v3"] }
 
-[target.'cfg(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
-tikv-jemallocator = { workspace = true }
+[target.'cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_family = "wasm")))'.dependencies]
+mimalloc = { workspace = true, features = ["v3"] }
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+test    = false

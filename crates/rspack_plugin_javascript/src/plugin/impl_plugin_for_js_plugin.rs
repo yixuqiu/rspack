@@ -1,23 +1,54 @@
-use std::hash::Hash;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use rspack_core::rspack_sources::BoxSource;
 use rspack_core::{
-  get_js_chunk_filename_template, ChunkGraph, ChunkKind, ChunkUkey, Compilation,
+  AssetInfo, CachedConstDependencyTemplate, Chunk, ChunkGraph, ChunkKind, ChunkUkey, Compilation,
   CompilationAdditionalTreeRuntimeRequirements, CompilationChunkHash, CompilationContentHash,
-  CompilationParams, CompilationRenderManifest, CompilerCompilation, CompilerOptions,
-  DependencyType, ErrorSpan, IgnoreErrorModuleFactory, ModuleGraph, ModuleType, ParserAndGenerator,
-  PathData, Plugin, PluginContext, RenderManifestEntry, RuntimeGlobals, SelfModuleFactory,
-  SourceType,
+  CompilationId, CompilationParams, CompilationRenderManifest, CompilerCompilation,
+  ConstDependencyTemplate, DependencyType, IgnoreErrorModuleFactory, ManifestAssetType,
+  ModuleGraph, ModuleIdentifier, ModuleType, ParserAndGenerator, PathData, Plugin,
+  RenderManifestEntry, RuntimeGlobals, RuntimeModule, RuntimeRequirementsDependencyTemplate,
+  SelfModuleFactory, SourceType, get_js_chunk_filename_template,
+  rspack_sources::{BoxSource, CachedSource, SourceExt},
 };
 use rspack_error::{Diagnostic, Result};
-use rspack_hash::RspackHash;
+use rspack_hash::{RspackHash, RspackHasher};
 use rspack_hook::plugin_hook;
 use rustc_hash::FxHashMap;
 
-use crate::parser_and_generator::JavaScriptParserAndGenerator;
-use crate::{JsPlugin, JsPluginInner};
+use crate::{
+  JsPlugin, JsPluginInner,
+  dependency::{
+    AMDRequireContextDependencyTemplate, CommonJsExportRequireDependencyTemplate,
+    CommonJsExportsDependencyTemplate, CommonJsFullRequireDependencyTemplate,
+    CommonJsRequireContextDependencyTemplate, CommonJsRequireDependencyTemplate,
+    CommonJsSelfReferenceDependencyTemplate, CreateScriptUrlDependencyTemplate,
+    ESMAcceptDependencyTemplate, ESMCompatibilityDependencyTemplate,
+    ESMExportExpressionDependencyTemplate, ESMExportHeaderDependencyTemplate,
+    ESMExportImportedSpecifierDependencyTemplate, ESMExportSpecifierDependencyTemplate,
+    ESMImportSideEffectDependencyTemplate, ESMImportSpecifierDependencyTemplate,
+    ExportInfoDependencyTemplate, ExternalModuleDependencyTemplate,
+    ImportContextDependencyTemplate, ImportDependencyTemplate, ImportEagerDependencyTemplate,
+    ImportMetaContextDependencyTemplate, ImportMetaHotAcceptDependencyTemplate,
+    ImportMetaHotDeclineDependencyTemplate, ImportMetaResolveContextDependencyTemplate,
+    ImportMetaResolveDependencyTemplate, ImportMetaResolveHeaderDependencyTemplate,
+    ImportMetaRscDependencyTemplate, ImportWeakDependencyTemplate, IsIncludedDependencyTemplate,
+    ModuleArgumentDependencyTemplate, ModuleDecoratorDependencyTemplate,
+    ModuleHotAcceptDependencyTemplate, ModuleHotDeclineDependencyTemplate,
+    ProvideDependencyTemplate, PureExpressionDependencyTemplate, RequireContextDependencyTemplate,
+    RequireEnsureDependencyTemplate, RequireHeaderDependencyTemplate,
+    RequireMainDependencyTemplate, RequireResolveContextDependencyTemplate,
+    RequireResolveDependencyTemplate, RequireResolveHeaderDependencyTemplate,
+    URLContextDependencyTemplate, URLDependencyTemplate, WorkerDependencyTemplate,
+    amd_define_dependency::AMDDefineDependencyTemplate,
+    amd_exports_dependency::AMDExportsDependencyTemplate,
+    amd_require_array_dependency::AMDRequireArrayDependencyTemplate,
+    amd_require_dependency::AMDRequireDependencyTemplate,
+    amd_require_item_dependency::AMDRequireItemDependencyTemplate,
+    local_module_dependency::LocalModuleDependencyTemplate,
+    unsupported_dependency::UnsupportedDependencyTemplate,
+  },
+  parser_and_generator::JavaScriptParserAndGenerator,
+};
 
 #[plugin_hook(CompilerCompilation for JsPlugin)]
 async fn compilation(
@@ -25,9 +56,9 @@ async fn compilation(
   compilation: &mut Compilation,
   params: &mut CompilationParams,
 ) -> Result<()> {
-  // HarmonyModulesPlugin
+  // ESMModulesPlugin
   compilation.set_dependency_factory(
-    DependencyType::EsmImport(ErrorSpan::default()),
+    DependencyType::EsmImport,
     params.normal_module_factory.clone(),
   );
   compilation.set_dependency_factory(
@@ -35,7 +66,11 @@ async fn compilation(
     params.normal_module_factory.clone(),
   );
   compilation.set_dependency_factory(
-    DependencyType::EsmExport(ErrorSpan::default()),
+    DependencyType::ImportMetaRsc,
+    params.normal_module_factory.clone(),
+  );
+  compilation.set_dependency_factory(
+    DependencyType::EsmExportImport,
     params.normal_module_factory.clone(),
   );
   compilation.set_dependency_factory(
@@ -49,6 +84,10 @@ async fn compilation(
   // CommonJsPlugin
   compilation.set_dependency_factory(
     DependencyType::CjsRequire,
+    params.normal_module_factory.clone(),
+  );
+  compilation.set_dependency_factory(
+    DependencyType::CjsFullRequire,
     params.normal_module_factory.clone(),
   );
   compilation.set_dependency_factory(
@@ -67,13 +106,35 @@ async fn compilation(
     DependencyType::RequireResolve,
     params.normal_module_factory.clone(),
   );
+  compilation.set_dependency_factory(
+    DependencyType::RequireResolveContext,
+    params.context_module_factory.clone(),
+  );
+  // AMDPlugin
+  compilation.set_dependency_factory(
+    DependencyType::AmdRequireItem,
+    params.normal_module_factory.clone(),
+  );
+  compilation.set_dependency_factory(
+    DependencyType::AmdRequireContext,
+    params.context_module_factory.clone(),
+  );
   // RequireContextPlugin
   compilation.set_dependency_factory(
     DependencyType::RequireContext,
     params.context_module_factory.clone(),
   );
+  // RequireEnsurePlugin
   compilation.set_dependency_factory(
-    DependencyType::ContextElement,
+    DependencyType::RequireEnsureItem,
+    params.normal_module_factory.clone(),
+  );
+  compilation.set_dependency_factory(
+    DependencyType::ContextElement(rspack_core::ContextTypePrefix::Import),
+    params.normal_module_factory.clone(),
+  );
+  compilation.set_dependency_factory(
+    DependencyType::ContextElement(rspack_core::ContextTypePrefix::Normal),
     params.normal_module_factory.clone(),
   );
   // ImportMetaContextPlugin
@@ -82,7 +143,15 @@ async fn compilation(
     params.context_module_factory.clone(),
   );
   compilation.set_dependency_factory(
-    DependencyType::ContextElement,
+    DependencyType::ImportMetaGlob,
+    params.context_module_factory.clone(),
+  );
+  compilation.set_dependency_factory(
+    DependencyType::ImportMetaResolveContext,
+    params.context_module_factory.clone(),
+  );
+  compilation.set_dependency_factory(
+    DependencyType::ImportMetaResolve,
     params.normal_module_factory.clone(),
   );
   // ImportPlugin
@@ -90,8 +159,13 @@ async fn compilation(
     DependencyType::DynamicImport,
     params.normal_module_factory.clone(),
   );
+
   compilation.set_dependency_factory(
     DependencyType::DynamicImportEager,
+    params.normal_module_factory.clone(),
+  );
+  compilation.set_dependency_factory(
+    DependencyType::DynamicImportWeak,
     params.normal_module_factory.clone(),
   );
   compilation.set_dependency_factory(
@@ -100,36 +174,294 @@ async fn compilation(
   );
   // URLPlugin
   compilation.set_dependency_factory(DependencyType::NewUrl, params.normal_module_factory.clone());
+  compilation.set_dependency_factory(
+    DependencyType::NewUrlContext,
+    params.context_module_factory.clone(),
+  );
   // ProvidePlugin
   compilation.set_dependency_factory(
     DependencyType::Provided,
     params.normal_module_factory.clone(),
   );
+  // ImportModule
+  compilation.set_dependency_factory(
+    DependencyType::LoaderImport,
+    params.normal_module_factory.clone(),
+  );
   // other
   compilation.set_dependency_factory(
-    DependencyType::WebpackIsIncluded,
+    DependencyType::IsIncluded,
     Arc::new(IgnoreErrorModuleFactory {
       normal_module_factory: params.normal_module_factory.clone(),
     }),
   );
+
+  let self_factory = Arc::new(SelfModuleFactory {});
+  compilation.set_dependency_factory(DependencyType::CjsSelfReference, self_factory.clone());
+  compilation.set_dependency_factory(DependencyType::ModuleDecorator, self_factory);
+
+  // esm dependency templates
+  compilation.set_dependency_template(
+    ESMCompatibilityDependencyTemplate::template_type(),
+    Arc::new(ESMCompatibilityDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportDependencyTemplate::template_type(),
+    Arc::new(ImportDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ESMExportExpressionDependencyTemplate::template_type(),
+    Arc::new(ESMExportExpressionDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ESMExportHeaderDependencyTemplate::template_type(),
+    Arc::new(ESMExportHeaderDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ESMExportImportedSpecifierDependencyTemplate::template_type(),
+    Arc::new(ESMExportImportedSpecifierDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ESMExportSpecifierDependencyTemplate::template_type(),
+    Arc::new(ESMExportSpecifierDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ESMImportSideEffectDependencyTemplate::template_type(),
+    Arc::new(ESMImportSideEffectDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ESMImportSpecifierDependencyTemplate::template_type(),
+    Arc::new(ESMImportSpecifierDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ExternalModuleDependencyTemplate::template_type(),
+    Arc::new(ExternalModuleDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportEagerDependencyTemplate::template_type(),
+    Arc::new(ImportEagerDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportWeakDependencyTemplate::template_type(),
+    Arc::new(ImportWeakDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ProvideDependencyTemplate::template_type(),
+    Arc::new(ProvideDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportMetaRscDependencyTemplate::template_type(),
+    Arc::new(ImportMetaRscDependencyTemplate),
+  );
+
+  // amd dependency templates
+  compilation.set_dependency_template(
+    AMDDefineDependencyTemplate::template_type(),
+    Arc::new(AMDDefineDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    AMDRequireArrayDependencyTemplate::template_type(),
+    Arc::new(AMDRequireArrayDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    AMDRequireDependencyTemplate::template_type(),
+    Arc::new(AMDRequireDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    AMDRequireItemDependencyTemplate::template_type(),
+    Arc::new(AMDRequireItemDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    LocalModuleDependencyTemplate::template_type(),
+    Arc::new(LocalModuleDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    UnsupportedDependencyTemplate::template_type(),
+    Arc::new(UnsupportedDependencyTemplate::default()),
+  );
+  // commonjs dependency templates
+  compilation.set_dependency_template(
+    CommonJsExportRequireDependencyTemplate::template_type(),
+    Arc::new(CommonJsExportRequireDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    CommonJsExportsDependencyTemplate::template_type(),
+    Arc::new(CommonJsExportsDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    CommonJsFullRequireDependencyTemplate::template_type(),
+    Arc::new(CommonJsFullRequireDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    CommonJsRequireDependencyTemplate::template_type(),
+    Arc::new(CommonJsRequireDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    CommonJsSelfReferenceDependencyTemplate::template_type(),
+    Arc::new(CommonJsSelfReferenceDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ModuleDecoratorDependencyTemplate::template_type(),
+    Arc::new(ModuleDecoratorDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    RequireEnsureDependencyTemplate::template_type(),
+    Arc::new(RequireEnsureDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    RequireHeaderDependencyTemplate::template_type(),
+    Arc::new(RequireHeaderDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    RequireResolveDependencyTemplate::template_type(),
+    Arc::new(RequireResolveDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    RequireResolveHeaderDependencyTemplate::template_type(),
+    Arc::new(RequireResolveHeaderDependencyTemplate::default()),
+  );
+
+  // commonjs context dependency templates
+  compilation.set_dependency_template(
+    AMDRequireContextDependencyTemplate::template_type(),
+    Arc::new(AMDRequireContextDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    CommonJsRequireContextDependencyTemplate::template_type(),
+    Arc::new(CommonJsRequireContextDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportContextDependencyTemplate::template_type(),
+    Arc::new(ImportContextDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportMetaContextDependencyTemplate::template_type(),
+    Arc::new(ImportMetaContextDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportMetaContextDependencyTemplate::glob_template_type(),
+    Arc::new(ImportMetaContextDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportMetaResolveContextDependencyTemplate::template_type(),
+    Arc::new(ImportMetaResolveContextDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportMetaResolveDependencyTemplate::template_type(),
+    Arc::new(ImportMetaResolveDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportMetaResolveHeaderDependencyTemplate::template_type(),
+    Arc::new(ImportMetaResolveHeaderDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    RequireContextDependencyTemplate::template_type(),
+    Arc::new(RequireContextDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    RequireResolveContextDependencyTemplate::template_type(),
+    Arc::new(RequireResolveContextDependencyTemplate::default()),
+  );
+  // hmr dependency templates
+  compilation.set_dependency_template(
+    ESMAcceptDependencyTemplate::template_type(),
+    Arc::new(ESMAcceptDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportMetaHotAcceptDependencyTemplate::template_type(),
+    Arc::new(ImportMetaHotAcceptDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ImportMetaHotDeclineDependencyTemplate::template_type(),
+    Arc::new(ImportMetaHotDeclineDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ModuleHotAcceptDependencyTemplate::template_type(),
+    Arc::new(ModuleHotAcceptDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ModuleHotDeclineDependencyTemplate::template_type(),
+    Arc::new(ModuleHotDeclineDependencyTemplate::default()),
+  );
+  // url dependency templates
+  compilation.set_dependency_template(
+    URLDependencyTemplate::template_type(),
+    Arc::new(URLDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    URLContextDependencyTemplate::template_type(),
+    Arc::new(URLContextDependencyTemplate::default()),
+  );
+  // worker dependency templates
+  compilation.set_dependency_template(
+    CreateScriptUrlDependencyTemplate::template_type(),
+    Arc::new(CreateScriptUrlDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    WorkerDependencyTemplate::template_type(),
+    Arc::new(WorkerDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ExportInfoDependencyTemplate::template_type(),
+    Arc::new(ExportInfoDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    IsIncludedDependencyTemplate::template_type(),
+    Arc::new(IsIncludedDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ModuleArgumentDependencyTemplate::template_type(),
+    Arc::new(ModuleArgumentDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    AMDExportsDependencyTemplate::template_type(),
+    Arc::new(AMDExportsDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    PureExpressionDependencyTemplate::template_type(),
+    Arc::new(PureExpressionDependencyTemplate::default()),
+  );
+  // core plugins
+  compilation.set_dependency_template(
+    CachedConstDependencyTemplate::template_type(),
+    Arc::new(CachedConstDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    ConstDependencyTemplate::template_type(),
+    Arc::new(ConstDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    RuntimeRequirementsDependencyTemplate::template_type(),
+    Arc::new(RuntimeRequirementsDependencyTemplate::default()),
+  );
+  compilation.set_dependency_template(
+    RequireMainDependencyTemplate::template_type(),
+    Arc::new(RequireMainDependencyTemplate::default()),
+  );
+  // Rstest
   compilation.set_dependency_factory(
-    DependencyType::CjsSelfReference,
-    Arc::new(SelfModuleFactory {}),
+    DependencyType::RstestMockModuleId,
+    params.normal_module_factory.clone(),
   );
   Ok(())
 }
 
 #[plugin_hook(CompilationAdditionalTreeRuntimeRequirements for JsPlugin)]
-fn additional_tree_runtime_requirements(
+async fn additional_tree_runtime_requirements(
   &self,
-  compilation: &mut Compilation,
+  compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
   runtime_requirements: &mut RuntimeGlobals,
+  _runtime_modules: &mut Vec<Box<dyn RuntimeModule>>,
 ) -> Result<()> {
   if !runtime_requirements.contains(RuntimeGlobals::STARTUP_NO_DEFAULT)
     && compilation
+      .build_chunk_graph_artifact
       .chunk_graph
-      .has_chunk_entry_dependent_chunks(chunk_ukey, &compilation.chunk_group_by_ukey)
+      .has_chunk_entry_dependent_chunks(
+        chunk_ukey,
+        &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
+      )
   {
     runtime_requirements.insert(RuntimeGlobals::ON_CHUNKS_LOADED);
     runtime_requirements.insert(RuntimeGlobals::REQUIRE);
@@ -138,79 +470,80 @@ fn additional_tree_runtime_requirements(
 }
 
 #[plugin_hook(CompilationChunkHash for JsPlugin)]
-fn chunk_hash(
+async fn chunk_hash(
   &self,
   compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
-  hasher: &mut RspackHash,
+  hasher: &mut RspackHasher,
 ) -> Result<()> {
-  self.get_chunk_hash(chunk_ukey, compilation, hasher)?;
+  self.get_chunk_hash(chunk_ukey, compilation, hasher).await?;
   if compilation
+    .build_chunk_graph_artifact
     .chunk_by_ukey
     .expect_get(chunk_ukey)
-    .has_runtime(&compilation.chunk_group_by_ukey)
+    .has_runtime(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
   {
-    self.update_hash_with_bootstrap(chunk_ukey, compilation, hasher)
+    self
+      .update_hash_with_bootstrap(chunk_ukey, compilation, hasher)
+      .await?;
   }
   Ok(())
 }
 
 #[plugin_hook(CompilationContentHash for JsPlugin)]
-fn content_hash(
+async fn content_hash(
   &self,
   compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
-  hashes: &mut FxHashMap<SourceType, RspackHash>,
+  hashes: &mut FxHashMap<SourceType, RspackHasher>,
 ) -> Result<()> {
-  let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
-  let mut hasher = hashes
+  let chunk = compilation
+    .build_chunk_graph_artifact
+    .chunk_by_ukey
+    .expect_get(chunk_ukey);
+  let hasher = hashes
     .entry(SourceType::JavaScript)
-    .or_insert_with(|| RspackHash::from(&compilation.options.output));
+    .or_insert_with(|| RspackHasher::from(&compilation.options.output));
 
-  if chunk.has_runtime(&compilation.chunk_group_by_ukey) {
-    self.update_hash_with_bootstrap(chunk_ukey, compilation, hasher)
-  } else {
-    chunk.id.hash(&mut hasher);
-    chunk.ids.hash(&mut hasher);
+  if !chunk.has_runtime(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey) {
+    chunk.id().hash(hasher);
   }
 
-  self.get_chunk_hash(chunk_ukey, compilation, hasher)?;
-
   let module_graph = compilation.get_module_graph();
-  let mut ordered_modules = compilation.chunk_graph.get_chunk_modules_by_source_type(
-    chunk_ukey,
-    SourceType::JavaScript,
-    &module_graph,
-  );
+  let mut ordered_modules = compilation
+    .build_chunk_graph_artifact
+    .chunk_graph
+    .get_chunk_modules_identifier_by_source_type(chunk_ukey, SourceType::JavaScript, module_graph);
   // SAFETY: module identifier is unique
-  ordered_modules.sort_unstable_by_key(|m| m.identifier().as_str());
+  ordered_modules.sort_unstable();
 
   ordered_modules
     .iter()
-    .map(|mgm| {
+    .map(|mid| {
       (
         compilation
           .code_generation_results
-          .get_hash(&mgm.identifier(), Some(&chunk.runtime)),
-        compilation.chunk_graph.get_module_id(mgm.identifier()),
+          .get_hash(mid, Some(chunk.runtime())),
+        ChunkGraph::get_module_id(&compilation.module_ids_artifact, *mid),
       )
     })
     .for_each(|(current, id)| {
       if let Some(current) = current {
-        current.hash(&mut hasher);
-        id.hash(&mut hasher);
+        current.hash(hasher);
+        id.hash(hasher);
       }
     });
 
-  for (runtime_module_idenfitier, _) in compilation
+  for (runtime_module_identifier, _) in compilation
+    .build_chunk_graph_artifact
     .chunk_graph
     .get_chunk_runtime_modules_in_order(chunk_ukey, compilation)
   {
-    if let Some((hash, _)) = compilation
-      .runtime_module_code_generation_results
-      .get(runtime_module_idenfitier)
+    if let Some(hash) = compilation
+      .runtime_modules_hash
+      .get(runtime_module_identifier)
     {
-      hash.hash(&mut hasher);
+      hash.hash(hasher);
     }
   }
 
@@ -223,103 +556,154 @@ async fn render_manifest(
   compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
   manifest: &mut Vec<RenderManifestEntry>,
-  _diagnostics: &mut Vec<Diagnostic>,
+  diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<()> {
-  let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
-  let source = if matches!(chunk.kind, ChunkKind::HotUpdate) {
-    self.render_chunk_impl(compilation, chunk_ukey).await?
-  } else if chunk.has_runtime(&compilation.chunk_group_by_ukey) {
-    self.render_main(compilation, chunk_ukey).await?
-  } else {
-    if !chunk_has_js(
-      chunk_ukey,
-      &compilation.chunk_graph,
-      &compilation.get_module_graph(),
-    ) {
-      return Ok(());
-    }
-
-    self.render_chunk_impl(compilation, chunk_ukey).await?
-  };
-
+  let chunk = compilation
+    .build_chunk_graph_artifact
+    .chunk_by_ukey
+    .expect_get(chunk_ukey);
   let filename_template = get_js_chunk_filename_template(
     chunk,
     &compilation.options.output,
-    &compilation.chunk_group_by_ukey,
+    &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
   );
-  let (output_path, mut asset_info) = compilation.get_path_with_info(
-    filename_template,
-    PathData::default()
-      .chunk(chunk)
-      .content_hash_optional(
-        chunk
-          .content_hash
-          .get(&SourceType::JavaScript)
-          .map(|i| i.rendered(compilation.options.output.hash_digest_length)),
-      )
-      .runtime(&chunk.runtime),
-  )?;
+  if let Some(name) = chunk.name()
+    && (name.contains('?') || name.contains('#'))
+    && filename_template
+      .template()
+      .is_some_and(|template| template.contains("[name]"))
+  {
+    diagnostics.push(Diagnostic::warn(
+      "Invalid chunk name".to_string(),
+      format!(
+        "Chunk name \"{name}\" contains '?' or '#', which can make the emitted filename differ from the URL requested by the runtime. Avoid these characters in chunk names."
+      ),
+    ));
+  }
+  let runtime_template = compilation.runtime_template.create_chunk_code_template();
+  let is_hot_update = matches!(chunk.kind(), ChunkKind::HotUpdate);
+  let is_runtime_chunk =
+    chunk.has_runtime(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey);
+
+  if !is_hot_update && !is_js_entry_chunk(chunk, compilation) {
+    let has_js = chunk_has_js(chunk_ukey, compilation)
+      || (is_runtime_chunk && chunk_has_required_runtime(chunk, compilation));
+    if !has_js {
+      return Ok(());
+    }
+  }
+  let mut asset_info = AssetInfo::default().with_asset_type(ManifestAssetType::JavaScript);
   asset_info.set_javascript_module(compilation.options.output.module);
-  manifest.push(RenderManifestEntry::new(
+  let output_path = compilation
+    .get_path_with_info(
+      &filename_template,
+      PathData::default()
+        .chunk(*chunk_ukey, compilation)
+        .chunk_hash_optional(chunk.rendered_hash(
+          &compilation.chunk_hashes_artifact,
+          compilation.options.output.hash_digest_length,
+        ))
+        .chunk_id_optional(chunk.id().map(|id| id.as_str()))
+        .chunk_name_optional(chunk.name_for_filename_template())
+        .content_hash_optional(chunk.rendered_content_hash_by_source_type(
+          &compilation.chunk_hashes_artifact,
+          &SourceType::JavaScript,
+          compilation.options.output.hash_digest_length,
+        ))
+        .runtime(chunk.runtime().as_str()),
+      &mut asset_info,
+    )
+    .await?;
+
+  let hooks = JsPlugin::get_compilation_hooks(compilation.id());
+  let hooks = hooks.read().await;
+
+  let (source, _) = compilation
+    .chunk_render_cache_artifact
+    .use_cache(
+      compilation,
+      chunk,
+      &SourceType::JavaScript,
+      &output_path,
+      || async {
+        let source = if let Some(source) = hooks
+          .render_chunk_content
+          .call(compilation, chunk_ukey, &mut asset_info, &runtime_template)
+          .await?
+        {
+          source.source
+        } else if is_hot_update {
+          self
+            .render_chunk(compilation, chunk_ukey, &output_path, &runtime_template)
+            .await?
+        } else if is_runtime_chunk {
+          self
+            .render_main(compilation, chunk_ukey, &output_path, &runtime_template)
+            .await?
+        } else {
+          self
+            .render_chunk(compilation, chunk_ukey, &output_path, &runtime_template)
+            .await?
+        };
+        Ok((CachedSource::new(source).boxed(), Vec::new()))
+      },
+    )
+    .await?;
+
+  manifest.push(RenderManifestEntry {
     source,
-    output_path,
-    asset_info,
-    false,
-    false,
-  ));
+    filename: output_path,
+    has_filename: false,
+    info: asset_info,
+    auxiliary: false,
+  });
   Ok(())
 }
 
-#[async_trait]
 impl Plugin for JsPlugin {
   fn name(&self) -> &'static str {
     "javascript"
   }
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut rspack_core::ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
     ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
-    ctx
-      .context
       .compilation_hooks
       .additional_tree_runtime_requirements
       .tap(additional_tree_runtime_requirements::new(self));
+    ctx.compilation_hooks.chunk_hash.tap(chunk_hash::new(self));
     ctx
-      .context
-      .compilation_hooks
-      .chunk_hash
-      .tap(chunk_hash::new(self));
-    ctx
-      .context
       .compilation_hooks
       .content_hash
       .tap(content_hash::new(self));
     ctx
-      .context
       .compilation_hooks
       .render_manifest
       .tap(render_manifest::new(self));
 
-    ctx.context.register_parser_and_generator_builder(
-      ModuleType::Js,
-      Box::new(|_, _| Box::new(JavaScriptParserAndGenerator) as Box<dyn ParserAndGenerator>),
-    );
-    ctx.context.register_parser_and_generator_builder(
-      ModuleType::JsEsm,
-      Box::new(|_, _| Box::new(JavaScriptParserAndGenerator) as Box<dyn ParserAndGenerator>),
-    );
-    ctx.context.register_parser_and_generator_builder(
-      ModuleType::JsDynamic,
-      Box::new(|_, _| Box::new(JavaScriptParserAndGenerator) as Box<dyn ParserAndGenerator>),
-    );
+    ctx.register_parser_and_generator_builder(ModuleType::JsAuto, {
+      Box::new(move |options| {
+        Box::new(JavaScriptParserAndGenerator::new(options)) as Box<dyn ParserAndGenerator>
+      })
+    });
+    ctx.register_parser_and_generator_builder(ModuleType::JsEsm, {
+      Box::new(move |options| {
+        Box::new(JavaScriptParserAndGenerator::new(options)) as Box<dyn ParserAndGenerator>
+      })
+    });
+    ctx.register_parser_and_generator_builder(ModuleType::JsDynamic, {
+      Box::new(move |options| {
+        Box::new(JavaScriptParserAndGenerator::new(options)) as Box<dyn ParserAndGenerator>
+      })
+    });
 
     Ok(())
+  }
+
+  fn clear_cache(&self, id: CompilationId) {
+    crate::plugin::COMPILATION_HOOKS_MAP
+      .write()
+      .expect("should have js plugin drive")
+      .remove(&id);
   }
 }
 
@@ -329,13 +713,81 @@ pub struct ExtractedCommentsInfo {
   pub comments_file_name: String,
 }
 
-fn chunk_has_js(chunk: &ChunkUkey, chunk_graph: &ChunkGraph, module_graph: &ModuleGraph) -> bool {
-  if chunk_graph.get_number_of_entry_modules(chunk) > 0 {
-    true
-  } else {
-    chunk_graph
-      .get_chunk_modules_iterable_by_source_type(chunk, SourceType::JavaScript, module_graph)
-      .next()
-      .is_some()
+pub(super) fn module_has_js(
+  module_identifier: &ModuleIdentifier,
+  module_graph: &ModuleGraph,
+) -> bool {
+  module_graph
+    .module_by_identifier(module_identifier)
+    .is_some_and(|module| {
+      module
+        .source_types(module_graph)
+        .contains(&SourceType::JavaScript)
+    })
+}
+
+fn is_js_entry_chunk(chunk: &Chunk, compilation: &Compilation) -> bool {
+  let module_graph = compilation.get_module_graph();
+  // ESM optimizations can move both the entry module and its chunk graph entry
+  // connection. The original entrypoint still needs to emit its re-exports.
+  chunk.groups().iter().any(|group_ukey| {
+    let group = compilation
+      .build_chunk_graph_artifact
+      .chunk_group_by_ukey
+      .expect_get(group_ukey);
+    group.is_initial()
+      && group.get_entrypoint_chunk() == chunk.ukey()
+      && group
+        .name()
+        .and_then(|name| compilation.entries.get(name))
+        .is_some_and(|entry| {
+          entry
+            .all_dependencies()
+            .chain(compilation.global_entry.all_dependencies())
+            .filter_map(|dependency| module_graph.module_identifier_by_dependency_id(dependency))
+            .any(|module_identifier| module_has_js(module_identifier, module_graph))
+        })
+  })
+}
+
+pub fn chunk_has_js(chunk_ukey: &ChunkUkey, compilation: &Compilation) -> bool {
+  let chunk_graph = &compilation.build_chunk_graph_artifact.chunk_graph;
+  let module_graph = compilation.get_module_graph();
+
+  // JavaScript entries still need startup code when their modules move to another chunk.
+  if chunk_graph
+    .get_chunk_entry_modules_with_chunk_group_iterable(chunk_ukey)
+    .keys()
+    .any(|module_identifier| module_has_js(module_identifier, module_graph))
+  {
+    return true;
   }
+
+  chunk_graph.has_chunk_module_by_source_type(chunk_ukey, SourceType::JavaScript, module_graph)
+}
+
+fn chunk_has_required_runtime(chunk: &Chunk, compilation: &Compilation) -> bool {
+  let chunk_ukey = chunk.ukey();
+  let chunk_graph = &compilation.build_chunk_graph_artifact.chunk_graph;
+  if chunk_graph
+    .get_chunk_runtime_modules_iterable(&chunk_ukey)
+    .next()
+    .is_none()
+  {
+    return false;
+  }
+
+  for group_ukey in chunk.groups() {
+    let chunk_group = compilation
+      .build_chunk_graph_artifact
+      .chunk_group_by_ukey
+      .expect_get(group_ukey);
+    for other_chunk_ukey in &chunk_group.chunks {
+      if *other_chunk_ukey != chunk_ukey && chunk_has_js(other_chunk_ukey, compilation) {
+        return true;
+      }
+    }
+  }
+
+  false
 }

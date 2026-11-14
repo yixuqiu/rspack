@@ -1,0 +1,16 @@
+<>
+
+```ts
+type Source = {
+  source(): string | Buffer;
+  buffer(): Buffer;
+  buffers(): Buffer[];
+  size(): number;
+  map(options?: MapOptions): RawSourceMap | null;
+  sourceAndMap(options?: MapOptions): SourceAndMap;
+  updateHash(hash: HashLike): void;
+  clearCache(options?: ClearCacheOptions, visited?: WeakSet<Source>): void;
+};
+```
+
+</>

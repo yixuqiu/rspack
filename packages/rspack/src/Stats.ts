@@ -7,186 +7,216 @@
  * Copyright (c) JS Foundation and other contributors
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
-import type * as binding from "@rspack/binding";
-import { Compilation, FilterItemTypes } from ".";
-import { StatsValue, StatsOptions } from "./config";
-import type { StatsCompilation } from "./stats/statsFactoryUtils";
+import type binding from '@rspack/binding';
+
+import type { Compilation } from './Compilation';
+import type { StatsOptions, StatsValue } from './config';
+import type { StatsCompilation } from './stats/statsFactoryUtils';
 
 export type {
-	StatsCompilation,
-	StatsAsset,
-	StatsChunk,
-	StatsModule,
-	StatsError,
-	StatsWarnings
-} from "./stats/statsFactoryUtils";
+  StatsAsset,
+  StatsCacheInfo,
+  StatsChunk,
+  StatsCompilation,
+  StatsError,
+  StatsModule,
+} from './stats/statsFactoryUtils';
 
 export class Stats {
-	#inner: binding.JsStats;
-	compilation: Compilation;
-	#innerMap: WeakMap<Compilation, binding.JsStats>;
+  #inner: binding.JsStats;
+  #compilation: Compilation;
+  #innerMap: WeakMap<Compilation, binding.JsStats>;
 
-	constructor(compilation: Compilation) {
-		this.#inner = compilation.__internal_getInner().getStats();
-		this.compilation = compilation;
-		this.#innerMap = new WeakMap([[this.compilation, this.#inner]]);
-	}
+  constructor(compilation: Compilation) {
+    this.#inner = compilation.__internal_getInner().getStats();
+    this.#compilation = compilation;
+    this.#innerMap = new WeakMap([[this.compilation, this.#inner]]);
+  }
 
-	// use correct JsStats for child compilation
-	#getInnerByCompilation(compilation: Compilation) {
-		if (this.#innerMap.has(compilation)) {
-			return this.#innerMap.get(compilation);
-		}
-		const inner = compilation.__internal_getInner().getStats();
-		this.#innerMap.set(compilation, inner);
-		return inner;
-	}
+  // use correct JsStats for child compilation
+  #getInnerByCompilation(compilation: Compilation): binding.JsStats {
+    if (this.#innerMap.has(compilation)) {
+      return this.#innerMap.get(compilation)!;
+    }
+    const inner = compilation.__internal_getInner().getStats();
+    this.#innerMap.set(compilation, inner);
+    return inner;
+  }
 
-	get hash() {
-		return this.compilation.hash;
-	}
+  get compilation() {
+    if (this.#compilation.__internal__shutdown) {
+      throw new Error(
+        'Unable to access `Stats` after the compiler was shutdown',
+      );
+    }
+    return this.#compilation;
+  }
 
-	hasErrors() {
-		return this.#inner.getErrors().length > 0;
-	}
+  get hash() {
+    return this.compilation.hash;
+  }
 
-	hasWarnings() {
-		return this.#inner.getWarnings().length > 0;
-	}
+  get startTime() {
+    return this.compilation.startTime;
+  }
 
-	toJson(opts?: StatsValue, forToString?: boolean): StatsCompilation {
-		const options = this.compilation.createStatsOptions(opts, {
-			forToString
-		});
+  get endTime() {
+    return this.compilation.endTime;
+  }
 
-		const statsFactory = this.compilation.createStatsFactory(options);
+  hasErrors(): boolean {
+    return (
+      this.#compilation.errors.length > 0 ||
+      this.#compilation.children.some((child) => child.getStats().hasErrors())
+    );
+  }
 
-		// FIXME: This is a really ugly workaround for avoid panic for accessing previous compilation.
-		// Modern.js dev server will detect whether the returned stats is available.
-		// So this does not do harm to these frameworks.
-		// Modern.js: https://github.com/web-infra-dev/modern.js/blob/63f916f882f7d16096949e264e119218c0ab8d7d/packages/server/server/src/dev-tools/dev-middleware/socketServer.ts#L172
-		let stats: StatsCompilation | null = null;
-		try {
-			stats = statsFactory.create("compilation", this.compilation, {
-				compilation: this.compilation,
-				getInner: this.#getInnerByCompilation.bind(this)
-			});
-		} catch (e) {
-			console.warn(
-				"Failed to get stats. " +
-					"Are you trying to access the stats from the previous compilation?"
-			);
-		}
-		return stats as StatsCompilation;
-	}
+  hasWarnings(): boolean {
+    const warnings = this.#compilation.hooks.processWarnings.call(
+      this.#compilation.warnings,
+    );
+    return (
+      warnings.length > 0 ||
+      this.#compilation.children.some((child) => child.getStats().hasWarnings())
+    );
+  }
 
-	toString(opts?: StatsValue) {
-		const options = this.compilation.createStatsOptions(opts, {
-			forToString: true
-		});
-		const statsFactory = this.compilation.createStatsFactory(options);
+  toJson(opts?: StatsValue, forToString?: boolean): StatsCompilation {
+    const options = this.compilation.createStatsOptions(opts, {
+      forToString,
+    });
 
-		const statsPrinter = this.compilation.createStatsPrinter(options);
+    const statsFactory = this.compilation.createStatsFactory(options);
 
-		// FIXME: This is a really ugly workaround for avoid panic for accessing previous compilation.
-		// Modern.js dev server will detect whether the returned stats is available.
-		// So this does not do harm to these frameworks.
-		// Modern.js: https://github.com/web-infra-dev/modern.js/blob/63f916f882f7d16096949e264e119218c0ab8d7d/packages/server/server/src/dev-tools/dev-middleware/socketServer.ts#L172
-		let stats: StatsCompilation | null = null;
-		try {
-			stats = statsFactory.create("compilation", this.compilation, {
-				compilation: this.compilation,
-				getInner: this.#getInnerByCompilation.bind(this)
-			});
-		} catch (e) {
-			console.warn(
-				"Failed to get stats. " +
-					"Are you trying to access the stats from the previous compilation?"
-			);
-		}
+    const statsCompilationMap = new Map<
+      Compilation,
+      binding.JsStatsCompilation
+    >();
 
-		if (!stats) {
-			return "";
-		}
+    const stats = statsFactory.create('compilation', this.compilation, {
+      compilation: this.compilation,
+      getStatsCompilation: (
+        compilation: Compilation,
+      ): binding.JsStatsCompilation => {
+        if (statsCompilationMap.has(compilation)) {
+          return statsCompilationMap.get(compilation)!;
+        }
+        // return empty stats for stale compilation
+        // TODO: Find a better way to handle accessing stats from stale compilations
+        if (this.compilation !== this.compilation.compiler._lastCompilation) {
+          return {
+            assets: [],
+            assetsByChunkName: [],
+            chunks: [],
+            entrypoints: [],
+            errors: [],
+            hash: 'XXXX',
+            modules: [],
+            namedChunkGroups: [],
+            warnings: [],
+          };
+        }
+        const innerStats = this.#getInnerByCompilation(compilation);
+        options.warnings = false;
+        const innerStatsCompilation = innerStats.toJson(options);
+        statsCompilationMap.set(compilation, innerStatsCompilation);
+        return innerStatsCompilation;
+      },
+      getInner: this.#getInnerByCompilation.bind(this),
+    });
+    return stats as StatsCompilation;
+  }
 
-		const result = statsPrinter.print("compilation", stats);
+  toString(opts?: StatsValue) {
+    const options = this.compilation.createStatsOptions(opts, {
+      forToString: true,
+    });
+    const statsFactory = this.compilation.createStatsFactory(options);
 
-		return result === undefined ? "" : result;
-	}
+    const statsPrinter = this.compilation.createStatsPrinter(options);
+
+    const statsCompilationMap = new Map<
+      Compilation,
+      binding.JsStatsCompilation
+    >();
+
+    const stats = statsFactory.create('compilation', this.compilation, {
+      compilation: this.compilation,
+      getStatsCompilation: (
+        compilation: Compilation,
+      ): binding.JsStatsCompilation => {
+        if (statsCompilationMap.has(compilation)) {
+          return statsCompilationMap.get(compilation)!;
+        }
+        // return empty stats for stale compilation
+        // TODO: Find a better way to handle accessing stats from stale compilations
+        if (this.compilation !== this.compilation.compiler._lastCompilation) {
+          return {
+            assets: [],
+            assetsByChunkName: [],
+            chunks: [],
+            entrypoints: [],
+            errors: [],
+            hash: 'XXXX',
+            modules: [],
+            namedChunkGroups: [],
+            warnings: [],
+          };
+        }
+        const innerStats = this.#getInnerByCompilation(compilation);
+        const innerStatsCompilation = innerStats.toJson(options);
+        statsCompilationMap.set(compilation, innerStatsCompilation);
+        return innerStatsCompilation;
+      },
+      getInner: this.#getInnerByCompilation.bind(this),
+    });
+
+    const result = statsPrinter.print('compilation', stats);
+
+    return result === undefined ? '' : result;
+  }
 }
 
 export function normalizeStatsPreset(options?: StatsValue): StatsOptions {
-	if (typeof options === "boolean" || typeof options === "string")
-		return presetToOptions(options);
-	else if (!options) return {};
-	else {
-		let obj = { ...presetToOptions(options.preset), ...options };
-		delete obj.preset;
-		return obj;
-	}
+  if (typeof options === 'boolean' || typeof options === 'string')
+    return presetToOptions(options);
+  if (!options) return {};
+
+  const obj = { ...presetToOptions(options.preset), ...options };
+  delete obj.preset;
+  return obj;
 }
 
 function presetToOptions(name?: boolean | string): StatsOptions {
-	const preset = (typeof name === "string" && name.toLowerCase()) || name;
-	switch (preset) {
-		case "none":
-			return {
-				all: false
-			};
-		case "verbose":
-			return {
-				all: true,
-				modulesSpace: Infinity
-			};
-		case "errors-only":
-			return {
-				all: false,
-				errors: true,
-				errorsCount: true,
-				logging: "error"
-				// TODO: moduleTrace: true,
-			};
-		case "errors-warnings":
-			return {
-				all: false,
-				errors: true,
-				errorsCount: true,
-				warnings: true,
-				warningsCount: true,
-				logging: "warn"
-			};
-		default:
-			return {};
-	}
+  const preset = (typeof name === 'string' && name.toLowerCase()) || name;
+  switch (preset) {
+    case 'none':
+      return {
+        all: false,
+      };
+    case 'verbose':
+      return {
+        all: true,
+        modulesSpace: Number.POSITIVE_INFINITY,
+      };
+    case 'errors-only':
+      return {
+        all: false,
+        errors: true,
+        errorsCount: true,
+        logging: 'error',
+        moduleTrace: true,
+      };
+    case 'errors-warnings':
+      return {
+        all: false,
+        errors: true,
+        errorsCount: true,
+        warnings: true,
+        warningsCount: true,
+        logging: 'warn',
+      };
+    default:
+      return {};
+  }
 }
-
-export const normalizeFilter = (item: FilterItemTypes) => {
-	if (typeof item === "string") {
-		const regExp = new RegExp(
-			`[\\\\/]${item.replace(
-				// eslint-disable-next-line no-useless-escape
-				/[-[\]{}()*+?.\\^$|]/g,
-				"\\$&"
-			)}([\\\\/]|$|!|\\?)`
-		);
-		return (ident: string) => regExp.test(ident);
-	}
-	if (item && typeof item === "object" && typeof item.test === "function") {
-		return (ident: string) => item.test(ident);
-	}
-	if (typeof item === "function") {
-		return item;
-	}
-	if (typeof item === "boolean") {
-		return () => item;
-	}
-	throw new Error(
-		`unreachable: typeof ${item} should be one of string | RegExp | ((value: string) => boolean)`
-	);
-};
-
-export const optionsOrFallback = (...args: any) => {
-	let optionValues = [];
-	optionValues.push(...args);
-	return optionValues.find(optionValue => optionValue !== undefined);
-};

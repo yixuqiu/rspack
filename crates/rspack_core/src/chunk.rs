@@ -1,55 +1,312 @@
-use std::cmp::Ordering;
-use std::hash::BuildHasherDefault;
-use std::{fmt::Debug, hash::Hash, sync::Arc};
+use std::{cmp::Ordering, fmt::Debug};
 
-use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
-use rspack_database::{DatabaseItem, Ukey};
-use rspack_hash::{RspackHash, RspackHashDigest};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
+use rayon::prelude::*;
+use rspack_collections::IdentifierSet;
+use rspack_error::Diagnostic;
+use rspack_hash::{RspackHash, RspackHashDigest, RspackHasher};
+use rspack_util::fx_hash::{FxIndexMap, FxIndexSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use ustr::Ustr;
 
 use crate::{
-  compare_chunk_group, get_chunk_group_from_ukey, sort_group_by_index, ChunkGraph, ChunkGroup,
-  ChunkGroupOrderKey,
+  ChunkGraph, ChunkGroupByUkey, ChunkGroupOrderKey, ChunkGroupUkey, ChunkHashesArtifact, ChunkUkey,
+  Compilation, EntryOptions, Filename, ModuleIdsArtifact, RenderManifestEntry, RuntimeSpec,
+  SourceType,
+  chunk_graph_chunk::{ChunkId, IndexChunkIdMap},
+  compare_chunk_group, sort_group_by_index,
 };
-use crate::{ChunkGroupByUkey, ChunkGroupUkey, ChunkUkey, SourceType};
-use crate::{Compilation, EntryOptions, Filename, ModuleGraph, RuntimeSpec};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkKind {
   HotUpdate,
   Normal,
+  /// A module-less chunk that preserves a logical output identity.
+  Facade,
 }
 
 pub type ChunkContentHash = HashMap<SourceType, RspackHashDigest>;
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChunkHashesResult {
+  hash: RspackHashDigest,
+  content_hash: ChunkContentHash,
+}
+
+impl ChunkHashesResult {
+  pub fn new(hash: RspackHashDigest, content_hash: ChunkContentHash) -> Self {
+    Self { hash, content_hash }
+  }
+
+  pub fn hash(&self) -> &RspackHashDigest {
+    &self.hash
+  }
+
+  pub fn content_hash(&self) -> &ChunkContentHash {
+    &self.content_hash
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkRenderResult {
+  pub manifests: Vec<RenderManifestEntry>,
+  pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Default)]
+pub struct ChunkSplitData {
+  groups: HashSet<ChunkGroupUkey>,
+  id_name_hints: HashSet<String>,
+  runtimes: Vec<Ustr>,
+}
+
+impl ChunkSplitData {
+  pub fn with_capacity(groups: usize, id_name_hints: usize) -> Self {
+    Self {
+      groups: HashSet::with_capacity_and_hasher(groups, Default::default()),
+      id_name_hints: HashSet::with_capacity_and_hasher(id_name_hints, Default::default()),
+      runtimes: Vec::new(),
+    }
+  }
+
+  fn add_runtime(&mut self, runtime: &RuntimeSpec) {
+    self.runtimes.extend(runtime.iter().copied());
+  }
+
+  pub fn apply_to(self, chunk: &mut Chunk) {
+    chunk.groups.extend(self.groups);
+    chunk.id_name_hints.extend(self.id_name_hints);
+    if !self.runtimes.is_empty() {
+      let runtime = if chunk.runtime.is_empty() {
+        self.runtimes.into_iter().collect::<RuntimeSpec>()
+      } else {
+        chunk
+          .runtime
+          .iter()
+          .copied()
+          .chain(self.runtimes)
+          .collect::<RuntimeSpec>()
+      };
+      chunk.runtime = runtime;
+    }
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct Chunk {
+  ukey: ChunkUkey,
+  kind: ChunkKind,
+  id: Option<ChunkId>,
   // - If the chunk is create by entry config, the name is the entry name
   // - The name of chunks create by dynamic import is `None` unless users use
   // magic comment like `import(/* webpackChunkName: "someChunk" * / './someModule.js')` to specify it.
-  pub name: Option<String>,
-  pub filename_template: Option<Filename>,
-  pub css_filename_template: Option<Filename>,
-  pub ukey: ChunkUkey,
-  pub id: Option<String>,
-  pub ids: Vec<String>,
-  pub id_name_hints: HashSet<String>,
-  pub prevent_integration: bool,
-  pub files: HashSet<String>,
-  pub auxiliary_files: HashSet<String>,
-  pub groups: HashSet<ChunkGroupUkey>,
-  pub runtime: RuntimeSpec,
-  pub kind: ChunkKind,
-  pub hash: Option<RspackHashDigest>,
-  pub rendered_hash: Option<Arc<str>>,
-  pub content_hash: ChunkContentHash,
-  pub chunk_reasons: Vec<String>,
+  name: Option<String>,
+  id_name_hints: HashSet<String>,
+  filename_template: Option<Filename>,
+  css_filename_template: Option<Filename>,
+  prevent_integration: bool,
+  groups: HashSet<ChunkGroupUkey>,
+  runtime: RuntimeSpec,
+  files: HashSet<String>,
+  auxiliary_files: HashSet<String>,
+  chunk_reason: Option<String>,
+  rendered: bool,
 }
 
-impl DatabaseItem for Chunk {
-  fn ukey(&self) -> rspack_database::Ukey<Self> {
+impl Chunk {
+  pub fn ukey(&self) -> ChunkUkey {
     self.ukey
+  }
+
+  pub fn kind(&self) -> ChunkKind {
+    self.kind
+  }
+
+  pub fn set_kind(&mut self, kind: ChunkKind) {
+    self.kind = kind;
+  }
+
+  pub fn name(&self) -> Option<&str> {
+    self.name.as_deref()
+  }
+
+  pub fn set_name(&mut self, name: Option<String>) {
+    self.name = name;
+  }
+
+  pub fn filename_template(&self) -> Option<&Filename> {
+    self.filename_template.as_ref()
+  }
+
+  pub fn set_filename_template(&mut self, filename_template: Option<Filename>) {
+    self.filename_template = filename_template;
+  }
+
+  pub fn css_filename_template(&self) -> Option<&Filename> {
+    self.css_filename_template.as_ref()
+  }
+
+  pub fn id(&self) -> Option<&ChunkId> {
+    self.id.as_ref()
+  }
+
+  pub fn expect_id(&self) -> &ChunkId {
+    self.id().expect("Should set id before calling expect_id")
+  }
+
+  pub fn set_id(&mut self, id: impl Into<ChunkId>) -> bool {
+    let id: ChunkId = id.into();
+    if let Some(prev_id) = &self.id
+      && prev_id == &id
+    {
+      return false;
+    }
+
+    self.id = Some(id);
+    true
+  }
+
+  pub fn prevent_integration(&self) -> bool {
+    self.prevent_integration
+  }
+
+  pub fn set_prevent_integration(&mut self, prevent_integration: bool) {
+    self.prevent_integration = prevent_integration;
+  }
+
+  pub fn id_name_hints(&self) -> &HashSet<String> {
+    &self.id_name_hints
+  }
+
+  pub fn add_id_name_hints(&mut self, hint: String) {
+    self.id_name_hints.insert(hint);
+  }
+
+  pub fn groups(&self) -> &HashSet<ChunkGroupUkey> {
+    &self.groups
+  }
+
+  pub fn add_group(&mut self, group: ChunkGroupUkey) {
+    self.groups.insert(group);
+  }
+
+  pub fn is_in_group(&self, chunk_group: &ChunkGroupUkey) -> bool {
+    self.groups.contains(chunk_group)
+  }
+
+  pub fn remove_group(&mut self, chunk_group: &ChunkGroupUkey) -> bool {
+    self.groups.remove(chunk_group)
+  }
+
+  pub fn get_number_of_groups(&self) -> usize {
+    self.groups.len()
+  }
+
+  pub fn runtime(&self) -> &RuntimeSpec {
+    &self.runtime
+  }
+
+  pub fn set_runtime(&mut self, runtime: RuntimeSpec) {
+    self.runtime = runtime;
+  }
+
+  pub fn files(&self) -> &HashSet<String> {
+    &self.files
+  }
+
+  pub fn add_file(&mut self, file: String) {
+    self.files.insert(file);
+  }
+
+  pub fn remove_file(&mut self, file: &str) -> bool {
+    self.files.remove(file)
+  }
+
+  pub fn auxiliary_files(&self) -> &HashSet<String> {
+    &self.auxiliary_files
+  }
+
+  pub fn add_auxiliary_file(&mut self, auxiliary_file: String) {
+    self.auxiliary_files.insert(auxiliary_file);
+  }
+
+  pub fn remove_auxiliary_file(&mut self, auxiliary_file: &str) -> bool {
+    self.auxiliary_files.remove(auxiliary_file)
+  }
+
+  pub fn chunk_reason(&self) -> Option<&str> {
+    self.chunk_reason.as_deref()
+  }
+
+  pub fn chunk_reason_mut(&mut self) -> &mut Option<String> {
+    &mut self.chunk_reason
+  }
+
+  pub fn hash<'a>(
+    &self,
+    chunk_hashes_results: &'a ChunkHashesArtifact,
+  ) -> Option<&'a RspackHashDigest> {
+    chunk_hashes_results
+      .get(&self.ukey)
+      .map(|result| result.hash())
+  }
+
+  pub fn rendered_hash<'a>(
+    &self,
+    chunk_hashes_results: &'a ChunkHashesArtifact,
+    len: usize,
+  ) -> Option<&'a str> {
+    chunk_hashes_results
+      .get(&self.ukey)
+      .map(|result| result.hash().rendered(len))
+  }
+
+  pub fn content_hash<'a>(
+    &self,
+    chunk_hashes_results: &'a ChunkHashesArtifact,
+  ) -> Option<&'a ChunkContentHash> {
+    chunk_hashes_results
+      .get(&self.ukey)
+      .map(|result| result.content_hash())
+  }
+
+  pub fn content_hash_by_source_type<'a>(
+    &self,
+    chunk_hashes_results: &'a ChunkHashesArtifact,
+    source_type: &SourceType,
+  ) -> Option<&'a RspackHashDigest> {
+    self
+      .content_hash(chunk_hashes_results)
+      .and_then(|content_hash| content_hash.get(source_type))
+  }
+
+  pub fn rendered_content_hash_by_source_type<'a>(
+    &self,
+    chunk_hashes_results: &'a ChunkHashesArtifact,
+    source_type: &SourceType,
+    len: usize,
+  ) -> Option<&'a str> {
+    self
+      .content_hash(chunk_hashes_results)
+      .and_then(|content_hash| content_hash.get(source_type))
+      .map(|hash| hash.rendered(len))
+  }
+
+  pub fn set_hashes(
+    &self,
+    chunk_hashes_results: &mut ChunkHashesArtifact,
+    chunk_hash: RspackHashDigest,
+    content_hash: ChunkContentHash,
+  ) -> bool {
+    chunk_hashes_results.set_hashes(self.ukey, ChunkHashesResult::new(chunk_hash, content_hash))
+  }
+
+  pub fn rendered(&self) -> bool {
+    self.rendered
+  }
+
+  pub fn set_rendered(&mut self, rendered: bool) {
+    self.rendered = rendered;
   }
 }
 
@@ -61,7 +318,6 @@ impl Chunk {
       css_filename_template: None,
       ukey: ChunkUkey::new(),
       id: None,
-      ids: vec![],
       id_name_hints: Default::default(),
       prevent_integration: false,
       files: Default::default(),
@@ -69,17 +325,15 @@ impl Chunk {
       groups: Default::default(),
       runtime: RuntimeSpec::default(),
       kind,
-      hash: None,
-      rendered_hash: None,
-      content_hash: HashMap::default(),
-      chunk_reasons: Default::default(),
+      chunk_reason: Default::default(),
+      rendered: false,
     }
   }
 
-  pub fn get_sorted_groups_iter(
-    &self,
-    chunk_group_by_ukey: &ChunkGroupByUkey,
-  ) -> impl Iterator<Item = &Ukey<ChunkGroup>> {
+  pub fn get_sorted_groups_iter<'a>(
+    &'a self,
+    chunk_group_by_ukey: &'a ChunkGroupByUkey,
+  ) -> impl Iterator<Item = &'a ChunkGroupUkey> + use<'a> {
     self
       .groups
       .iter()
@@ -91,7 +345,7 @@ impl Chunk {
     chunk_group_by_ukey: &'a ChunkGroupByUkey,
   ) -> Option<&'a EntryOptions> {
     for group_ukey in &self.groups {
-      if let Some(group) = get_chunk_group_from_ukey(group_ukey, chunk_group_by_ukey)
+      if let Some(group) = chunk_group_by_ukey.get(group_ukey)
         && let Some(entry_options) = group.kind.get_entry_options()
       {
         return Some(entry_options);
@@ -100,27 +354,42 @@ impl Chunk {
     None
   }
 
-  pub fn add_group(&mut self, group: ChunkGroupUkey) {
-    self.groups.insert(group);
+  pub fn split_collect_new_chunk_data(
+    &self,
+    new_chunk_ukey: ChunkUkey,
+    chunk_group_by_ukey: &mut ChunkGroupByUkey,
+    split_data: &mut ChunkSplitData,
+  ) {
+    let group_keys: Vec<_> = {
+      let temp_ref = chunk_group_by_ukey as &ChunkGroupByUkey;
+      self.get_sorted_groups_iter(temp_ref).copied().collect()
+    };
+
+    split_data.groups.reserve(group_keys.len());
+    for group_key in group_keys {
+      let group = chunk_group_by_ukey.expect_get_mut(&group_key);
+      group.insert_chunk(new_chunk_ukey, self.ukey);
+      split_data.groups.insert(group.ukey);
+    }
+
+    split_data.id_name_hints.reserve(self.id_name_hints.len());
+    split_data
+      .id_name_hints
+      .extend(self.id_name_hints.iter().cloned());
+    split_data.add_runtime(&self.runtime);
   }
 
   pub fn split(&mut self, new_chunk: &mut Chunk, chunk_group_by_ukey: &mut ChunkGroupByUkey) {
-    self
-      .get_sorted_groups_iter(chunk_group_by_ukey)
-      .for_each(|group| {
-        let group = chunk_group_by_ukey.expect_get_mut(group);
-        group.insert_chunk(new_chunk.ukey, self.ukey);
-        new_chunk.add_group(group.ukey);
-      });
-    new_chunk.id_name_hints.extend(self.id_name_hints.clone());
-    new_chunk.runtime.extend(self.runtime.clone());
+    let mut split_data = ChunkSplitData::with_capacity(self.groups.len(), self.id_name_hints.len());
+    self.split_collect_new_chunk_data(new_chunk.ukey, chunk_group_by_ukey, &mut split_data);
+    split_data.apply_to(new_chunk);
   }
 
   pub fn can_be_initial(&self, chunk_group_by_ukey: &ChunkGroupByUkey) -> bool {
     self
       .groups
       .iter()
-      .filter_map(|ukey| get_chunk_group_from_ukey(ukey, chunk_group_by_ukey))
+      .filter_map(|ukey| chunk_group_by_ukey.get(ukey))
       .any(|group| group.is_initial())
   }
 
@@ -128,7 +397,7 @@ impl Chunk {
     self
       .groups
       .iter()
-      .filter_map(|ukey| get_chunk_group_from_ukey(ukey, chunk_group_by_ukey))
+      .filter_map(|ukey| chunk_group_by_ukey.get(ukey))
       .all(|group| group.is_initial())
   }
 
@@ -139,13 +408,13 @@ impl Chunk {
   pub fn get_all_referenced_chunks(
     &self,
     chunk_group_by_ukey: &ChunkGroupByUkey,
-  ) -> IndexSet<ChunkUkey, BuildHasherDefault<FxHasher>> {
-    let mut chunks = IndexSet::default();
+  ) -> FxIndexSet<ChunkUkey> {
+    let mut chunks = FxIndexSet::default();
     let mut visit_chunk_groups = HashSet::default();
 
     fn add_chunks(
       chunk_group_ukey: &ChunkGroupUkey,
-      chunks: &mut IndexSet<ChunkUkey, BuildHasherDefault<FxHasher>>,
+      chunks: &mut FxIndexSet<ChunkUkey>,
       chunk_group_by_ukey: &ChunkGroupByUkey,
       visit_chunk_groups: &mut HashSet<ChunkGroupUkey>,
     ) {
@@ -156,8 +425,7 @@ impl Chunk {
       }
 
       for child_group_ukey in group.children.iter() {
-        if !visit_chunk_groups.contains(child_group_ukey) {
-          visit_chunk_groups.insert(*child_group_ukey);
+        if visit_chunk_groups.insert(*child_group_ukey) {
           add_chunks(
             child_group_ukey,
             chunks,
@@ -184,13 +452,13 @@ impl Chunk {
   pub fn get_all_initial_chunks(
     &self,
     chunk_group_by_ukey: &ChunkGroupByUkey,
-  ) -> IndexSet<ChunkUkey, BuildHasherDefault<FxHasher>> {
-    let mut chunks = IndexSet::default();
+  ) -> FxIndexSet<ChunkUkey> {
+    let mut chunks = FxIndexSet::default();
     let mut visit_chunk_groups = HashSet::default();
 
     fn add_chunks(
       chunk_group_ukey: &ChunkGroupUkey,
-      chunks: &mut IndexSet<ChunkUkey, BuildHasherDefault<FxHasher>>,
+      chunks: &mut FxIndexSet<ChunkUkey>,
       chunk_group_by_ukey: &ChunkGroupByUkey,
       visit_chunk_groups: &mut HashSet<ChunkGroupUkey>,
     ) {
@@ -202,8 +470,7 @@ impl Chunk {
         }
 
         for child_group_ukey in group.children.iter() {
-          if !visit_chunk_groups.contains(child_group_ukey) {
-            visit_chunk_groups.insert(*child_group_ukey);
+          if visit_chunk_groups.insert(*child_group_ukey) {
             add_chunks(
               child_group_ukey,
               chunks,
@@ -230,13 +497,13 @@ impl Chunk {
   pub fn get_all_referenced_async_entrypoints(
     &self,
     chunk_group_by_ukey: &ChunkGroupByUkey,
-  ) -> IndexSet<ChunkGroupUkey, BuildHasherDefault<FxHasher>> {
-    let mut async_entrypoints = IndexSet::default();
+  ) -> FxIndexSet<ChunkGroupUkey> {
+    let mut async_entrypoints = FxIndexSet::default();
     let mut visit_chunk_groups = HashSet::default();
 
     fn add_async_entrypoints(
       chunk_group_ukey: &ChunkGroupUkey,
-      async_entrypoints: &mut IndexSet<ChunkGroupUkey, BuildHasherDefault<FxHasher>>,
+      async_entrypoints: &mut FxIndexSet<ChunkGroupUkey>,
       chunk_group_by_ukey: &ChunkGroupByUkey,
       visit_chunk_groups: &mut HashSet<ChunkGroupUkey>,
     ) {
@@ -247,8 +514,7 @@ impl Chunk {
       }
 
       for child_group_ukey in group.children.iter() {
-        if !visit_chunk_groups.contains(child_group_ukey) {
-          visit_chunk_groups.insert(*child_group_ukey);
+        if visit_chunk_groups.insert(*child_group_ukey) {
           add_async_entrypoints(
             child_group_ukey,
             async_entrypoints,
@@ -275,53 +541,124 @@ impl Chunk {
     self
       .groups
       .iter()
-      .filter_map(|ukey| get_chunk_group_from_ukey(ukey, chunk_group_by_ukey))
+      .filter_map(|ukey| chunk_group_by_ukey.get(ukey))
       .any(|group| {
         group.kind.is_entrypoint() && group.get_runtime_chunk(chunk_group_by_ukey) == self.ukey
       })
   }
 
   pub fn has_async_chunks(&self, chunk_group_by_ukey: &ChunkGroupByUkey) -> bool {
-    !self.get_all_async_chunks(chunk_group_by_ukey).is_empty()
-  }
-
-  pub fn get_all_async_chunks(
-    &self,
-    chunk_group_by_ukey: &ChunkGroupByUkey,
-  ) -> IndexSet<ChunkUkey, BuildHasherDefault<FxHasher>> {
-    use rustc_hash::FxHashSet;
-
-    let mut queue = IndexSet::default();
-    let mut chunks = IndexSet::default();
+    // The reason why we don't just return !self.get_all_async_chunks(chunk_group_by_ukey).is_empty() here is
+    // get_all_async_chunks will check the whether the chunk is inside Entrypoint, which cause the chunk not return
+    // as a async chunk, but has_async_chunks is used to check whether need to add the chunk loading runtime, which
+    // is about loading the async chunks, so even the chunk is inside Entrypoint but loading it indeed need the
+    // chunk loading runtime.
+    // For a real case checkout the test: `rspack-test-tools/configCases/chunk-loading/depend-on-with-chunk-load`
+    let mut queue = FxIndexSet::default();
 
     let initial_chunks = self
       .groups
       .iter()
-      .map(|chunk_group| chunk_group.as_ref(chunk_group_by_ukey))
-      .map(|group| group.chunks.iter().copied().collect::<FxHashSet<_>>())
-      .reduce(|acc, prev| acc.intersection(&prev).copied().collect::<FxHashSet<_>>())
+      .map(|chunk_group| chunk_group_by_ukey.expect_get(chunk_group))
+      .map(|group| group.chunks.iter().copied().collect::<HashSet<_>>())
+      .reduce(|acc, prev| acc.intersection(&prev).copied().collect::<HashSet<_>>())
       .unwrap_or_default();
-
-    let mut initial_queue = self
-      .get_sorted_groups_iter(chunk_group_by_ukey)
-      .map(|c| c.to_owned())
-      .collect::<IndexSet<ChunkGroupUkey, BuildHasherDefault<FxHasher>>>();
 
     let mut visit_chunk_groups = HashSet::default();
 
-    fn add_to_queue(
-      chunk_group_by_ukey: &ChunkGroupByUkey,
-      queue: &mut IndexSet<ChunkGroupUkey, BuildHasherDefault<FxHasher>>,
-      initial_queue: &mut IndexSet<ChunkGroupUkey, BuildHasherDefault<FxHasher>>,
-      chunk_group_ukey: &ChunkGroupUkey,
-    ) {
-      if let Some(chunk_group) = get_chunk_group_from_ukey(chunk_group_ukey, chunk_group_by_ukey) {
+    for chunk_group_ukey in self.get_sorted_groups_iter(chunk_group_by_ukey) {
+      if let Some(chunk_group) = chunk_group_by_ukey.get(chunk_group_ukey) {
         for child_ukey in chunk_group
           .children
           .iter()
           .sorted_by(|a, b| sort_group_by_index(a, b, chunk_group_by_ukey))
         {
-          if let Some(chunk_group) = get_chunk_group_from_ukey(child_ukey, chunk_group_by_ukey) {
+          if let Some(chunk_group) = chunk_group_by_ukey.get(child_ukey) {
+            queue.insert(chunk_group.ukey);
+          }
+        }
+      }
+    }
+
+    fn check_chunks(
+      chunk_group_by_ukey: &ChunkGroupByUkey,
+      initial_chunks: &HashSet<ChunkUkey>,
+      chunk_group_ukey: &ChunkGroupUkey,
+      visit_chunk_groups: &mut HashSet<ChunkGroupUkey>,
+    ) -> bool {
+      let Some(chunk_group) = chunk_group_by_ukey.get(chunk_group_ukey) else {
+        return false;
+      };
+      for chunk_ukey in chunk_group.chunks.iter() {
+        if !initial_chunks.contains(chunk_ukey) {
+          return true;
+        }
+      }
+      for group_ukey in chunk_group.children.iter() {
+        if !visit_chunk_groups.contains(group_ukey) {
+          visit_chunk_groups.insert(*group_ukey);
+          if check_chunks(
+            chunk_group_by_ukey,
+            initial_chunks,
+            group_ukey,
+            visit_chunk_groups,
+          ) {
+            return true;
+          }
+        }
+      }
+      false
+    }
+
+    for group_ukey in queue.iter() {
+      if check_chunks(
+        chunk_group_by_ukey,
+        &initial_chunks,
+        group_ukey,
+        &mut visit_chunk_groups,
+      ) {
+        return true;
+      }
+    }
+
+    false
+  }
+
+  pub fn get_all_async_chunks(
+    &self,
+    chunk_group_by_ukey: &ChunkGroupByUkey,
+  ) -> FxIndexSet<ChunkUkey> {
+    let mut queue = FxIndexSet::default();
+    let mut chunks = FxIndexSet::default();
+
+    let initial_chunks = self
+      .groups
+      .iter()
+      .map(|chunk_group| chunk_group_by_ukey.expect_get(chunk_group))
+      .map(|group| group.chunks.iter().copied().collect::<HashSet<_>>())
+      .reduce(|acc, prev| acc.intersection(&prev).copied().collect::<HashSet<_>>())
+      .unwrap_or_default();
+
+    let mut initial_queue = self
+      .get_sorted_groups_iter(chunk_group_by_ukey)
+      .map(|c| c.to_owned())
+      .collect::<FxIndexSet<ChunkGroupUkey>>();
+
+    let mut visit_chunk_groups = HashSet::default();
+
+    fn add_to_queue(
+      chunk_group_by_ukey: &ChunkGroupByUkey,
+      queue: &mut FxIndexSet<ChunkGroupUkey>,
+      initial_queue: &mut FxIndexSet<ChunkGroupUkey>,
+      chunk_group_ukey: &ChunkGroupUkey,
+    ) {
+      if let Some(chunk_group) = chunk_group_by_ukey.get(chunk_group_ukey) {
+        for child_ukey in chunk_group
+          .children
+          .iter()
+          .sorted_by(|a, b| sort_group_by_index(a, b, chunk_group_by_ukey))
+        {
+          if let Some(chunk_group) = chunk_group_by_ukey.get(child_ukey) {
             if chunk_group.is_initial() && !initial_queue.contains(&chunk_group.ukey) {
               initial_queue.insert(chunk_group.ukey);
               add_to_queue(chunk_group_by_ukey, queue, initial_queue, &chunk_group.ukey);
@@ -344,12 +681,12 @@ impl Chunk {
 
     fn add_chunks(
       chunk_group_by_ukey: &ChunkGroupByUkey,
-      chunks: &mut IndexSet<ChunkUkey, BuildHasherDefault<FxHasher>>,
+      chunks: &mut FxIndexSet<ChunkUkey>,
       initial_chunks: &HashSet<ChunkUkey>,
       chunk_group_ukey: &ChunkGroupUkey,
       visit_chunk_groups: &mut HashSet<ChunkGroupUkey>,
     ) {
-      if let Some(chunk_group) = get_chunk_group_from_ukey(chunk_group_ukey, chunk_group_by_ukey) {
+      if let Some(chunk_group) = chunk_group_by_ukey.get(chunk_group_ukey) {
         for chunk_ukey in chunk_group.chunks.iter() {
           if !initial_chunks.contains(chunk_ukey) {
             chunks.insert(*chunk_ukey);
@@ -384,29 +721,12 @@ impl Chunk {
     chunks
   }
 
-  // pub fn get_all_referenced_async_entry_points() -> HashSet<ChunkUkey> {}
-
-  pub fn get_render_hash(&self, length: usize) -> Option<&str> {
-    self.hash.as_ref().map(|hash| hash.rendered(length))
-  }
-
-  pub fn expect_id(&self) -> &str {
-    self
-      .id
-      .as_ref()
-      .expect("Should set id before calling expect_id")
-  }
-
   pub fn name_for_filename_template(&self) -> Option<&str> {
     if self.name.is_some() {
       self.name.as_deref()
     } else {
-      self.id.as_deref()
+      self.id().map(|id| id.as_str())
     }
-  }
-
-  pub fn is_in_group(&self, chunk_group: &ChunkGroupUkey) -> bool {
-    self.groups.contains(chunk_group)
   }
 
   pub fn disconnect_from_groups(&mut self, chunk_group_by_ukey: &mut ChunkGroupByUkey) {
@@ -417,36 +737,75 @@ impl Chunk {
     self.groups.clear();
   }
 
-  pub fn update_hash(&self, hasher: &mut RspackHash, compilation: &Compilation) {
-    self.id.hash(hasher);
-    self.ids.hash(hasher);
-    for module in compilation
+  pub fn update_hash(&self, hasher: &mut RspackHasher, compilation: &Compilation) {
+    self.id().hash(hasher);
+    let runtime_modules = compilation
+      .build_chunk_graph_artifact
       .chunk_graph
-      .get_ordered_chunk_modules(&self.ukey, &compilation.get_module_graph())
-    {
+      .get_chunk_runtime_modules_iterable(&self.ukey)
+      .copied()
+      .collect::<IdentifierSet>();
+
+    let module_ids: &ModuleIdsArtifact = &compilation.module_ids_artifact;
+    let modules = compilation
+      .build_chunk_graph_artifact
+      .chunk_graph
+      .get_ordered_chunk_modules_identifier(&self.ukey);
+    // 16-byte default codegen digest + 8-byte module_id precomputed hash.
+    let mut hashes = Vec::with_capacity(modules.len() * 24);
+    for module_identifier in modules {
+      if runtime_modules.contains(&module_identifier) {
+        continue;
+      }
       if let Some(hash) = compilation
         .code_generation_results
-        .get_hash(&module.identifier(), Some(&self.runtime))
+        .get_hash(&module_identifier, Some(&self.runtime))
       {
-        hash.hash(hasher);
+        let digest = hash.encoded().as_bytes();
+        if digest.len() == 16 {
+          // Fast path for default xxhash64 + hex digests
+          hashes.extend_from_slice(digest);
+        } else {
+          hashes.extend_from_slice(digest);
+        }
+        if let Some(module_id) = ChunkGraph::get_module_id(module_ids, module_identifier) {
+          hashes.extend_from_slice(&module_id.precomputed_hash().to_le_bytes());
+        }
       }
     }
+    hasher.write(&hashes);
+
+    for (runtime_module_identifier, _) in compilation
+      .build_chunk_graph_artifact
+      .chunk_graph
+      .get_chunk_runtime_modules_in_order(&self.ukey, compilation)
+    {
+      let hash = compilation
+        .runtime_modules_hash
+        .get(runtime_module_identifier)
+        .unwrap_or_else(|| {
+          panic!(
+            "Runtime module ({runtime_module_identifier}) should have hash result when updating chunk hash."
+          );
+        });
+      hash.hash(hasher);
+    }
+
     "entry".hash(hasher);
     for (module, chunk_group) in compilation
+      .build_chunk_graph_artifact
       .chunk_graph
       .get_chunk_entry_modules_with_chunk_group_iterable(&self.ukey)
     {
-      compilation.chunk_graph.get_module_id(*module).hash(hasher);
-      if let Some(chunk_group) =
-        get_chunk_group_from_ukey(chunk_group, &compilation.chunk_group_by_ukey)
+      ChunkGraph::get_module_id(&compilation.module_ids_artifact, *module).hash(hasher);
+      if let Some(chunk_group) = compilation
+        .build_chunk_graph_artifact
+        .chunk_group_by_ukey
+        .get(chunk_group)
       {
         chunk_group.id(compilation).hash(hasher);
       }
     }
-  }
-
-  pub fn remove_group(&mut self, chunk_group: &ChunkGroupUkey) {
-    self.groups.remove(chunk_group);
   }
 
   pub fn get_children_of_type_in_order(
@@ -456,13 +815,14 @@ impl Chunk {
     is_self_last_chunk: bool,
   ) -> Option<Vec<(Vec<ChunkUkey>, Vec<ChunkUkey>)>> {
     let mut list = vec![];
-    let chunk_group_by_ukey = &compilation.chunk_group_by_ukey;
+    let chunk_group_by_ukey = &compilation.build_chunk_graph_artifact.chunk_group_by_ukey;
     for group_ukey in self.get_sorted_groups_iter(chunk_group_by_ukey) {
       let group = chunk_group_by_ukey.expect_get(group_ukey);
-      if let Some(last_chunk) = group.chunks.last() {
-        if is_self_last_chunk && !last_chunk.eq(&self.ukey) {
-          continue;
-        }
+      if let Some(last_chunk) = group.chunks.last()
+        && is_self_last_chunk
+        && !last_chunk.eq(&self.ukey)
+      {
+        continue;
       }
 
       for child_group_ukey in group
@@ -496,11 +856,7 @@ impl Chunk {
       }
     });
 
-    let mut result: IndexMap<
-      ChunkGroupUkey,
-      IndexSet<ChunkUkey, BuildHasherDefault<FxHasher>>,
-      BuildHasherDefault<FxHasher>,
-    > = IndexMap::default();
+    let mut result: FxIndexMap<ChunkGroupUkey, FxIndexSet<ChunkUkey>> = FxIndexMap::default();
     for (_, group_ukey, child_group_ukey) in list.iter() {
       let child_group = chunk_group_by_ukey.expect_get(child_group_ukey);
       result
@@ -523,113 +879,158 @@ impl Chunk {
     )
   }
 
-  pub fn get_child_ids_by_order(
+  pub fn get_child_ids_by_order<F: Fn(&ChunkUkey, &Compilation) -> bool>(
     &self,
-    order: &ChunkGroupOrderKey,
+    order_key: &ChunkGroupOrderKey,
     compilation: &Compilation,
-  ) -> Option<Vec<String>> {
-    self
-      .get_children_of_type_in_order(order, compilation, true)
-      .map(|order_children| {
-        order_children
-          .iter()
-          .flat_map(|(_, child_chunks)| {
-            child_chunks.iter().filter_map(|chunk_ukey| {
-              compilation
-                .chunk_by_ukey
-                .expect_get(chunk_ukey)
-                .id
-                .to_owned()
+    filter_fn: &F,
+  ) -> Option<Vec<ChunkId>> {
+    let mut list = vec![];
+    for group_ukey in
+      self.get_sorted_groups_iter(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
+    {
+      let group = compilation
+        .build_chunk_graph_artifact
+        .chunk_group_by_ukey
+        .expect_get(group_ukey);
+      if group
+        .chunks
+        .last()
+        .is_some_and(|chunk_ukey| chunk_ukey.eq(&self.ukey))
+      {
+        for child_group_ukey in group.children_iterable() {
+          let child_group = compilation
+            .build_chunk_graph_artifact
+            .chunk_group_by_ukey
+            .expect_get(child_group_ukey);
+          if let Some(order) = child_group
+            .kind
+            .get_normal_options()
+            .and_then(|o| match order_key {
+              ChunkGroupOrderKey::Prefetch => o.prefetch_order,
+              ChunkGroupOrderKey::Preload => o.preload_order,
             })
-          })
-          .collect_vec()
-      })
+          {
+            list.push((order, *child_group_ukey));
+          }
+        }
+      }
+    }
+
+    list.sort_by(|a, b| {
+      let order = b.0.cmp(&a.0);
+      match order {
+        Ordering::Equal => compare_chunk_group(&a.1, &b.1, compilation),
+        _ => order,
+      }
+    });
+
+    let mut chunk_ids = vec![];
+    for (_, child_group_ukey) in list.iter() {
+      let child_group = compilation
+        .build_chunk_graph_artifact
+        .chunk_group_by_ukey
+        .expect_get(child_group_ukey);
+      for chunk_ukey in child_group.chunks.iter() {
+        if filter_fn(chunk_ukey, compilation)
+          && let Some(chunk_id) = compilation
+            .build_chunk_graph_artifact
+            .chunk_by_ukey
+            .expect_get(chunk_ukey)
+            .id()
+            .cloned()
+        {
+          chunk_ids.push(chunk_id);
+        }
+      }
+    }
+
+    if chunk_ids.is_empty() {
+      return None;
+    }
+
+    Some(chunk_ids)
   }
 
-  pub fn get_child_ids_by_orders_map(
+  pub fn get_child_ids_by_orders_map<F: Fn(&ChunkUkey, &Compilation) -> bool + Sync>(
     &self,
     include_direct_children: bool,
     compilation: &Compilation,
-  ) -> HashMap<ChunkGroupOrderKey, IndexMap<String, Vec<String>, BuildHasherDefault<FxHasher>>> {
-    let mut result = HashMap::default();
-
-    fn add_child_ids_by_orders_to_map(
+    filter_fn: &F,
+  ) -> HashMap<ChunkGroupOrderKey, IndexChunkIdMap<Vec<ChunkId>>> {
+    fn add_child_ids_by_orders_to_map<F: Fn(&ChunkUkey, &Compilation) -> bool>(
       chunk_ukey: &ChunkUkey,
       order: &ChunkGroupOrderKey,
-      result: &mut HashMap<
-        ChunkGroupOrderKey,
-        IndexMap<String, Vec<String>, BuildHasherDefault<FxHasher>>,
-      >,
       compilation: &Compilation,
-    ) {
-      let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+      filter_fn: &F,
+    ) -> Option<(ChunkId, Vec<ChunkId>)> {
+      let chunk = compilation
+        .build_chunk_graph_artifact
+        .chunk_by_ukey
+        .expect_get(chunk_ukey);
       if let (Some(chunk_id), Some(child_chunk_ids)) = (
-        chunk.id.to_owned(),
-        chunk.get_child_ids_by_order(order, compilation),
+        chunk.id().cloned(),
+        chunk.get_child_ids_by_order(order, compilation, filter_fn),
       ) {
-        result
-          .entry(order.clone())
-          .or_default()
-          .insert(chunk_id, child_chunk_ids);
+        return Some((chunk_id, child_chunk_ids));
       }
+      None
     }
+
+    let mut add_child_ids_task = vec![];
 
     if include_direct_children {
       for chunk_ukey in self
-        .get_sorted_groups_iter(&compilation.chunk_group_by_ukey)
+        .get_sorted_groups_iter(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
         .filter_map(|chunk_group_ukey| {
-          get_chunk_group_from_ukey(chunk_group_ukey, &compilation.chunk_group_by_ukey)
-            .map(|g| g.chunks.to_owned())
+          compilation
+            .build_chunk_graph_artifact
+            .chunk_group_by_ukey
+            .get(chunk_group_ukey)
+            .map(|g| g.chunks.clone())
         })
         .flatten()
       {
-        add_child_ids_by_orders_to_map(
-          &chunk_ukey,
-          &ChunkGroupOrderKey::Prefetch,
-          &mut result,
-          compilation,
-        );
-        add_child_ids_by_orders_to_map(
-          &chunk_ukey,
-          &ChunkGroupOrderKey::Preload,
-          &mut result,
-          compilation,
-        );
+        add_child_ids_task.push((chunk_ukey, ChunkGroupOrderKey::Prefetch));
+        add_child_ids_task.push((chunk_ukey, ChunkGroupOrderKey::Preload));
       }
     }
 
-    for chunk_ukey in self.get_all_async_chunks(&compilation.chunk_group_by_ukey) {
-      add_child_ids_by_orders_to_map(
-        &chunk_ukey,
-        &ChunkGroupOrderKey::Prefetch,
-        &mut result,
-        compilation,
-      );
-      add_child_ids_by_orders_to_map(
-        &chunk_ukey,
-        &ChunkGroupOrderKey::Preload,
-        &mut result,
-        compilation,
-      );
+    for chunk_ukey in
+      self.get_all_async_chunks(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
+    {
+      add_child_ids_task.push((chunk_ukey, ChunkGroupOrderKey::Prefetch));
+      add_child_ids_task.push((chunk_ukey, ChunkGroupOrderKey::Preload));
+    }
+
+    let add_child_ids_results = add_child_ids_task
+      .into_par_iter()
+      .filter_map(|(chunk_ukey, order)| {
+        let (chunk_id, child_ids) =
+          add_child_ids_by_orders_to_map(&chunk_ukey, &order, compilation, filter_fn)?;
+        Some((order, chunk_id, child_ids))
+      })
+      .collect::<Vec<_>>();
+
+    let mut result: HashMap<ChunkGroupOrderKey, IndexChunkIdMap<Vec<ChunkId>>> = HashMap::default();
+    for (order, chunk_ukey, child_chunk_ids) in add_child_ids_results {
+      result
+        .entry(order)
+        .or_default()
+        .insert(chunk_ukey, child_chunk_ids);
     }
 
     result
   }
-}
 
-pub fn chunk_hash_js<'a>(
-  chunk: &ChunkUkey,
-  chunk_graph: &'a ChunkGraph,
-  module_graph: &'a ModuleGraph,
-) -> bool {
-  if chunk_graph.get_number_of_entry_modules(chunk) > 0 {
-    return true;
+  pub fn has_child_by_order<F: Fn(&ChunkUkey, &Compilation) -> bool + Sync>(
+    &self,
+    compilation: &Compilation,
+    r#type: &ChunkGroupOrderKey,
+    include_direct_children: bool,
+    filter_fn: &F,
+  ) -> bool {
+    let map = self.get_child_ids_by_orders_map(include_direct_children, compilation, filter_fn);
+    map.get(r#type).is_some_and(|map| !map.is_empty())
   }
-  if !chunk_graph
-    .get_chunk_modules_by_source_type(chunk, SourceType::JavaScript, module_graph)
-    .is_empty()
-  {
-    return true;
-  }
-  false
 }

@@ -1,61 +1,65 @@
-use rspack_core::SpanExt;
-use swc_core::ecma::ast::NewExpr;
+use rspack_util::{SpanExt, swc::AstSubRangeExt};
+use swc_next_ecma_ast::{ArgumentData, GetSpan, NewExpression};
 
 use super::BasicEvaluatedExpression;
-use crate::utils::eval;
-use crate::visitors::JavascriptParser;
+use crate::{
+  parser_plugin::{evaluate_create_require_new_expression, is_create_require_specifier},
+  utils::eval,
+  visitors::JavascriptParser,
+};
 
-pub fn eval_new_expression(
-  scanner: &mut JavascriptParser,
-  expr: &NewExpr,
-) -> Option<BasicEvaluatedExpression> {
-  let Some(ident) = expr.callee.as_ident() else {
-    return None;
-  };
-  if ident.sym.as_str() != "RegExp" {
-    // FIXME: call hooks
-    return None;
-  }
-  // FIXME: should detect RegExpr variable info
-  let Some(args) = &expr.args else {
-    let mut res = BasicEvaluatedExpression::with_range(expr.span.real_lo(), expr.span.hi().0);
-    res.set_regexp(String::new(), String::new());
-    return Some(res);
-  };
-
-  let Some(arg1) = args.first() else {
-    let mut res = BasicEvaluatedExpression::with_range(expr.span.real_lo(), expr.span.hi().0);
-    res.set_regexp(String::new(), String::new());
-    return Some(res);
-  };
-
-  if arg1.spread.is_some() {
-    return None;
-  }
-
-  let evaluated_reg_exp = scanner.evaluate_expression(&arg1.expr);
-  let Some(reg_exp) = evaluated_reg_exp.as_string() else {
-    return None;
-  };
-
-  let flags = if let Some(arg2) = args.get(1) {
-    if arg2.spread.is_some() {
-      return None;
-    }
-    let evaluated_flags = scanner.evaluate_expression(&arg2.expr);
-
-    if let Some(flags) = evaluated_flags.as_string()
-      && eval::is_valid_reg_exp_flags(&flags)
+#[inline]
+pub fn eval_new_expression<'parser>(
+  parser: &mut JavascriptParser<'parser>,
+  expression: NewExpression,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = parser.ast.ast;
+  let callee = expression.callee(ast);
+  let identifier = callee.as_identifier_reference(ast);
+  if parser.javascript_options.is_create_require_enabled() {
+    if let Some(identifier) = identifier {
+      let name = ast.get_utf8(identifier.name(ast));
+      if is_create_require_specifier(parser, name) {
+        let evaluated = parser.call_hooks_name(name, |parser, for_name| {
+          evaluate_create_require_new_expression(parser, for_name, Some(callee), expression)
+        });
+        if evaluated.is_some() {
+          return evaluated;
+        }
+      }
+    } else if callee.as_member_expression(ast).is_some()
+      && let Some(evaluated) =
+        evaluate_create_require_new_expression(parser, "", Some(callee), expression)
     {
-      flags
-    } else {
-      return None;
+      return Some(evaluated);
     }
+  }
+  let identifier = identifier?;
+  if ast.get_utf8(identifier.name(ast)) != "RegExp" || parser.get_variable_info("RegExp").is_some()
+  {
+    return None;
+  }
+  let arguments = expression.arguments(ast);
+  let span = expression.span(ast);
+  let Some(first) = ast.first(arguments) else {
+    let mut result = BasicEvaluatedExpression::with_range(span.real_lo(), span.real_hi());
+    result.set_regexp(String::new(), String::new());
+    return Some(result);
+  };
+  let ArgumentData::Expr(first) = ast.argument_data(first) else {
+    return None;
+  };
+  let regexp = parser.evaluate_expression(first).as_string()?;
+  let flags = if let Some(second) = ast.second(arguments) {
+    let ArgumentData::Expr(second) = ast.argument_data(second) else {
+      return None;
+    };
+    let flags = parser.evaluate_expression(second).as_string()?;
+    eval::is_valid_reg_exp_flags(&flags).then_some(flags)?
   } else {
     String::new()
   };
-
-  let mut res = BasicEvaluatedExpression::with_range(expr.span.real_lo(), expr.span.hi().0);
-  res.set_regexp(reg_exp, flags);
-  Some(res)
+  let mut result = BasicEvaluatedExpression::with_range(span.real_lo(), span.real_hi());
+  result.set_regexp(regexp, flags);
+  Some(result)
 }

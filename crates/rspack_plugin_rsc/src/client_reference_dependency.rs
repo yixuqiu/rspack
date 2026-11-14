@@ -1,0 +1,106 @@
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsPreset, AsVec},
+};
+use rspack_core::{
+  AsContextDependency, AsDependencyCodeGeneration, Dependency, DependencyCategory, DependencyId,
+  DependencyType, ExportsInfoArtifact, ModuleDependency, ModuleGraph, ModuleGraphCacheArtifact,
+  ReferencedExport, ResourceIdentifier, RuntimeSpec, create_exports_object_referenced,
+};
+use rspack_intern::IndexAtomSet;
+
+#[cacheable]
+#[derive(Debug)]
+pub struct ClientReferenceDependency {
+  id: DependencyId,
+  request: String,
+  #[cacheable(with=AsVec<AsPreset>)]
+  referenced_exports: IndexAtomSet,
+  is_server_side_rendering: bool,
+  resource_identifier: ResourceIdentifier,
+}
+
+impl ClientReferenceDependency {
+  pub fn new(
+    request: String,
+    referenced_exports: IndexAtomSet,
+    is_server_side_rendering: bool,
+  ) -> Self {
+    let resource_identifier = format!("rsc-client-reference={request}").into();
+    Self {
+      id: DependencyId::new(),
+      request,
+      referenced_exports,
+      resource_identifier,
+      is_server_side_rendering,
+    }
+  }
+}
+
+#[cacheable_dyn]
+impl Dependency for ClientReferenceDependency {
+  fn id(&self) -> &DependencyId {
+    &self.id
+  }
+
+  fn category(&self) -> &DependencyCategory {
+    &DependencyCategory::Esm
+  }
+
+  fn dependency_type(&self) -> &DependencyType {
+    &DependencyType::RscClientReference
+  }
+
+  fn resource_identifier(&self) -> Option<&str> {
+    Some(&self.resource_identifier)
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
+  }
+
+  fn get_referenced_exports(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
+    _runtime: Option<&RuntimeSpec>,
+  ) -> Vec<ReferencedExport> {
+    // An empty set and `*` both mean this client reference needs the whole
+    // exports object, not a narrowed list of named exports.
+    if self.referenced_exports.is_empty()
+      || self
+        .referenced_exports
+        .iter()
+        .any(|export_name| export_name == "*")
+    {
+      return create_exports_object_referenced();
+    }
+
+    // Otherwise keep the exact export names so usage analysis can preserve
+    // tree-shaking granularity for this client reference.
+    self
+      .referenced_exports
+      .iter()
+      .map(|export_name| {
+        ReferencedExport::from(export_name)
+          .with_can_mangle(false)
+          .with_can_inline(false)
+      })
+      .collect()
+  }
+}
+
+#[cacheable_dyn]
+impl ModuleDependency for ClientReferenceDependency {
+  fn request(&self) -> &str {
+    &self.request
+  }
+
+  fn user_request(&self) -> &str {
+    &self.request
+  }
+}
+
+impl AsContextDependency for ClientReferenceDependency {}
+impl AsDependencyCodeGeneration for ClientReferenceDependency {}

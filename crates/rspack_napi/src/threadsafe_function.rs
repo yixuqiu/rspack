@@ -1,87 +1,185 @@
-use std::{fmt::Debug, marker::PhantomData};
+use std::{cell::OnceCell, fmt::Debug, marker::PhantomData, sync::Arc};
 
 use napi::{
+  Env, JsValue, Status, Unknown, ValueType,
   bindgen_prelude::{
-    check_status, Either3, Either4, FromNapiValue, JsValuesTupleIntoVec, Promise, TypeName,
-    ValidateNapiValue,
+    FromNapiValue, Function, JsValuesTupleIntoVec, Promise, TypeName, ValidateNapiValue,
   },
-  sys::{self, napi_env},
-  threadsafe_function::{
-    ErrorStrategy, ThreadsafeFunction as RawThreadsafeFunction, ThreadsafeFunctionCallMode,
-  },
-  Either, Env, JsUnknown, NapiRaw, Status, ValueType,
+  sys::{self, napi_env, napi_value},
+  threadsafe_function::{ThreadsafeFunction as RawThreadsafeFunction, ThreadsafeFunctionCallMode},
 };
-use oneshot::Receiver;
-use rspack_error::{miette::IntoDiagnostic, Error, Result};
+use oneshot::{Receiver, channel};
+use rspack_error::{Error, Result};
 
-use crate::{JsCallback, NapiErrorExt};
+use crate::{JsCallback, NapiErrorToRspackErrorExt};
 
 type ErrorResolver = dyn FnOnce(Env);
 
-pub struct ThreadsafeFunction<T: 'static, R> {
-  inner: RawThreadsafeFunction<T, ErrorStrategy::Fatal>,
+thread_local! {
+  // Each Node worker has its own JS thread and env. Capture its resolver when
+  // constructing a TSFN; error resolution itself can run on a Rust worker.
+  static ERROR_RESOLVER: OnceCell<JsCallback<Box<ErrorResolver>>> = const { OnceCell::new() };
+}
+
+pub struct ThreadsafeFunction<T: 'static + JsValuesTupleIntoVec, R> {
+  inner: Arc<RawThreadsafeFunction<T, Unknown<'static>, T, Status, false, true>>,
+  error_resolver: JsCallback<Box<ErrorResolver>>,
   env: napi_env,
-  resolver: JsCallback<Box<ErrorResolver>>,
   _data: PhantomData<R>,
 }
 
-impl<T, R> Debug for ThreadsafeFunction<T, R> {
+pub struct DynThreadsafeFunction {
+  inner: Arc<RawThreadsafeFunction<DynJsArgs, Unknown<'static>, DynJsArgs, Status, false, true>>,
+  error_resolver: JsCallback<Box<ErrorResolver>>,
+  env: napi_env,
+}
+
+struct DynJsArgs(Box<dyn DynJsArgsToVec>);
+
+trait DynJsArgsToVec {
+  fn into_vec(self: Box<Self>, env: napi_env) -> napi::Result<Vec<napi_value>>;
+}
+
+impl<T: JsValuesTupleIntoVec> DynJsArgsToVec for T {
+  fn into_vec(self: Box<Self>, env: napi_env) -> napi::Result<Vec<napi_value>> {
+    (*self).into_vec(env)
+  }
+}
+
+impl JsValuesTupleIntoVec for DynJsArgs {
+  fn into_vec(self, env: napi_env) -> napi::Result<Vec<napi_value>> {
+    self.0.into_vec(env)
+  }
+}
+
+impl<T: 'static + JsValuesTupleIntoVec, R> Debug for ThreadsafeFunction<T, R> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("ThreadsafeFunction").finish_non_exhaustive()
   }
 }
 
-impl<T: 'static, R> Clone for ThreadsafeFunction<T, R> {
+impl<T: 'static + JsValuesTupleIntoVec, R> Clone for ThreadsafeFunction<T, R> {
   fn clone(&self) -> Self {
     Self {
       inner: self.inner.clone(),
+      error_resolver: self.error_resolver.clone(),
       env: self.env,
-      resolver: self.resolver.clone(),
       _data: self._data,
     }
   }
 }
 
-unsafe impl<T: 'static, R> Sync for ThreadsafeFunction<T, R> {}
-unsafe impl<T: 'static, R> Send for ThreadsafeFunction<T, R> {}
+impl Debug for DynThreadsafeFunction {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("DynThreadsafeFunction")
+      .finish_non_exhaustive()
+  }
+}
+
+impl Clone for DynThreadsafeFunction {
+  fn clone(&self) -> Self {
+    Self {
+      inner: self.inner.clone(),
+      error_resolver: self.error_resolver.clone(),
+      env: self.env,
+    }
+  }
+}
+
+unsafe impl<T: 'static + JsValuesTupleIntoVec, R> Sync for ThreadsafeFunction<T, R> {}
+unsafe impl<T: 'static + JsValuesTupleIntoVec, R> Send for ThreadsafeFunction<T, R> {}
+unsafe impl Sync for DynThreadsafeFunction {}
+unsafe impl Send for DynThreadsafeFunction {}
 
 impl<T: 'static + JsValuesTupleIntoVec, R> FromNapiValue for ThreadsafeFunction<T, R> {
   unsafe fn from_napi_value(env: sys::napi_env, napi_val: sys::napi_value) -> napi::Result<Self> {
-    let inner = unsafe {
-      <RawThreadsafeFunction<T, ErrorStrategy::Fatal> as FromNapiValue>::from_napi_value(
-        env, napi_val,
-      )
-    }?;
-    check_status!(unsafe { sys::napi_unref_threadsafe_function(env, inner.raw()) })?;
+    unsafe { Self::from_napi_value_with_finalize(env, napi_val, || {}) }
+  }
+}
+
+impl<T: 'static + JsValuesTupleIntoVec, R> ThreadsafeFunction<T, R> {
+  /// Runs `finalize` on the owning JS thread when N-API finalizes the TSFN, or
+  /// during construction if it fails. The callback may own thread-local data;
+  /// it must not retain the TSFN itself and prevent its finalization.
+  /// The callback must not panic, since finalization runs through N-API.
+  ///
+  /// # Safety
+  /// `env` and `napi_val` must be valid on the calling JS thread.
+  pub unsafe fn from_napi_value_with_finalize(
+    env: sys::napi_env,
+    napi_val: sys::napi_value,
+    finalize: impl FnOnce() + 'static,
+  ) -> napi::Result<Self> {
+    let finalize = scopeguard::guard(finalize, |finalize| finalize());
+    let function = unsafe { Function::<T, Unknown>::from_napi_value(env, napi_val) }?;
+    let inner = function
+      .build_threadsafe_function::<T>()
+      .callee_handled::<false>()
+      .weak::<true>()
+      .build_callback(move |ctx| {
+        // napi-rs owns this closure until its TSFN finalizer drops it on the
+        // JS thread. Dropping a Rust TSFN handle on a worker does not drop it.
+        let _keep_finalize = &finalize;
+        Ok(ctx.value)
+      })?;
+    let error_resolver = ERROR_RESOLVER.with(|resolver| {
+      resolver
+        .get_or_init(|| unsafe { JsCallback::new(env).expect("should initialize error resolver") })
+        .clone()
+    });
     Ok(Self {
-      inner,
+      inner: Arc::new(inner),
+      error_resolver,
       env,
-      resolver: unsafe { JsCallback::new(env) }?,
       _data: PhantomData,
     })
   }
 }
 
-impl<T: 'static, R> ThreadsafeFunction<T, R> {
+impl FromNapiValue for DynThreadsafeFunction {
+  unsafe fn from_napi_value(env: sys::napi_env, napi_val: sys::napi_value) -> napi::Result<Self> {
+    let inner = unsafe {
+      <RawThreadsafeFunction<DynJsArgs, Unknown, DynJsArgs, Status, false, true> as FromNapiValue>::from_napi_value(
+        env, napi_val,
+      )
+    }?;
+    let error_resolver = ERROR_RESOLVER.with(|resolver| {
+      resolver
+        .get_or_init(|| unsafe { JsCallback::new(env).expect("should initialize error resolver") })
+        .clone()
+    });
+    Ok(Self {
+      inner: Arc::new(inner),
+      error_resolver,
+      env,
+    })
+  }
+}
+
+impl<T: 'static + JsValuesTupleIntoVec, R> ThreadsafeFunction<T, R> {
   async fn resolve_error(&self, err: napi::Error) -> Error {
     let (tx, rx) = tokio::sync::oneshot::channel::<rspack_error::Error>();
-    self.resolver.call(Box::new(move |env| {
-      let err = err.into_rspack_error_with_detail(&env);
+    self.error_resolver.call(Box::new(move |env| {
+      let err = err.to_rspack_error(&env);
       tx.send(err).expect("failed to resolve js error");
     }));
     rx.await.expect("failed to resolve js error")
   }
 
   fn call_with_return<D: 'static + FromNapiValue>(&self, value: T) -> Receiver<Result<D>> {
-    let (tx, rx) = oneshot::channel::<Result<D>>();
-    let env = self.env;
+    let (tx, rx) = channel::<Result<D>>();
     self
       .inner
-      .call_with_return_value_raw(value, ThreadsafeFunctionCallMode::NonBlocking, {
-        move |r: napi::Result<JsUnknown>| {
+      .call_with_return_value(value, ThreadsafeFunctionCallMode::NonBlocking, {
+        move |r: napi::Result<Unknown>, env| {
           let r = match r {
-            Err(err) => Err(err.into_rspack_error_with_detail(&unsafe { Env::from_raw(env) })),
-            Ok(o) => unsafe { D::from_napi_value(env, o.raw()) }.into_diagnostic(),
+            Err(err) => Err(err.to_rspack_error(&env)),
+            Ok(o) => {
+              let raw_env = env.raw();
+              let return_value = o.raw();
+              unsafe { D::from_napi_value(raw_env, return_value) }
+                .map_err(|e| pretty_type_error(o, e))
+            }
           };
           tx.send(r)
             .unwrap_or_else(|_| panic!("failed to send tsfn value"));
@@ -95,57 +193,93 @@ impl<T: 'static, R> ThreadsafeFunction<T, R> {
     let rx = self.call_with_return(value);
     rx.await.expect("failed to receive tsfn value")
   }
+}
 
-  fn blocking_call<D: 'static + FromNapiValue>(&self, value: T) -> Result<D> {
+impl DynThreadsafeFunction {
+  async fn resolve_error(&self, err: napi::Error) -> Error {
+    let (tx, rx) = tokio::sync::oneshot::channel::<rspack_error::Error>();
+    self.error_resolver.call(Box::new(move |env| {
+      let err = err.to_rspack_error(&env);
+      tx.send(err).expect("failed to resolve js error");
+    }));
+    rx.await.expect("failed to resolve js error")
+  }
+
+  fn call_with_return<T, D>(&self, value: T) -> Receiver<Result<D>>
+  where
+    T: 'static + JsValuesTupleIntoVec,
+    D: 'static + FromNapiValue,
+  {
+    let (tx, rx) = channel::<Result<D>>();
+    self.inner.call_with_return_value(
+      DynJsArgs(Box::new(value)),
+      ThreadsafeFunctionCallMode::NonBlocking,
+      {
+        move |r: napi::Result<Unknown>, env| {
+          let r = match r {
+            Err(err) => Err(err.to_rspack_error(&env)),
+            Ok(o) => {
+              let raw_env = env.raw();
+              let return_value = o.raw();
+              unsafe { D::from_napi_value(raw_env, return_value) }
+                .map_err(|e| pretty_type_error(o, e))
+            }
+          };
+          tx.send(r)
+            .unwrap_or_else(|_| panic!("failed to send tsfn value"));
+          Ok(())
+        }
+      },
+    );
+    rx
+  }
+
+  async fn call_async<T, D>(&self, value: T) -> Result<D>
+  where
+    T: 'static + JsValuesTupleIntoVec,
+    D: 'static + FromNapiValue,
+  {
     let rx = self.call_with_return(value);
-    rx.recv().expect("failed to receive tsfn value")
+    rx.await.expect("failed to receive tsfn value")
   }
-}
 
-impl<T: 'static, R> ThreadsafeFunction<T, R> {
-  /// Synchronously call JS function and report error as `uncaughtException`.
-  /// See: [napi_create_threadsafe_function](https://nodejs.org/dist/latest/docs/api/n-api.html#napi_create_threadsafe_function)
-  pub fn call_with_fatal(&self, value: T) {
-    let status = self
-      .inner
-      .call(value, ThreadsafeFunctionCallMode::NonBlocking);
-    debug_assert_eq!(status, Status::Ok, "failed to call tsfn with fatal")
-  }
-}
-
-impl<T: 'static, R: 'static + FromNapiValue> ThreadsafeFunction<T, R> {
   /// Call the JS function.
-  pub async fn call_with_sync(&self, value: T) -> Result<R> {
-    self.call_async::<R>(value).await
+  pub async fn call_with_sync<T, R>(&self, value: T) -> Result<R>
+  where
+    T: 'static + JsValuesTupleIntoVec,
+    R: 'static + FromNapiValue,
+  {
+    self.call_async::<T, R>(value).await
   }
 
-  /// Call the JS function with blocking.
-  pub fn blocking_call_with_sync(&self, value: T) -> Result<R> {
-    self.blocking_call::<R>(value)
-  }
-}
-
-impl<T: 'static, R: 'static + FromNapiValue + ValidateNapiValue> ThreadsafeFunction<T, R> {
   /// Call the JS function.
-  /// This method expects the returned value of JS function to be a `Promise<R>` or `R`.
   /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  ///
-  /// ## Warning
-  /// This method is **NOT** recommended to be used in most cases. It makes return value ambiguous.
-  pub async fn call(&self, value: T) -> Result<R> {
-    match self.call_async::<Either<Promise<R>, R>>(value).await {
-      Ok(Either::A(r)) => match r.await {
+  /// Otherwise, an [napi::Error] is returned.
+  pub async fn call_with_promise<T, R>(&self, value: T) -> Result<R>
+  where
+    T: 'static + JsValuesTupleIntoVec,
+    R: 'static + FromNapiValue,
+  {
+    match self.call_async::<T, Promise<R>>(value).await {
+      Ok(r) => match r.await {
         Ok(r) => Ok(r),
         Err(err) => Err(self.resolve_error(err).await),
       },
-      Ok(Either::B(r)) => Ok(r),
       Err(err) => Err(err),
     }
   }
 }
 
-impl<T: 'static, R: 'static + FromNapiValue> ThreadsafeFunction<T, Promise<R>> {
+impl<T: 'static + JsValuesTupleIntoVec, R: 'static + FromNapiValue> ThreadsafeFunction<T, R> {
+  /// Call the JS function.
+  pub async fn call_with_sync(&self, value: T) -> Result<R> {
+    self.call_async::<R>(value).await
+  }
+}
+
+impl<T: 'static + JsValuesTupleIntoVec, R: 'static + FromNapiValue>
+  ThreadsafeFunction<T, Promise<R>>
+{
   /// Call the JS function.
   /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
   /// Otherwise, an [napi::Error] is returned.
@@ -160,224 +294,86 @@ impl<T: 'static, R: 'static + FromNapiValue> ThreadsafeFunction<T, Promise<R>> {
   }
 }
 
-impl<T: 'static, R: 'static + FromNapiValue + ValidateNapiValue + TypeName>
-  ThreadsafeFunction<T, Either<Promise<R>, R>>
+impl<T: 'static + JsValuesTupleIntoVec + JsValuesTupleIntoVec, R> ValidateNapiValue
+  for ThreadsafeFunction<T, R>
 {
-  /// Call the JS function and resolve the returned value depending on its type.
-  /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  pub async fn call_with_auto(&self, value: T) -> Result<R> {
-    match self.call_async::<Either<Promise<R>, R>>(value).await? {
-      Either::A(r) => match r.await {
-        Ok(r) => Ok(r),
-        Err(err) => Err(self.resolve_error(err).await),
-      },
-      Either::B(r) => Ok(r),
-    }
-  }
 }
 
-impl<T: 'static, R: 'static + FromNapiValue + ValidateNapiValue + TypeName>
-  ThreadsafeFunction<T, Either<R, Promise<R>>>
-{
-  /// Call the JS function and resolve the returned value depending on its type.
-  /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  pub async fn call_with_auto(&self, value: T) -> Result<R> {
-    match self.call_async::<Either<R, Promise<R>>>(value).await? {
-      Either::A(r) => Ok(r),
-      Either::B(r) => match r.await {
-        Ok(r) => Ok(r),
-        Err(err) => Err(self.resolve_error(err).await),
-      },
-    }
-  }
-}
+impl ValidateNapiValue for DynThreadsafeFunction {}
 
-impl<
-    T: 'static,
-    T0: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T1: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-  > ThreadsafeFunction<T, Either3<T0, T1, Promise<Either<T0, T1>>>>
-{
-  /// Call the JS function and resolve the returned value depending on its type.
-  /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  pub async fn call_with_auto(&self, value: T) -> Result<Either<T0, T1>> {
-    match self
-      .call_async::<Either3<T0, T1, Promise<Either<T0, T1>>>>(value)
-      .await?
-    {
-      Either3::A(r) => Ok(Either::A(r)),
-      Either3::B(r) => Ok(Either::B(r)),
-      Either3::C(r) => match r.await {
-        Ok(r) => Ok(r),
-        Err(err) => Err(self.resolve_error(err).await),
-      },
-    }
-  }
-}
-
-impl<
-    T: 'static,
-    T0: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T1: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-  > ThreadsafeFunction<T, Either3<T0, Promise<Either<T0, T1>>, T1>>
-{
-  /// Call the JS function and resolve the returned value depending on its type.
-  /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  pub async fn call_with_auto(&self, value: T) -> Result<Either<T0, T1>> {
-    match self
-      .call_async::<Either3<T0, Promise<Either<T0, T1>>, T1>>(value)
-      .await?
-    {
-      Either3::A(r) => Ok(Either::A(r)),
-      Either3::B(r) => match r.await {
-        Ok(r) => Ok(r),
-        Err(err) => Err(self.resolve_error(err).await),
-      },
-      Either3::C(r) => Ok(Either::B(r)),
-    }
-  }
-}
-
-impl<
-    T: 'static,
-    T0: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T1: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-  > ThreadsafeFunction<T, Either3<Promise<Either<T0, T1>>, T0, T1>>
-{
-  /// Call the JS function and resolve the returned value depending on its type.
-  /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  pub async fn call_with_auto(&self, value: T) -> Result<Either<T0, T1>> {
-    match self
-      .call_async::<Either3<Promise<Either<T0, T1>>, T0, T1>>(value)
-      .await?
-    {
-      Either3::A(r) => match r.await {
-        Ok(r) => Ok(r),
-        Err(err) => Err(self.resolve_error(err).await),
-      },
-      Either3::B(r) => Ok(Either::A(r)),
-      Either3::C(r) => Ok(Either::B(r)),
-    }
-  }
-}
-
-impl<
-    T: 'static,
-    T0: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T1: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T2: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-  > ThreadsafeFunction<T, Either4<T0, T1, T2, Promise<Either3<T0, T1, T2>>>>
-{
-  /// Call the JS function and resolve the returned value depending on its type.
-  /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  pub async fn call_with_auto(&self, value: T) -> Result<Either3<T0, T1, T2>> {
-    match self
-      .call_async::<Either4<T0, T1, T2, Promise<Either3<T0, T1, T2>>>>(value)
-      .await?
-    {
-      Either4::A(r) => Ok(Either3::A(r)),
-      Either4::B(r) => Ok(Either3::B(r)),
-      Either4::C(r) => Ok(Either3::C(r)),
-      Either4::D(r) => match r.await {
-        Ok(r) => Ok(r),
-        Err(err) => Err(self.resolve_error(err).await),
-      },
-    }
-  }
-}
-
-impl<
-    T: 'static,
-    T0: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T1: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T2: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-  > ThreadsafeFunction<T, Either4<T0, T1, Promise<Either3<T0, T1, T2>>, T2>>
-{
-  /// Call the JS function and resolve the returned value depending on its type.
-  /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  pub async fn call_with_auto(&self, value: T) -> Result<Either3<T0, T1, T2>> {
-    match self
-      .call_async::<Either4<T0, T1, Promise<Either3<T0, T1, T2>>, T2>>(value)
-      .await?
-    {
-      Either4::A(r) => Ok(Either3::A(r)),
-      Either4::B(r) => Ok(Either3::B(r)),
-      Either4::C(r) => match r.await {
-        Ok(r) => Ok(r),
-        Err(err) => Err(self.resolve_error(err).await),
-      },
-      Either4::D(r) => Ok(Either3::C(r)),
-    }
-  }
-}
-
-impl<
-    T: 'static,
-    T0: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T1: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T2: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-  > ThreadsafeFunction<T, Either4<T0, Promise<Either3<T0, T1, T2>>, T1, T2>>
-{
-  /// Call the JS function and resolve the returned value depending on its type.
-  /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  pub async fn call_with_auto(&self, value: T) -> Result<Either3<T0, T1, T2>> {
-    match self
-      .call_async::<Either4<T0, Promise<Either3<T0, T1, T2>>, T1, T2>>(value)
-      .await?
-    {
-      Either4::A(r) => Ok(Either3::A(r)),
-      Either4::B(r) => match r.await {
-        Ok(r) => Ok(r),
-        Err(err) => Err(self.resolve_error(err).await),
-      },
-      Either4::C(r) => Ok(Either3::B(r)),
-      Either4::D(r) => Ok(Either3::C(r)),
-    }
-  }
-}
-
-impl<
-    T: 'static,
-    T0: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T1: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-    T2: 'static + FromNapiValue + ValidateNapiValue + TypeName,
-  > ThreadsafeFunction<T, Either4<Promise<Either3<T0, T1, T2>>, T0, T1, T2>>
-{
-  /// Call the JS function and resolve the returned value depending on its type.
-  /// If `Promise<T>` is returned, it will be awaited and its value `T` will be returned.
-  /// Otherwise, if `T` is returned, it will be returned as-is.
-  pub async fn call_with_auto(&self, value: T) -> Result<Either3<T0, T1, T2>> {
-    match self
-      .call_async::<Either4<Promise<Either3<T0, T1, T2>>, T0, T1, T2>>(value)
-      .await?
-    {
-      Either4::A(r) => match r.await {
-        Ok(r) => Ok(r),
-        Err(err) => Err(self.resolve_error(err).await),
-      },
-      Either4::B(r) => Ok(Either3::A(r)),
-      Either4::C(r) => Ok(Either3::B(r)),
-      Either4::D(r) => Ok(Either3::C(r)),
-    }
-  }
-}
-
-impl<T: 'static + JsValuesTupleIntoVec, R> ValidateNapiValue for ThreadsafeFunction<T, R> {}
-
-impl<T: 'static, R> TypeName for ThreadsafeFunction<T, R> {
+impl<T: 'static + JsValuesTupleIntoVec, R> TypeName for ThreadsafeFunction<T, R> {
   fn type_name() -> &'static str {
     "ThreadsafeFunction"
   }
 
   fn value_type() -> napi::ValueType {
     ValueType::Function
+  }
+}
+
+impl TypeName for DynThreadsafeFunction {
+  fn type_name() -> &'static str {
+    "ThreadsafeFunction"
+  }
+
+  fn value_type() -> napi::ValueType {
+    ValueType::Function
+  }
+}
+
+fn pretty_type_error(return_value: Unknown, error: napi::Error) -> rspack_error::Error {
+  let expected_type = match error.status {
+    Status::ObjectExpected => "object",
+    Status::StringExpected => "string",
+    Status::FunctionExpected => "function",
+    Status::NumberExpected => "number",
+    Status::BooleanExpected => "boolean",
+    Status::ArrayExpected => "Array",
+    Status::BigintExpected => "bigint",
+    Status::DateExpected => "Date",
+    Status::ArrayBufferExpected => "ArrayBuffer",
+    _ => return rspack_error::error!("{}", error),
+  };
+  let reason = match return_value.get_type() {
+    Ok(return_value_type) => {
+      let return_value_type_str = match return_value_type {
+        ValueType::Undefined => "undefined",
+        ValueType::Null => "null",
+        ValueType::Boolean => "boolean",
+        ValueType::Number => "number",
+        ValueType::String => "string",
+        ValueType::Symbol => "symbol",
+        ValueType::Object => "object",
+        ValueType::Function => "function",
+        ValueType::External => "external",
+        ValueType::BigInt => "bigint",
+        _ => "unknown",
+      };
+      format!(
+        "TypeError: Expected return a '{expected_type}' value, but received `{return_value_type_str}`"
+      )
+    }
+    Err(_) => format!("TypeError: Expected return a '{expected_type}' value"),
+  };
+  rspack_error::error!(reason)
+}
+
+#[cfg(allocative)]
+impl<T: 'static + JsValuesTupleIntoVec, R> rspack_allocative::Allocative
+  for ThreadsafeFunction<T, R>
+{
+  fn visit<'a, 'b: 'a>(&self, visitor: &'a mut rspack_allocative::Visitor<'b>) {
+    let mut visitor = visitor.enter_self(self);
+    visitor.visit_field(rspack_allocative::Key::new("inner"), &self.inner);
+    // env is borrowed from Node; PhantomData owns no T/R values.
+    visitor.exit();
+  }
+}
+#[cfg(allocative)]
+impl rspack_allocative::Allocative for DynThreadsafeFunction {
+  fn visit<'a, 'b: 'a>(&self, visitor: &'a mut rspack_allocative::Visitor<'b>) {
+    let mut visitor = visitor.enter_self(self);
+    visitor.visit_field(rspack_allocative::Key::new("inner"), &self.inner);
+    visitor.exit();
   }
 }

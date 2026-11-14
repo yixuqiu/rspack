@@ -1,73 +1,109 @@
 import {
-	BuiltinPlugin,
-	BuiltinPluginName,
-	RawProvideOptions
-} from "@rspack/binding";
+  type BuiltinPlugin,
+  BuiltinPluginName,
+  type RawProvideOptions,
+} from '@rspack/binding';
 import {
-	RspackBuiltinPlugin,
-	createBuiltinPlugin
-} from "../builtin-plugin/base";
-import { parseOptions } from "../container/options";
-import { Compiler } from "../Compiler";
-import { ShareRuntimePlugin } from "./ShareRuntimePlugin";
+  createBuiltinPlugin,
+  RspackBuiltinPlugin,
+} from '../builtin-plugin/base';
+import type { Compiler } from '../Compiler';
+import { parseOptions } from '../container/options';
+import type { ShareScope } from './SharePlugin';
+import { ShareRuntimePlugin } from './ShareRuntimePlugin';
 
-export type ProvideSharedPluginOptions = {
-	provides: Provides;
-	shareScope?: string;
-	enhanced?: boolean;
+export type ProvideSharedPluginOptions<Enhanced extends boolean = false> = {
+  provides: Provides<Enhanced>;
+  shareScope?: ShareScope;
+  enhanced?: Enhanced;
 };
-export type Provides = (ProvidesItem | ProvidesObject)[] | ProvidesObject;
+export type Provides<Enhanced extends boolean> =
+  (ProvidesItem | ProvidesObject<Enhanced>)[] | ProvidesObject<Enhanced>;
 export type ProvidesItem = string;
-export type ProvidesObject = {
-	[k: string]: ProvidesConfig | ProvidesItem;
+export type ProvidesObject<Enhanced extends boolean> = {
+  [k: string]: ProvidesConfig<Enhanced> | ProvidesItem;
 };
-export type ProvidesConfig = {
-	eager?: boolean;
-	shareKey: string;
-	shareScope?: string;
-	version?: false | string;
+export type ProvidesConfig<Enhanced extends boolean> = Enhanced extends true
+  ? ProvidesEnhancedConfig
+  : ProvidesV1Config;
+type ProvidesV1Config = {
+  eager?: boolean;
+  shareKey: string;
+  shareScope?: ShareScope;
+  version?: false | string;
+};
+type ProvidesEnhancedConfig = ProvidesV1Config & ProvidesEnhancedExtraConfig;
+type ProvidesEnhancedExtraConfig = {
+  singleton?: boolean;
+  strictVersion?: boolean;
+  requiredVersion?: false | string;
+  /**
+   * Tree shaking strategy for the shared module.
+   */
+  treeShakingMode?: 'server-calc' | 'runtime-infer';
 };
 
-export class ProvideSharedPlugin extends RspackBuiltinPlugin {
-	name = BuiltinPluginName.ProvideSharedPlugin;
-	_options;
+export function normalizeProvideShareOptions<Enhanced extends boolean = false>(
+  options: Provides<Enhanced>,
+  shareScope?: ShareScope,
+  enhanced?: boolean,
+) {
+  return parseOptions(
+    options,
+    (item) => {
+      if (Array.isArray(item)) throw new Error('Unexpected array of provides');
+      return {
+        shareKey: item,
+        version: undefined,
+        shareScope: shareScope || 'default',
+        eager: false,
+      };
+    },
+    (item) => {
+      const raw = {
+        shareKey: item.shareKey,
+        version: item.version,
+        shareScope: item.shareScope || shareScope || 'default',
+        eager: !!item.eager,
+      };
+      if (enhanced) {
+        const enhancedItem: ProvidesConfig<true> = item;
+        return {
+          ...raw,
+          singleton: enhancedItem.singleton,
+          requiredVersion: enhancedItem.requiredVersion,
+          strictVersion: enhancedItem.strictVersion,
+          treeShakingMode: enhancedItem.treeShakingMode,
+        };
+      }
+      return raw;
+    },
+  );
+}
+export class ProvideSharedPlugin<
+  Enhanced extends boolean = false,
+> extends RspackBuiltinPlugin {
+  name = BuiltinPluginName.ProvideSharedPlugin;
+  _provides: [string, Omit<RawProvideOptions, 'key'>][];
+  _enhanced?: Enhanced;
 
-	constructor(options: ProvideSharedPluginOptions) {
-		super();
-		this._options = {
-			provides: parseOptions(
-				options.provides,
-				item => {
-					if (Array.isArray(item))
-						throw new Error("Unexpected array of provides");
-					const result = {
-						shareKey: item,
-						version: undefined,
-						shareScope: options.shareScope || "default",
-						eager: false
-					};
-					return result;
-				},
-				item => ({
-					shareKey: item.shareKey,
-					version: item.version,
-					shareScope: item.shareScope || options.shareScope || "default",
-					eager: !!item.eager
-				})
-			),
-			enhanced: options.enhanced ?? false
-		};
-	}
+  constructor(options: ProvideSharedPluginOptions<Enhanced>) {
+    super();
+    this._provides = normalizeProvideShareOptions(
+      options.provides,
+      options.shareScope,
+      options.enhanced,
+    );
+    this._enhanced = options.enhanced;
+  }
 
-	raw(compiler: Compiler): BuiltinPlugin {
-		new ShareRuntimePlugin(this._options.enhanced).apply(compiler);
+  raw(compiler: Compiler): BuiltinPlugin {
+    new ShareRuntimePlugin(this._enhanced ?? false).apply(compiler);
 
-		const rawOptions: RawProvideOptions[] = this._options.provides.map(
-			([key, v]) => ({
-				key,
-				...v
-			})
-		);
-		return createBuiltinPlugin(this.name, rawOptions);
-	}
+    const rawOptions: RawProvideOptions[] = this._provides.map(([key, v]) => ({
+      key,
+      ...v,
+    }));
+    return createBuiltinPlugin(this.name, rawOptions);
+  }
 }

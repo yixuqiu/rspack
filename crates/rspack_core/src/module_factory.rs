@@ -1,89 +1,115 @@
-use std::{fmt::Debug, path::PathBuf};
+use std::{fmt::Debug, sync::Arc};
 
 use rspack_error::{Diagnostic, Result};
-use rustc_hash::FxHashSet as HashSet;
-use sugar_path::SugarPath;
+use rspack_paths::{InternedPath, InternedPathSet};
 
-use crate::{BoxDependency, BoxModule, Context, ModuleIdentifier, Resolve};
+use crate::{
+  BoxModule, BuildContext, Context, DependencyRef, ModuleIdentifier, ModuleLayer, Resolve,
+};
 
 #[derive(Debug)]
 pub struct ModuleFactoryCreateData {
-  pub resolve_options: Option<Box<Resolve>>,
+  pub build_context: Arc<BuildContext>,
+  pub resolve_options: Option<Arc<Resolve>>,
+  pub request: String,
   pub context: Context,
-  pub dependency: BoxDependency,
+  pub dependencies: Vec<DependencyRef>,
   pub issuer: Option<Box<str>>,
   pub issuer_identifier: Option<ModuleIdentifier>,
+  pub issuer_layer: Option<ModuleLayer>,
 
-  pub file_dependencies: HashSet<PathBuf>,
-  pub context_dependencies: HashSet<PathBuf>,
-  pub missing_dependencies: HashSet<PathBuf>,
+  pub file_dependencies: InternedPathSet,
+  pub context_dependencies: InternedPathSet,
+  pub missing_dependencies: InternedPathSet,
   pub diagnostics: Vec<Diagnostic>,
 }
 
 impl ModuleFactoryCreateData {
-  pub fn request(&self) -> Option<&str> {
-    self
-      .dependency
+  /// Creates factory inputs from a build context and a non-empty dependency group.
+  pub fn new(
+    build_context: Arc<BuildContext>,
+    resolve_options: Option<Arc<Resolve>>,
+    original_module_context: Option<&Context>,
+    dependencies: Vec<DependencyRef>,
+    issuer: Option<Box<str>>,
+    issuer_identifier: Option<ModuleIdentifier>,
+    issuer_layer: Option<ModuleLayer>,
+  ) -> Self {
+    let dependency = &dependencies[0];
+    let context = if let Some(context) = dependency.get_context()
+      && !context.is_empty()
+    {
+      context
+    } else if let Some(context) = dependency
+      .as_context_dependency()
+      .and_then(|dependency| crate::ContextDependency::get_context(dependency))
+      && !context.is_empty()
+    {
+      context
+    } else if let Some(context) = original_module_context
+      && !context.is_empty()
+    {
+      context
+    } else {
+      &build_context.compiler_options.context
+    }
+    .into();
+    let issuer_layer = dependency.get_layer().or(issuer_layer.as_ref()).cloned();
+    let request = dependency
       .as_module_dependency()
-      .map(|d| d.request())
-      .or_else(|| self.dependency.as_context_dependency().map(|d| d.request()))
-  }
+      .map(|dependency| dependency.request().to_string())
+      .or_else(|| {
+        dependency
+          .as_context_dependency()
+          .map(|dependency| dependency.request().to_string())
+      })
+      .unwrap_or_default();
 
-  pub fn add_file_dependency(&mut self, file: PathBuf) {
-    if file.is_absolute() {
-      self.file_dependencies.insert(file.normalize());
+    Self {
+      build_context,
+      resolve_options,
+      request,
+      context,
+      dependencies,
+      issuer,
+      issuer_identifier,
+      issuer_layer,
+      file_dependencies: Default::default(),
+      context_dependencies: Default::default(),
+      missing_dependencies: Default::default(),
+      diagnostics: Default::default(),
     }
   }
 
-  pub fn add_file_dependencies(&mut self, files: impl IntoIterator<Item = PathBuf>) {
+  pub fn add_file_dependencies<F: Into<InternedPath>>(
+    &mut self,
+    files: impl IntoIterator<Item = F>,
+  ) {
     self
       .file_dependencies
-      .extend(files.into_iter().map(|x| x.normalize()));
+      .extend(files.into_iter().map(Into::into));
   }
 
-  pub fn add_context_dependency(&mut self, context: PathBuf) {
-    self.context_dependencies.insert(context.normalize());
-  }
-
-  pub fn add_context_dependencies(&mut self, contexts: impl IntoIterator<Item = PathBuf>) {
-    self
-      .context_dependencies
-      .extend(contexts.into_iter().map(|x| x.normalize()));
-  }
-
-  pub fn add_missing_dependency(&mut self, missing: PathBuf) {
-    self.missing_dependencies.insert(missing.normalize());
-  }
-
-  pub fn add_missing_dependencies(&mut self, missing: impl IntoIterator<Item = PathBuf>) {
+  pub fn add_missing_dependencies<F: Into<InternedPath>>(
+    &mut self,
+    missing: impl IntoIterator<Item = F>,
+  ) {
     self
       .missing_dependencies
-      .extend(missing.into_iter().map(|x| x.normalize()));
+      .extend(missing.into_iter().map(Into::into));
   }
 }
 
 #[derive(Debug, Default)]
 pub struct ModuleFactoryResult {
   pub module: Option<BoxModule>,
-  pub from_cache: bool,
 }
 
 impl ModuleFactoryResult {
   pub fn new_with_module(module: BoxModule) -> Self {
     Self {
       module: Some(module),
-      from_cache: false,
     }
-  }
-
-  pub fn module(mut self, module: Option<BoxModule>) -> Self {
-    self.module = module;
-    self
-  }
-
-  pub fn from_cache(mut self, from_cache: bool) -> Self {
-    self.from_cache = from_cache;
-    self
   }
 }
 

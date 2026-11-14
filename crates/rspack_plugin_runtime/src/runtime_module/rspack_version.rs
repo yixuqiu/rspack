@@ -1,38 +1,55 @@
 use rspack_core::{
+  Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext, RuntimeTemplate,
   impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Compilation, RuntimeModule,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
+#[derive(Debug)]
 pub struct RspackVersionRuntimeModule {
-  id: Identifier,
   version: String,
 }
 
 impl RspackVersionRuntimeModule {
-  pub fn new(version: String) -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/rspack_version"),
-      version,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
-    }
+  pub fn new(runtime_template: &RuntimeTemplate, version: String) -> Self {
+    Self::with_default(runtime_template, version)
   }
 }
 
+#[async_trait::async_trait]
 impl RuntimeModule for RspackVersionRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
   }
 
-  fn generate(&self, _: &Compilation) -> rspack_error::Result<BoxSource> {
-    Ok(
-      RawSource::from(include_str!("runtime/get_version.js").replace("$VERSION$", &self.version))
-        .boxed(),
-    )
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define: { RuntimeGlobals::RSPACK_VERSION },
+      force_context: RuntimeGlobals::RSPACK_VERSION,
+      ..Default::default()
+    }
+  }
+
+  fn template(&self) -> Vec<(String, String)> {
+    vec![(
+      self.id().to_string(),
+      include_str!("runtime/get_version.ejs").to_string(),
+    )]
+  }
+
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let source = context.runtime_template.render(
+      self.id(),
+      Some(serde_json::json!({
+        "_version": format!("\"{}\"", &self.version),
+      })),
+    )?;
+
+    Ok(source)
   }
 }

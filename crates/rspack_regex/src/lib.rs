@@ -1,41 +1,96 @@
-#![feature(let_chains)]
+mod algo;
+mod napi;
 
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 
+use cow_utils::CowUtils;
+use rspack_cacheable::{
+  cacheable,
+  with::{AsString, AsStringConverter},
+};
 use rspack_error::Error;
 use swc_core::ecma::ast::Regex as SwcRegex;
 
 use self::algo::Algo;
 
-mod algo;
-
 /// Using wrapper type required by [TryFrom] trait
-#[derive(Clone, Hash)]
+#[cacheable(with=AsString)]
+#[derive(Clone)]
 pub struct RspackRegex {
   algo: Box<Algo>,
-  source: String,
-  flags: String,
+  pub flags: String,
+  pub source: String,
+}
+
+impl PartialEq for RspackRegex {
+  fn eq(&self, other: &Self) -> bool {
+    self.flags == other.flags && self.source == other.source
+  }
+}
+
+impl Eq for RspackRegex {}
+
+impl std::hash::Hash for RspackRegex {
+  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    self.flags.hash(state);
+    self.source.hash(state);
+  }
 }
 
 impl Debug for RspackRegex {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_tuple("RspackRegex")
-      .field(&self.to_string())
+    f.debug_struct("RspackRegex")
+      .field("flags", &self.flags)
+      .field("source", &self.source)
       .finish()
   }
 }
 
 impl RspackRegex {
+  /// Return capture `index` from the first match, corresponding to
+  /// `RegExp.exec(text)[index]`. Index zero returns the full match.
+  pub fn capture<'a>(&self, text: &'a str, index: usize) -> Option<&'a str> {
+    let range = match self.algo.as_ref() {
+      Algo::Regress(regex) => regex.regex.find(text)?.group(index)?,
+      Algo::RustRegex(regex) => regex.regex.captures(text)?.get(index)?.range(),
+      Algo::EndWith { .. } => {
+        // The suffix optimization only retains the information needed by test().
+        let regex = regress::Regex::with_flags(&self.source, self.flags.as_str())
+          .expect("an existing regexp should compile");
+        regex.find(text)?.group(index)?
+      }
+    };
+    text.get(range)
+  }
+
+  #[inline]
   pub fn test(&self, text: &str) -> bool {
     self.algo.test(text)
   }
 
+  #[inline]
   pub fn global(&self) -> bool {
-    self.algo.global()
+    self.flags.contains('g')
   }
 
+  #[inline]
   pub fn sticky(&self) -> bool {
-    self.algo.sticky()
+    self.flags.contains('y')
+  }
+
+  #[inline]
+  pub fn source(&self) -> &str {
+    &self.source
+  }
+
+  #[inline]
+  pub fn flags(&self) -> &str {
+    &self.flags
+  }
+
+  #[inline]
+  pub fn new(expr: &str) -> Result<Self, Error> {
+    Self::with_flags(expr, "")
   }
 
   pub fn with_flags(expr: &str, flags: &str) -> Result<Self, Error> {
@@ -48,24 +103,33 @@ impl RspackRegex {
     })
   }
 
-  pub fn new(expr: &str) -> Result<Self, Error> {
-    Self::with_flags(expr, "")
+  pub fn new_rust_regex(expr: &str, flags: &str) -> Result<Self, Error> {
+    let mut chars = flags.chars().collect::<Vec<char>>();
+    chars.sort_unstable();
+    Ok(Self {
+      flags: chars.into_iter().collect::<String>(),
+      source: expr.to_string(),
+      algo: Box::new(Algo::new_rust_regex(expr, flags)?),
+    })
   }
 
+  // https://github.com/webpack/webpack/blob/4baf1c075d59babd028f8201526cb8c4acfd24a0/lib/dependencies/ContextDependency.js#L30
+  #[inline]
+  pub fn to_source_string(&self) -> String {
+    format!("/{}/{}", self.source, self.flags)
+  }
+
+  // https://github.com/webpack/webpack/blob/4baf1c075d59babd028f8201526cb8c4acfd24a0/lib/ContextModule.js#L192
+  #[inline]
   pub fn to_pretty_string(&self, strip_slash: bool) -> String {
     if strip_slash {
       format!("{}{}", self.source, self.flags)
     } else {
-      self.to_string()
+      self.to_source_string()
     }
-    .replace('!', "%21")
-    .replace('|', "%7C")
-  }
-}
-
-impl Display for RspackRegex {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(f, "/{}/{}", self.source, self.flags)
+    .cow_replace('!', "%21")
+    .cow_replace('|', "%7C")
+    .into_owned()
   }
 }
 
@@ -82,5 +146,18 @@ impl TryFrom<SwcRegex> for RspackRegex {
 
   fn try_from(value: SwcRegex) -> Result<Self, Self::Error> {
     RspackRegex::with_flags(value.exp.as_ref(), value.flags.as_ref())
+  }
+}
+
+impl AsStringConverter for RspackRegex {
+  fn to_string(&self) -> Result<String, rspack_cacheable::Error> {
+    Ok(format!("{}#{}", self.flags, self.source))
+  }
+  fn from_str(s: &str) -> Result<Self, rspack_cacheable::Error>
+  where
+    Self: Sized,
+  {
+    let (flags, source) = s.split_once("#").expect("should have flags");
+    Ok(RspackRegex::with_flags(source, flags).expect("should generate regex"))
   }
 }

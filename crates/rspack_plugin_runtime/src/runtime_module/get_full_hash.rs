@@ -1,43 +1,57 @@
 use rspack_core::{
+  Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext, RuntimeTemplate,
   impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Compilation, RuntimeModule,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
-pub struct GetFullHashRuntimeModule {
-  id: Identifier,
+#[derive(Debug)]
+pub struct GetFullHashRuntimeModule {}
+
+impl GetFullHashRuntimeModule {
+  pub fn new(runtime_template: &RuntimeTemplate) -> Self {
+    Self::with_default(runtime_template)
+  }
 }
 
-impl Default for GetFullHashRuntimeModule {
-  fn default() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/get_full_hash"),
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
+#[async_trait::async_trait]
+impl RuntimeModule for GetFullHashRuntimeModule {
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
+  }
+
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define: { RuntimeGlobals::GET_FULL_HASH },
+      ..Default::default()
     }
   }
-}
 
-impl RuntimeModule for GetFullHashRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn template(&self) -> Vec<(String, String)> {
+    vec![(
+      self.id().to_string(),
+      include_str!("runtime/get_full_hash.ejs").to_string(),
+    )]
   }
 
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    Ok(
-      RawSource::from(
-        include_str!("runtime/get_full_hash.js")
-          .replace("$HASH$", compilation.get_hash().unwrap_or("XXXX")),
-      )
-      .boxed(),
-    )
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
+    let source = context.runtime_template.render(
+      self.id(),
+      Some(serde_json::json!({
+        "_hash": format!("\"{}\"", compilation.get_hash().unwrap_or("XXXX"))
+      })),
+    )?;
+
+    Ok(source.trim_end().to_string())
   }
 
-  fn cacheable(&self) -> bool {
-    false
+  fn full_hash(&self) -> bool {
+    true
   }
 }

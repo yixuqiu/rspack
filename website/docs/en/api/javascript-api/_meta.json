@@ -1,0 +1,13 @@
+[
+  "index",
+  "architecture",
+  "compiler",
+  "compilation",
+  "stats",
+  "stats-json",
+  "logger",
+  "cache",
+  "swc",
+  "resolver",
+  "browser"
+]

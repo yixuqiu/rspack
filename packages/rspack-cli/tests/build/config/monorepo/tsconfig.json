@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "rootDir": ".",
+    "target": "ESNext",
+    "module": "NodeNext",
+    "noEmit": true,
+    "types": ["node"],
+    "resolveJsonModule": true,
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "allowSyntheticDefaultImports": true
+  },
+  "include": ["**/*.ts", "**/*.js"]
+}

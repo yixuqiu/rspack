@@ -1,48 +1,29 @@
-use rspack_core::SpanExt;
-use swc_core::common::Spanned;
-use swc_core::ecma::ast::{Lit, PropName, Str};
+use rspack_util::SpanExt;
+use swc_next_ecma_ast::{Ast, Expr, ExprData, GetSpan};
 
 use super::BasicEvaluatedExpression;
 
-fn eval_str(str: &Str) -> BasicEvaluatedExpression {
-  let mut res = BasicEvaluatedExpression::with_range(str.span().real_lo(), str.span_hi().0);
-  res.set_string(str.value.to_string());
-  res
-}
-
-fn eval_number(num: &swc_core::ecma::ast::Number) -> BasicEvaluatedExpression {
-  let mut res = BasicEvaluatedExpression::with_range(num.span().real_lo(), num.span_hi().0);
-  res.set_number(num.value);
-  res
-}
-
-pub fn eval_lit_expr(expr: &Lit) -> Option<BasicEvaluatedExpression> {
-  match expr {
-    Lit::Str(str) => Some(eval_str(str)),
-    Lit::Regex(regexp) => {
-      let mut res =
-        BasicEvaluatedExpression::with_range(regexp.span().real_lo(), regexp.span_hi().0);
-      res.set_regexp(regexp.exp.to_string(), regexp.flags.to_string());
-      Some(res)
+#[inline]
+pub fn eval_lit_expr<'a>(ast: &'a Ast<'_>, expr: Expr) -> Option<BasicEvaluatedExpression<'a>> {
+  let span = expr.span(ast);
+  let mut result = BasicEvaluatedExpression::with_range(span.real_lo(), span.real_hi());
+  match ast.expr_data(expr) {
+    ExprData::StringLiteral(string) => {
+      let value = ast.get_wtf8(string.value(ast));
+      // Leave lone surrogates to JavaScript: a Rust str cannot represent them.
+      result.set_string(std::str::from_utf8(value.as_bytes()).ok()?);
     }
-    Lit::Null(null) => {
-      let mut res = BasicEvaluatedExpression::with_range(null.span.real_lo(), null.span.hi().0);
-      res.set_null();
-      Some(res)
+    ExprData::RegExpLiteral(regexp) => result.set_regexp(
+      ast.get_utf8(regexp.pattern(ast)).to_string(),
+      ast.get_utf8(regexp.flags(ast)).to_string(),
+    ),
+    ExprData::NullLiteral(_) => result.set_null(),
+    ExprData::NumericLiteral(number) => result.set_number(number.value(ast)),
+    ExprData::BooleanLiteral(boolean) => result.set_bool(boolean.value(ast)),
+    ExprData::BigIntLiteral(bigint) => {
+      result.set_bigint(bigint.value(ast)?);
     }
-    Lit::Num(num) => Some(eval_number(num)),
-    // TODO:
-    _ => None,
+    _ => return None,
   }
-}
-
-pub fn eval_prop_name(prop_name: &PropName) -> Option<BasicEvaluatedExpression> {
-  match prop_name {
-    PropName::Str(str) => Some(eval_str(str)),
-    PropName::Num(num) => Some(eval_number(num)),
-    // TODO:
-    PropName::Ident(_) => None,
-    PropName::Computed(_) => None,
-    PropName::BigInt(_) => None,
-  }
+  Some(result)
 }

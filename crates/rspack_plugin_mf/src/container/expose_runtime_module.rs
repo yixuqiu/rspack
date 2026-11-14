@@ -1,29 +1,19 @@
 use rspack_core::{
-  impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  ChunkUkey, Compilation, RuntimeModule, RuntimeModuleStage, SourceType,
+  ChunkUkey, Compilation, RuntimeModule, RuntimeModuleGenerateContext, RuntimeModuleStage,
+  RuntimeTemplate, SourceType, impl_runtime_module,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 use super::container_entry_module::CodeGenerationDataExpose;
-use crate::utils::json_stringify;
+use crate::utils::{json_stringify, module_require_scope_name, runtime_require_scope_requirement};
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
-pub struct ExposeRuntimeModule {
-  id: Identifier,
-  chunk: Option<ChunkUkey>,
-}
+#[derive(Debug)]
+pub struct ExposeRuntimeModule {}
 
 impl ExposeRuntimeModule {
-  pub fn new() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/initialize_exposes"),
-      chunk: None,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
-    }
+  #[allow(clippy::new_without_default)]
+  pub fn new(runtime_template: &RuntimeTemplate) -> Self {
+    Self::with_name(runtime_template, "initialize_exposes")
   }
 }
 
@@ -33,18 +23,27 @@ impl ExposeRuntimeModule {
     chunk_ukey: &ChunkUkey,
     compilation: &'a Compilation,
   ) -> Option<&'a CodeGenerationDataExpose> {
-    let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+    let chunk = compilation
+      .build_chunk_graph_artifact
+      .chunk_by_ukey
+      .expect_get(chunk_ukey);
     let module_graph = compilation.get_module_graph();
-    for c in chunk.get_all_initial_chunks(&compilation.chunk_group_by_ukey) {
-      let chunk = compilation.chunk_by_ukey.expect_get(&c);
+    for c in
+      chunk.get_all_initial_chunks(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
+    {
+      let chunk = compilation
+        .build_chunk_graph_artifact
+        .chunk_by_ukey
+        .expect_get(&c);
       let modules = compilation
+        .build_chunk_graph_artifact
         .chunk_graph
-        .get_chunk_modules_iterable_by_source_type(&c, SourceType::Expose, &module_graph);
+        .get_chunk_modules_identifier_by_source_type(&c, SourceType::Expose, module_graph);
       for m in modules {
         let code_gen = compilation
           .code_generation_results
-          .get(&m.identifier(), Some(&chunk.runtime));
-        if let Some(data) = code_gen.data.get::<CodeGenerationDataExpose>() {
+          .get(&m, Some(chunk.runtime()));
+        if let Some(data) = code_gen.data().get::<CodeGenerationDataExpose>() {
           return Some(data);
         };
       }
@@ -53,26 +52,49 @@ impl ExposeRuntimeModule {
   }
 }
 
+#[async_trait::async_trait]
 impl RuntimeModule for ExposeRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
+  }
+
+  fn runtime_requirements(
+    &self,
+    compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    let mut dependencies = runtime_require_scope_requirement(compilation);
+    if let Some(chunk_ukey) = self.chunk()
+      && let Some(data) = self.find_expose_data(&chunk_ukey, compilation)
+    {
+      dependencies.insert(data.module_map_runtime_requirements);
+    }
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      dependencies,
+      ..Default::default()
+    }
   }
 
   fn stage(&self) -> RuntimeModuleStage {
     RuntimeModuleStage::Attach
   }
 
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
     let chunk_ukey = self
-      .chunk
+      .chunk()
       .expect("should have chunk in <ExposeRuntimeModule as RuntimeModule>::generate");
     let Some(data) = self.find_expose_data(&chunk_ukey, compilation) else {
-      return Ok(RawSource::from("").boxed());
+      return Ok(String::new());
     };
-    let module_map = data.module_map.render();
+    let mut runtime_template = compilation.runtime_template.create_module_code_template();
+    let module_map = data.module_map.render(&mut runtime_template);
+    let require_name = module_require_scope_name(compilation, &mut runtime_template);
     let mut source = format!(
       r#"
-__webpack_require__.initializeExposesData = {{
+    {require_name}.initializeExposesData = {{
   moduleMap: {},
   shareScope: {},
 }};
@@ -80,12 +102,12 @@ __webpack_require__.initializeExposesData = {{
       module_map,
       json_stringify(&data.share_scope)
     );
-    source += "__webpack_require__.getContainer = function() { throw new Error(\"should have __webpack_require__.getContainer\") };";
-    source += "__webpack_require__.initContainer = function() { throw new Error(\"should have __webpack_require__.initContainer\") };";
-    Ok(RawSource::from(source).boxed())
-  }
-
-  fn attach(&mut self, chunk: ChunkUkey) {
-    self.chunk = Some(chunk);
+    source += &format!(
+      "{require_name}.getContainer = {require_name}.getContainer || function() {{ throw new Error(\"should have {require_name}.getContainer\") }};",
+    );
+    source += &format!(
+      "{require_name}.initContainer = {require_name}.initContainer || function() {{ throw new Error(\"should have {require_name}.initContainer\") }};",
+    );
+    Ok(source)
   }
 }

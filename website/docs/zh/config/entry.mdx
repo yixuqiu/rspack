@@ -1,35 +1,24 @@
-import WebpackLicense from '@components/webpack-license';
-import { ApiMeta, Stability } from '../../../components/ApiMeta';
+---
+description: 'Rspack Entry 配置项参考，涵盖单入口、多入口、动态入口函数以及入口描述对象的配置方式与行为。'
+---
 
-<WebpackLicense from="https://webpack.docschina.org/configuration/entry-context/#entry" />
+import Attribution from '@components/Attribution';
+import PropertyType from '@components/PropertyType';
 
 # Entry
 
-输入：该选项用于设置 Rspack 构建的入口。
-
 - **类型：**
 
-  ```ts
-  type EntryDescription = {
-    import: EntryItem;
-    runtime?: EntryRuntime;
-    chunkLoading?: ChunkLoading;
-    asyncChunks?: boolean;
-    publicPath?: PublicPath;
-    baseUri?: string;
-    filename?: EntryFilename;
-  };
+```ts
+type EntryStatic =
+  string | string[] | Record<string, string | string[] | EntryDescription>;
 
-  type EntryObject = {
-    [k: string]: EntryItem | EntryDescription;
-  };
+type Entry = EntryStatic | (() => EntryStatic | Promise<EntryStatic>);
+```
 
-  type Config = {
-    entry: EntryItem | EntryObject;
-  };
-  ```
+- **默认值：** `'./src/index.js'`
 
-- **默认值：** `./src/index.js`
+入口：该选项用于设置 Rspack 构建的入口。
 
 ## 单个入口
 
@@ -37,16 +26,16 @@ import { ApiMeta, Stability } from '../../../components/ApiMeta';
 
 设置单个入口时，直接将入口模块的路径作为字符串传入 `entry` 配置项即可。
 
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: './src/index.js',
 };
 ```
 
 以上写法会自动将入口模块的名称设置为 `main`，等价于以下写法：
 
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: {
     main: './src/index.js',
   },
@@ -57,15 +46,15 @@ module.exports = {
 
 入口模块的路径可以是一个相对路径，也可以是一个绝对路径。
 
-当 `entry` 被设置为相对路径时，Rspack 会使用 [context 配置项](/config/context.html) 设置的值作为基础路径，默认为 Node.js 进程的当前工作目录，即 `process.cwd()`。
+当 `entry` 被设置为相对路径时，Rspack 会使用 [context 配置项](/config/context) 设置的值作为基础路径，默认为 Node.js 进程的当前工作目录，即 `process.cwd()`。
 
 你也可以使用 Node.js 中的 [path 模块](https://nodejs.org/api/path.html) 来生成一个绝对路径，并传递给 `entry` 配置项：
 
-```ts title="rspack.config.js"
-const path = require('path');
+```js title="rspack.config.mjs"
+import path from 'node:path';
 
-module.exports = {
-  entry: path.join(__dirname, './src/index.js'),
+export default {
+  entry: path.join(import.meta.dirname, './src/index.js'),
 };
 ```
 
@@ -75,15 +64,27 @@ module.exports = {
 
 比如以下示例，会将 `pre.js` 和 `post.js` 构建到 `page` 的产物中。
 
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: {
     page: ['./src/pre.js', './src/post.js'],
   },
 };
 ```
 
-多个模块会按照数组定义的顺序依次执行，因此 `pre.js` 的代码会早于 `post.js` 的代码执行。
+当某个入口的值是数组时，Rspack 仍然只会为该入口生成一个 chunk。数组中的模块会按声明顺序加载，并合并到同一个依赖图中，因此 `pre.js` 会早于 `post.js` 执行。
+
+这种模式常用于在主应用入口之前注入额外代码，例如 polyfill 或仅在开发环境使用的工具脚本，而不必在业务源码中手动导入它们。
+
+**示例：注入 polyfill**
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    main: ['./src/polyfill.js', './src/index.js'],
+  },
+};
+```
 
 ## 多个入口
 
@@ -91,8 +92,8 @@ module.exports = {
 
 比如以下示例，会将 `page1` 和 `page2` 作为两个入口进行构建：
 
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: {
     page1: './src/page1/index.js',
     page2: './src/page2/index.js',
@@ -106,32 +107,48 @@ module.exports = {
 
 #### EntryDescription.import
 
-- **类型：**
+<PropertyType
+  type="string[] | string"
+  defaultValueList={[{ defaultValue: "'./src/index.js'" }]}
+/>
 
-  ```ts
-  type EntryItem = string[] | string;
-  ```
+一个或多个入口模块的路径。
 
-- **默认值：** `'./src/index.js'`
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    foo: {
+      import: './src/foo.js',
+    },
+  },
+};
+```
 
-入口模块的路径
+`import` 属性可以设置多个路径：
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    foo: {
+      import: ['./src/foo.js', './src/bar.js'],
+    },
+  },
+};
+```
 
 #### EntryDescription.runtime
 
-- **类型：**
+<PropertyType
+  type="false | string"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
-  ```ts
-  type EntryRuntime = false | string;
-  ```
+设置 Rspack 运行时 chunk 的名称。指定 `runtime` 后，会创建一个独立的 chunk 来存放运行时代码；设为 `false` 则不创建独立的 chunk。
 
-- **默认值：** `undefined`
+例如，将 `main` 入口使用的 Rspack 运行时 chunk 命名为 `'foo'`：
 
-运行时 chunk 的名称。设置 `runtime` 后，会创建一个新的运行时 chunk。你也可以将它设置为 `false` 来避免一个新的运行时 chunk。
-
-`runtime` 属性用于设置运行时 `chunk` 的名称，比如将 `main` 入口的 chunk 名称设置为 `'foo'`：
-
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: {
     main: {
       import: './src/index.js',
@@ -143,94 +160,178 @@ module.exports = {
 
 #### EntryDescription.chunkLoading
 
-<ApiMeta addedVersion={'0.2.6'} />
+<PropertyType
+  type="false | string | 'jsonp' | 'import-scripts' | 'require' | 'async-node' | 'import'"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
-- **类型：**
-
-  ```ts
-  type ChunkLoading = false | ChunkLoadingType;
-  type ChunkLoadingType =
-    | ('jsonp' | 'import-scripts' | 'require' | 'async-node' | 'import')
-    | string;
-  ```
-
-- **默认值：** `undefined`
-
-决定该入口在加载 chunk 时的加载方式。
+设置当前入口在加载 chunk 时的加载方式。默认包含的方式有 `'jsonp'` (web), `'import'` (ESM), `'import-scripts'` (WebWorker), `'require'` (sync node.js), `'async-node'` (async node.js)，其他方式可由插件提供。
 
 #### EntryDescription.asyncChunks
 
-<ApiMeta addedVersion={'0.2.6'} />
+<PropertyType type="boolean" defaultValueList={[{ defaultValue: 'true' }]} />
 
-- **类型：** `boolean`
-- **默认值：** `true`
-
-是否为该入口创建按需加载的异步 chunk。
+是否为当前入口创建按需加载的异步 chunk。
 
 #### EntryDescription.publicPath
 
-<ApiMeta addedVersion={'0.2.6'} />
+<PropertyType
+  type="'auto' | string | ((pathData: PathData, assetInfo?: AssetInfo) => string)"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
-- **类型：**
-
-  ```ts
-  type PublicPath = 'auto' | string;
-  ```
-
-- **默认值：** `undefined`
-
-修改该入口引用的资源的 publicPath。
+修改当前入口引用的资源的 publicPath。
 
 #### EntryDescription.baseUri
 
-<ApiMeta addedVersion={'0.2.6'} />
+<PropertyType
+  type="string"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
-- **类型：** `string`
-- **默认值：** `undefined`
-
-修改该入口引用的资源的 baseURI。
+设置当前入口用于解析资源和 Worker 相对 URL 的初始基准 URI。未配置时，使用 Rspack 的默认基准 URI。关于默认值和使用示例，参阅 [Base URI](/guide/features/asset-base-path#base-uri)。
 
 #### EntryDescription.filename
 
-<ApiMeta addedVersion={'0.2.6'} />
+<PropertyType
+  type="string | ((pathData: PathData, assetInfo?: AssetInfo) => string)"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
-- **类型：** `string`
-- **默认值：** `undefined`
-
-修改该入口所生成 chunk 的文件名。
+修改当前入口所生成 chunk 的文件名。
 
 #### EntryDescription.library
 
-<ApiMeta addedVersion={'0.3.12'} />
+- **类型：** `LibraryOptions`
+- **默认值：** `undefined`
 
-修改该入口所生成 chunk 作为库的导出格式，详细配置可参考 [output.library](/config/output#outputlibrary)。
+修改当前入口所生成 chunk 作为库的导出格式，详细配置可参考 [output.library](/config/output#outputlibrary)。
+
+#### EntryDescription.dependOn
+
+<PropertyType
+  type="string[] | string"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+声明当前入口所依赖的入口。可以设置为一个**入口名称**或入口名称数组。
+
+当同一页面中的多个入口具有明确的依赖关系时，可以使用 `dependOn`，例如多个业务入口依赖同一个应用基础入口。Rspack 会：
+
+- 复用依赖入口中的模块，避免将它们重复打包到当前入口 chunk 中。
+- 使用依赖入口的 [Rspack 运行时](/misc/glossary#rspack-runtime)。这些入口共享同一份模块缓存，因此共享模块只会初始化一次。
+- 等待所需的 chunks 就绪后，再启动当前入口。
+
+例如，让 `editor` 和 `preview` 两个入口都依赖 `shell`：
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    shell: './src/shell.js',
+    editor: {
+      import: './src/editor.js',
+      dependOn: 'shell',
+    },
+    preview: {
+      import: './src/preview.js',
+      dependOn: 'shell',
+    },
+  },
+};
+```
+
+```js title="src/shell.js"
+export const documentState = { title: 'Untitled' };
+
+console.log('Shell initialized');
+```
+
+```js title="src/editor.js"
+import { documentState } from './shell.js';
+
+documentState.title = 'Draft';
+```
+
+```js title="src/preview.js"
+import { documentState } from './shell.js';
+
+console.log(documentState.title);
+```
+
+构建会生成 `shell.js`、`editor.js` 和 `preview.js`。shell 模块只打包到 `shell.js` 中，三个入口使用同一个 Rspack 运行时和模块缓存。假设产物目录通过 `/dist/` 提供访问，在页面中按以下顺序加载这些文件：
+
+```html
+<script defer src="/dist/shell.js"></script>
+<script defer src="/dist/editor.js"></script>
+<script defer src="/dist/preview.js"></script>
+```
+
+页面会输出一次 `Shell initialized`，随后输出 `Draft`：preview 读取的对象正是 editor 修改的对象。源码中仍需导入要使用的模块，`dependOn` 不会将模块的导出暴露为全局变量。
+
+`dependOn` 控制的是 chunk 之间的依赖关系，不会等待异步业务初始化完成，例如 `shell` 发起的网络请求。这类操作需要在业务代码中显式协调。入口之间不能形成循环依赖，配置了 `dependOn` 的入口也不能同时配置 `runtime`。
+
+如果只是希望自动抽取共享模块，通常优先使用 [SplitChunksPlugin](/plugins/split-chunks-plugin)。它按照可配置的规则拆分模块，不会声明入口之间的依赖关系，也不会统一各入口的 Rspack 运行时。如果同一页面中的多个入口还需要共享模块实例，可以配合 [`optimization.runtimeChunk: 'single'`](/config/optimization#optimizationruntimechunk) 使用。需要明确声明入口依赖关系时，再使用 `dependOn`；它也可以与 `splitChunks` 配合使用。
+
+#### EntryDescription.wasmLoading
+
+<PropertyType
+  type="false | 'fetch' | 'async-node' | 'universal'"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+设置当前入口加载 WebAssembly 模块的方式。省略时使用 [`output.wasmLoading`](/config/output#outputwasmloading) 的值。
+
+[`output.wasmLoading`](/config/output#outputwasmloading) 的默认值会根据 [target](/config/target) 的变化而变化：
+
+- 如果 target 设置为 `'web'`，`'webworker'`，`'electron-renderer'` 或 `'node-webkit'` 其中之一，其默认值为 `'fetch'`。
+- 如果 target 设置为 `'node'`，`'async-node'`，`'electron-main'` 或 `'electron-preload'`，其默认值为 `'async-node'`。
+
+#### EntryDescription.layer
+
+<PropertyType
+  type="string | null | undefined"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+指定当前入口的模块所在的 layer。用于在 split chunks, [rules](/config/module-rules#rulesissuerlayer)、stats、externals 中通过 layer 匹配使对应的配置生效。
+
+更多关于 layer 的信息，请参考[模块分层指南](/guide/advanced/layer)。
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    index: {
+      import: './src/index.js',
+      layer: 'layer-name',
+    },
+  },
+};
+```
 
 ## 动态入口
 
 如果传入一个函数，那么它将会在每次 [make](/api/plugin-api/compiler-hooks#make) 事件中被调用。
 
-> 要注意的是，`make` 事件在 webpack 启动和每当[监听文件变化](/config/watch)时都会触发。
+> 要注意的是，`make` 事件在 Rspack 启动和每当[监听文件变化](/config/watch)时都会触发。
 
-```js title=rspack.config.js
-module.exports = {
-  //...
+```js title="rspack.config.mjs"
+export default {
   entry: () => './demo',
 };
 ```
 
-或者
+或者：
 
-```js title=rspack.config.js
-module.exports = {
-  //...
-  entry: () => new Promise(resolve => resolve(['./demo', './demo2'])),
+```js title="rspack.config.mjs"
+export default {
+  entry: () => new Promise((resolve) => resolve(['./demo', './demo2'])),
 };
 ```
 
 例如，你可以使用动态入口来从外部来源（远程服务器，文件系统内容或者数据库）获取真正的入口：
 
-```js title=rspack.config.js
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry() {
     return fetchPathsFromSomeExternalSource(); // 返回一个会被用像 ['src/main-layout.js', 'src/admin-layout.js'] 的东西 resolve 的 promise
   },
@@ -238,3 +339,5 @@ module.exports = {
 ```
 
 当和 [output.library](/config/output#outputlibrary) 选项结合：如果传入的是一个数组，只有数组的最后一个条目会被导出。
+
+<Attribution url="https://webpack.docschina.org/configuration/entry-context/#entry" />

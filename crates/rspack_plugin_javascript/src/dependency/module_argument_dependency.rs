@@ -1,56 +1,113 @@
+use rspack_cacheable::{cacheable, cacheable_dyn};
 use rspack_core::{
-  AsDependency, DependencyTemplate, RuntimeGlobals, TemplateContext, TemplateReplaceSource,
+  Compilation, DependencyCodeGeneration, DependencyLocation, DependencyRange, DependencyTemplate,
+  DependencyTemplateType, RuntimeGlobals, RuntimeSpec, TemplateContext, TemplateReplaceSource,
 };
+use rspack_hash::{RspackHash, RspackHasher};
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct ModuleArgumentDependency {
-  pub start: u32,
-  pub end: u32,
-  pub id: Option<&'static str>,
+  id: Option<String>,
+  range: DependencyRange,
+  loc: Option<DependencyLocation>,
 }
 
 impl ModuleArgumentDependency {
-  pub fn new(start: u32, end: u32, id: Option<&'static str>) -> Self {
-    Self { start, end, id }
+  pub fn new(id: Option<String>, range: DependencyRange, loc: Option<DependencyLocation>) -> Self {
+    Self { id, range, loc }
   }
 }
 
-impl DependencyTemplate for ModuleArgumentDependency {
-  fn apply(
+impl RspackHash for ModuleArgumentDependency {
+  fn hash(&self, state: &mut RspackHasher) {
+    "range".hash(state);
+    self.range.hash(state);
+    if let Some(id) = &self.id {
+      "id".hash(state);
+      id.hash(state);
+    }
+
+    match self.id.as_deref() {
+      Some("id") => {
+        "runtime_requirements".hash(state);
+        RuntimeGlobals::MODULE_ID.hash(state);
+      }
+      Some("loaded") => {
+        "runtime_requirements".hash(state);
+        RuntimeGlobals::MODULE_LOADED.hash(state);
+      }
+      Some("hot" | "hot.accept" | "hot.decline") => {
+        "runtime_requirements".hash(state);
+        RuntimeGlobals::MODULE.hash(state);
+      }
+      _ => {}
+    }
+  }
+}
+
+#[cacheable_dyn]
+impl DependencyCodeGeneration for ModuleArgumentDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(ModuleArgumentDependencyTemplate::template_type())
+  }
+
+  fn update_hash(
     &self,
+    hasher: &mut RspackHasher,
+    _compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+  ) {
+    RspackHash::hash(self, hasher);
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct ModuleArgumentDependencyTemplate;
+
+impl ModuleArgumentDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Custom("ModuleArgumentDependency")
+  }
+}
+
+impl DependencyTemplate for ModuleArgumentDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
     source: &mut TemplateReplaceSource,
     code_generatable_context: &mut TemplateContext,
   ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<ModuleArgumentDependency>()
+      .expect("ModuleArgumentDependencyTemplate should be used for ModuleArgumentDependency");
+
     let TemplateContext {
-      runtime_requirements,
-      compilation,
       module,
+      runtime_template,
       ..
     } = code_generatable_context;
 
-    runtime_requirements.insert(RuntimeGlobals::MODULE);
+    let module_argument = runtime_template.render_module_argument(module.get_module_argument());
 
-    let module_argument = compilation
-      .get_module_graph()
-      .module_by_identifier(&module.identifier())
-      .expect("should have mgm")
-      .get_module_argument();
+    let content = if let Some(id) = &dep.id {
+      match id.as_str() {
+        "id" => runtime_template
+          .runtime_requirements_mut()
+          .insert(RuntimeGlobals::MODULE_ID),
+        "loaded" => runtime_template
+          .runtime_requirements_mut()
+          .insert(RuntimeGlobals::MODULE_LOADED),
+        _ => {}
+      };
 
-    if let Some(id) = self.id {
-      source.replace(
-        self.start,
-        self.end,
-        format!("{module_argument}.{id}").as_str(),
-        None,
-      );
+      format!("{module_argument}.{id}")
     } else {
-      source.replace(self.start, self.end, &format!("{module_argument}"), None);
-    }
-  }
+      module_argument
+    };
 
-  fn dependency_id(&self) -> Option<rspack_core::DependencyId> {
-    None
+    source.replace(dep.range.start, dep.range.end, content, None);
   }
 }
-
-impl AsDependency for ModuleArgumentDependency {}

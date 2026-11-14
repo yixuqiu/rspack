@@ -1,44 +1,64 @@
+use rspack_cacheable::{cacheable, cacheable_dyn};
 use rspack_core::{
-  AsContextDependency, AsDependencyTemplate, Dependency, DependencyCategory, DependencyId,
-  DependencyType, ModuleDependency,
+  AsContextDependency, AsDependencyCodeGeneration, Dependency, DependencyCategory, DependencyId,
+  DependencyType, ModuleDependency, ResourceIdentifier,
 };
 
-use crate::ExposeOptions;
+use crate::{ExposeOptions, ShareScope};
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct ContainerEntryDependency {
   id: DependencyId,
   pub name: String,
   pub exposes: Vec<(String, ExposeOptions)>,
-  pub share_scope: String,
-  resource_identifier: String,
+  pub share_scope: ShareScope,
+  pub request: Option<String>,
+  pub version: Option<String>,
+  resource_identifier: ResourceIdentifier,
   pub(crate) enhanced: bool,
+  dependency_type: DependencyType,
 }
 
 impl ContainerEntryDependency {
   pub fn new(
     name: String,
     exposes: Vec<(String, ExposeOptions)>,
-    share_scope: String,
+    share_scope: ShareScope,
     enhanced: bool,
   ) -> Self {
-    let resource_identifier = format!("container-entry-{}", &name);
+    let resource_identifier = format!("container-entry-{}", &name).into();
     Self {
       id: DependencyId::new(),
       name,
       exposes,
       share_scope,
+      request: None,
+      version: None,
       resource_identifier,
       enhanced,
+      dependency_type: DependencyType::ContainerEntry,
+    }
+  }
+
+  pub fn new_share_container_entry(name: String, request: String, version: String) -> Self {
+    let resource_identifier = format!("share-container-entry-{}", &name).into();
+    Self {
+      id: DependencyId::new(),
+      name,
+      exposes: vec![],
+      share_scope: ShareScope::Multiple(vec![]),
+      request: Some(request),
+      version: Some(version),
+      resource_identifier,
+      enhanced: false,
+      dependency_type: DependencyType::ShareContainerEntry,
     }
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for ContainerEntryDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "ContainerEntryDependency"
-  }
-
   fn id(&self) -> &DependencyId {
     &self.id
   }
@@ -48,19 +68,28 @@ impl Dependency for ContainerEntryDependency {
   }
 
   fn dependency_type(&self) -> &DependencyType {
-    &DependencyType::ContainerEntry
+    &self.dependency_type
   }
 
   fn resource_identifier(&self) -> Option<&str> {
     Some(&self.resource_identifier)
   }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::Transitive
+  }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for ContainerEntryDependency {
   fn request(&self) -> &str {
-    &self.resource_identifier
+    if self.dependency_type == DependencyType::ShareContainerEntry {
+      self.request.as_deref().unwrap_or_default()
+    } else {
+      &self.resource_identifier
+    }
   }
 }
 
 impl AsContextDependency for ContainerEntryDependency {}
-impl AsDependencyTemplate for ContainerEntryDependency {}
+impl AsDependencyCodeGeneration for ContainerEntryDependency {}

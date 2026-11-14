@@ -1,672 +1,715 @@
-use std::collections::VecDeque;
-use std::fmt::Debug;
-use std::sync::Arc;
+use std::{
+  borrow::Cow,
+  fmt::Debug,
+  sync::{Arc, RwLock},
+};
 
-use once_cell::sync::Lazy;
-use rspack_core::tree_shaking::visitor::{get_side_effects_from_package_json, SideEffects};
+use rayon::prelude::*;
+use rspack_collections::{IdentifierMap, IdentifierSet};
 use rspack_core::{
-  BoxModule, Compilation, CompilationOptimizeDependencies, ConnectionState, FactoryMeta,
-  ModuleFactoryCreateData, ModuleGraph, ModuleIdentifier, MutableModuleGraph,
-  NormalModuleCreateData, NormalModuleFactoryModule, Plugin, ResolvedExportInfoTarget,
-  SideEffectsBailoutItemWithSpan,
+  AsyncModulesArtifact, BoxModule, Compilation, CompilationFinishModules,
+  CompilationOptimizeDependencies, ConnectionState, DependencyExtraMeta, DependencyId,
+  ExportProvided, ExportsInfoArtifact, FactoryMeta, GetTargetResult, Logger, Module,
+  ModuleFactoryCreateData, ModuleGraph, ModuleGraphConnection, ModuleIdentifier,
+  NormalModuleCreateData, NormalModuleFactoryModule, OptimizationBailoutItem, Plugin,
+  ResolvedExportInfoTarget, SideEffectsDoOptimize, SideEffectsDoOptimizeMoveTarget,
+  SideEffectsOptimizeArtifact, SideEffectsState, SideEffectsStateArtifact,
+  build_module_graph::BuildModuleGraphArtifact,
+  can_move_target, get_target,
+  incremental::{self, IncrementalPasses, Mutation},
 };
-use rspack_error::Result;
+use rspack_error::{Diagnostic, Result};
+use rspack_fs::FsResultToIoResultExt;
 use rspack_hook::{plugin, plugin_hook};
-use rspack_identifier::IdentifierSet;
-use rustc_hash::FxHashSet as HashSet;
+use rspack_paths::{AssertUtf8, InternedPath, Utf8Path, Utf8PathBuf};
+use rustc_hash::FxHashMap;
 use sugar_path::SugarPath;
-// use rspack_core::Plugin;
-// use rspack_error::Result;
-use swc_core::common::{comments, Spanned, SyntaxContext, GLOBALS};
-use swc_core::ecma::ast::*;
-use swc_core::ecma::utils::{ExprCtx, ExprExt};
-use swc_core::ecma::visit::{noop_visit_type, Visit, VisitWith};
-use swc_node_comments::SwcComments;
 
-use crate::dependency::{
-  HarmonyExportImportedSpecifierDependency, HarmonyImportSpecifierDependency,
+use crate::{
+  FLAG_DEPENDENCY_EXPORTS_STAGE, JS_DEFAULT_KEYWORD, deferred_pure_check_is_impure,
+  dependency::{ESMExportImportedSpecifierDependency, ESMImportSpecifierDependency},
 };
 
-pub struct SideEffectsFlagPluginVisitor<'a> {
-  unresolved_ctxt: SyntaxContext,
-  pub side_effects_item: Option<SideEffectsBailoutItemWithSpan>,
-  is_top_level: bool,
-  comments: Option<&'a SwcComments>,
-}
+pub static SIDE_EFFECTS_FLAG_PLUGIN_STAGE: i32 = FLAG_DEPENDENCY_EXPORTS_STAGE + 10;
+const CALL_WITH_SIDE_EFFECTS_BAILOUT: &str = "Call with side effects";
 
-impl<'a> Debug for SideEffectsFlagPluginVisitor<'a> {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("SideEffectsFlagPluginVisitor")
-      .field("unresolved_ctxt", &self.unresolved_ctxt)
-      .field("side_effects_span", &self.side_effects_item)
-      .field("is_top_level", &self.is_top_level)
-      .finish()
-  }
+#[derive(Debug)]
+enum SideEffects {
+  Bool(bool),
+  String(String),
+  Array(Vec<String>),
 }
 
 #[derive(Debug)]
-pub struct SyntaxContextInfo {
-  unresolved_ctxt: SyntaxContext,
+struct OwningSideEffects {
+  side_effects: SideEffects,
+  package_root: Utf8PathBuf,
 }
 
-impl SyntaxContextInfo {
-  pub fn new(unresolved_ctxt: SyntaxContext) -> Self {
-    Self { unresolved_ctxt }
-  }
+#[derive(Debug, Default)]
+struct OwningSideEffectsResult {
+  owning: Option<OwningSideEffects>,
+  file_dependencies: Vec<InternedPath>,
+  missing_dependencies: Vec<InternedPath>,
 }
 
-impl<'a> SideEffectsFlagPluginVisitor<'a> {
-  pub fn new(mark_info: SyntaxContextInfo, comments: Option<&'a SwcComments>) -> Self {
-    Self {
-      unresolved_ctxt: mark_info.unresolved_ctxt,
-      side_effects_item: None,
-      is_top_level: true,
-      comments,
-    }
-  }
-}
-
-impl<'a> Visit for SideEffectsFlagPluginVisitor<'a> {
-  noop_visit_type!();
-  fn visit_program(&mut self, node: &Program) {
-    assert!(GLOBALS.is_set());
-    node.visit_children_with(self);
-  }
-
-  fn visit_module(&mut self, node: &Module) {
-    for module_item in &node.body {
-      match module_item {
-        ModuleItem::ModuleDecl(decl) => match decl {
-          ModuleDecl::Import(_) => {}
-          ModuleDecl::ExportDecl(decl) => decl.visit_with(self),
-          // `export { foo } from 'mod'`
-          // `export { foo as bar } from 'mod'`
-          ModuleDecl::ExportNamed(_) => {}
-          ModuleDecl::ExportDefaultDecl(decl) => {
-            decl.visit_with(self);
-          }
-          ModuleDecl::ExportDefaultExpr(expr) => {
-            if !is_pure_expression(&expr.expr, self.unresolved_ctxt, self.comments) {
-              self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-                expr.span,
-                String::from("ExportDefaultExpr"),
-              ));
-            }
-          }
-          // export * from './x'
-          ModuleDecl::ExportAll(_) => {}
-          ModuleDecl::TsImportEquals(_) => unreachable!(),
-          ModuleDecl::TsExportAssignment(_) => unreachable!(),
-          ModuleDecl::TsNamespaceExport(_) => unreachable!(),
-        },
-        ModuleItem::Stmt(stmt) => stmt.visit_with(self),
-      }
-    }
-  }
-
-  fn visit_script(&mut self, node: &Script) {
-    for stmt in &node.body {
-      stmt.visit_with(self);
-    }
-  }
-
-  fn visit_stmt(&mut self, node: &Stmt) {
-    if !self.is_top_level {
-      return;
-    }
-    self.analyze_stmt_side_effects(node);
-    node.visit_children_with(self);
-  }
-
-  fn visit_export_decl(&mut self, node: &ExportDecl) {
-    if !is_pure_decl(&node.decl, self.unresolved_ctxt, self.comments) {
-      self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-        node.decl.span(),
-        String::from("Decl"),
-      ));
-    }
-    node.visit_children_with(self);
-  }
-  fn visit_class_member(&mut self, node: &ClassMember) {
-    if let Some(key) = node.class_key()
-      && key.is_computed()
-    {
-      key.visit_with(self);
-    }
-
-    let top_level = self.is_top_level;
-    self.is_top_level = false;
-    node.visit_children_with(self);
-    self.is_top_level = top_level;
-  }
-
-  fn visit_fn_decl(&mut self, node: &FnDecl) {
-    let top_level = self.is_top_level;
-    self.is_top_level = false;
-    node.visit_children_with(self);
-    self.is_top_level = top_level;
-  }
-
-  fn visit_fn_expr(&mut self, node: &FnExpr) {
-    let top_level = self.is_top_level;
-    self.is_top_level = false;
-    node.visit_children_with(self);
-    self.is_top_level = top_level;
-  }
-
-  fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
-    let top_level = self.is_top_level;
-    self.is_top_level = false;
-    node.visit_children_with(self);
-    self.is_top_level = top_level;
+impl OwningSideEffectsResult {
+  fn add_dependencies(&self, data: &mut ModuleFactoryCreateData) {
+    data.add_file_dependencies(self.file_dependencies.iter().cloned());
+    data.add_missing_dependencies(self.missing_dependencies.iter().cloned());
   }
 }
 
-impl<'a> SideEffectsFlagPluginVisitor<'a> {
-  /// If we find a stmt that has side effects, we will skip the rest of the stmts.
-  /// And mark the module as having side effects.
-  fn analyze_stmt_side_effects(&mut self, ele: &Stmt) {
-    if self.side_effects_item.is_some() {
-      return;
-    }
-    match ele {
-      Stmt::If(stmt) => {
-        if !is_pure_expression(&stmt.test, self.unresolved_ctxt, self.comments) {
-          self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-            stmt.span(),
-            String::from("Statement"),
-          ));
+impl SideEffects {
+  pub fn from_description(description: &serde_json::Value) -> Option<Self> {
+    description.get("sideEffects").and_then(Self::from_value)
+  }
+
+  fn from_value(value: &serde_json::Value) -> Option<Self> {
+    if let Some(b) = value.as_bool() {
+      Some(SideEffects::Bool(b))
+    } else if let Some(s) = value.as_str() {
+      Some(SideEffects::String(s.to_owned()))
+    } else if let Some(vec) = value.as_array() {
+      let mut side_effects = vec![];
+      for value in vec {
+        if let Some(str) = value.as_str() {
+          side_effects.push(str.to_string());
+        } else {
+          return None;
         }
       }
-      Stmt::While(stmt) => {
-        if !is_pure_expression(&stmt.test, self.unresolved_ctxt, self.comments) {
-          self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-            stmt.span(),
-            String::from("Statement"),
-          ));
-        }
-      }
-      Stmt::DoWhile(stmt) => {
-        if !is_pure_expression(&stmt.test, self.unresolved_ctxt, self.comments) {
-          self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-            stmt.span(),
-            String::from("Statement"),
-          ));
-        }
-      }
-      Stmt::For(stmt) => {
-        let pure_init = match stmt.init {
-          Some(ref init) => match init {
-            VarDeclOrExpr::VarDecl(decl) => {
-              is_pure_var_decl(decl, self.unresolved_ctxt, self.comments)
-            }
-            VarDeclOrExpr::Expr(expr) => {
-              is_pure_expression(expr, self.unresolved_ctxt, self.comments)
-            }
-          },
-          None => true,
-        };
-
-        if !pure_init {
-          self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-            stmt.span(),
-            String::from("Statement"),
-          ));
-          return;
-        }
-
-        let pure_test = match stmt.test {
-          Some(box ref test) => is_pure_expression(test, self.unresolved_ctxt, self.comments),
-          None => true,
-        };
-
-        if !pure_test {
-          self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-            stmt.span(),
-            String::from("Statement"),
-          ));
-          return;
-        }
-
-        let pure_update = match stmt.update {
-          Some(ref expr) => is_pure_expression(expr, self.unresolved_ctxt, self.comments),
-          None => true,
-        };
-
-        if !pure_update {
-          self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-            stmt.span(),
-            String::from("Statement"),
-          ));
-        }
-      }
-      Stmt::Expr(stmt) => {
-        if !is_pure_expression(&stmt.expr, self.unresolved_ctxt, self.comments) {
-          self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-            stmt.span(),
-            String::from("Statement"),
-          ));
-        }
-      }
-      Stmt::Switch(stmt) => {
-        if !is_pure_expression(&stmt.discriminant, self.unresolved_ctxt, self.comments) {
-          self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-            stmt.span(),
-            String::from("Statement"),
-          ));
-        }
-      }
-      Stmt::Decl(stmt) => {
-        if !is_pure_decl(stmt, self.unresolved_ctxt, self.comments) {
-          self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-            stmt.span(),
-            String::from("Statement"),
-          ));
-        }
-      }
-      Stmt::Empty(_) => {}
-      Stmt::Labeled(_) => {}
-      Stmt::Block(_) => {}
-      _ => {
-        self.side_effects_item = Some(SideEffectsBailoutItemWithSpan::new(
-          ele.span(),
-          String::from("Statement"),
-        ))
-      }
-    };
-  }
-}
-
-static PURE_COMMENTS: Lazy<regex::Regex> =
-  Lazy::new(|| regex::Regex::new("^\\s*(#|@)__PURE__\\s*$").expect("Should create the regex"));
-
-fn is_pure_call_expr(
-  call_expr: &CallExpr,
-  unresolved_ctxt: SyntaxContext,
-  comments: Option<&SwcComments>,
-) -> bool {
-  let callee = &call_expr.callee;
-  let pure_flag = comments
-    .and_then(|comments| {
-      // dbg!(&comments.leading);
-      let comment_list = comments.leading.get(&callee.span_lo())?;
-      let last_comment = comment_list.last()?;
-      match last_comment.kind {
-        comments::CommentKind::Line => None,
-        comments::CommentKind::Block => Some(PURE_COMMENTS.is_match(&last_comment.text)),
-      }
-    })
-    .unwrap_or(false);
-  if !pure_flag {
-    let expr = Expr::Call(call_expr.clone());
-    !expr.may_have_side_effects(&ExprCtx {
-      unresolved_ctxt,
-      is_unresolved_ref_safe: false,
-    })
-  } else {
-    call_expr.args.iter().all(|arg| {
-      if arg.spread.is_some() {
-        false
-      } else {
-        is_pure_expression(&arg.expr, unresolved_ctxt, comments)
-      }
-    })
-  }
-}
-
-pub fn is_pure_expression<'a>(
-  expr: &'a Expr,
-  unresolved_ctxt: SyntaxContext,
-  comments: Option<&'a SwcComments>,
-) -> bool {
-  match expr {
-    Expr::Call(call) => is_pure_call_expr(call, unresolved_ctxt, comments),
-    Expr::Paren(par) => {
-      let mut cur = par.expr.as_ref();
-      while let Expr::Paren(paren) = cur {
-        cur = paren.expr.as_ref();
-      }
-
-      is_pure_expression(cur, unresolved_ctxt, comments)
-    }
-    _ => !expr.may_have_side_effects(&ExprCtx {
-      unresolved_ctxt,
-      is_unresolved_ref_safe: true,
-    }),
-  }
-}
-
-pub fn is_pure_class_member<'a>(
-  member: &'a ClassMember,
-  unresolved_ctxt: SyntaxContext,
-  comments: Option<&'a SwcComments>,
-) -> bool {
-  let is_key_pure = match member.class_key() {
-    Some(PropName::Ident(_ident)) => true,
-    Some(PropName::Str(_)) => true,
-    Some(PropName::Num(_)) => true,
-    Some(PropName::Computed(computed)) => {
-      is_pure_expression(&computed.expr, unresolved_ctxt, comments)
-    }
-    Some(PropName::BigInt(_)) => true,
-    None => true,
-  };
-  if !is_key_pure {
-    return false;
-  }
-  let is_static = member.is_static();
-  let is_value_pure = match member {
-    ClassMember::Constructor(_) => true,
-    ClassMember::Method(_) => true,
-    ClassMember::PrivateMethod(_) => true,
-    ClassMember::ClassProp(prop) => {
-      if let Some(ref value) = prop.value {
-        is_pure_expression(value, unresolved_ctxt, comments)
-      } else {
-        true
-      }
-    }
-    ClassMember::PrivateProp(ref prop) => {
-      if let Some(ref value) = prop.value {
-        is_pure_expression(value, unresolved_ctxt, comments)
-      } else {
-        true
-      }
-    }
-    ClassMember::TsIndexSignature(_) => unreachable!(),
-    ClassMember::Empty(_) => true,
-    ClassMember::StaticBlock(_) => false,
-    ClassMember::AutoAccessor(_) => false,
-  };
-  if is_static && !is_value_pure {
-    return false;
-  }
-  true
-}
-
-pub fn is_pure_decl(
-  stmt: &Decl,
-  unresolved_ctxt: SyntaxContext,
-  comments: Option<&SwcComments>,
-) -> bool {
-  match stmt {
-    Decl::Class(class) => is_pure_class(&class.class, unresolved_ctxt, comments),
-    Decl::Fn(_) => true,
-    Decl::Var(var) => is_pure_var_decl(var, unresolved_ctxt, comments),
-    Decl::Using(_) => false,
-    Decl::TsInterface(_) => unreachable!(),
-    Decl::TsTypeAlias(_) => unreachable!(),
-
-    Decl::TsEnum(_) => unreachable!(),
-    Decl::TsModule(_) => unreachable!(),
-  }
-}
-
-pub fn is_pure_class(
-  class: &Class,
-  unresolved_ctxt: SyntaxContext,
-  comments: Option<&SwcComments>,
-) -> bool {
-  if let Some(ref super_class) = class.super_class {
-    if !is_pure_expression(super_class, unresolved_ctxt, comments) {
-      return false;
-    }
-  }
-  let is_pure_key = |key: &PropName| -> bool {
-    match key {
-      PropName::BigInt(_) | PropName::Ident(_) | PropName::Str(_) | PropName::Num(_) => true,
-      PropName::Computed(ref computed) => {
-        is_pure_expression(&computed.expr, unresolved_ctxt, comments)
-      }
-    }
-  };
-
-  class.body.iter().all(|item| -> bool {
-    match item {
-      ClassMember::Constructor(_) => class.super_class.is_none(),
-      ClassMember::Method(method) => is_pure_key(&method.key),
-      ClassMember::PrivateMethod(method) => is_pure_expression(
-        &Expr::PrivateName(method.key.clone()),
-        unresolved_ctxt,
-        comments,
-      ),
-      ClassMember::ClassProp(prop) => {
-        is_pure_key(&prop.key)
-          && (!prop.is_static
-            || if let Some(ref value) = prop.value {
-              is_pure_expression(value, unresolved_ctxt, comments)
-            } else {
-              true
-            })
-      }
-      ClassMember::PrivateProp(prop) => {
-        is_pure_expression(
-          &Expr::PrivateName(prop.key.clone()),
-          unresolved_ctxt,
-          comments,
-        ) && (!prop.is_static
-          || if let Some(ref value) = prop.value {
-            is_pure_expression(value, unresolved_ctxt, comments)
-          } else {
-            true
-          })
-      }
-      ClassMember::TsIndexSignature(_) => unreachable!(),
-      ClassMember::Empty(_) => true,
-      ClassMember::StaticBlock(_) => true,
-      ClassMember::AutoAccessor(_) => true,
-    }
-  })
-}
-
-fn is_pure_var_decl<'a>(
-  var: &'a VarDecl,
-  unresolved_ctxt: SyntaxContext,
-  comments: Option<&'a SwcComments>,
-) -> bool {
-  var.decls.iter().all(|decl| {
-    if let Some(ref init) = decl.init {
-      is_pure_expression(init, unresolved_ctxt, comments)
+      Some(SideEffects::Array(side_effects))
     } else {
-      true
-    }
-  })
-}
-
-pub trait ClassExt {
-  fn class_key(&self) -> Option<&PropName>;
-  fn is_static(&self) -> bool;
-}
-
-impl ClassExt for ClassMember {
-  fn class_key(&self) -> Option<&PropName> {
-    match self {
-      ClassMember::Constructor(c) => Some(&c.key),
-      ClassMember::Method(m) => Some(&m.key),
-      ClassMember::PrivateMethod(_) => None,
-      ClassMember::ClassProp(c) => Some(&c.key),
-      ClassMember::PrivateProp(_) => None,
-      ClassMember::TsIndexSignature(_) => unreachable!(),
-      ClassMember::Empty(_) => None,
-      ClassMember::StaticBlock(_) => None,
-      ClassMember::AutoAccessor(a) => match a.key {
-        Key::Private(_) => None,
-        Key::Public(ref public) => Some(public),
-      },
+      None
     }
   }
+}
 
-  fn is_static(&self) -> bool {
-    match self {
-      ClassMember::Constructor(_cons) => false,
-      ClassMember::Method(m) => m.is_static,
-      ClassMember::PrivateMethod(m) => m.is_static,
-      ClassMember::ClassProp(p) => p.is_static,
-      ClassMember::PrivateProp(p) => p.is_static,
-      ClassMember::TsIndexSignature(_) => unreachable!(),
-      ClassMember::Empty(_) => false,
-      ClassMember::StaticBlock(_) => true,
-      ClassMember::AutoAccessor(a) => a.is_static,
-    }
+fn get_side_effects_from_package_json(
+  side_effects: &SideEffects,
+  relative_path: &Utf8Path,
+) -> bool {
+  match side_effects {
+    SideEffects::Bool(s) => *s,
+    SideEffects::String(s) => glob_match_with_normalized_pattern(s, relative_path.as_str()),
+    SideEffects::Array(patterns) => patterns
+      .iter()
+      .any(|pattern| glob_match_with_normalized_pattern(pattern, relative_path.as_str())),
   }
+}
+
+fn glob_match_with_normalized_pattern(pattern: &str, string: &str) -> bool {
+  let trim_start = pattern.trim_start_matches("./");
+  let normalized_glob = if trim_start.contains('/') {
+    trim_start.to_string()
+  } else {
+    String::from("**/") + trim_start
+  };
+  fast_glob::glob_match(&normalized_glob, string.trim_start_matches("./"))
 }
 
 #[plugin]
 #[derive(Debug, Default)]
-pub struct SideEffectsFlagPlugin;
+pub struct SideEffectsFlagPlugin {
+  analyze_side_effects_free: bool,
+  owning_side_effects_cache: RwLock<FxHashMap<Utf8PathBuf, Arc<OwningSideEffectsResult>>>,
+}
 
-#[plugin_hook(NormalModuleFactoryModule for SideEffectsFlagPlugin)]
+impl SideEffectsFlagPlugin {
+  pub fn new(analyze_side_effects_free: bool) -> Self {
+    Self::new_inner(analyze_side_effects_free, Default::default())
+  }
+
+  async fn get_owning_side_effects(
+    &self,
+    data: &mut ModuleFactoryCreateData,
+    description_root: &Utf8Path,
+  ) -> Arc<OwningSideEffectsResult> {
+    if let Some(cached) = self
+      .owning_side_effects_cache
+      .read()
+      .expect("sideEffects cache lock should not be poisoned")
+      .get(description_root)
+      .cloned()
+    {
+      cached.add_dependencies(data);
+      return cached;
+    }
+
+    let fs = &data.build_context.fs;
+    let mut dir = description_root.parent();
+    let mut result = OwningSideEffectsResult::default();
+
+    while let Some(current) = dir {
+      if current.file_name() == Some("node_modules") {
+        break;
+      }
+
+      let description_file = current.join("package.json");
+      match fs.read(&description_file).await.to_io_result() {
+        Ok(content) => {
+          result
+            .file_dependencies
+            .push(description_file.as_path().into());
+          // An unreadable manifest cannot be overridden by an outer declaration.
+          let Ok(description) = serde_json::from_slice::<serde_json::Value>(&content) else {
+            break;
+          };
+          if let Some(side_effects) = SideEffects::from_description(&description) {
+            result.owning = Some(OwningSideEffects {
+              side_effects,
+              package_root: current.to_path_buf(),
+            });
+            break;
+          }
+          if description.get("name").is_some() || description.get("sideEffects").is_some() {
+            break;
+          }
+        }
+        Err(err) => {
+          if err.kind() == std::io::ErrorKind::NotFound {
+            result
+              .missing_dependencies
+              .push(description_file.as_path().into());
+          } else {
+            result
+              .file_dependencies
+              .push(description_file.as_path().into());
+            break;
+          }
+        }
+      }
+
+      dir = current.parent();
+    }
+
+    result.add_dependencies(data);
+    let result = Arc::new(result);
+    self
+      .owning_side_effects_cache
+      .write()
+      .expect("sideEffects cache lock should not be poisoned")
+      .insert(description_root.to_path_buf(), result.clone());
+    result
+  }
+}
+
+#[plugin_hook(NormalModuleFactoryModule for SideEffectsFlagPlugin,tracing=false)]
 async fn nmf_module(
   &self,
-  _data: &mut ModuleFactoryCreateData,
-  create_data: &mut NormalModuleCreateData,
+  data: &mut ModuleFactoryCreateData,
+  create_data: &NormalModuleCreateData,
   module: &mut BoxModule,
 ) -> Result<()> {
   if let Some(has_side_effects) = create_data.side_effects {
     module.set_factory_meta(FactoryMeta {
       side_effect_free: Some(!has_side_effects),
-      side_effect_free_old: None,
     });
     return Ok(());
   }
-  let resource_data = &create_data.resource_resolve_data;
-  let resource_path = &resource_data.resource_path;
-  let Some(description) = resource_data.resource_description.as_ref() else {
+
+  let resource_data = create_data.resource_resolve_data();
+  let Some(resource_path) = resource_data.path() else {
+    return Ok(());
+  };
+  let Some(description) = resource_data.description() else {
     return Ok(());
   };
   let package_path = description.path();
-  let Some(side_effects) = SideEffects::from_description(description.json()) else {
-    return Ok(());
+  let side_effects_value = description.get(["sideEffects"]);
+  let direct = side_effects_value
+    .as_deref()
+    .and_then(SideEffects::from_value);
+  let inherited;
+  let (side_effects, package_path) = if let Some(side_effects) = &direct {
+    (side_effects, package_path.assert_utf8())
+  } else {
+    // A named package owns its metadata boundary even when it omits sideEffects.
+    if description.get(["name"]).is_some() || side_effects_value.is_some() {
+      return Ok(());
+    }
+
+    let description_root = package_path.assert_utf8();
+    // Check the resolved file so symlinked packages have the same answer for all imports.
+    if !resource_path
+      .components()
+      .any(|component| component.as_str() == "node_modules")
+    {
+      return Ok(());
+    }
+
+    inherited = self.get_owning_side_effects(data, description_root).await;
+    let Some(owning) = &inherited.owning else {
+      return Ok(());
+    };
+    (&owning.side_effects, owning.package_root.as_path())
   };
-  let relative_path = resource_path.relative(package_path);
-  let has_side_effects = get_side_effects_from_package_json(side_effects, relative_path);
+  let relative_path = resource_path
+    .as_std_path()
+    .relative(package_path.as_std_path())
+    .assert_utf8();
+  let has_side_effects = get_side_effects_from_package_json(side_effects, relative_path.as_path());
+
   module.set_factory_meta(FactoryMeta {
     side_effect_free: Some(!has_side_effects),
-    side_effect_free_old: None,
   });
   Ok(())
 }
 
-#[plugin_hook(CompilationOptimizeDependencies for SideEffectsFlagPlugin)]
-fn optimize_dependencies(&self, compilation: &mut Compilation) -> Result<Option<bool>> {
-  let entries = compilation.entry_modules().collect::<Vec<_>>();
-  let level_order_module_identifier =
-    get_level_order_module_ids(&compilation.get_module_graph(), entries);
-  for module_identifier in level_order_module_identifier {
-    let module_graph = compilation.get_module_graph();
-    let mut module_chain = HashSet::default();
-    // dbg!(&module_identifier);
-    let Some(module) = module_graph.module_by_identifier(&module_identifier) else {
+// run after exports info are set
+#[plugin_hook(CompilationFinishModules for SideEffectsFlagPlugin, stage = SIDE_EFFECTS_FLAG_PLUGIN_STAGE)]
+async fn finish_modules(
+  &self,
+  compilation: &Compilation,
+  _modules: &mut AsyncModulesArtifact,
+  exports_info_artifact: &mut ExportsInfoArtifact,
+  side_effects_state_artifact: &mut SideEffectsStateArtifact,
+) -> Result<()> {
+  let modules: IdentifierSet = compilation
+    .get_module_graph()
+    .modules()
+    .map(|(id, _)| *id)
+    .collect();
+
+  let module_graph = compilation.get_module_graph();
+  let mut deferred_side_effect_states = Vec::new();
+  for module_identifier in &modules {
+    let Some(module) = module_graph.module_by_identifier(module_identifier) else {
       continue;
     };
-    let side_effects_state =
-      module.get_side_effects_connection_state(&module_graph, &mut module_chain);
-    if side_effects_state != rspack_core::ConnectionState::Bool(false) {
+
+    let build_info = module.build_info();
+    if !self.analyze_side_effects_free || build_info.deferred_pure_checks.is_empty() {
       continue;
     }
-    let cur_exports_info_id = module_graph.get_exports_info(&module_identifier).id;
 
-    let incoming_connections = module_graph
-      .module_graph_module_by_identifier(&module_identifier)
-      .map(|mgm| mgm.incoming_connections().clone())
-      .unwrap_or_default();
-    for con_id in incoming_connections {
-      let mut module_graph = compilation.get_module_graph_mut();
-      let con = module_graph
-        .connection_by_connection_id(&con_id)
-        .expect("should have connection");
-      let Some(dep) = module_graph.dependency_by_id(&con.dependency_id) else {
-        continue;
-      };
-      let dep_id = *dep.id();
-      let is_reexport = dep
-        .downcast_ref::<HarmonyExportImportedSpecifierDependency>()
-        .is_some();
-      let is_valid_import_specifier_dep = dep
-        .downcast_ref::<HarmonyImportSpecifierDependency>()
-        .map(|import_specifier_dep| !import_specifier_dep.namespace_object_as_context)
-        .unwrap_or_default();
-      if !is_reexport && !is_valid_import_specifier_dep {
-        continue;
-      }
-      if let Some(name) = dep
-        .downcast_ref::<HarmonyExportImportedSpecifierDependency>()
-        .and_then(|dep| dep.name.clone())
-      {
-        let export_info_id = module_graph.get_export_info(
-          con
-            .original_module_identifier
-            .expect("should have original_module_identifier"),
-          &name,
+    let baseline_side_effect_free = module.build_meta().side_effect_free();
+
+    let has_impure_deferred_check =
+      // find the first deferred pure check that resolves to an impure target
+      build_info
+        .deferred_pure_checks
+        .iter()
+        .any(|deferred_check| {
+          deferred_pure_check_is_impure(
+            module_graph,
+            exports_info_artifact,
+            &deferred_check.dep_id,
+            &deferred_check.atom,
+          )
+        });
+
+    deferred_side_effect_states.push((
+      *module_identifier,
+      baseline_side_effect_free && !has_impure_deferred_check,
+      has_impure_deferred_check,
+    ));
+  }
+
+  side_effects_state_artifact.clear();
+  for (module_id, side_effect_free, has_impure_deferred_check) in deferred_side_effect_states {
+    side_effects_state_artifact.insert(
+      module_id,
+      SideEffectsState {
+        side_effect_free,
+        optimization_bailouts_to_add: if has_impure_deferred_check {
+          vec![OptimizationBailoutItem::Message(String::from(
+            CALL_WITH_SIDE_EFFECTS_BAILOUT,
+          ))]
+        } else {
+          Vec::new()
+        },
+        optimization_bailouts_to_remove: vec![OptimizationBailoutItem::Message(String::from(
+          CALL_WITH_SIDE_EFFECTS_BAILOUT,
+        ))],
+      },
+    );
+  }
+
+  Ok(())
+}
+
+#[plugin_hook(CompilationOptimizeDependencies for SideEffectsFlagPlugin,tracing=false)]
+async fn optimize_dependencies(
+  &self,
+  compilation: &Compilation,
+  side_effects_optimize_artifact: &mut SideEffectsOptimizeArtifact,
+  build_module_graph_artifact: &mut BuildModuleGraphArtifact,
+  exports_info_artifact: &mut ExportsInfoArtifact,
+  _diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Option<bool>> {
+  let logger = compilation.get_logger("rspack.SideEffectsFlagPlugin");
+  let start = logger.time("update connections");
+
+  let (side_effects_state_map, star_passthrough_targets) = {
+    let module_graph = &build_module_graph_artifact.module_graph;
+    let side_effects_state_artifact = &build_module_graph_artifact.side_effects_state_artifact;
+
+    let states: Vec<_> = module_graph
+      .modules_par()
+      .map(|(module_identifier, module)| {
+        let state = module.get_side_effects_connection_state(
+          module_graph,
+          &compilation.module_graph_cache_artifact,
+          side_effects_state_artifact,
+          &mut Default::default(),
+          &mut Default::default(),
         );
-        export_info_id.move_target(
-          &mut module_graph,
-          Arc::new(|target: &ResolvedExportInfoTarget, mg: &ModuleGraph| {
-            mg.module_by_identifier(&target.module)
-              .expect("should have module")
-              .get_side_effects_connection_state(mg, &mut HashSet::default())
-              == ConnectionState::Bool(false)
-          }),
-          Arc::new(
-            move |target: &ResolvedExportInfoTarget, mg: &mut ModuleGraph| {
-              mg.update_module(&dep_id, &target.module);
-              // TODO: Explain https://github.com/webpack/webpack/blob/ac7e531436b0d47cd88451f497cdfd0dad41535d/lib/optimize/SideEffectsFlagPlugin.js#L303-L306
-              let ids = dep_id.get_ids(mg);
-              let processed_ids = target
-                .export
-                .as_ref()
-                .map(|item| {
-                  let mut ret = Vec::from_iter(item.iter().cloned());
-                  ret.extend_from_slice(ids.get(1..).unwrap_or_default());
-                  ret
-                })
-                .unwrap_or_else(|| ids.get(1..).unwrap_or_default().to_vec());
-              dep_id.set_ids(processed_ids, mg);
-              mg.connection_by_dependency(&dep_id).map(|_| dep_id)
-            },
-          ),
-        );
-        continue;
-      }
+        let star_passthrough_target = (state == ConnectionState::Active(false)
+          && has_single_star_reexport(module.as_ref())
+          && matches!(
+            exports_info_artifact
+              .get_exports_info_data(module_identifier)
+              .other_exports_info()
+              .provided(),
+            Some(ExportProvided::NotProvided)
+          ))
+        .then(|| {
+          module_graph
+            .module_identifier_by_dependency_id(&module.build_info().all_star_exports[0])
+            .copied()
+        })
+        .flatten();
+        (*module_identifier, state, star_passthrough_target)
+      })
+      .collect();
 
-      let ids = dep_id.get_ids(&module_graph);
-
-      if !ids.is_empty() {
-        let export_info_id = cur_exports_info_id.get_export_info(&ids[0], &mut module_graph);
-
-        let mut mga = MutableModuleGraph::new(&mut module_graph);
-        let target = export_info_id.get_target(
-          &mut mga,
-          Some(Arc::new(
-            |target: &ResolvedExportInfoTarget, mg: &ModuleGraph| {
-              mg.module_by_identifier(&target.module)
-                .expect("should have module graph")
-                .get_side_effects_connection_state(mg, &mut HashSet::default())
-                == ConnectionState::Bool(false)
-            },
-          )),
-        );
-        let Some(target) = target else {
-          continue;
-        };
-
-        // dbg!(&mg.connection_by_dependency(&dep_id));
-        module_graph.update_module(&dep_id, &target.module);
-        // TODO: Explain https://github.com/webpack/webpack/blob/ac7e531436b0d47cd88451f497cdfd0dad41535d/lib/optimize/SideEffectsFlagPlugin.js#L303-L306
-        let processed_ids = target
-          .export
-          .map(|mut item| {
-            item.extend_from_slice(&ids[1..]);
-            item
-          })
-          .unwrap_or_else(|| ids[1..].to_vec());
-
-        // dbg!(&mg.connection_by_dependency(&dep_id));
-        dep_id.set_ids(processed_ids, &mut module_graph);
+    let mut side_effects_state_map: IdentifierMap<ConnectionState> =
+      IdentifierMap::with_capacity_and_hasher(states.len(), Default::default());
+    let mut star_passthrough_targets: IdentifierMap<ModuleIdentifier> = IdentifierMap::default();
+    for (module_identifier, state, star_passthrough_target) in states {
+      side_effects_state_map.insert(module_identifier, state);
+      if let Some(target) = star_passthrough_target {
+        star_passthrough_targets.insert(module_identifier, target);
       }
     }
+    (side_effects_state_map, star_passthrough_targets)
+  };
+  let module_graph = build_module_graph_artifact.get_module_graph();
+
+  if self.analyze_side_effects_free {
+    // `finish_modules` may change the side-effect state of modules that were not part of the
+    // incremental mutation frontier. Reuse of the previous optimize artifact can therefore keep
+    // stale connection rewrites alive, so pure-function analysis falls back to a full refresh here.
+    side_effects_optimize_artifact.clear();
   }
+
+  let inner_start = logger.time("prepare connections");
+  let modules: Vec<_> = if !self.analyze_side_effects_free
+    && let Some(mutations) = compilation
+      .incremental
+      .mutations_read(IncrementalPasses::OPTIMIZE_DEPENDENCIES)
+    && !side_effects_optimize_artifact.is_empty()
+  {
+    side_effects_optimize_artifact.retain(|dependency_id, do_optimize| {
+      let dep_exist = module_graph
+        .connection_by_dependency_id(dependency_id)
+        .is_some();
+      let target_module_exist = module_graph
+        .module_by_identifier(&do_optimize.target_module)
+        .is_some();
+      dep_exist && target_module_exist
+    });
+
+    fn affected_incoming_modules(
+      module: &ModuleIdentifier,
+      module_graph: &ModuleGraph,
+      modules: &mut IdentifierSet,
+    ) {
+      for connection in module_graph.get_incoming_connections(module) {
+        let Some(original_module) = connection.original_module_identifier else {
+          continue;
+        };
+        if modules.contains(&original_module) {
+          continue;
+        }
+        let dep = module_graph.dependency_by_id(&connection.dependency_id);
+        if dep.is::<ESMExportImportedSpecifierDependency>() && modules.insert(original_module) {
+          affected_incoming_modules(&original_module, module_graph, modules);
+        }
+      }
+    }
+
+    let modules: IdentifierSet = mutations.iter().fold(
+      IdentifierSet::default(),
+      |mut modules, mutation| match mutation {
+        Mutation::ModuleAdd { module } | Mutation::ModuleUpdate { module } => {
+          if modules.insert(*module) {
+            affected_incoming_modules(module, module_graph, &mut modules);
+          }
+          modules.extend(
+            module_graph
+              .get_outgoing_connections(module)
+              .map(|connection| *connection.module_identifier()),
+          );
+          modules
+        }
+        _ => modules,
+      },
+    );
+
+    tracing::debug!(target: incremental::TRACING_TARGET, passes = %IncrementalPasses::OPTIMIZE_DEPENDENCIES, %mutations, ?modules);
+    let logger = compilation.get_logger("rspack.incremental.optimizeDependencies");
+    logger.log(format!(
+      "{} modules are affected, {} in total",
+      modules.len(),
+      module_graph.modules_len()
+    ));
+
+    let mut modules = modules.into_iter().collect::<Vec<_>>();
+    modules.sort_unstable();
+    modules
+  } else {
+    let mut modules = module_graph.modules_keys().copied().collect::<Vec<_>>();
+    modules.sort_unstable();
+    modules
+  };
+  logger.time_end(inner_start);
+
+  let inner_start = logger.time("find optimizable connections");
+  let mut optimized_connections = modules
+    .par_iter()
+    .filter(|module| side_effects_state_map[module] == ConnectionState::Active(false))
+    .flat_map(|module| {
+      module_graph
+        .get_incoming_connections(module)
+        .collect::<Vec<_>>()
+    })
+    .map(|connection| {
+      (
+        connection.dependency_id,
+        can_optimize_connection(
+          connection,
+          &side_effects_state_map,
+          &star_passthrough_targets,
+          module_graph,
+          exports_info_artifact,
+        ),
+      )
+    })
+    .collect::<Vec<_>>();
+  optimized_connections.sort_unstable_by_key(|(dep_id, _)| *dep_id);
+  for (dep_id, can_optimize) in optimized_connections {
+    if let Some(do_optimize) = can_optimize {
+      side_effects_optimize_artifact.insert(dep_id, do_optimize);
+    } else {
+      side_effects_optimize_artifact.remove(&dep_id);
+    }
+  }
+  logger.time_end(inner_start);
+
+  let mut do_optimizes = side_effects_optimize_artifact
+    .iter()
+    .map(|(dependency, do_optimize)| (*dependency, do_optimize.clone()))
+    .collect::<Vec<_>>();
+  do_optimizes.sort_unstable_by_key(|(dependency, _)| *dependency);
+
+  let inner_start = logger.time("do optimize connections");
+  let mut do_optimized_count = 0;
+  while !do_optimizes.is_empty() {
+    do_optimized_count += do_optimizes.len();
+
+    let module_graph = build_module_graph_artifact.get_module_graph_mut();
+
+    let new_connections: Vec<_> = do_optimizes
+      .into_iter()
+      .map(|(dependency, do_optimize)| {
+        do_optimize_connection(dependency, do_optimize, module_graph, exports_info_artifact)
+      })
+      .collect();
+
+    let module_graph = build_module_graph_artifact.get_module_graph();
+    do_optimizes = new_connections
+      .into_par_iter()
+      .filter(|(_, module)| side_effects_state_map[module] == ConnectionState::Active(false))
+      .filter_map(|(connection, _)| module_graph.connection_by_dependency_id(&connection))
+      .filter_map(|connection| {
+        can_optimize_connection(
+          connection,
+          &side_effects_state_map,
+          &star_passthrough_targets,
+          module_graph,
+          exports_info_artifact,
+        )
+        .map(|i| (connection.dependency_id, i))
+      })
+      .collect();
+    do_optimizes.sort_unstable_by_key(|(dependency, _)| *dependency);
+  }
+  logger.time_end(inner_start);
+
+  build_module_graph_artifact
+    .side_effects_state_artifact
+    .set_module_evaluation_side_effects_states(side_effects_state_map);
+
+  logger.time_end(start);
+  logger.log(format!("optimized {do_optimized_count} connections"));
   Ok(None)
+}
+
+#[tracing::instrument(skip_all)]
+fn do_optimize_connection(
+  dependency: DependencyId,
+  do_optimize: SideEffectsDoOptimize,
+  module_graph: &mut ModuleGraph,
+  exports_info_artifact: &mut ExportsInfoArtifact,
+) -> (DependencyId, ModuleIdentifier) {
+  let SideEffectsDoOptimize {
+    ids,
+    target_module,
+    need_move_target,
+  } = do_optimize;
+  module_graph.do_update_module(&dependency, &target_module);
+  module_graph.set_dependency_extra_meta(
+    dependency,
+    DependencyExtraMeta {
+      ids,
+      explanation: Some("(skipped side-effect-free modules)"),
+    },
+  );
+  if let Some(SideEffectsDoOptimizeMoveTarget {
+    export_info,
+    target_export,
+  }) = need_move_target
+  {
+    export_info
+      .as_data_mut(exports_info_artifact)
+      .do_move_target(dependency, target_export);
+  }
+  (dependency, target_module)
+}
+
+fn has_single_star_reexport(module: &dyn Module) -> bool {
+  let build_info = module.build_info();
+  // `export *` never forwards `default`, so a default export does not change what star consumers see.
+  build_info.all_star_exports.len() == 1
+    && build_info
+      .esm_named_exports
+      .iter()
+      .all(|name| *name == *JS_DEFAULT_KEYWORD)
+}
+
+#[tracing::instrument("can_optimize_connection", level = "trace", skip_all)]
+fn can_optimize_connection(
+  connection: &ModuleGraphConnection,
+  side_effects_state_map: &IdentifierMap<ConnectionState>,
+  star_passthrough_targets: &IdentifierMap<ModuleIdentifier>,
+  module_graph: &ModuleGraph,
+  exports_info_artifact: &ExportsInfoArtifact,
+) -> Option<SideEffectsDoOptimize> {
+  let original_module = connection.original_module_identifier?;
+  let dependency_id = connection.dependency_id;
+  let dep = module_graph.dependency_by_id(&dependency_id);
+
+  if let Some(dep) = dep.downcast_ref::<ESMExportImportedSpecifierDependency>()
+    && dep.name.is_none()
+  {
+    // The export targets of a star re-export point at this dependency and keep their names,
+    // so they follow the connection once it is updated and need no move.
+    let mut target_module = *connection.module_identifier();
+    let mut hops = 0;
+    while let Some(next) = star_passthrough_targets.get(&target_module) {
+      if hops == star_passthrough_targets.len() {
+        return None;
+      }
+      target_module = *next;
+      hops += 1;
+    }
+    if hops == 0 || target_module == original_module {
+      return None;
+    }
+    return Some(SideEffectsDoOptimize {
+      ids: dep.get_ids(module_graph).to_vec(),
+      target_module,
+      need_move_target: None,
+    });
+  }
+
+  if let Some(dep) = dep.downcast_ref::<ESMExportImportedSpecifierDependency>()
+    && let Some(name) = &dep.name
+  {
+    let exports_info = exports_info_artifact.get_exports_info_data(&original_module);
+    let export_info = exports_info.get_export_info_without_mut_module_graph(name);
+
+    let resolve_filter = |target: &ResolvedExportInfoTarget| {
+      side_effects_state_map[&target.module] == ConnectionState::Active(false)
+    };
+    let target = can_move_target(
+      &export_info,
+      module_graph,
+      exports_info_artifact,
+      &resolve_filter,
+    )?;
+    if !module_graph.can_update_module(&dependency_id, &target.module) {
+      return None;
+    }
+
+    let ids = dep.get_ids(module_graph);
+    let processed_ids = target.export.as_ref().map_or_else(
+      || ids.get(1..).unwrap_or_default().to_vec(),
+      |item| {
+        let mut ret = item.clone();
+        ret.extend_from_slice(ids.get(1..).unwrap_or_default());
+        ret
+      },
+    );
+    let need_move_target = match export_info {
+      Cow::Borrowed(export_info) => Some(SideEffectsDoOptimizeMoveTarget {
+        export_info: export_info.id(),
+        target_export: target.export,
+      }),
+      Cow::Owned { .. } => None,
+    };
+
+    return Some(SideEffectsDoOptimize {
+      ids: processed_ids,
+      target_module: target.module,
+      need_move_target,
+    });
+  }
+
+  if let Some(dep) = dep.downcast_ref::<ESMImportSpecifierDependency>()
+    && !dep.namespace_object_as_context
+    && let ids = dep.get_ids(module_graph)
+    && !ids.is_empty()
+  {
+    let exports_info = exports_info_artifact.get_exports_info_data(connection.module_identifier());
+    let export_info = exports_info.get_export_info_without_mut_module_graph(&ids[0]);
+
+    let resolve_filter = |target: &ResolvedExportInfoTarget| {
+      side_effects_state_map[&target.module] == ConnectionState::Active(false)
+    };
+    let Some(GetTargetResult::Target(target)) = get_target(
+      &export_info,
+      module_graph,
+      exports_info_artifact,
+      &resolve_filter,
+      &mut Default::default(),
+    ) else {
+      return None;
+    };
+
+    if !module_graph.can_update_module(&dependency_id, &target.module) {
+      return None;
+    }
+
+    let processed_ids = target.export.map_or_else(
+      || ids[1..].to_vec(),
+      |mut item| {
+        item.extend_from_slice(&ids[1..]);
+        item
+      },
+    );
+
+    return Some(SideEffectsDoOptimize {
+      ids: processed_ids,
+      target_module: target.module,
+      need_move_target: None,
+    });
+  }
+
+  None
 }
 
 impl Plugin for SideEffectsFlagPlugin {
@@ -674,18 +717,26 @@ impl Plugin for SideEffectsFlagPlugin {
     "SideEffectsFlagPlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: rspack_core::PluginContext<&mut rspack_core::ApplyContext>,
-    _options: &mut rspack_core::CompilerOptions,
-  ) -> Result<()> {
+  fn clear_cache(&self, _id: rspack_core::CompilationId) {
+    self
+      .owning_side_effects_cache
+      .write()
+      .expect("sideEffects cache lock should not be poisoned")
+      .clear();
+  }
+
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
     ctx
-      .context
       .normal_module_factory_hooks
       .module
       .tap(nmf_module::new(self));
+
     ctx
-      .context
+      .compilation_hooks
+      .finish_modules
+      .tap(finish_modules::new(self));
+
+    ctx
       .compilation_hooks
       .optimize_dependencies
       .tap(optimize_dependencies::new(self));
@@ -693,32 +744,118 @@ impl Plugin for SideEffectsFlagPlugin {
   }
 }
 
-fn get_level_order_module_ids(
-  mg: &ModuleGraph,
-  entries: Vec<ModuleIdentifier>,
-) -> Vec<ModuleIdentifier> {
-  let mut res = vec![];
-  let mut visited = IdentifierSet::default();
-  for entry in entries {
-    let mut q = VecDeque::from_iter([entry]);
-    while let Some(mi) = q.pop_front() {
-      if visited.contains(&mi) {
-        continue;
-      } else {
-        visited.insert(mi);
-        res.push(mi);
-      }
-      for con in mg.get_outgoing_connections(&mi) {
-        let mi = *con.module_identifier();
-        q.push_back(mi);
-      }
-    }
+#[cfg(test)]
+mod test_side_effects {
+  use super::*;
+
+  fn get_side_effects_from_package_json_helper(
+    side_effects_config: Vec<&str>,
+    relative_path: &str,
+  ) -> bool {
+    assert!(!side_effects_config.is_empty());
+    let relative_path = Utf8Path::new(relative_path);
+    let side_effects = if side_effects_config.len() > 1 {
+      SideEffects::Array(
+        side_effects_config
+          .into_iter()
+          .map(String::from)
+          .collect::<Vec<_>>(),
+      )
+    } else {
+      SideEffects::String((&side_effects_config[0]).to_string())
+    };
+
+    get_side_effects_from_package_json(&side_effects, relative_path)
   }
 
-  res.sort_by(|a, b| {
-    let ad = mg.get_depth(a);
-    let bd = mg.get_depth(b);
-    ad.cmp(&bd)
-  });
-  res
+  #[test]
+  fn cases() {
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js"],
+      "./src/x/y/z.js"
+    ));
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/index.js", "./src/selection/index.js"],
+      "./src/selection/index.js"
+    ));
+    assert!(!get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js"],
+      "./x.js"
+    ));
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./**/src/x/y/z.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"./src/**/z.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/z.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"./**/x/**/z.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./**/x/**/z.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"./**/src/**",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./**/src/**"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"./**/src/*",
+    assert!(!get_side_effects_from_package_json_helper(
+      vec!["./src/x/y/z.js"],
+      "./**/src/*"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"*.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["*.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"x/**/z.js",
+    assert!(!get_side_effects_from_package_json_helper(
+      vec!["./src/x/y/z.js"],
+      "x/**/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"src/**/z.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/z.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"src/**/{x,y,z}.js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["src/**/{x,y,z}.js"],
+      "./src/x/y/z.js"
+    ));
+    // 				"./src/x/y/z.js",
+    // 				"src/**/[x-z].js",
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/[x-z].js"],
+      "./src/x/y/z.js"
+    ));
+    // 		const array = ["./src/**/*.js", "./dirty.js"];
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js", "./dirty.js"],
+      "./src/x/y/z.js"
+    ));
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js", "./dirty.js"],
+      "./dirty.js"
+    ));
+    assert!(!get_side_effects_from_package_json_helper(
+      vec!["./src/**/*.js", "./dirty.js"],
+      "./clean.js"
+    ));
+    assert!(get_side_effects_from_package_json_helper(
+      vec!["./src/**/*/z.js"],
+      "./src/x/y/z.js"
+    ));
+  }
 }

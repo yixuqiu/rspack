@@ -1,0 +1,7 @@
+ERROR in ./index.tsx
+  × Module build failed (from builtin:swc-loader):
+  ╰─▶   × Syntax Error: Unexpected token. Did you mean `{'>'}` or `&gt;`?
+         ╭────
+       1 │ let c = <test>() => {}</test>;
+         ·                   ▲
+         ╰────

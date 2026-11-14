@@ -1,0 +1,16 @@
+{
+  "name": "examples-vanilla",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "rspack build",
+    "dev": "rspack dev",
+    "preview": "rspack preview"
+  },
+  "devDependencies": {
+    "@rspack/cli": "workspace:*",
+    "@rspack/core": "workspace:*",
+    "@rspack/dev-server": "catalog:",
+    "typescript": "catalog:"
+  }
+}

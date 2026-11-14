@@ -1,22 +1,32 @@
-#![feature(let_chains)]
-
 mod amd_library_plugin;
 mod assign_library_plugin;
 mod export_property_library_plugin;
+mod jsonp_library_plugin;
 mod module_library_plugin;
 mod system_library_plugin;
 mod umd_library_plugin;
 mod utils;
 
+use std::path::PathBuf;
+
 pub use amd_library_plugin::AmdLibraryPlugin;
 pub use assign_library_plugin::*;
 pub use export_property_library_plugin::ExportPropertyLibraryPlugin;
-pub use module_library_plugin::ModuleLibraryPlugin;
+pub use jsonp_library_plugin::JsonpLibraryPlugin;
 use rspack_core::{BoxPlugin, PluginExt};
+use rspack_plugin_esm_library::EsmLibraryPlugin;
+use rspack_plugin_split_chunks::CacheGroup;
 pub use system_library_plugin::SystemLibraryPlugin;
 pub use umd_library_plugin::UmdLibraryPlugin;
 
-pub fn enable_library_plugin(library_type: String, plugins: &mut Vec<BoxPlugin>) {
+use crate::module_library_plugin::ModuleLibraryPlugin;
+
+pub fn enable_library_plugin(
+  library_type: String,
+  preserve_modules: Option<PathBuf>,
+  split_chunks: Option<Vec<CacheGroup>>,
+  plugins: &mut Vec<BoxPlugin>,
+) {
   let ns_object_used = library_type != "module";
   match library_type.as_str() {
     "var" => plugins.push(
@@ -100,22 +110,37 @@ pub fn enable_library_plugin(library_type: String, plugins: &mut Vec<BoxPlugin>)
       .boxed(),
     ),
     "umd" | "umd2" => {
-      plugins.push(ExportPropertyLibraryPlugin::new(library_type.clone(), ns_object_used).boxed());
+      plugins
+        .push(ExportPropertyLibraryPlugin::new(library_type.clone(), ns_object_used, true).boxed());
       plugins.push(UmdLibraryPlugin::new("umd2" == library_type, library_type).boxed());
     }
     "amd" | "amd-require" => {
-      plugins.push(ExportPropertyLibraryPlugin::new(library_type.clone(), ns_object_used).boxed());
+      plugins
+        .push(ExportPropertyLibraryPlugin::new(library_type.clone(), ns_object_used, true).boxed());
       plugins.push(AmdLibraryPlugin::new("amd-require" == library_type, library_type).boxed());
     }
     "module" => {
-      plugins.push(ExportPropertyLibraryPlugin::new(library_type.clone(), ns_object_used).boxed());
+      plugins
+        .push(ExportPropertyLibraryPlugin::new(library_type.clone(), ns_object_used, true).boxed());
       plugins.push(ModuleLibraryPlugin::default().boxed());
+    }
+    "modern-module" => {
+      plugins.push(
+        rspack_plugin_remove_duplicate_modules::RemoveDuplicateModulesPlugin::default().boxed(),
+      );
+      plugins.push(EsmLibraryPlugin::new(preserve_modules, split_chunks).boxed());
     }
     "system" => {
       plugins.push(
-        ExportPropertyLibraryPlugin::new(library_type.clone(), library_type != "module").boxed(),
+        ExportPropertyLibraryPlugin::new(library_type.clone(), library_type != "module", true)
+          .boxed(),
       );
       plugins.push(SystemLibraryPlugin::default().boxed());
+    }
+    "jsonp" => {
+      plugins
+        .push(ExportPropertyLibraryPlugin::new(library_type.clone(), ns_object_used, true).boxed());
+      plugins.push(JsonpLibraryPlugin::new(library_type).boxed());
     }
     _ => {}
   }

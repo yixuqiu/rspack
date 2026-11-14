@@ -1,41 +1,53 @@
 use rspack_core::{
-  impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Compilation, RuntimeModule,
+  Compilation, Filename, PublicPath, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext,
+  RuntimeTemplate, impl_runtime_module,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
+#[derive(Debug)]
 pub struct PublicPathRuntimeModule {
-  id: Identifier,
-  public_path: Box<str>,
+  public_path: Box<Filename>,
 }
 
 impl PublicPathRuntimeModule {
-  pub fn new(public_path: Box<str>) -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/public_path"),
-      public_path,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
-    }
+  pub fn new(runtime_template: &RuntimeTemplate, public_path: Box<Filename>) -> Self {
+    Self::with_default(runtime_template, public_path)
   }
 }
 
+#[async_trait::async_trait]
 impl RuntimeModule for PublicPathRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
   }
 
-  fn generate(&self, _compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    Ok(
-      RawSource::from(
-        include_str!("runtime/public_path.js")
-          .replace("__PUBLIC_PATH_PLACEHOLDER__", &self.public_path),
-      )
-      .boxed(),
-    )
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define: { RuntimeGlobals::PUBLIC_PATH },
+      force_context: RuntimeGlobals::PUBLIC_PATH,
+      ..Default::default()
+    }
+  }
+
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
+    Ok(format!(
+      "{} = \"{}\";",
+      context
+        .runtime_template
+        .render_runtime_global_definition(&RuntimeGlobals::PUBLIC_PATH),
+      &PublicPath::render_filename(compilation, &self.public_path).await,
+    ))
+  }
+
+  // be cacheable only when the template does not contain a hash placeholder
+  fn full_hash(&self) -> bool {
+    self.public_path.has_hash_placeholder()
   }
 }

@@ -1,24 +1,36 @@
 [package]
-edition    = "2021"
-license    = "MIT"
-name       = "rspack_regex"
-repository = "https://github.com/web-infra-dev/rspack"
-version    = "0.1.0"
+description       = "rspack regex"
+edition.workspace = true
+license           = "MIT"
+name              = "rspack_regex"
+repository        = "https://github.com/web-infra-dev/rspack"
+version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+allocative = ["dep:rspack-allocative"]
+
 [dependencies]
-regex-syntax = { version = "0.8.3", default-features = false, features = ["std"] }
-regress      = "0.9.1"
-rspack_error = { path = "../rspack_error" }
-swc_core     = { workspace = true, features = ["ecma_ast"] }
+cow-utils         = { workspace = true }
+napi              = { workspace = true }
+regex             = { workspace = true }
+regex-syntax      = { workspace = true }
+regress           = { workspace = true, features = ["backend-pikevm", "std"] }
+rspack-allocative = { workspace = true, optional = true }
+rspack_cacheable  = { workspace = true }
+rspack_error      = { workspace = true }
+swc_core          = { workspace = true, features = ["ecma_ast"] }
 
 [dev-dependencies]
-swc_core = { workspace = true, features = [
-  "ecma_ast",
-  "__visit",
-  "__common",
-  "__parser",
-  "__utils",
-  "ecma_preset_env",
-] }
+swc_core = { workspace = true, features = ["ecma_ast", "__visit", "__common", "__parser", "__utils", "ecma_preset_env"] }
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[package.metadata.cargo-shear]
+# The allocative compiler driver injects enum derives that use this dependency.
+ignored = ["rspack-allocative"]

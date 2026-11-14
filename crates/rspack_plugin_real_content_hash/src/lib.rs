@@ -1,35 +1,64 @@
-#![feature(let_chains)]
+mod drive;
 
 use std::{
   borrow::Cow,
-  hash::{BuildHasherDefault, Hash},
+  hash::BuildHasherDefault,
+  io::Write,
+  sync::{Arc, LazyLock},
 };
 
-use derivative::Derivative;
-use once_cell::sync::{Lazy, OnceCell};
+use aho_corasick::{AhoCorasick, AhoCorasickKind, Match, MatchKind};
+use atomic_refcell::AtomicRefCell;
+use derive_more::Debug;
+pub use drive::*;
+use once_cell::sync::OnceCell;
 use rayon::prelude::*;
-use regex::{Captures, Regex};
 use rspack_core::{
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  AssetInfo, Compilation, CompilationProcessAssets, Logger, Plugin, PluginContext,
+  AssetInfo, BindingCell, Compilation, CompilationId, CompilationProcessAssets, Logger, Plugin,
+  rspack_sources::{
+    BoxSource, CachedSource, DevToolCodeSource, DevToolMapSource, RawStringSource, ReplaceSource,
+    SourceExt, SourceValue, source_content_eq, update_content_hash,
+  },
 };
-use rspack_error::Result;
-use rspack_hash::RspackHash;
+use rspack_error::{Diagnostic, Result, ToStringResultToRspackResultExt};
+use rspack_hash::RspackHasher;
 use rspack_hook::{plugin, plugin_hook};
+use rspack_util::{fx_hash::FxDashMap, streaming_matcher::StreamingMatcher};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
 
 type IndexSet<T> = indexmap::IndexSet<T, BuildHasherDefault<FxHasher>>;
 
-pub static QUOTE_META: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"[-\[\]\\/{}()*+?.^$|]").expect("Invalid regex"));
+/// Safety with [atomic_refcell::AtomicRefCell]:
+///
+/// We should make sure that there's no read-write and write-write conflicts for each hook instance by looking up [RealContentHashPlugin::get_compilation_hooks_mut]
+type ArcReadContentHashPluginHooks = Arc<AtomicRefCell<RealContentHashPluginHooks>>;
+
+static COMPILATION_HOOKS_MAP: LazyLock<FxDashMap<CompilationId, ArcReadContentHashPluginHooks>> =
+  LazyLock::new(Default::default);
 
 #[plugin]
 #[derive(Debug, Default)]
 pub struct RealContentHashPlugin;
 
+impl RealContentHashPlugin {
+  pub fn get_compilation_hooks(id: CompilationId) -> ArcReadContentHashPluginHooks {
+    if !COMPILATION_HOOKS_MAP.contains_key(&id) {
+      COMPILATION_HOOKS_MAP.insert(id, Default::default());
+    }
+    COMPILATION_HOOKS_MAP
+      .get(&id)
+      .expect("should have js plugin drive")
+      .clone()
+  }
+
+  pub fn get_compilation_hooks_mut(id: CompilationId) -> ArcReadContentHashPluginHooks {
+    COMPILATION_HOOKS_MAP.entry(id).or_default().clone()
+  }
+}
+
 #[plugin_hook(CompilationProcessAssets for RealContentHashPlugin, stage = Compilation::PROCESS_ASSETS_STAGE_OPTIMIZE_HASH)]
 async fn process_assets(&self, compilation: &mut Compilation) -> Result<()> {
-  inner_impl(compilation)
+  inner_impl(compilation).await
 }
 
 impl Plugin for RealContentHashPlugin {
@@ -37,21 +66,20 @@ impl Plugin for RealContentHashPlugin {
     "rspack.RealContentHashPlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut rspack_core::ApplyContext>,
-    _options: &mut rspack_core::CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
     ctx
-      .context
       .compilation_hooks
       .process_assets
       .tap(process_assets::new(self));
     Ok(())
   }
+
+  fn clear_cache(&self, id: CompilationId) {
+    COMPILATION_HOOKS_MAP.remove(&id);
+  }
 }
 
-fn inner_impl(compilation: &mut Compilation) -> Result<()> {
+async fn inner_impl(compilation: &mut Compilation) -> Result<()> {
   let logger = compilation.get_logger("rspack.RealContentHashPlugin");
   let start = logger.time("hash to asset names");
   let mut hash_to_asset_names: HashMap<&str, Vec<&str>> = HashMap::default();
@@ -65,7 +93,7 @@ fn inner_impl(compilation: &mut Compilation) -> Result<()> {
       hash_to_asset_names
         .entry(hash)
         .and_modify(|names| names.push(name))
-        .or_insert(vec![name]);
+        .or_insert_with(|| vec![name]);
     }
   }
   logger.time_end(start);
@@ -73,16 +101,21 @@ fn inner_impl(compilation: &mut Compilation) -> Result<()> {
     return Ok(());
   }
   let start = logger.time("create hash regexp");
-  let mut hash_list = hash_to_asset_names
-    .keys()
-    // xx\xx{xx?xx.xx -> xx\\xx\{xx\?xx\.xx escape for Regex::new
-    .map(|hash| QUOTE_META.replace_all(hash, "\\$0"))
-    .collect::<Vec<Cow<str>>>();
-  // long hash should sort before short hash to make sure match long hash first in hash_regexp matching
+  // use LeftmostLongest here:
   // e.g. 4afc|4afcbe match xxx.4afcbe-4afc.js -> xxx.[4afc]be-[4afc].js
   //      4afcbe|4afc match xxx.4afcbe-4afc.js -> xxx.[4afcbe]-[4afc].js
-  hash_list.par_sort_by(|a, b| b.len().cmp(&a.len()));
-  let hash_regexp = Regex::new(&hash_list.join("|")).expect("Invalid regex");
+  // force the DFA: hex hash patterns defeat the literal prefilters, leaving
+  // the default automaton scanning with the slower contiguous NFA. Total
+  // pattern bytes bound the DFA size; beyond the cap fall back to the default
+  // automaton so pathological hash counts don't pay the DFA build cost
+  const DFA_PATTERN_BYTES_CAP: usize = 128 * 1024;
+  let total_pattern_bytes: usize = hash_to_asset_names.keys().map(|s| s.len()).sum();
+  let hash_patterns = hash_to_asset_names.keys().copied().collect::<Vec<_>>();
+  let hash_ac = AhoCorasick::builder()
+    .match_kind(MatchKind::LeftmostLongest)
+    .kind((total_pattern_bytes <= DFA_PATTERN_BYTES_CAP).then_some(AhoCorasickKind::DFA))
+    .build(&hash_patterns)
+    .expect("Invalid patterns");
   logger.time_end(start);
 
   let start = logger.time("create ordered hashes");
@@ -93,66 +126,177 @@ fn inner_impl(compilation: &mut Compilation) -> Result<()> {
       asset.get_source().map(|source| {
         (
           name.as_str(),
-          AssetData::new(source.clone(), asset.get_info(), &hash_regexp),
+          AssetData::new(source, asset.get_info(), &hash_ac, &hash_patterns),
         )
       })
     })
     .collect();
 
-  let ordered_hashes = OrderedHashesBuilder::new(&hash_to_asset_names, &assets_data).build();
+  let ordered_hashes_result = OrderedHashesBuilder::new(&hash_to_asset_names, &assets_data).build();
   logger.time_end(start);
+
+  let OrderedHashes {
+    ordered_hashes,
+    mut hash_dependencies,
+  } = match ordered_hashes_result {
+    Ok(result) => result,
+    Err(paths) => {
+      compilation.push_diagnostic(Diagnostic::error(
+        "Circular Real Content Hash".to_string(),
+        format!(
+          "Circular real content hash dependency between assets detected:\n {}",
+          paths.join(" -> ")
+        ),
+      ));
+      return Ok(());
+    }
+  };
+  let mut ordered_hashes_iter = ordered_hashes.into_iter();
 
   let start = logger.time("old hash to new hash");
   let mut hash_to_new_hash = HashMap::default();
 
-  for old_hash in &ordered_hashes {
-    if let Some(asset_names) = hash_to_asset_names.get_mut(old_hash.as_str()) {
-      asset_names.sort();
-      let asset_contents: Vec<_> = asset_names
-        .par_iter()
-        .filter_map(|name| assets_data.get(name))
-        .map(|data| {
-          data.compute_new_source(
-            data.own_hashes.contains(old_hash),
-            &hash_to_new_hash,
-            &hash_regexp,
-          )
-        })
-        .collect();
-      let mut hasher = RspackHash::from(&compilation.options.output);
-      for asset_content in asset_contents {
-        asset_content.hash(&mut hasher);
+  let hooks = RealContentHashPlugin::get_compilation_hooks(compilation.id());
+
+  let mut computed_hashes = HashSet::default();
+  let mut top_task = ordered_hashes_iter.next();
+
+  while let Some(top) = top_task {
+    let mut batch = vec![top];
+    top_task = None;
+
+    for hash in ordered_hashes_iter.by_ref() {
+      let Some(dependencies) = hash_dependencies.remove(hash.as_str()) else {
+        top_task = Some(hash);
+        break;
+      };
+      if dependencies.iter().all(|dep| computed_hashes.contains(dep)) {
+        batch.push(hash);
+      } else {
+        top_task = Some(hash);
+        break;
       }
-      let new_hash = hasher.digest(&compilation.options.output.hash_digest);
-      let new_hash = new_hash.rendered(old_hash.len()).to_string();
+    }
+
+    let batch_source_tasks = batch
+      .iter()
+      .filter_map(|hash| {
+        let assets_names = hash_to_asset_names.get(hash.as_str())?;
+        let tasks = assets_names
+          .iter()
+          .filter_map(|name| {
+            let data = assets_data.get(name)?;
+            Some((hash.as_str(), *name, data))
+          })
+          .collect::<Vec<_>>();
+        Some(tasks)
+      })
+      .flatten()
+      .collect::<Vec<_>>();
+
+    let batch_sources = batch_source_tasks
+      .into_par_iter()
+      .map(|(hash, name, data)| {
+        let new_source = data.compute_new_source(
+          data.own_hashes.contains(hash),
+          &hash_to_new_hash,
+          &hash_ac,
+          &hash_patterns,
+        );
+        // Lazy DevTool outputs stand in for raw text, even after hash replacement.
+        let by_content =
+          data.streaming_matches.is_some() || new_source.as_ref().as_any().is::<RawStringSource>();
+        ((hash, name), (new_source, by_content))
+      })
+      .collect::<HashMap<_, _>>();
+
+    let new_hashes = rspack_parallel::scope::<_, Result<_>>(|token| {
+      batch
+        .iter()
+        .cloned()
+        .filter_map(|old_hash| {
+          let asset_names = hash_to_asset_names.remove(old_hash.as_str())?;
+          Some((old_hash, asset_names))
+        })
+        .for_each(|(old_hash, asset_names)| {
+          let s =
+            unsafe { token.used((&hooks, &compilation, &batch_sources, old_hash, asset_names)) };
+          s.spawn(
+            |(hooks, compilation, batch_sources, old_hash, mut asset_names)| async move {
+              asset_names.sort_unstable();
+              asset_names.dedup_by(|a, b| {
+                let (a, a_by_content) = &batch_sources[&(old_hash.as_str(), *a)];
+                let (b, b_by_content) = &batch_sources[&(old_hash.as_str(), *b)];
+                if *a_by_content && *b_by_content {
+                  source_content_eq(a.as_ref(), b.as_ref())
+                } else {
+                  a == b
+                }
+              });
+              let asset_contents = asset_names
+                .into_iter()
+                .map(|name| Arc::clone(&batch_sources[&(old_hash.as_str(), name)].0))
+                .collect::<Vec<_>>();
+              let updated_hash = hooks
+                .borrow()
+                .update_hash
+                .call(compilation, &asset_contents, &old_hash)
+                .await?;
+
+              let new_hash = if let Some(new_hash) = updated_hash {
+                new_hash
+              } else {
+                let mut hasher = RspackHasher::from(&compilation.options.output);
+                for asset_content in asset_contents {
+                  update_content_hash(asset_content.as_ref(), &mut hasher);
+                }
+                let new_hash = hasher.digest(&compilation.options.output.hash_digest);
+
+                new_hash.rendered(old_hash.len()).to_string()
+              };
+
+              Ok((old_hash.clone(), new_hash))
+            },
+          );
+        });
+    })
+    .await
+    .into_iter()
+    .map(|r| r.to_rspack_result())
+    .collect::<Result<Vec<_>>>()?;
+
+    for res in new_hashes {
+      let (old_hash, new_hash) = res?;
       hash_to_new_hash.insert(old_hash, new_hash);
     }
+
+    computed_hashes.extend(batch);
   }
+
   logger.time_end(start);
 
   let start = logger.time("collect hash updates");
   let updates: Vec<_> = assets_data
     .into_par_iter()
     .filter_map(|(name, data)| {
-      let new_source = data.compute_new_source(false, &hash_to_new_hash, &hash_regexp);
-      let new_name = hash_regexp
-        .replace_all(name, |c: &Captures| {
-          let hash = c
-            .get(0)
-            .expect("RealContentHashPlugin: should have match")
-            .as_str();
-          hash_to_new_hash
-            .get(hash)
-            .expect("RealContentHashPlugin: should have new hash")
-        })
-        .into_owned();
+      let new_source = data.compute_new_source(false, &hash_to_new_hash, &hash_ac, &hash_patterns);
+      drop(data);
+      let mut new_name = String::with_capacity(name.len());
+      hash_ac.replace_all_with(name, &mut new_name, |_, hash, dst| {
+        let replace_to = hash_to_new_hash
+          .get(hash)
+          .expect("RealContentHashPlugin: should have new hash");
+        dst.push_str(replace_to);
+        true
+      });
       let new_name = (name != new_name).then_some(new_name);
-      Some((name.to_owned(), new_source.clone(), new_name))
+      Some((name.to_owned(), new_source, new_name))
     })
     .collect();
   logger.time_end(start);
 
   let start = logger.time("update assets");
+  let mut asset_renames = Vec::with_capacity(updates.len());
   for (name, new_source, new_name) in updates {
     compilation.update_asset(&name, |_, old_info| {
       let new_hashes: HashSet<_> = old_info
@@ -165,54 +309,112 @@ fn inner_impl(compilation: &mut Compilation) -> Result<()> {
             .to_owned()
         })
         .collect();
-      Ok((new_source.clone(), old_info.with_content_hashes(new_hashes)))
+      let info_update = (*old_info).clone();
+      Ok((
+        new_source.clone(),
+        BindingCell::from(info_update.with_content_hashes(new_hashes)),
+      ))
     })?;
     if let Some(new_name) = new_name {
-      compilation.rename_asset(&name, new_name);
+      asset_renames.push((name, new_name));
     }
   }
+
+  compilation.par_rename_assets(asset_renames);
+
   logger.time_end(start);
 
   Ok(())
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
-struct AssetData {
-  own_hashes: HashSet<String>,
-  referenced_hashes: HashSet<String>,
-  #[derivative(Debug = "ignore")]
-  old_source: BoxSource,
-  #[derivative(Debug = "ignore")]
-  content: AssetDataContent,
-  #[derivative(Debug = "ignore")]
+#[derive(Debug)]
+struct AssetData<'a> {
+  own_hashes: HashSet<&'a str>,
+  referenced_hashes: HashSet<&'a str>,
+  #[debug(skip)]
+  old_source: &'a BoxSource,
+  #[debug(skip)]
+  content: Option<Cow<'a, str>>,
+  #[debug(skip)]
+  streaming_matches: Option<Vec<Match>>,
+  #[debug(skip)]
   new_source: OnceCell<BoxSource>,
-  #[derivative(Debug = "ignore")]
+  #[debug(skip)]
   new_source_without_own: OnceCell<BoxSource>,
 }
 
-#[derive(Debug)]
-enum AssetDataContent {
-  Buffer,
-  String(String),
-}
-
-impl AssetData {
-  pub fn new(source: BoxSource, info: &AssetInfo, hash_regexp: &Regex) -> Self {
+impl<'a> AssetData<'a> {
+  pub fn new(
+    source: &'a BoxSource,
+    info: &AssetInfo,
+    hash_ac: &AhoCorasick,
+    hash_patterns: &[&'a str],
+  ) -> Self {
     let mut own_hashes = HashSet::default();
     let mut referenced_hashes = HashSet::default();
-    // TODO(ahabhgk): source.is_buffer() instead of String::from_utf8().is_ok()
-    let content = if let Ok(content) = String::from_utf8(source.buffer().to_vec()) {
-      for hash in hash_regexp.find_iter(&content) {
-        if info.content_hash.contains(hash.as_str()) {
-          own_hashes.insert(hash.as_str().to_string());
+    // Cache wrappers are transparent; keep the outermost edit when scanning.
+    let mut inner = source.as_ref();
+    let mut edited = None;
+    loop {
+      if let Some(cache) = inner.as_any().downcast_ref::<CachedSource>() {
+        inner = cache.inner().as_ref();
+      } else if let Some(edit) = inner.as_any().downcast_ref::<ReplaceSource>() {
+        edited.get_or_insert(inner);
+        inner = edit.inner().as_ref();
+      } else {
+        break;
+      }
+    }
+    if inner.as_any().is::<DevToolCodeSource>() || inner.as_any().is::<DevToolMapSource>() {
+      let scan_source = edited.unwrap_or(inner);
+      let mut matches = Vec::new();
+      let mut matcher = StreamingMatcher::new(hash_ac, |found| {
+        let hash = hash_patterns[found.pattern().as_usize()];
+        if info.content_hash.contains(hash) {
+          own_hashes.insert(hash);
+        } else {
+          referenced_hashes.insert(hash);
+        }
+        matches.push(found);
+      });
+      if scan_source.as_any().is::<DevToolMapSource>() {
+        scan_source
+          .to_writer(&mut matcher)
+          .expect("scan devtool map");
+      } else {
+        // ReplaceSource applies these byte offsets to rope chunks.
+        scan_source.rope(&mut |chunk| {
+          matcher
+            .write_all(chunk.as_bytes())
+            .expect("scan devtool text");
+        });
+      }
+      matcher.finish();
+      return Self {
+        own_hashes,
+        referenced_hashes,
+        old_source: source,
+        content: None,
+        streaming_matches: Some(matches),
+        new_source: OnceCell::new(),
+        new_source_without_own: OnceCell::new(),
+      };
+    }
+    let content = if let SourceValue::String(content) = source.source() {
+      for found in hash_ac.find_iter(content.as_ref()) {
+        let hash = hash_patterns[found.pattern().as_usize()];
+        if info.content_hash.contains(hash) {
+          own_hashes.insert(hash);
           continue;
         }
-        referenced_hashes.insert(hash.as_str().to_string());
+        referenced_hashes.insert(hash);
       }
-      AssetDataContent::String(content)
+      // Borrow contiguous sources instead of copying them for the entire pass.
+      // Sources without hash matches will never need replacement, so discard
+      // their materialized content as soon as the scan is complete.
+      (!own_hashes.is_empty() || !referenced_hashes.is_empty()).then_some(content)
     } else {
-      AssetDataContent::Buffer
+      None
     };
 
     Self {
@@ -220,6 +422,7 @@ impl AssetData {
       referenced_hashes,
       old_source: source,
       content,
+      streaming_matches: None,
       new_source: OnceCell::new(),
       new_source_without_own: OnceCell::new(),
     }
@@ -228,50 +431,96 @@ impl AssetData {
   pub fn compute_new_source(
     &self,
     without_own: bool,
-    hash_to_new_hash: &HashMap<&str, String>,
-    hash_regexp: &Regex,
-  ) -> &BoxSource {
+    hash_to_new_hash: &HashMap<String, String>,
+    hash_ac: &AhoCorasick,
+    hash_patterns: &[&str],
+  ) -> BoxSource {
     (if without_own {
       &self.new_source_without_own
     } else {
       &self.new_source
     })
     .get_or_init(|| {
-      if let AssetDataContent::String(content) = &self.content
+      if let Some(matches) = &self.streaming_matches {
+        let replacements = matches.iter().filter_map(|found| {
+          let hash = hash_patterns[found.pattern().as_usize()];
+          let replacement = if without_own && self.own_hashes.contains(hash) {
+            ""
+          } else {
+            hash_to_new_hash
+              .get(hash)
+              .expect("RealContentHashPlugin: should have new hash")
+          };
+          (replacement != hash).then_some((found.start(), found.end(), replacement))
+        });
+        if replacements.clone().next().is_none() {
+          return Arc::clone(self.old_source);
+        }
+        // ReplaceSource uses u32 offsets. Keep the previous flat fallback for
+        // an asset whose edits cannot be represented without truncation.
+        if replacements
+          .clone()
+          .all(|(_, end, _)| u32::try_from(end).is_ok())
+        {
+          let mut edited = ReplaceSource::new(Arc::clone(self.old_source));
+          for (start, end, replacement) in replacements {
+            edited.replace(start as u32, end as u32, replacement.to_owned(), None);
+          }
+          return edited.boxed();
+        }
+        let mut content = String::with_capacity(self.old_source.size());
+        self.old_source.rope(&mut |chunk| content.push_str(chunk));
+        let mut result = String::with_capacity(content.len());
+        let mut start = 0;
+        for (from, to, replacement) in replacements {
+          result.push_str(&content[start..from]);
+          result.push_str(replacement);
+          start = to;
+        }
+        result.push_str(&content[start..]);
+        return RawStringSource::from(result).boxed();
+      }
+      if let Some(content) = &self.content
         && (!self.own_hashes.is_empty()
           || self
             .referenced_hashes
             .iter()
-            .any(|hash| matches!(hash_to_new_hash.get(hash.as_str()), Some(h) if h != hash)))
+            .any(|&hash| matches!(hash_to_new_hash.get(hash), Some(h) if h != hash)))
       {
-        let new_content = hash_regexp.replace_all(content, |c: &Captures| {
-          let hash = c
-            .get(0)
-            .expect("RealContentHashPlugin: should have matched")
-            .as_str();
-          if without_own && self.own_hashes.contains(hash) {
-            return "";
-          }
-          hash_to_new_hash
-            .get(hash)
-            .expect("RealContentHashPlugin: should have new hash")
+        let mut new_content = String::with_capacity(content.len());
+        hash_ac.replace_all_with(content, &mut new_content, |_, hash, dst| {
+          let replace_to = if without_own && self.own_hashes.contains(hash) {
+            ""
+          } else {
+            hash_to_new_hash
+              .get(hash)
+              .expect("RealContentHashPlugin: should have new hash")
+          };
+          dst.push_str(replace_to);
+          true
         });
-        return RawSource::from(new_content.into_owned()).boxed();
+        return RawStringSource::from(new_content).boxed();
       }
       self.old_source.clone()
     })
+    .clone()
   }
 }
 
 struct OrderedHashesBuilder<'a> {
   hash_to_asset_names: &'a HashMap<&'a str, Vec<&'a str>>,
-  assets_data: &'a HashMap<&'a str, AssetData>,
+  assets_data: &'a HashMap<&'a str, AssetData<'a>>,
+}
+
+struct OrderedHashes {
+  ordered_hashes: IndexSet<String>,
+  hash_dependencies: HashMap<String, HashSet<String>>,
 }
 
 impl<'a> OrderedHashesBuilder<'a> {
   pub fn new(
     hash_to_asset_names: &'a HashMap<&'a str, Vec<&'a str>>,
-    assets_data: &'a HashMap<&'a str, AssetData>,
+    assets_data: &'a HashMap<&'a str, AssetData<'a>>,
   ) -> Self {
     Self {
       hash_to_asset_names,
@@ -279,12 +528,32 @@ impl<'a> OrderedHashesBuilder<'a> {
     }
   }
 
-  pub fn build(&self) -> IndexSet<String> {
+  pub fn build(&self) -> std::result::Result<OrderedHashes, Vec<String>> {
     let mut ordered_hashes = IndexSet::default();
+    let mut hash_dependencies = HashMap::default();
+    let mut stack = Vec::new();
+    let mut stack_indexes = HashMap::default();
     for hash in self.hash_to_asset_names.keys() {
-      self.add_to_ordered_hashes(hash, &mut ordered_hashes, &mut HashSet::default());
+      self.add_to_ordered_hashes(
+        hash,
+        &mut ordered_hashes,
+        &mut stack,
+        &mut stack_indexes,
+        &mut hash_dependencies,
+      )?;
     }
-    ordered_hashes
+    Ok(OrderedHashes {
+      ordered_hashes,
+      hash_dependencies: hash_dependencies
+        .into_iter()
+        .map(|(k, v)| {
+          (
+            k.to_string(),
+            v.into_iter().map(|s| s.to_string()).collect(),
+          )
+        })
+        .collect(),
+    })
   }
 }
 
@@ -299,11 +568,11 @@ impl OrderedHashesBuilder<'_> {
       if let Some(asset_hash) = self.assets_data.get(name) {
         if !asset_hash.own_hashes.contains(hash) {
           for hash in &asset_hash.own_hashes {
-            hashes.insert(hash.as_str());
+            hashes.insert(*hash);
           }
         }
         for hash in &asset_hash.referenced_hashes {
-          hashes.insert(hash.as_str());
+          hashes.insert(*hash);
         }
       }
     }
@@ -314,22 +583,50 @@ impl OrderedHashesBuilder<'_> {
     &'a self,
     hash: &'b str,
     ordered_hashes: &mut IndexSet<String>,
-    stack: &mut HashSet<&'b str>,
-  ) {
-    let deps = self.get_hash_dependencies(hash);
-    stack.insert(hash);
+    stack: &mut Vec<&'b str>,
+    stack_indexes: &mut HashMap<&'b str, usize>,
+    hash_dependencies: &mut HashMap<&'b str, HashSet<&'b str>>,
+  ) -> std::result::Result<(), Vec<String>> {
+    let deps = hash_dependencies
+      .entry(hash)
+      .or_insert_with(|| self.get_hash_dependencies(hash))
+      .clone();
+    stack_indexes.insert(hash, stack.len());
+    stack.push(hash);
     for dep in deps {
       if ordered_hashes.contains(dep) {
         continue;
       }
-      if stack.contains(dep) {
-        // Safety: all chunk-level hash will be collected in runtime chunk
-        // so there shouldn't have circular hash dependency between chunks
-        panic!("RealContentHashPlugin: circular hash dependency");
+      if let Some(&cycle_start) = stack_indexes.get(dep) {
+        let mut cycle = stack[cycle_start..]
+          .iter()
+          .copied()
+          .map(|hash| {
+            let asset_names = self
+              .hash_to_asset_names
+              .get(hash)
+              .expect("RealContentHashPlugin: should have asset names");
+            match asset_names.as_slice() {
+              [name] => (*name).to_string(),
+              names => format!("[{}]", names.join(", ")),
+            }
+          })
+          .collect::<Vec<_>>();
+        let cycle_start = cycle
+          .iter()
+          .enumerate()
+          .min_by(|(_, a), (_, b)| a.cmp(b))
+          .map(|(index, _)| index)
+          .expect("RealContentHashPlugin: circular dependency should not be empty");
+        cycle.rotate_left(cycle_start);
+        cycle.push(cycle[0].clone());
+        return Err(cycle);
       }
-      self.add_to_ordered_hashes(dep, ordered_hashes, stack);
+      self.add_to_ordered_hashes(dep, ordered_hashes, stack, stack_indexes, hash_dependencies)?;
     }
     ordered_hashes.insert(hash.to_string());
-    stack.remove(hash);
+    stack.pop();
+    stack_indexes.remove(hash);
+    Ok(())
   }
 }

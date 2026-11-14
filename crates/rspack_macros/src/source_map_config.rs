@@ -1,5 +1,5 @@
 use quote::quote;
-use syn::{parse::Parser, parse_macro_input, ItemStruct};
+use syn::{ItemStruct, parse::Parser, parse_macro_input};
 
 pub fn impl_source_map_config(
   _args: proc_macro::TokenStream,
@@ -13,7 +13,9 @@ pub fn impl_source_map_config(
   if let syn::Fields::Named(ref mut fields) = input.fields {
     fields.named.push(
       syn::Field::parse_named
-        .parse2(quote! { pub source_map_kind: ::rspack_util::source_map::SourceMapKind })
+        .parse2(quote! {
+            pub source_map_kind: ::rspack_util::source_map::SourceMapKind
+        })
         .expect("Failed to parse new field for source_map_kind"),
     );
   }

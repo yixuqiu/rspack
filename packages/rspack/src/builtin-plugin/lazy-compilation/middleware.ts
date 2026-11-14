@@ -1,0 +1,295 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createRequire } from 'node:module';
+import { type Compiler, MultiCompiler } from '../..';
+import type { LazyCompilationOptions } from '../../config';
+import type { ExternalItem, Externals } from '../../config';
+import type { DevServerMiddlewareHandler } from '../../config/devServer';
+import { resolveLayerExternals } from '../../util/resolveLayerExternals';
+import { BuiltinLazyCompilationPlugin } from './lazyCompilation';
+
+const require = createRequire(import.meta.url);
+
+export const LAZY_COMPILATION_PREFIX = '/_rspack/lazy/trigger';
+
+const getDefaultClient = (compiler: Compiler): string =>
+  require.resolve(
+    `../hot/lazy-compilation-${
+      compiler.options.externalsPresets.node ? 'node' : 'web'
+    }.js`,
+  );
+
+const noop = (
+  _req: IncomingMessage,
+  _res: ServerResponse,
+  next?: (err?: any) => void,
+) => {
+  if (typeof next === 'function') {
+    next();
+  }
+};
+
+const getFullServerUrl = ({ serverUrl, prefix }: LazyCompilationOptions) => {
+  const lazyCompilationPrefix = prefix || LAZY_COMPILATION_PREFIX;
+  if (!serverUrl) {
+    return lazyCompilationPrefix;
+  }
+  return (
+    serverUrl +
+    (serverUrl.endsWith('/')
+      ? lazyCompilationPrefix.slice(1)
+      : lazyCompilationPrefix)
+  );
+};
+
+/**
+ * Create a middleware that handles lazy compilation requests from the client.
+ * This function returns an Express-style middleware that listens for
+ * requests triggered by lazy compilation in the dev server client,
+ * then invokes the Rspack compiler to compile modules on demand.
+ * Use this middleware when integrating lazy compilation into a
+ * custom development server instead of relying on the built-in server.
+ */
+export const lazyCompilationMiddleware = (
+  compiler: Compiler | MultiCompiler,
+): DevServerMiddlewareHandler => {
+  if (compiler instanceof MultiCompiler) {
+    const middlewareByCompiler: Map<string, DevServerMiddlewareHandler> =
+      new Map();
+
+    let i = 0;
+
+    for (const c of compiler.compilers) {
+      if (!c.options.lazyCompilation) {
+        continue;
+      }
+
+      const options = {
+        ...c.options.lazyCompilation,
+      };
+
+      const prefix = options.prefix || LAZY_COMPILATION_PREFIX;
+      options.prefix = `${prefix}__${i++}`;
+      const newlyActiveModules = new Set<string>();
+
+      middlewareByCompiler.set(
+        options.prefix,
+        lazyCompilationMiddlewareInternal(
+          c,
+          newlyActiveModules,
+          options.prefix,
+        ),
+      );
+
+      applyPlugin(c, options, newlyActiveModules);
+    }
+
+    const keys = [...middlewareByCompiler.keys()];
+    return (req: IncomingMessage, res: ServerResponse, next: () => void) => {
+      const key = keys.find(
+        (key) => req.url === key || req.url?.startsWith(`${key}?`),
+      );
+      if (!key) {
+        return next?.();
+      }
+
+      const middleware = middlewareByCompiler.get(key);
+
+      return middleware?.(req, res, next);
+    };
+  }
+
+  if (!compiler.options.lazyCompilation) {
+    return noop;
+  }
+
+  const newlyActiveModules: Set<string> = new Set();
+
+  const options = {
+    ...compiler.options.lazyCompilation,
+  };
+
+  applyPlugin(compiler, options, newlyActiveModules);
+
+  const lazyCompilationPrefix = options.prefix || LAZY_COMPILATION_PREFIX;
+  return lazyCompilationMiddlewareInternal(
+    compiler,
+    newlyActiveModules,
+    lazyCompilationPrefix,
+  );
+};
+
+function applyPlugin(
+  compiler: Compiler,
+  options: LazyCompilationOptions,
+  newlyActiveModules: Set<string>,
+) {
+  const externals = compiler.options.externals;
+  const plugin = new BuiltinLazyCompilationPlugin(
+    // Hand over the modules reported since the last compilation; the native
+    // plugin keeps every activated module and skips the ones already active.
+    () => {
+      const res = new Set(newlyActiveModules);
+      newlyActiveModules.clear();
+      return res;
+    },
+    options.entries ?? true,
+    options.imports ?? true,
+    `${options.client || getDefaultClient(compiler)}?${encodeURIComponent(getFullServerUrl(options))}`,
+    (layer) => collectReservedExternals(externals, layer ?? null),
+    options.test,
+  );
+  plugin.apply(compiler);
+}
+
+// Statically-declared external requests to reserve in the closure-library wrapper
+// (externals live on the JS options, not Rust's `CompilerOptions`).
+function collectReservedExternals(
+  externals: Externals | undefined,
+  layer: string | null,
+): string[] {
+  const requests = new Set<string>();
+  const visit = (item: ExternalItem) => {
+    if (typeof item === 'string') {
+      requests.add(item);
+      return;
+    }
+    if (!item || typeof item !== 'object' || item instanceof RegExp) {
+      return;
+    }
+    const resolved = resolveLayerExternals(item, layer);
+    if (typeof resolved === 'string') {
+      requests.add(resolved);
+      return;
+    }
+    if (
+      !resolved ||
+      typeof resolved !== 'object' ||
+      resolved instanceof RegExp
+    ) {
+      return;
+    }
+    for (const [request, value] of Object.entries(resolved)) {
+      // `false` opts out of externalization; every other key mirrors `ExternalsPlugin`.
+      if (value === false) {
+        continue;
+      }
+      requests.add(request);
+    }
+  };
+  if (Array.isArray(externals)) {
+    for (const item of externals) {
+      visit(item);
+    }
+  } else if (externals !== undefined) {
+    visit(externals);
+  }
+  return [...requests];
+}
+
+function readModuleIdsFromBody(
+  req: IncomingMessage & { body?: unknown },
+): Promise<string[]> {
+  // If body is already parsed by another middleware, use it directly
+  if (req.body !== undefined) {
+    if (Array.isArray(req.body)) {
+      return Promise.resolve(req.body);
+    }
+    if (typeof req.body === 'string') {
+      return Promise.resolve(req.body.split('\n').filter(Boolean));
+    }
+    throw new Error('Invalid body type');
+  }
+
+  return new Promise((resolve, reject) => {
+    if ((req as any).aborted || req.destroyed) {
+      reject(new Error('Request was aborted before body could be read'));
+      return;
+    }
+
+    const cleanup = () => {
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      req.removeListener('close', onClose);
+      req.removeListener('aborted', onAborted);
+    };
+
+    const chunks: Buffer[] = [];
+    const onData = (chunk: Buffer) => {
+      chunks.push(chunk);
+    };
+
+    const onEnd = () => {
+      cleanup();
+      // Concatenate all chunks and decode as UTF-8 to handle multibyte characters correctly
+      const body = Buffer.concat(chunks).toString('utf8');
+      resolve(body.split('\n').filter(Boolean));
+    };
+
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+
+    const onClose = () => {
+      cleanup();
+      reject(new Error('Request was closed before body could be read'));
+    };
+
+    const onAborted = () => {
+      cleanup();
+      reject(new Error('Request was aborted before body could be read'));
+    };
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('close', onClose);
+    req.on('aborted', onAborted);
+  });
+}
+
+const lazyCompilationMiddlewareInternal = (
+  compiler: Compiler | MultiCompiler,
+  newlyActiveModules: Set<string>,
+  lazyCompilationPrefix: string,
+): DevServerMiddlewareHandler => {
+  const logger = compiler.getInfrastructureLogger('LazyCompilation');
+
+  return async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    next?: () => void,
+  ) => {
+    if (!req.url?.startsWith(lazyCompilationPrefix) || req.method !== 'POST') {
+      return next?.();
+    }
+
+    let modules: string[] = [];
+    try {
+      modules = await readModuleIdsFromBody(req);
+    } catch (err) {
+      logger.error(`Failed to parse request body: ${err}`);
+      res.writeHead(400);
+      res.end('Bad Request');
+      return;
+    }
+
+    const moduleActivated = [];
+    for (const key of modules) {
+      if (!newlyActiveModules.has(key)) {
+        newlyActiveModules.add(key);
+        logger.log(`${key} is now in use and will be compiled.`);
+        moduleActivated.push(key);
+      }
+    }
+
+    if (moduleActivated.length && compiler.watching) {
+      compiler.watching.invalidate();
+    }
+
+    res.writeHead(200);
+    res.write('\n');
+    res.end();
+  };
+};

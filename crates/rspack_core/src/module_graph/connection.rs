@@ -1,55 +1,51 @@
-use std::hash::Hash;
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering::Relaxed;
+use rspack_cacheable::cacheable;
+use rspack_hash::RspackHasher;
 
-use crate::{DependencyId, ModuleGraph, ModuleIdentifier, RuntimeSpec};
+use crate::{
+  DependencyId, ExportsInfoArtifact, ModuleGraph, ModuleGraphCacheArtifact, ModuleIdentifier,
+  RuntimeSpec, SideEffectsStateArtifact,
+};
 
-pub static CONNECTION_ID: AtomicU32 = AtomicU32::new(0);
+/// A copyable connection identity allocated by its owning module graph.
+/// Multiple connections may share a dependency while retaining distinct IDs.
+#[cacheable(hashable)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModuleGraphConnectionId(u32);
 
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ConnectionId(u32);
-
-impl ConnectionId {
-  pub fn new() -> Self {
-    Self(CONNECTION_ID.fetch_add(1, Relaxed))
+impl From<u32> for ModuleGraphConnectionId {
+  fn from(id: u32) -> Self {
+    Self(id)
   }
 }
 
-impl Default for ConnectionId {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-impl std::ops::Deref for ConnectionId {
+impl std::ops::Deref for ModuleGraphConnectionId {
   type Target = u32;
 
   fn deref(&self) -> &Self::Target {
     &self.0
   }
 }
-impl From<u32> for ConnectionId {
-  fn from(id: u32) -> Self {
-    Self(id)
-  }
-}
 
+/// Connections are cloned when concatenation copies an inner module's external
+/// references to a new root, preserving the dependency while changing the origin.
+#[cacheable]
 #[derive(Debug, Clone, Eq)]
 pub struct ModuleGraphConnection {
-  pub id: ConnectionId,
+  pub id: ModuleGraphConnectionId,
+  pub dependency_id: DependencyId,
   /// The referencing module identifier
   pub original_module_identifier: Option<ModuleIdentifier>,
   pub resolved_original_module_identifier: Option<ModuleIdentifier>,
+  pub resolved_module: ModuleIdentifier,
 
   /// The referenced module identifier
   module_identifier: ModuleIdentifier,
 
-  /// The referencing dependency id
-  pub dependency_id: DependencyId,
-  pub active: bool,
-  pub conditional: bool,
+  active: bool,
+  conditional: bool,
 }
 
-impl Hash for ModuleGraphConnection {
+impl std::hash::Hash for ModuleGraphConnection {
   fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
     self.id.hash(state);
   }
@@ -63,34 +59,48 @@ impl PartialEq for ModuleGraphConnection {
 
 impl ModuleGraphConnection {
   pub fn new(
-    original_module_identifier: Option<ModuleIdentifier>,
+    id: ModuleGraphConnectionId,
     dependency_id: DependencyId,
+    original_module_identifier: Option<ModuleIdentifier>,
     module_identifier: ModuleIdentifier,
-    active: bool,
     conditional: bool,
   ) -> Self {
     Self {
-      id: ConnectionId::new(),
+      id,
+      dependency_id,
       original_module_identifier,
       module_identifier,
-      dependency_id,
-      active,
+      active: true,
       conditional,
       resolved_original_module_identifier: original_module_identifier,
+      resolved_module: module_identifier,
     }
   }
 
-  pub fn set_active(&mut self, value: bool) {
+  pub fn force_inactive(&mut self) {
+    self.active = false;
     self.conditional = false;
-    self.active = value;
   }
 
-  pub fn is_active(&self, module_graph: &ModuleGraph, runtime: Option<&RuntimeSpec>) -> bool {
+  pub fn is_active(
+    &self,
+    module_graph: &ModuleGraph,
+    runtime: Option<&RuntimeSpec>,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> bool {
     if !self.conditional {
       return self.active;
     }
     module_graph
-      .get_condition_state(self, runtime)
+      .get_condition_state(
+        self,
+        runtime,
+        module_graph_cache,
+        side_effects_state_artifact,
+        exports_info_artifact,
+      )
       .is_not_false()
   }
 
@@ -98,23 +108,41 @@ impl ModuleGraphConnection {
     &self,
     module_graph: &ModuleGraph,
     runtime: Option<&RuntimeSpec>,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
   ) -> bool {
     if !self.conditional {
       return self.active;
     }
-    module_graph.get_condition_state(self, runtime).is_true()
+    module_graph.is_connection_active(
+      self,
+      runtime,
+      module_graph_cache,
+      side_effects_state_artifact,
+      exports_info_artifact,
+    )
   }
 
-  pub fn get_active_state(
+  pub fn active_state(
     &self,
     module_graph: &ModuleGraph,
     runtime: Option<&RuntimeSpec>,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
   ) -> ConnectionState {
     if !self.conditional {
-      return ConnectionState::Bool(self.active);
+      return ConnectionState::Active(self.active);
     }
 
-    module_graph.get_condition_state(self, runtime)
+    module_graph.get_condition_state(
+      self,
+      runtime,
+      module_graph_cache,
+      side_effects_state_artifact,
+      exports_info_artifact,
+    )
   }
 
   pub fn module_identifier(&self) -> &ModuleIdentifier {
@@ -127,20 +155,36 @@ impl ModuleGraphConnection {
   }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cacheable]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConnectionState {
-  Bool(bool),
+  Active(bool),
+  // While determining the active state, this flag is used to signal a circular connection.
   CircularConnection,
+  // Module itself is not connected, but transitive modules are connected transitively.
   TransitiveOnly,
+}
+
+impl rspack_hash::RspackHash for ConnectionState {
+  fn hash(&self, state: &mut RspackHasher) {
+    match self {
+      ConnectionState::Active(value) => {
+        "active".hash(state);
+        value.hash(state);
+      }
+      ConnectionState::CircularConnection => "circular".hash(state),
+      ConnectionState::TransitiveOnly => "transitive-only".hash(state),
+    }
+  }
 }
 
 impl ConnectionState {
   pub fn is_true(&self) -> bool {
-    matches!(self, ConnectionState::Bool(true))
+    matches!(self, ConnectionState::Active(true))
   }
 
   pub fn is_not_false(&self) -> bool {
-    !matches!(self, ConnectionState::Bool(false))
+    !matches!(self, ConnectionState::Active(false))
   }
 
   pub fn is_false(&self) -> bool {
@@ -148,21 +192,26 @@ impl ConnectionState {
   }
 }
 
-pub fn add_connection_states(a: ConnectionState, b: ConnectionState) -> ConnectionState {
-  if matches!(a, ConnectionState::Bool(true)) || matches!(b, ConnectionState::Bool(true)) {
-    return ConnectionState::Bool(true);
+impl std::ops::Add for ConnectionState {
+  type Output = Self;
+  fn add(self, other: Self) -> Self::Output {
+    if matches!(self, ConnectionState::Active(true))
+      || matches!(other, ConnectionState::Active(true))
+    {
+      return ConnectionState::Active(true);
+    }
+    if matches!(self, ConnectionState::Active(false)) {
+      return other;
+    }
+    if matches!(other, ConnectionState::Active(false)) {
+      return self;
+    }
+    if matches!(self, ConnectionState::TransitiveOnly) {
+      return other;
+    }
+    if matches!(other, ConnectionState::TransitiveOnly) {
+      return self;
+    }
+    self
   }
-  if matches!(a, ConnectionState::Bool(false)) {
-    return b;
-  }
-  if matches!(b, ConnectionState::Bool(false)) {
-    return a;
-  }
-  if matches!(a, ConnectionState::TransitiveOnly) {
-    return b;
-  }
-  if matches!(b, ConnectionState::TransitiveOnly) {
-    return a;
-  }
-  a
 }

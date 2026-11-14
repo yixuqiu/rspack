@@ -1,6 +1,8 @@
-import { Link } from 'rspress/theme';
-import { useLang } from 'rspress/runtime';
+import { useLang } from '@rspress/core/runtime';
+import { Link } from '@rspress/core/theme-original';
+import { memo } from 'react';
 import { useI18n } from '../../i18n/index';
+import styles from './index.module.scss';
 
 function useFooterData() {
   const t = useI18n();
@@ -25,7 +27,7 @@ function useFooterData() {
         },
         {
           title: t('compatibility'),
-          link: getLink('/guide/compatibility/loader'),
+          link: getLink('/plugins/community-plugin-compatibility'),
         },
       ],
     },
@@ -44,26 +46,34 @@ function useFooterData() {
           title: 'Loader API',
           link: getLink('/api/loader-api/index'),
         },
+        {
+          title: 'JavaScript API',
+          link: getLink('/api/javascript-api'),
+        },
       ],
     },
     {
-      title: t('ecosystem'),
+      title: t('toolchain'),
       items: [
         {
           title: 'Rsbuild',
-          link: 'https://rsbuild.dev/',
+          link: 'https://rsbuild.rs/',
+        },
+        {
+          title: 'Rslib',
+          link: 'https://rslib.rs/',
         },
         {
           title: 'Rspress',
-          link: 'https://rspress.dev/',
+          link: 'https://rspress.rs/',
         },
         {
           title: 'Rsdoctor',
-          link: 'https://rsdoctor.dev/',
+          link: 'https://rsdoctor.rs/',
         },
         {
-          title: 'Modern.js',
-          link: 'https://modernjs.dev/en/',
+          title: 'Rstest',
+          link: 'https://rstest.rs/',
         },
       ],
     },
@@ -76,33 +86,43 @@ function useFooterData() {
         },
         {
           title: 'Discord',
-          link: 'https://discord.gg/ab2Rv4BXwf',
+          link: 'https://discord.gg/sYK4QjyZ4V',
         },
         {
-          title: 'X',
+          title: 'Twitter (X)',
           link: 'https://twitter.com/rspack_dev',
+        },
+        {
+          title: 'BlueSky',
+          link: 'https://bsky.app/profile/rspack.dev',
+        },
+        {
+          title: 'Awesome Rspack',
+          link: 'https://github.com/rstackjs/awesome-rstack',
         },
       ],
     },
   ];
 }
 
-export function HomeFooter() {
+export const HomeFooter = memo(() => {
   const footerData = useFooterData();
   return (
     <div
-      className="flex flex-col border-t items-center mt-12"
+      className="flex flex-col border-t items-center mt-24 hidden sm:flex"
       style={{ borderColor: 'var(--rp-c-divider-light)' }}
     >
-      <div className="pt-8 pb-4 w-full justify-around max-w-6xl hidden sm:flex">
-        {footerData.map(item => (
+      <div className="pt-12 pb-4 w-full justify-around max-w-6xl flex">
+        {footerData.map((item) => (
           <div key={item.title} className="flex flex-col items-start">
             <h2 className="font-bold my-4 text-lg">{item.title}</h2>
             <ul className="flex flex-col gap-3">
-              {item.items.map(subItem => (
+              {item.items.map((subItem) => (
                 <li key={subItem.title}>
                   <Link href={subItem.link}>
-                    <span className="font-normal">{subItem.title}</span>
+                    <span className={`font-normal ${styles.text}`}>
+                      {subItem.title}
+                    </span>
                   </Link>
                 </li>
               ))}
@@ -110,11 +130,6 @@ export function HomeFooter() {
           </div>
         ))}
       </div>
-      <div className="flex flex-center">
-        <h2 className="font-normal text-sm text-gray-600 dark:text-light-600 py-4">
-          © 2022-present ByteDance Inc. All Rights Reserved.
-        </h2>
-      </div>
     </div>
   );
-}
+});

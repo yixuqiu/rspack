@@ -1,6 +1,6 @@
 use rspack_core::{
-  ChunkUkey, Compilation, CompilationRuntimeRequirementInTree, Plugin, PluginContext,
-  RuntimeGlobals, RuntimeModuleExt,
+  ChunkUkey, Compilation, CompilationRuntimeRequirementInTree, Plugin, RuntimeGlobals,
+  RuntimeModule, RuntimeModuleExt,
 };
 use rspack_error::Result;
 use rspack_hook::{plugin, plugin_hook};
@@ -20,15 +20,20 @@ impl ShareRuntimePlugin {
 }
 
 #[plugin_hook(CompilationRuntimeRequirementInTree for ShareRuntimePlugin)]
-fn runtime_requirements_in_tree(
+async fn runtime_requirements_in_tree(
   &self,
-  compilation: &mut Compilation,
+  compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
+  _all_runtime_requirements: &RuntimeGlobals,
   runtime_requirements: &RuntimeGlobals,
   _runtime_requirements_mut: &mut RuntimeGlobals,
+  runtime_modules_to_add: &mut Vec<(ChunkUkey, Box<dyn RuntimeModule>)>,
 ) -> Result<Option<()>> {
   if runtime_requirements.contains(RuntimeGlobals::SHARE_SCOPE_MAP) {
-    compilation.add_runtime_module(chunk_ukey, ShareRuntimeModule::new(self.enhanced).boxed())?;
+    runtime_modules_to_add.push((
+      *chunk_ukey,
+      ShareRuntimeModule::new(&compilation.runtime_template, self.enhanced).boxed(),
+    ));
   }
   Ok(None)
 }
@@ -38,13 +43,8 @@ impl Plugin for ShareRuntimePlugin {
     "rspack.ShareRuntimePlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut rspack_core::ApplyContext>,
-    _options: &mut rspack_core::CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
     ctx
-      .context
       .compilation_hooks
       .runtime_requirement_in_tree
       .tap(runtime_requirements_in_tree::new(self));

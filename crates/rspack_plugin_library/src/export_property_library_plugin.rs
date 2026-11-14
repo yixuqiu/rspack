@@ -1,17 +1,16 @@
-use std::{hash::Hash, sync::Arc};
-
 use rspack_core::{
-  get_entry_runtime, property_access,
-  rspack_sources::{ConcatSource, RawSource, SourceExt},
-  ApplyContext, ChunkUkey, Compilation, CompilationFinishModules, CompilationParams,
-  CompilerCompilation, CompilerOptions, EntryData, LibraryExport, LibraryOptions, LibraryType,
-  Plugin, PluginContext, UsageState,
+  AsyncModulesArtifact, CanInlineUse, ChunkUkey, Compilation,
+  CompilationAdditionalChunkRuntimeRequirements, CompilationFinishModules, CompilationParams,
+  CompilerCompilation, EntryData, ExportsInfoArtifact, LibraryExport, LibraryOptions, LibraryType,
+  ModuleIdentifier, Plugin, RuntimeCodeTemplate, RuntimeGlobals, RuntimeModule, RuntimeVariable,
+  SideEffectsStateArtifact, UsageState, get_entry_runtime, property_access,
+  rspack_sources::{ConcatSource, RawStringSource, SourceExt},
 };
 use rspack_error::Result;
+use rspack_hash::{RspackHash, RspackHasher};
 use rspack_hook::{plugin, plugin_hook};
 use rspack_plugin_javascript::{
-  JavascriptModulesPluginPlugin, JsChunkHashArgs, JsPlugin, PluginJsChunkHashHookOutput,
-  PluginRenderJsStartupHookOutput, RenderJsStartupArgs,
+  JavascriptModulesChunkHash, JavascriptModulesRenderStartup, JsPlugin, RenderSource,
 };
 
 use crate::utils::get_options_for_chunk;
@@ -24,27 +23,18 @@ struct ExportPropertyLibraryPluginParsed<'a> {
 #[plugin]
 #[derive(Debug)]
 pub struct ExportPropertyLibraryPlugin {
-  js_plugin: Arc<ExportPropertyLibraryJavascriptModulesPluginPlugin>,
+  library_type: LibraryType,
+  ns_object_used: bool,
+  runtime_exports_used: bool,
 }
 
 impl ExportPropertyLibraryPlugin {
-  pub fn new(library_type: LibraryType, ns_object_used: bool) -> Self {
-    Self::new_inner(Arc::new(
-      ExportPropertyLibraryJavascriptModulesPluginPlugin {
-        library_type,
-        ns_object_used,
-      },
-    ))
+  pub fn new(library_type: LibraryType, ns_object_used: bool, runtime_exports_used: bool) -> Self {
+    Self::new_inner(library_type, ns_object_used, runtime_exports_used)
   }
 }
 
-#[derive(Debug)]
-struct ExportPropertyLibraryJavascriptModulesPluginPlugin {
-  library_type: LibraryType,
-  ns_object_used: bool,
-}
-
-impl ExportPropertyLibraryJavascriptModulesPluginPlugin {
+impl ExportPropertyLibraryPlugin {
   fn parse_options<'a>(
     &self,
     library: &'a LibraryOptions,
@@ -65,47 +55,70 @@ impl ExportPropertyLibraryJavascriptModulesPluginPlugin {
   }
 }
 
-impl JavascriptModulesPluginPlugin for ExportPropertyLibraryJavascriptModulesPluginPlugin {
-  fn render_startup(&self, args: &RenderJsStartupArgs) -> PluginRenderJsStartupHookOutput {
-    let Some(options) = self.get_options_for_chunk(args.compilation, args.chunk) else {
-      return Ok(None);
-    };
-    if let Some(export) = options.export {
-      let mut s = ConcatSource::default();
-      s.add(args.source.clone());
-      s.add(RawSource::from(format!(
-        "__webpack_exports__ = __webpack_exports__{};",
-        property_access(export, 0)
-      )));
-      return Ok(Some(s.boxed()));
-    }
-    Ok(Some(args.source.clone()))
-  }
-
-  fn js_chunk_hash(&self, args: &mut JsChunkHashArgs) -> PluginJsChunkHashHookOutput {
-    let Some(options) = self.get_options_for_chunk(args.compilation, args.chunk_ukey) else {
-      return Ok(());
-    };
-    if let Some(export) = &options.export {
-      export.hash(&mut args.hasher);
-    }
-    Ok(())
-  }
-}
-
 #[plugin_hook(CompilerCompilation for ExportPropertyLibraryPlugin)]
 async fn compilation(
   &self,
   compilation: &mut Compilation,
   _params: &mut CompilationParams,
 ) -> Result<()> {
-  let mut drive = JsPlugin::get_compilation_drives_mut(compilation);
-  drive.add_plugin(self.js_plugin.clone());
+  let hooks = JsPlugin::get_compilation_hooks_mut(compilation.id());
+  let mut hooks = hooks.write().await;
+  hooks.render_startup.tap(render_startup::new(self));
+  hooks.chunk_hash.tap(js_chunk_hash::new(self));
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesRenderStartup for ExportPropertyLibraryPlugin)]
+async fn render_startup(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  _module: &ModuleIdentifier,
+  render_source: &mut RenderSource,
+  runtime_template: &RuntimeCodeTemplate,
+) -> Result<()> {
+  let Some(options) = self.get_options_for_chunk(compilation, chunk_ukey) else {
+    return Ok(());
+  };
+  if let Some(export) = options.export {
+    let exports_name = runtime_template.render_runtime_variable(&RuntimeVariable::Exports);
+    let mut s = ConcatSource::default();
+    s.add(render_source.source.clone());
+    s.add(RawStringSource::from(format!(
+      "{exports_name} = {exports_name}{};",
+      property_access(export, 0)
+    )));
+    render_source.source = s.boxed();
+    return Ok(());
+  }
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesChunkHash for ExportPropertyLibraryPlugin)]
+async fn js_chunk_hash(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  hasher: &mut RspackHasher,
+) -> Result<()> {
+  let Some(options) = self.get_options_for_chunk(compilation, chunk_ukey) else {
+    return Ok(());
+  };
+  if let Some(export) = &options.export {
+    export.hash(hasher);
+  }
   Ok(())
 }
 
 #[plugin_hook(CompilationFinishModules for ExportPropertyLibraryPlugin)]
-async fn finish_modules(&self, compilation: &mut Compilation) -> Result<()> {
+async fn finish_modules(
+  &self,
+  compilation: &Compilation,
+  _async_modules_artifact: &mut AsyncModulesArtifact,
+  exports_info_artifact: &mut ExportsInfoArtifact,
+  _side_effects_state_artifact: &mut SideEffectsStateArtifact,
+) -> Result<()> {
+  let module_graph = compilation.get_module_graph();
   let mut runtime_info = Vec::with_capacity(compilation.entries.len());
   for (entry_name, entry) in compilation.entries.iter() {
     let EntryData {
@@ -118,7 +131,6 @@ async fn finish_modules(&self, compilation: &mut Compilation) -> Result<()> {
       .library
       .as_ref()
       .or_else(|| compilation.options.output.library.as_ref());
-    let module_graph = compilation.get_module_graph();
     let module_of_last_dep = dependencies
       .last()
       .and_then(|dep| module_graph.get_module_by_dependency_id(dep));
@@ -144,20 +156,20 @@ async fn finish_modules(&self, compilation: &mut Compilation) -> Result<()> {
   }
 
   for (runtime, export, module_identifier) in runtime_info {
-    let mut module_graph = compilation.get_module_graph_mut();
     if let Some(export) = export {
-      let export_info_id =
-        module_graph.get_export_info(module_identifier, &(export.as_str()).into());
-      export_info_id.set_used(&mut module_graph, UsageState::Used, Some(&runtime));
-      export_info_id
-        .get_export_info_mut(&mut module_graph)
-        .can_mangle_use = Some(false);
+      let export_info = exports_info_artifact
+        .get_exports_info_data_mut(&module_identifier)
+        .ensure_export_info(&(export.as_str()).into());
+      let info = export_info.as_data_mut(exports_info_artifact);
+      info.set_used(UsageState::Used, Some(&runtime));
+      info.set_can_mangle_use(Some(false));
+      info.set_can_inline_use(Some(CanInlineUse::No));
     } else {
-      let exports_info_id = module_graph.get_exports_info(&module_identifier).id;
-      if self.js_plugin.ns_object_used {
-        exports_info_id.set_used_in_unknown_way(&mut module_graph, Some(&runtime));
+      let exports_info = exports_info_artifact.get_exports_info_data_mut(&module_identifier);
+      if self.ns_object_used {
+        exports_info.set_used_in_unknown_way(Some(&runtime));
       } else {
-        exports_info_id.set_all_known_exports_used(&mut module_graph, Some(&runtime));
+        exports_info.set_all_known_exports_used(Some(&runtime));
       }
     }
   }
@@ -165,27 +177,42 @@ async fn finish_modules(&self, compilation: &mut Compilation) -> Result<()> {
   Ok(())
 }
 
-#[async_trait::async_trait]
 impl Plugin for ExportPropertyLibraryPlugin {
   fn name(&self) -> &'static str {
     "rspack.ExportPropertyLibraryPlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
     ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
-    ctx
-      .context
       .compilation_hooks
       .finish_modules
       .tap(finish_modules::new(self));
+    ctx
+      .compilation_hooks
+      .additional_chunk_runtime_requirements
+      .tap(additional_chunk_runtime_requirements::new(self));
     Ok(())
   }
+}
+
+#[plugin_hook(CompilationAdditionalChunkRuntimeRequirements for ExportPropertyLibraryPlugin)]
+async fn additional_chunk_runtime_requirements(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  runtime_requirements: &mut RuntimeGlobals,
+  _runtime_modules: &mut Vec<Box<dyn RuntimeModule>>,
+) -> Result<()> {
+  if self
+    .get_options_for_chunk(compilation, chunk_ukey)
+    .is_none()
+  {
+    return Ok(());
+  }
+
+  if self.runtime_exports_used {
+    runtime_requirements.insert(RuntimeGlobals::EXPORTS);
+  }
+  Ok(())
 }

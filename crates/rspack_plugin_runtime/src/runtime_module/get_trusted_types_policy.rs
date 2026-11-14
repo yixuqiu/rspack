@@ -1,37 +1,55 @@
-use rspack_core::{
-  impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  ChunkUkey, Compilation, RuntimeGlobals, RuntimeModule,
-};
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
+use std::sync::LazyLock;
 
-use crate::get_chunk_runtime_requirements;
+use rspack_core::{
+  Compilation, OnPolicyCreationFailure, RuntimeGlobals, RuntimeModule,
+  RuntimeModuleGenerateContext, RuntimeTemplate, impl_runtime_module,
+};
+
+use crate::{extract_runtime_module_variables_from_ejs, get_chunk_runtime_requirements};
+
+static GET_TRUSTED_TYPES_POLICY_TEMPLATE: &str =
+  include_str!("runtime/get_trusted_types_policy.ejs");
+static RUNTIME_MODULE_VARIABLES: LazyLock<Vec<&'static str>> =
+  LazyLock::new(|| extract_runtime_module_variables_from_ejs(&[GET_TRUSTED_TYPES_POLICY_TEMPLATE]));
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
-pub struct GetTrustedTypesPolicyRuntimeModule {
-  id: Identifier,
-  chunk: Option<ChunkUkey>,
+#[derive(Debug)]
+pub struct GetTrustedTypesPolicyRuntimeModule {}
+
+impl GetTrustedTypesPolicyRuntimeModule {
+  pub fn new(runtime_template: &RuntimeTemplate) -> Self {
+    Self::with_default(runtime_template)
+  }
 }
 
-impl Default for GetTrustedTypesPolicyRuntimeModule {
-  fn default() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/get_trusted_types_policy"),
-      chunk: None,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
+#[async_trait::async_trait]
+impl RuntimeModule for GetTrustedTypesPolicyRuntimeModule {
+  fn runtime_module_variables() -> &'static [&'static str] {
+    RUNTIME_MODULE_VARIABLES.as_slice()
+  }
+
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define: { RuntimeGlobals::GET_TRUSTED_TYPES_POLICY },
+      ..Default::default()
     }
   }
-}
 
-impl RuntimeModule for GetTrustedTypesPolicyRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn template(&self) -> Vec<(String, String)> {
+    vec![(
+      self.id().to_string(),
+      GET_TRUSTED_TYPES_POLICY_TEMPLATE.to_string(),
+    )]
   }
 
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
     let trusted_types = compilation
       .options
       .output
@@ -39,40 +57,22 @@ impl RuntimeModule for GetTrustedTypesPolicyRuntimeModule {
       .as_ref()
       .expect("should have trusted_types");
     let runtime_requirements =
-      get_chunk_runtime_requirements(compilation, &self.chunk.expect("should have chunk"));
-    let create_script = runtime_requirements.contains(RuntimeGlobals::CREATE_SCRIPT);
-    let create_script_url = runtime_requirements.contains(RuntimeGlobals::CREATE_SCRIPT_URL);
-
-    let mut result = include_str!("runtime/get_trusted_types_policy.js").replace(
-      "$policyName$",
-      &trusted_types.policy_name.clone().unwrap_or_default(),
+      get_chunk_runtime_requirements(compilation, &self.chunk().expect("should have chunk"));
+    let wrap_policy_creation_in_try_catch = matches!(
+      trusted_types.on_policy_creation_failure,
+      OnPolicyCreationFailure::Continue
     );
-    let mut policy_content: Vec<String> = Vec::new();
-    if create_script {
-      policy_content.push(
-        r#"
-        createScript: function (script) {
-          return script;
-        }
-        "#
-        .to_string(),
-      );
-    }
-    if create_script_url {
-      policy_content.push(
-        r#"
-        createScriptURL: function (url) {
-          return url;
-        }
-        "#
-        .to_string(),
-      );
-    }
-    result = result.replace("$policyContent$", policy_content.join(",\n").as_ref());
-    Ok(RawSource::from(result).boxed())
-  }
 
-  fn attach(&mut self, chunk: ChunkUkey) {
-    self.chunk = Some(chunk);
+    let source = context.runtime_template.render(
+      self.id(),
+      Some(serde_json::json!({
+        "_create_script": runtime_requirements.contains(RuntimeGlobals::CREATE_SCRIPT),
+        "_create_script_url": runtime_requirements.contains(RuntimeGlobals::CREATE_SCRIPT_URL),
+        "_wrap_try_catch": wrap_policy_creation_in_try_catch,
+        "_policy_name": &trusted_types.policy_name.clone().unwrap_or_default(),
+      })),
+    )?;
+
+    Ok(source)
   }
 }

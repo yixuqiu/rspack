@@ -1,0 +1,17 @@
+<>
+
+```ts
+interface RspackError extends Error {
+  name: string;
+  message: string;
+  details?: string;
+  module?: Module | null;
+  loc?: DependencyLocation;
+  file?: string;
+  stack?: string;
+  hideStack?: boolean;
+  error?: Error;
+}
+```
+
+</>

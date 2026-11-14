@@ -1,0 +1,9 @@
+Object {
+  btn--info_is-disabled_1: tYAZEz,
+  btn-info_is-disabled: SoW1Xa,
+  btnInfoIsDisabled: SoW1Xa,
+  btnInfoIsDisabled1: tYAZEz,
+  fooBar: xQxhRt,
+  foo_bar: xQxhRt,
+  simple: bHNeS1,
+}

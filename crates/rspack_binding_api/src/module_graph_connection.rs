@@ -1,0 +1,255 @@
+use std::cell::RefCell;
+
+use napi::bindgen_prelude::ToNapiValue;
+use napi_derive::napi;
+use rspack_core::{
+  Compilation, CompilationId, ConnectionState, DependencyId, ModuleGraph, ModuleGraphConnectionId,
+  internal,
+};
+use rspack_napi::OneShotRef;
+use rustc_hash::FxHashMap;
+
+use crate::{dependency::DependencyWrapper, module::ModuleObject, symbols, with_compilation};
+
+/// Wrapper for ConnectionState that serializes to JS as `boolean | symbol`.
+pub enum JsConnectionState {
+  Bool(bool),
+  CircularConnection,
+  TransitiveOnly,
+}
+
+impl ToNapiValue for JsConnectionState {
+  unsafe fn to_napi_value(
+    env: napi::sys::napi_env,
+    val: Self,
+  ) -> napi::Result<napi::sys::napi_value> {
+    unsafe {
+      match val {
+        JsConnectionState::Bool(b) => ToNapiValue::to_napi_value(env, b),
+        JsConnectionState::CircularConnection => ToNapiValue::to_napi_value(
+          env,
+          napi::Env::from_raw(env).symbol_for(symbols::CIRCULAR_CONNECTION_SYMBOL)?,
+        ),
+        JsConnectionState::TransitiveOnly => ToNapiValue::to_napi_value(
+          env,
+          napi::Env::from_raw(env).symbol_for(symbols::TRANSITIVE_ONLY_SYMBOL)?,
+        ),
+      }
+    }
+  }
+}
+
+#[napi]
+pub struct ModuleGraphConnection {
+  compilation_id: CompilationId,
+  dependency_id: DependencyId,
+  connection_id: ModuleGraphConnectionId,
+}
+
+impl ModuleGraphConnection {
+  fn with_ref<R>(
+    &self,
+    f: impl FnOnce(&Compilation, &ModuleGraph) -> napi::Result<R>,
+  ) -> napi::Result<R> {
+    with_compilation(self.compilation_id, |compilation| {
+      let module_graph = compilation.get_module_graph();
+
+      f(compilation, module_graph)
+    })
+  }
+}
+
+#[napi]
+impl ModuleGraphConnection {
+  #[napi(getter, ts_return_type = "Dependency")]
+  pub fn dependency(&self) -> napi::Result<DependencyWrapper> {
+    self.with_ref(|compilation, module_graph| {
+      if let Some(dependency) = internal::try_dependency_ref_by_id(module_graph, &self.dependency_id) {
+        Ok(DependencyWrapper::from_graph(dependency, compilation.id()))
+      } else {
+        Err(napi::Error::from_reason(format!(
+          "Unable to access Dependency with id = {:#?} now. The Dependency have been removed on the Rust side.",
+          self.dependency_id
+        )))
+      }
+    })
+  }
+
+  #[napi(getter, ts_return_type = "Module | null")]
+  pub fn module(&self) -> napi::Result<Option<ModuleObject>> {
+    self.with_ref(|compilation, module_graph| {
+      if let Some(connection) = module_graph.connection_by_id(&self.connection_id) {
+        let module = module_graph.module_by_identifier(connection.module_identifier());
+        Ok(module.map(|m| ModuleObject::with_ref(m.as_ref(), compilation.compiler_id())))
+      } else {
+        Err(napi::Error::from_reason(format!(
+          "Unable to access ModuleGraphConnection with id = {:#?} now. The ModuleGraphConnection have been removed on the Rust side.",
+          self.connection_id
+        )))
+      }
+    })
+  }
+
+  #[napi(getter, ts_return_type = "Module | null")]
+  pub fn resolved_module(&self) -> napi::Result<Option<ModuleObject>> {
+    self.with_ref(|compilation, module_graph| {
+      if let Some(connection) = module_graph.connection_by_id(&self.connection_id) {
+        let module = module_graph.module_by_identifier(&connection.resolved_module);
+        Ok(module.map(|m| ModuleObject::with_ref(m.as_ref(), compilation.compiler_id())))
+      } else {
+        Err(napi::Error::from_reason(format!(
+          "Unable to access ModuleGraphConnection with id = {:#?} now. The ModuleGraphConnection have been removed on the Rust side.",
+          self.connection_id
+        )))
+      }
+    })
+  }
+
+  #[napi(getter, ts_return_type = "Module | null")]
+  pub fn origin_module(&self) -> napi::Result<Option<ModuleObject>> {
+    self.with_ref(|compilation, module_graph| {
+      if let Some(connection) = module_graph.connection_by_id(&self.connection_id) {
+        Ok(match connection.original_module_identifier {
+          Some(original_module_identifier) => module_graph
+            .module_by_identifier(&original_module_identifier)
+            .map(|m| ModuleObject::with_ref(m.as_ref(), compilation.compiler_id())),
+          None => None,
+        })
+      } else {
+        Err(napi::Error::from_reason(format!(
+          "Unable to access ModuleGraphConnection with id = {:#?} now. The ModuleGraphConnection have been removed on the Rust side.",
+          self.connection_id
+        )))
+      }
+    })
+  }
+
+  #[napi(
+    ts_args_type = "runtime: string | string[] | undefined",
+    ts_return_type = "ConnectionState"
+  )]
+  pub fn get_active_state(
+    &self,
+    runtime: Option<napi::Either<String, Vec<String>>>,
+  ) -> napi::Result<JsConnectionState> {
+    self.with_ref(|compilation, module_graph| {
+      if let Some(connection) = module_graph.connection_by_id(&self.connection_id) {
+        // When exports_info_artifact is stolen (e.g. during finishModules hook),
+        // we cannot evaluate conditional connections properly, so we need the
+        // real artifact to get accurate results.
+        let Some(exports_info_artifact) = compilation.exports_info_artifact.try_read() else {
+          // Fallback: without exports info, non-conditional connections return
+          // their raw active state; conditional ones are treated as active since
+          // the optimization phase hasn't run yet.
+          return Ok(JsConnectionState::Bool(true));
+        };
+        let runtime_spec = runtime.map(|r| {
+          let mut set = ustr::UstrSet::default();
+          match r {
+            napi::Either::A(s) => {
+              set.insert(s.into());
+            }
+            napi::Either::B(vec) => {
+              set.extend(vec.iter().map(String::as_str).map(ustr::Ustr::from));
+            }
+          }
+          rspack_core::RuntimeSpec::new(set)
+        });
+        let default_mgc: rspack_core::ModuleGraphCacheArtifact = Default::default();
+        let module_graph_cache = compilation
+          .module_graph_cache_artifact
+          .try_read()
+          .unwrap_or(&default_mgc);
+        let side_effects_state_artifact = &compilation
+          .build_module_graph_artifact
+          .side_effects_state_artifact;
+        let state = connection.active_state(
+          module_graph,
+          runtime_spec.as_ref(),
+          module_graph_cache,
+          side_effects_state_artifact,
+          exports_info_artifact,
+        );
+        Ok(match state {
+          ConnectionState::Active(active) => JsConnectionState::Bool(active),
+          ConnectionState::CircularConnection => JsConnectionState::CircularConnection,
+          ConnectionState::TransitiveOnly => JsConnectionState::TransitiveOnly,
+        })
+      } else {
+        Err(napi::Error::from_reason(format!(
+          "Unable to access ModuleGraphConnection with id = {:#?} now. The ModuleGraphConnection have been removed on the Rust side.",
+          self.connection_id
+        )))
+      }
+    })
+  }
+}
+
+type ModuleGraphConnectionRefs = FxHashMap<ModuleGraphConnectionId, OneShotRef>;
+
+type ModuleGraphConnectionRefsByCompilationId =
+  RefCell<FxHashMap<CompilationId, ModuleGraphConnectionRefs>>;
+
+thread_local! {
+  static MODULE_GRAPH_CONNECTION_INSTANCE_REFS: ModuleGraphConnectionRefsByCompilationId = Default::default();
+}
+
+pub struct ModuleGraphConnectionWrapper {
+  compilation_id: CompilationId,
+  dependency_id: DependencyId,
+  connection_id: ModuleGraphConnectionId,
+}
+
+impl ModuleGraphConnectionWrapper {
+  pub fn new(connection: &rspack_core::ModuleGraphConnection, compilation: &Compilation) -> Self {
+    Self {
+      dependency_id: connection.dependency_id,
+      connection_id: connection.id,
+      compilation_id: compilation.id(),
+    }
+  }
+
+  pub fn cleanup_last_compilation(compilation_id: CompilationId) {
+    MODULE_GRAPH_CONNECTION_INSTANCE_REFS.with(|refs| {
+      let mut refs_by_compilation_id = refs.borrow_mut();
+      refs_by_compilation_id.remove(&compilation_id)
+    });
+  }
+}
+
+impl ToNapiValue for ModuleGraphConnectionWrapper {
+  unsafe fn to_napi_value(
+    env: napi::sys::napi_env,
+    val: Self,
+  ) -> napi::Result<napi::sys::napi_value> {
+    unsafe {
+      MODULE_GRAPH_CONNECTION_INSTANCE_REFS.with(|refs| {
+        let mut refs_by_compilation_id = refs.borrow_mut();
+        let entry = refs_by_compilation_id.entry(val.compilation_id);
+        let refs = match entry {
+          std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+          std::collections::hash_map::Entry::Vacant(entry) => {
+            let refs = FxHashMap::default();
+            entry.insert(refs)
+          }
+        };
+
+        match refs.entry(val.connection_id) {
+          std::collections::hash_map::Entry::Occupied(occupied_entry) => {
+            let r = occupied_entry.get();
+            ToNapiValue::to_napi_value(env, r)
+          }
+          std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+            let js_dependency = ModuleGraphConnection {
+              compilation_id: val.compilation_id,
+              dependency_id: val.dependency_id,
+              connection_id: val.connection_id,
+            };
+            let r = vacant_entry.insert(OneShotRef::new(env, js_dependency)?);
+            ToNapiValue::to_napi_value(env, r)
+          }
+        }
+      })
+    }
+  }
+}

@@ -1,13 +1,11 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export default {
-	mode: "production",
-	entry: path.resolve(__dirname, "main.ts"),
-	output: {
-		path: path.resolve(__dirname, "dist"),
-		filename: "js.bundle.js"
-	}
+  mode: 'production',
+  entry: path.resolve(import.meta.dirname, 'main.ts'),
+  output: {
+    path: path.resolve(import.meta.dirname, 'dist'),
+    filename: 'js.bundle.js',
+  },
 };

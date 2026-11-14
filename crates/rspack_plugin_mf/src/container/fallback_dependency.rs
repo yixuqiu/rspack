@@ -1,18 +1,20 @@
+use rspack_cacheable::{cacheable, cacheable_dyn};
 use rspack_core::{
-  AsContextDependency, AsDependencyTemplate, Dependency, DependencyCategory, DependencyId,
-  DependencyType, ModuleDependency,
+  AsContextDependency, AsDependencyCodeGeneration, Dependency, DependencyCategory, DependencyId,
+  DependencyType, ModuleDependency, ResourceIdentifier,
 };
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct FallbackDependency {
   id: DependencyId,
-  resource_identifier: String,
+  resource_identifier: ResourceIdentifier,
   pub requests: Vec<String>,
 }
 
 impl FallbackDependency {
   pub fn new(requests: Vec<String>) -> Self {
-    let resource_identifier = format!("fallback {}", &requests.join(" "));
+    let resource_identifier = format!("fallback {}", &requests.join(" ")).into();
     Self {
       id: DependencyId::new(),
       resource_identifier,
@@ -21,11 +23,8 @@ impl FallbackDependency {
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for FallbackDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "FallbackDependency"
-  }
-
   fn id(&self) -> &DependencyId {
     &self.id
   }
@@ -41,8 +40,13 @@ impl Dependency for FallbackDependency {
   fn resource_identifier(&self) -> Option<&str> {
     Some(&self.resource_identifier)
   }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::Transitive
+  }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for FallbackDependency {
   fn request(&self) -> &str {
     &self.resource_identifier
@@ -50,4 +54,4 @@ impl ModuleDependency for FallbackDependency {
 }
 
 impl AsContextDependency for FallbackDependency {}
-impl AsDependencyTemplate for FallbackDependency {}
+impl AsDependencyCodeGeneration for FallbackDependency {}

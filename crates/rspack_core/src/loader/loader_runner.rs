@@ -1,23 +1,29 @@
 use std::sync::Arc;
 
-pub use rspack_loader_runner::{run_loaders, Content, Loader, LoaderContext};
+use rspack_fs::ReadableFileSystem;
+pub use rspack_loader_runner::{
+  CodeFilter, Content, Loader, LoaderContext, LoaderDependencies, LoaderExecutionKind,
+  LoaderFilter, LoaderRunnerOptions, run_loaders,
+};
 use rspack_util::source_map::SourceMapKind;
 
 use crate::{
-  cache::Cache, CompilerOptions, Context, ModuleIdentifier, ResolverFactory, SharedPluginDriver,
+  CompilationId, CompilerId, CompilerOptions, FileSystemInfo, LoaderCache, NormalModule,
+  ResolverFactory,
 };
 
-#[derive(Debug, Clone)]
-pub struct CompilerContext {
+#[derive(Debug)]
+pub struct RunnerContext {
+  pub compiler_id: CompilerId,
+  pub compilation_id: CompilationId,
   pub options: Arc<CompilerOptions>,
+  pub fs: Arc<dyn ReadableFileSystem>,
+  pub(crate) loader_cache: Option<Arc<LoaderCache>>,
+  pub(crate) loader_cache_counters: Arc<crate::CacheCounters>,
+  pub file_system_info: FileSystemInfo,
   pub resolver_factory: Arc<ResolverFactory>,
-  pub module: ModuleIdentifier,             // current module
-  pub module_context: Option<Box<Context>>, // current module context
-  pub module_source_map_kind: SourceMapKind,
-  pub plugin_driver: SharedPluginDriver,
-  pub cache: Arc<Cache>,
+  pub module: Box<NormalModule>,
+  pub source_map_kind: SourceMapKind,
 }
 
-pub type LoaderRunnerContext = CompilerContext;
-
-pub type BoxLoader = Arc<dyn Loader<LoaderRunnerContext>>;
+pub type BoxLoader = Arc<dyn for<'a> Loader<RunnerContext>>;

@@ -1,126 +1,135 @@
+use std::sync::Arc;
+
 use itertools::Itertools;
-use rspack_core::{ConstDependency, SpanExt};
+use rspack_core::ConstDependency;
+use rspack_util::{SpanExt, swc::AstSubRangeExt};
 use rustc_hash::FxHashSet;
-use swc_core::common::Spanned;
-use swc_core::ecma::ast::{BlockStmt, DoWhileStmt, ForHead, ForInStmt, ForOfStmt, Ident, IfStmt};
-use swc_core::ecma::ast::{LabeledStmt, ObjectPatProp, Pat, Stmt, VarDeclOrExpr, WhileStmt};
-use swc_core::ecma::ast::{VarDecl, VarDeclKind, VarDeclarator};
+use swc_next_ecma_ast::{
+  Ast, BindingPattern, BindingPatternData, GetSpan, IfStatement, NodeKindData, Stmt, VariableKind,
+};
 
 use crate::visitors::JavascriptParser;
 
-fn get_hoisted_declarations<'a>(
-  branch: &'a Stmt,
+fn collect_declaration_from_pattern<'a>(
+  ast: &'a Ast<'_>,
+  pattern: BindingPattern,
+  declarations: &mut FxHashSet<&'a str>,
+) {
+  let mut stack = vec![pattern];
+  while let Some(pattern) = stack.pop() {
+    match ast.binding_pattern_data(pattern) {
+      BindingPatternData::BindingIdentifier(identifier) => {
+        declarations.insert(ast.get_utf8(identifier.name(ast)));
+      }
+      BindingPatternData::AssignmentPattern(assignment) => stack.push(assignment.left(ast)),
+      BindingPatternData::BindingRestElement(rest) => stack.push(rest.argument(ast)),
+      BindingPatternData::ArrayPattern(array) => {
+        stack.extend(ast.nodes(array.elements(ast)).flatten());
+        if let Some(rest) = array.rest(ast) {
+          stack.push(rest.argument(ast));
+        }
+      }
+      BindingPatternData::ObjectPattern(object) => {
+        stack.extend(
+          ast
+            .nodes(object.properties(ast))
+            .map(|property| property.value(ast)),
+        );
+        if let Some(rest) = object.rest(ast) {
+          stack.push(rest.argument(ast));
+        }
+      }
+      BindingPatternData::SimpleAssignmentTarget(_) => {}
+    }
+  }
+}
+
+fn collect_variable_declaration<'a>(
+  ast: &'a Ast<'_>,
+  declaration: swc_next_ecma_ast::VariableDeclaration,
+  declarations: &mut FxHashSet<&'a str>,
+) {
+  if declaration.kind(ast) == VariableKind::Var {
+    for declarator in ast.nodes(declaration.declarators(ast)) {
+      collect_declaration_from_pattern(ast, declarator.id(ast), declarations);
+    }
+  }
+}
+
+/// Collects hoisted `var` and (in non-strict mode) function declaration identifiers.
+pub fn get_hoisted_declarations<'a>(
+  ast: &'a Ast<'_>,
+  stmt: Stmt,
   include_function_declarations: bool,
-) -> FxHashSet<&'a Ident> {
+) -> FxHashSet<&'a str> {
   let mut declarations = FxHashSet::default();
-  let mut stmt_stack = vec![branch];
+  let mut stmt_stack = vec![stmt];
 
-  let collect_declaration_from_ident =
-    |ident: &'a Ident, declarations: &mut FxHashSet<&'a Ident>| {
-      declarations.insert(ident);
-    };
-
-  let collect_declaration_from_pat = |pattern: &'a Pat, declarations: &mut FxHashSet<&'a Ident>| {
-    let mut stack = vec![pattern];
-    while let Some(node) = stack.pop() {
-      match node {
-        Pat::Ident(ident) => collect_declaration_from_ident(&ident.id, declarations),
-        Pat::Array(array) => {
-          for element in array.elems.iter().flatten() {
-            stack.push(element);
-          }
-        }
-        Pat::Assign(assign) => stack.push(&assign.left),
-        Pat::Object(object) => {
-          for property in &object.props {
-            match &property {
-              ObjectPatProp::KeyValue(key_value) => stack.push(&key_value.value),
-              ObjectPatProp::Assign(assign) => {
-                collect_declaration_from_ident(&assign.key, declarations)
-              }
-              ObjectPatProp::Rest(rest) => stack.push(&rest.arg),
-            }
-          }
-        }
-        Pat::Rest(rest) => stack.push(&rest.arg),
-        _ => {}
+  while let Some(statement) = stmt_stack.pop() {
+    match ast.kind_data(statement.node_id()) {
+      NodeKindData::BlockStatement(block) => {
+        stmt_stack.extend(ast.nodes(block.body(ast)));
       }
-    }
-  };
-
-  fn get_var_kind_decls(decl: &VarDecl) -> Option<&Vec<VarDeclarator>> {
-    matches!(decl.kind, VarDeclKind::Var).then_some(&decl.decls)
-  }
-
-  fn collect_from_block_stm<'b>(block: &'b BlockStmt, stack: &mut Vec<&'b Stmt>) {
-    for stmt in &block.stmts {
-      stack.push(stmt);
-    }
-  }
-
-  while let Some(node) = stmt_stack.pop() {
-    match node {
-      Stmt::Block(block) => {
-        collect_from_block_stm(block, &mut stmt_stack);
-      }
-      Stmt::If(r#if) => {
-        stmt_stack.push(&r#if.cons);
-        if let Some(alt) = &r#if.alt {
-          stmt_stack.push(alt);
+      NodeKindData::IfStatement(statement) => {
+        stmt_stack.push(statement.consequent(ast));
+        if let Some(alternate) = statement.alternate(ast) {
+          stmt_stack.push(alternate);
         }
       }
-      Stmt::For(r#for) => {
-        if let Some(init) = &r#for.init
-          && let VarDeclOrExpr::VarDecl(var_decl) = &init
-          && let Some(decls) = get_var_kind_decls(var_decl)
+      NodeKindData::ForStatement(statement) => {
+        if let Some(declaration) = statement
+          .init(ast)
+          .and_then(|init| init.as_variable_declaration(ast))
         {
-          for decl in decls {
-            collect_declaration_from_pat(&decl.name, &mut declarations);
-          }
+          collect_variable_declaration(ast, declaration, &mut declarations);
         }
-        stmt_stack.push(&r#for.body);
+        stmt_stack.push(statement.body(ast));
       }
-      Stmt::ForIn(ForInStmt { left, body, .. }) | Stmt::ForOf(ForOfStmt { left, body, .. }) => {
-        if let ForHead::VarDecl(var_decl) = &left {
-          for decl in &var_decl.decls {
-            collect_declaration_from_pat(&decl.name, &mut declarations);
-          }
+      NodeKindData::ForInStatement(statement) => {
+        if let Some(declaration) = statement.left(ast).as_variable_declaration(ast) {
+          collect_variable_declaration(ast, declaration, &mut declarations);
         }
-        stmt_stack.push(body);
+        stmt_stack.push(statement.body(ast));
       }
-      Stmt::DoWhile(DoWhileStmt { body, .. })
-      | Stmt::While(WhileStmt { body, .. })
-      | Stmt::Labeled(LabeledStmt { body, .. }) => {
-        stmt_stack.push(body);
-      }
-      Stmt::Switch(switch) => {
-        for cs in &switch.cases {
-          for consequent in &cs.cons {
-            stmt_stack.push(consequent);
-          }
+      NodeKindData::ForOfStatement(statement) => {
+        if let Some(declaration) = statement.left(ast).as_variable_declaration(ast) {
+          collect_variable_declaration(ast, declaration, &mut declarations);
         }
+        stmt_stack.push(statement.body(ast));
       }
-      Stmt::Try(r#try) => {
-        collect_from_block_stm(&r#try.block, &mut stmt_stack);
-        if let Some(handler) = &r#try.handler {
-          collect_from_block_stm(&handler.body, &mut stmt_stack);
-        }
-        if let Some(finalizer) = &r#try.finalizer {
-          collect_from_block_stm(finalizer, &mut stmt_stack);
+      NodeKindData::DoWhileStatement(statement) => {
+        stmt_stack.push(statement.body(ast));
+      }
+      NodeKindData::WhileStatement(statement) => {
+        stmt_stack.push(statement.body(ast));
+      }
+      NodeKindData::LabeledStatement(statement) => {
+        stmt_stack.push(statement.body(ast));
+      }
+      NodeKindData::SwitchStatement(statement) => {
+        for case in ast.nodes(statement.cases(ast)) {
+          stmt_stack.extend(ast.nodes(case.consequent(ast)));
         }
       }
-      Stmt::Decl(decl)
-        if let Some(r#fn) = decl.as_fn_decl()
-          && include_function_declarations =>
+      NodeKindData::TryStatement(statement) => {
+        stmt_stack.extend(ast.nodes(statement.block(ast).body(ast)));
+        if let Some(handler) = statement.handler(ast) {
+          stmt_stack.extend(ast.nodes(handler.body(ast).body(ast)));
+        }
+        if let Some(finalizer) = statement.finalizer(ast) {
+          stmt_stack.extend(ast.nodes(finalizer.body(ast)));
+        }
+      }
+      NodeKindData::Function(function) if include_function_declarations => {
+        if let Some(identifier) = function.id(ast) {
+          declarations.insert(ast.get_utf8(identifier.name(ast)));
+        }
+      }
+      NodeKindData::VariableDeclaration(declaration)
+        if declaration.kind(ast) == VariableKind::Var =>
       {
-        collect_declaration_from_ident(&r#fn.ident, &mut declarations);
-      }
-      Stmt::Decl(decl)
-        if let Some(var) = decl.as_var()
-          && let Some(decls) = get_var_kind_decls(var) =>
-      {
-        for decl in decls {
-          collect_declaration_from_pat(&decl.name, &mut declarations);
+        for declarator in ast.nodes(declaration.declarators(ast)) {
+          collect_declaration_from_pattern(ast, declarator.id(ast), &mut declarations);
         }
       }
       _ => {}
@@ -130,53 +139,41 @@ fn get_hoisted_declarations<'a>(
   declarations
 }
 
-pub fn statement_if(scanner: &mut JavascriptParser, stmt: &IfStmt) -> Option<bool> {
-  let param = scanner.evaluate_expression(&stmt.test);
-  let Some(boolean) = param.as_bool() else {
-    return None;
-  };
+pub fn statement_if<'p>(
+  scanner: &mut JavascriptParser<'p>,
+  statement: IfStatement,
+) -> Option<bool> {
+  let ast = scanner.ast.ast;
+  let param = scanner.evaluate_expression(statement.test(ast));
+  let boolean = param.as_bool()?;
   if !param.could_have_side_effects() {
-    scanner
-      .presentational_dependencies
-      .push(Box::new(ConstDependency::new(
-        param.range().0,
-        param.range().1 - 1,
-        boolean.to_string().into_boxed_str(),
-        None,
-      )));
+    scanner.add_presentational_dependency(Arc::new(ConstDependency::new(
+      param.range().into(),
+      boolean.to_string().into_boxed_str(),
+    )));
   } else {
-    scanner.walk_expression(&stmt.test);
+    scanner.walk_expression(statement.test(ast));
   }
 
   let branch_to_remove = if boolean {
-    stmt.alt.as_ref()
+    statement.alternate(ast)
   } else {
-    Some(&stmt.cons)
+    Some(statement.consequent(ast))
   };
 
   if let Some(branch_to_remove) = branch_to_remove {
-    let declarations = if scanner.is_strict() {
-      get_hoisted_declarations(branch_to_remove, false)
-    } else {
-      get_hoisted_declarations(branch_to_remove, true)
-    };
+    let declarations = get_hoisted_declarations(ast, branch_to_remove, !scanner.is_strict());
     let replacement = if declarations.is_empty() {
       "{}".to_string()
     } else {
-      format!(
-        "{{ var {} }}",
-        declarations.iter().map(|decl| decl.sym.as_str()).join(", ")
-      )
+      format!("{{ var {} }}", declarations.iter().join(", "))
     };
 
-    scanner
-      .presentational_dependencies
-      .push(Box::new(ConstDependency::new(
-        branch_to_remove.span().real_lo(),
-        branch_to_remove.span().hi().0 - 1,
-        replacement.into_boxed_str(),
-        None,
-      )))
+    let span = branch_to_remove.span(ast);
+    scanner.add_presentational_dependency(Arc::new(ConstDependency::new(
+      (span.real_lo(), span.real_hi()).into(),
+      replacement.into_boxed_str(),
+    )))
   }
   Some(boolean)
 }

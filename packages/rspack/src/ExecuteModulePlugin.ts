@@ -1,59 +1,89 @@
-import { RuntimeGlobals } from ".";
-import type { Compiler } from "./Compiler";
-import vm from "node:vm";
+import { createRequire } from 'node:module';
+import type { Compiler } from './Compiler';
+import { RuntimeVariable, renderRuntimeVariables } from './RuntimeGlobals';
+
+const require = createRequire(import.meta.url);
 
 export default class ExecuteModulePlugin {
-	constructor() {}
+  apply(compiler: Compiler) {
+    compiler.hooks.thisCompilation.tap('executeModule', (compilation) => {
+      // remove execution results every new compilation
+      const map = compiler.__internal__get_module_execution_results_map();
+      map.clear();
 
-	apply(compiler: Compiler) {
-		compiler.hooks.compilation.tap("executeModule", compilation => {
-			compilation.hooks.executeModule.tap(
-				"executeModule",
-				(options, context) => {
-					const moduleObject = options.moduleObject;
-					const source = options.codeGenerationResult.get("javascript");
-					try {
-						const fn = vm.runInThisContext(
-							`(function(module, __webpack_module__, __webpack_exports__, exports, ${RuntimeGlobals.require}) {\n${source}\n})`,
-							{
-								filename: moduleObject.id
-							}
-						);
+      compilation.hooks.executeModule.tap(
+        'executeModule',
+        (options, context) => {
+          const vm = require('node:vm');
+          const moduleObject = options.moduleObject;
+          const source = options.codeGenerationResult.get('javascript');
+          if (source === undefined) return;
+          const code = source;
 
-						fn.call(
-							moduleObject.exports,
-							moduleObject,
-							moduleObject,
-							moduleObject.exports,
-							moduleObject.exports,
-							context.__webpack_require__
-						);
-					} catch (e: any) {
-						let err = e instanceof Error ? e : new Error(e);
+          try {
+            const isRspackRuntimeMode =
+              compiler.options.experiments?.runtimeMode === 'rspack';
+            const moduleArgument = renderRuntimeVariables(
+              RuntimeVariable.Module,
+              compiler.options,
+            );
+            const exportsArgument = renderRuntimeVariables(
+              RuntimeVariable.Exports,
+              compiler.options,
+            );
+            const requireArgument = renderRuntimeVariables(
+              RuntimeVariable.Require,
+              compiler.options,
+            );
+            const runtimeContextArgument = renderRuntimeVariables(
+              RuntimeVariable.Context,
+              compiler.options,
+            );
+            const runtimeContext = context[runtimeContextArgument];
+            const runtimeModeArguments = isRspackRuntimeMode
+              ? `, ${runtimeContextArgument}`
+              : '';
+            const fn = vm.runInThisContext(
+              `(function(module, ${moduleArgument}, ${exportsArgument}, exports, ${requireArgument}${runtimeModeArguments}) {\n${code}\n})`,
+              {
+                filename: moduleObject.id,
+              },
+            );
 
-						err.stack += printGeneratedCodeForStack(moduleObject.id, source);
-						throw err;
-					}
-				}
-			);
-		});
-	}
+            fn.call(
+              moduleObject.exports,
+              moduleObject,
+              moduleObject,
+              moduleObject.exports,
+              moduleObject.exports,
+              context[requireArgument],
+              runtimeContext,
+            );
+          } catch (e: any) {
+            const err = e instanceof Error ? e : new Error(e);
+
+            err.stack += printGeneratedCodeForStack(moduleObject.id, code);
+            throw err;
+          }
+        },
+      );
+    });
+  }
 }
 const printGeneratedCodeForStack = (moduleId: string, code: string) => {
-	const lines = code.split("\n");
-	const n = `${lines.length}`.length;
-	return `\n\nGenerated code for ${moduleId}\n${lines
-		.map(
-			/**
-			 * @param {string} line the line
-			 * @param {number} i the index
-			 * @param {string[]} lines the lines
-			 * @returns {string} the line with line number
-			 */
-			(line, i, lines) => {
-				const iStr = `${i + 1}`;
-				return `${" ".repeat(n - iStr.length)}${iStr} | ${line}`;
-			}
-		)
-		.join("\n")}`;
+  const lines = code.split('\n');
+  const n = `${lines.length}`.length;
+  return `\n\nGenerated code for ${moduleId}\n${lines
+    .map(
+      /**
+       * @param {string} line the line
+       * @param {number} i the index
+       * @returns {string} the line with line number
+       */
+      (line, i) => {
+        const iStr = `${i + 1}`;
+        return `${' '.repeat(n - iStr.length)}${iStr} | ${line}`;
+      },
+    )
+    .join('\n')}`;
 };

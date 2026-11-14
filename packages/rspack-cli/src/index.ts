@@ -1,2 +1,2 @@
-export * from "./types";
-export { RspackCLI, defineConfig, definePlugin } from "./rspack-cli";
+export { defineConfig, definePlugin, RspackCLI } from './cli';
+export * from './types';

@@ -1,31 +1,37 @@
+mod boxfs;
 mod factory;
+mod resolver_cache;
 mod resolver_impl;
-use std::borrow::Borrow;
-use std::fs;
-use std::{fmt, path::PathBuf};
+use std::{
+  borrow::Borrow,
+  fmt,
+  sync::{Arc, LazyLock},
+};
 
-use once_cell::sync::Lazy;
 use regex::Regex;
-use rspack_error::{Error, MietteExt};
-use rspack_loader_runner::DescriptionData;
-use rustc_hash::FxHashSet;
+use rspack_cacheable::{cacheable, with::AsPreset};
+use rspack_error::Error;
+use rspack_fs::ReadableFileSystem;
+use rspack_loader_runner::{DescriptionData, ResourceData};
+use rspack_paths::{AssertUtf8, Utf8PathBuf};
+use rspack_util::identifier::format_resolved_resource;
 use sugar_path::SugarPath;
 
-pub use self::factory::{ResolveOptionsWithDependencyType, ResolverFactory};
-pub use self::resolver_impl::{ResolveInnerOptions, Resolver};
+pub use self::{
+  factory::{ResolveOptionsWithDependencyType, ResolverFactory},
+  resolver_cache::ResolverCache,
+  resolver_impl::{ResolveDependencies, ResolveInnerError, ResolveInnerOptions, Resolver},
+};
 use crate::{
-  Context, DependencyCategory, DependencyType, ErrorSpan, ModuleIdentifier, Resolve,
+  Context, DependencyCategory, DependencyRange, DependencyType, ModuleIdentifier, Resolve,
   SharedPluginDriver,
 };
 
-static RELATIVE_PATH_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^\.\.?\/").expect("should init regex"));
+static RELATIVE_PATH_REGEX: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"^\.\.?\/").expect("should init regex"));
 
-static PARENT_PATH_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^\.\.[\/]").expect("should init regex"));
-
-static CURRENT_DIR_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^(\.[\/])").expect("should init regex"));
+static CURRENT_DIR_REGEX: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"^(\.[\/])").expect("should init regex"));
 
 #[derive(Debug)]
 pub struct ResolveArgs<'a> {
@@ -35,15 +41,14 @@ pub struct ResolveArgs<'a> {
   pub specifier: &'a str,
   pub dependency_type: &'a DependencyType,
   pub dependency_category: &'a DependencyCategory,
-  pub span: Option<ErrorSpan>,
-  pub resolve_options: Option<Box<Resolve>>,
+  pub span: Option<DependencyRange>,
+  pub resolve_options: Option<Arc<Resolve>>,
   pub resolve_to_context: bool,
   pub optional: bool,
-  pub file_dependencies: &'a mut FxHashSet<PathBuf>,
-  pub missing_dependencies: &'a mut FxHashSet<PathBuf>,
 }
 
 /// A successful path resolution or an ignored path.
+#[cacheable]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ResolveResult {
   Resource(Resource),
@@ -53,9 +58,11 @@ pub enum ResolveResult {
 /// A successful path resolution.
 ///
 /// Contains the raw `package.json` value if there is one.
+#[cacheable]
 #[derive(Clone)]
 pub struct Resource {
-  pub path: PathBuf,
+  #[cacheable(with=AsPreset)]
+  pub path: Utf8PathBuf,
   pub query: String,
   pub fragment: String,
   pub description_data: Option<DescriptionData>,
@@ -76,20 +83,29 @@ impl Eq for Resource {}
 
 impl Resource {
   /// Get the full path with query and fragment attached.
-  pub fn full_path(&self) -> PathBuf {
-    let mut buf = format!("{}", self.path.display());
-    buf.push_str(&self.query);
-    buf.push_str(&self.fragment);
-    PathBuf::from(buf)
+  pub fn full_path(&self) -> String {
+    format_resolved_resource(self.path.as_str(), &self.query, &self.fragment)
   }
 }
 
-pub fn resolve_for_error_hints(
+impl From<Resource> for ResourceData {
+  fn from(resource: Resource) -> Self {
+    let mut resource_data =
+      Self::new_with_resolved_path(resource.path, resource.query, resource.fragment);
+    resource_data.set_description_optional(resource.description_data);
+    resource_data
+  }
+}
+
+pub async fn resolve_for_error_hints(
   args: ResolveArgs<'_>,
   plugin_driver: &SharedPluginDriver,
+  fs: Arc<dyn ReadableFileSystem>,
 ) -> Option<String> {
   let dep = ResolveOptionsWithDependencyType {
-    resolve_options: args.resolve_options.clone(),
+    resolve_options: args
+      .resolve_options
+      .map(|r| Box::new(Arc::unwrap_or_clone(r))),
     resolve_to_context: args.resolve_to_context,
     dependency_category: *args.dependency_category,
   };
@@ -117,37 +133,38 @@ pub fn resolve_for_error_hints(
       options
     });
     let resolver = plugin_driver.resolver_factory.get(dep);
-    match resolver.resolve(base_dir, args.specifier) {
-      Ok(ResolveResult::Resource(resource)) => {
-        let relative_path = resource.path.relative(args.context);
-        let suggestion = if let Some((_, [prefix])) = CURRENT_DIR_REGEX
-          .captures_iter(args.specifier)
-          .next()
-          .map(|c| c.extract())
-        {
-          // If the specifier is a relative path pointing to the current directory,
-          // we can suggest the path relative to the current directory.
-          format!("{}{}", prefix, relative_path.to_string_lossy())
-        } else if PARENT_PATH_REGEX.is_match(args.specifier) {
-          // If the specifier is a relative path to which the parent directory is,
-          // then we return the relative path directly.
-          relative_path.to_string_lossy().to_string()
-        } else {
-          // If the specifier is a package name like or some arbitrary alias,
-          // then we return the full path.
-          resource.path.to_string_lossy().to_string()
-        };
-        return Some(format!("Did you mean '{}'?
+    if let Ok(ResolveResult::Resource(resource)) = resolver.resolve(base_dir, args.specifier).await
+    {
+      let relative_path = resource
+        .path
+        .as_std_path()
+        .relative(args.context)
+        .assert_utf8();
+      let suggestion = if let Some((_, [prefix])) = CURRENT_DIR_REGEX
+        .captures_iter(args.specifier)
+        .next()
+        .map(|c| c.extract())
+      {
+        // If the specifier is a relative path pointing to the current directory,
+        // we can suggest the path relative to the current directory.
+        format!("{prefix}{relative_path}")
+      } else if args.specifier.starts_with("../") || args.specifier.starts_with("..\\") {
+        // If the specifier is a relative path to which the parent directory is,
+        // then we return the relative path directly.
+        relative_path.as_str().to_string()
+      } else {
+        // If the specifier is a package name like or some arbitrary alias,
+        // then we return the full path.
+        resource.path.as_str().to_string()
+      };
+      return Some(format!("Did you mean '{}'?
 
 The request '{}' failed to resolve only because it was resolved as fully specified,
-probably because the origin is strict EcmaScript Module,
+probably because the origin is strict ECMAScript Module,
 e. g. a module with javascript mimetype, a '*.mjs' file, or a '*.js' file where the package.json contains '\"type\": \"module\"'.
 
 The extension in the request is mandatory for it to be fully specified.
 Add the extension to the request.", suggestion, args.specifier));
-      }
-      Err(_) => return None,
-      _ => {}
     }
   }
 
@@ -168,9 +185,8 @@ Add the extension to the request.", suggestion, args.specifier));
     };
     let resolver = plugin_driver.resolver_factory.get(dep);
     let request = format!("./{}", args.specifier);
-    match resolver.resolve(base_dir, &request) {
-      Ok(ResolveResult::Resource(_)) => {
-        return Some(format!(
+    if resolver.resolve(base_dir, &request).await.is_ok() {
+      return Some(format!(
           "Did you mean './{}'?
 
 Requests that should resolve in the current directory need to start with './'.
@@ -180,9 +196,6 @@ If changing the source code is not an option, there is also a resolve options ca
 which tries to resolve these kind of requests in the current directory too.",
           args.specifier
         ));
-      }
-      Err(_) => return None,
-      _ => {}
     }
   }
 
@@ -194,10 +207,13 @@ which tries to resolve these kind of requests in the current directory too.",
     let mut is_resolving_dir = false; // whether the request is to resolve a directory or not
 
     let file_name = normalized_path.file_name();
-    let parent_path = match fs::metadata(&normalized_path) {
+    let utf8_normalized_path = Utf8PathBuf::from_path_buf(normalized_path.to_path_buf())
+      .expect("should be a valid utf8 path");
+
+    let parent_path = match fs.metadata(&utf8_normalized_path).await {
       Ok(metadata) => {
         // if the path is not directory, we need to resolve the parent directory
-        if !metadata.is_dir() {
+        if !metadata.is_directory {
           normalized_path.parent()
         } else {
           is_resolving_dir = true;
@@ -207,77 +223,69 @@ which tries to resolve these kind of requests in the current directory too.",
       Err(_) => normalized_path.parent(),
     };
 
-    if file_name.is_some() && parent_path.is_some() {
-      let file_name = file_name.expect("fail to get the filename of the current resolved module");
-      let parent_path =
-        parent_path.expect("fail to get the parent path of the current resolved module");
-
+    if let Some(file_name) = file_name
+      && let Some(parent_path) =
+        parent_path.and_then(|path| Utf8PathBuf::from_path_buf(path.to_path_buf()).ok())
+    {
       // read the files in the parent directory
-      let files = fs::read_dir(parent_path);
-      match files {
-        Ok(files) => {
-          let mut requested_names = vec![file_name
+      if let Ok(files) = fs.read_dir(&parent_path).await {
+        let mut requested_names = vec![
+          file_name
             .to_str()
             .map(|f| f.to_string())
-            .unwrap_or_default()];
-          if is_resolving_dir {
-            // The request maybe is like `./` or `./dir` to resolve the main file (e.g.: index) in directory
-            // So we need to check them.
-            let main_files = dep
-              .resolve_options
-              .as_deref()
-              .or(Some(&plugin_driver.options.resolve))
-              .and_then(|o| o.main_files.as_ref().cloned())
-              .unwrap_or_default();
+            .unwrap_or_default(),
+        ];
+        if is_resolving_dir {
+          // The request maybe is like `./` or `./dir` to resolve the main file (e.g.: index) in directory
+          // So we need to check them.
+          let main_files = dep
+            .resolve_options
+            .as_deref()
+            .or(Some(&plugin_driver.options.resolve))
+            .and_then(|o| o.main_files.as_ref().cloned())
+            .unwrap_or_default();
 
-            requested_names.extend(main_files);
-          }
+          requested_names.extend(main_files);
+        }
 
-          let suggestions = files
-            .into_iter()
-            .filter_map(|file| {
-              file.ok().and_then(|file| {
-                file.path().file_stem().and_then(|file_stem| {
-                  if requested_names.contains(&file_stem.to_string_lossy().to_string()) {
-                    let mut suggestion = file.path().relative(&args.context);
+        let suggestions = files
+          .into_iter()
+          .filter_map(|file| {
+            let path = parent_path.join(file);
+            path.file_stem().and_then(|file_stem| {
+              if requested_names.contains(&file_stem.to_string()) {
+                let mut suggestion = path.as_std_path().relative(&args.context).assert_utf8();
 
-                    if !suggestion.to_string_lossy().starts_with('.') {
-                      suggestion = PathBuf::from(format!("./{}", suggestion.to_string_lossy()));
-                    }
-                    Some(suggestion)
-                  } else {
-                    None
-                  }
-                })
-              })
+                if !suggestion.as_str().starts_with('.') {
+                  suggestion = Utf8PathBuf::from(format!("./{suggestion}"));
+                }
+                Some(suggestion)
+              } else {
+                None
+              }
             })
-            .collect::<Vec<_>>();
+          })
+          .collect::<Vec<_>>();
 
-          if suggestions.is_empty() {
-            return None;
-          }
+        if suggestions.is_empty() {
+          return None;
+        }
 
-          let mut hint: Vec<String> = vec![];
-          for suggestion in suggestions {
-            let suggestion_ext = suggestion
-              .extension()
-              .map(|e| e.to_string_lossy())
-              .unwrap_or_default();
-            let suggestion_path = suggestion.to_string_lossy();
-            let specifier = args.specifier;
+        let mut hint: Vec<String> = vec![];
+        for suggestion in suggestions {
+          let suggestion_ext = suggestion.extension().unwrap_or_default();
+          let specifier = args.specifier;
 
-            hint.push(format!(
-          "Found module '{suggestion_path}'. However, it's not possible to request this module without the extension 
+          hint.push(format!(
+          "Found module '{suggestion}'. However, it's not possible to request this module without the extension 
 if its extension was not listed in the `resolve.extensions`. Here're some possible solutions:
 
 1. add the extension `\".{suggestion_ext}\"` to `resolve.extensions` in your rspack configuration
-2. use '{suggestion_path}' instead of '{specifier}'
+2. use '{suggestion}' instead of '{specifier}'
 "));
-          }
-
-          return Some(hint.join("\n"));
         }
-        Err(_) => return None,
+
+        return Some(hint.join("\n"));
       }
     }
   }
@@ -286,32 +294,54 @@ if its extension was not listed in the `resolve.extensions`. Here're some possib
 }
 
 /// Main entry point for module resolution.
+// #[tracing::instrument(err, "resolve", skip_all, fields(
+//     resolve.specifier = args.specifier,
+//     resolve.importer = ?args.importer,
+//     resolve.context = ?args.context,
+//     resolve.dependency_type = ?args.dependency_type,
+//     resolve.dependency_category = ?args.dependency_category
+//   ),
+//   level = "trace"
+// )]
 pub async fn resolve(
   args: ResolveArgs<'_>,
   plugin_driver: &SharedPluginDriver,
-) -> Result<ResolveResult, Error> {
+) -> (Result<ResolveResult, Error>, ResolveDependencies) {
   let dep = ResolveOptionsWithDependencyType {
-    resolve_options: args.resolve_options.clone(),
+    resolve_options: args
+      .resolve_options
+      .clone()
+      .map(|r| Box::new(Arc::unwrap_or_clone(r))),
     resolve_to_context: args.resolve_to_context,
     dependency_category: *args.dependency_category,
   };
 
-  let mut context = Default::default();
   let resolver = plugin_driver.resolver_factory.get(dep);
-  let mut result = resolver
-    .resolve_with_context(args.context.as_ref(), args.specifier, &mut context)
-    .map_err(|error| error.into_resolve_error(&args));
+  let (result, dependencies) = resolver
+    .resolve_with_context(args.context.as_ref(), args.specifier)
+    .await;
+  let mut result = result.map_err(|error| error.into_resolve_error(&args));
 
-  args.file_dependencies.extend(context.file_dependencies);
-  args
-    .missing_dependencies
-    .extend(context.missing_dependencies);
+  if let Err(ref err) = result {
+    tracing::error!(
+      specifier = args.specifier,
+      importer = ?args.importer,
+      context = %args.context,
+      dependency_type = %args.dependency_type,
+      dependency_category = %args.dependency_category,
+      "Resolve error: {}",
+      err.to_string()
+    );
+  }
 
   if result.is_err()
-    && let Some(hint) = resolve_for_error_hints(args, plugin_driver)
+    && let Some(hint) = resolve_for_error_hints(args, plugin_driver, resolver.inner_fs()).await
   {
-    result = result.map_err(|err| err.with_help(hint))
+    result = result.map_err(|mut err| {
+      err.help = Some(hint);
+      err
+    })
   };
 
-  result.map_err(Error::new_boxed)
+  (result, dependencies)
 }

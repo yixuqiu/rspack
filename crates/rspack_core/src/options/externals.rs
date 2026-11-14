@@ -1,11 +1,11 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use futures::future::BoxFuture;
 use rspack_error::Result;
 use rspack_regex::RspackRegex;
 use rustc_hash::FxHashMap as HashMap;
 
-pub type Externals = Vec<ExternalItem>;
+use crate::{ResolveOptionsWithDependencyType, ResolverFactory};
 
 #[derive(Debug)]
 pub enum ExternalItemValue {
@@ -17,10 +17,18 @@ pub enum ExternalItemValue {
 
 pub type ExternalItemObject = HashMap<String, ExternalItemValue>;
 
+pub struct ContextInfo {
+  pub issuer: String,
+  pub issuer_layer: Option<String>,
+}
+
 pub struct ExternalItemFnCtx {
   pub request: String,
   pub context: String,
   pub dependency_type: String,
+  pub context_info: ContextInfo,
+  pub resolve_options_with_dependency_type: ResolveOptionsWithDependencyType,
+  pub resolver_factory: Arc<ResolverFactory>,
 }
 
 pub struct ExternalItemFnResult {
@@ -33,8 +41,11 @@ type ExternalItemFn =
 
 pub enum ExternalItem {
   Object(ExternalItemObject),
+  ByLayer(HashMap<String, ExternalItemObject>),
   String(String),
   RegExp(RspackRegex),
+  /// Synchronous request matcher for built-in external presets.
+  RequestPredicate(fn(&str) -> bool),
   Fn(ExternalItemFn),
 }
 
@@ -42,8 +53,10 @@ impl std::fmt::Debug for ExternalItem {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       Self::Object(v) => f.debug_tuple("Object").field(v).finish(),
+      Self::ByLayer(v) => f.debug_tuple("ByLayer").field(v).finish(),
       Self::String(v) => f.debug_tuple("String").field(v).finish(),
       Self::RegExp(v) => f.debug_tuple("RegExp").field(v).finish(),
+      Self::RequestPredicate(_) => f.debug_tuple("RequestPredicate").field(&"...").finish(),
       Self::Fn(_) => f.debug_tuple("Fn").field(&"...").finish(),
     }
   }

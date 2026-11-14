@@ -1,101 +1,149 @@
 use std::{
   fmt,
+  hash::{Hash, Hasher},
   path::{Path, PathBuf},
   sync::Arc,
 };
 
-use rspack_error::{
-  miette::{diagnostic, Diagnostic},
-  DiagnosticExt, Severity, TraceableError,
-};
+use futures::future::BoxFuture;
+use parking_lot::RwLock;
+use rspack_cacheable::cacheable;
+use rspack_error::{Error, Severity, cyan, yellow};
+use rspack_fs::ReadableFileSystem;
 use rspack_loader_runner::DescriptionData;
-use rustc_hash::FxHashSet as HashSet;
+use rspack_paths::{AssertUtf8, InternedPathSet};
+use rspack_util::location::byte_line_column_to_offset;
+use rustc_hash::FxHasher;
 
-use super::{ResolveResult, Resource};
-use crate::{AliasMap, DependencyCategory, Resolve, ResolveArgs, ResolveOptionsWithDependencyType};
+use super::{ResolveResult, Resource, boxfs::BoxFS};
+use crate::{
+  Alias, AliasMap, DependencyCategory, Resolve, ResolveArgs, ResolveOptionsWithDependencyType,
+  ResolverCache,
+};
 
+/// Cloning returns independent dependency collections to each cache caller while sharing paths.
+#[cacheable]
 #[derive(Debug, Default, Clone)]
-pub struct ResolveContext {
-  /// Files that was found on file system
-  pub file_dependencies: HashSet<PathBuf>,
-  /// Dependencies that was not found on file system
-  pub missing_dependencies: HashSet<PathBuf>,
+pub struct ResolveDependencies {
+  /// Files that were found on file system; entries carry the precomputed
+  /// `FxHash` from `rspack_resolver`.
+  pub file_dependencies: InternedPathSet,
+  /// Dependencies that were not found on file system; entries carry the
+  /// precomputed `FxHash` from `rspack_resolver`.
+  pub missing_dependencies: InternedPathSet,
 }
 
-/// Proxy to [nodejs_resolver::Error] or [oxc_resolver::ResolveError]
+/// Proxy to [nodejs_resolver::Error] or [rspack_resolver::ResolveError]
 #[derive(Debug)]
 pub enum ResolveInnerError {
-  OxcResolver(oxc_resolver::ResolveError),
+  RspackResolver(rspack_resolver::ResolveError),
 }
 
-/// Proxy to [oxc_resolver::ResolveOptions]
-pub enum ResolveInnerOptions<'a> {
-  OxcResolver(&'a oxc_resolver::ResolveOptions),
-}
-
-impl<'a> fmt::Debug for ResolveInnerOptions<'a> {
+impl fmt::Display for ResolveInnerError {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
     match self {
-      Self::OxcResolver(options) => {
-        write!(f, "{:?}", options)
+      Self::RspackResolver(error) => write!(f, "{error:?}"),
+    }
+  }
+}
+
+/// Proxy to [rspack_resolver::ResolveOptions]
+pub enum ResolveInnerOptions<'a> {
+  RspackResolver(&'a rspack_resolver::ResolveOptions),
+}
+
+impl fmt::Debug for ResolveInnerOptions<'_> {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    match self {
+      Self::RspackResolver(options) => {
+        write!(f, "{options:?}")
       }
     }
   }
 }
 
-impl<'a> ResolveInnerOptions<'a> {
+impl ResolveInnerOptions<'_> {
   pub fn is_enforce_extension_enabled(&self) -> bool {
     match self {
-      Self::OxcResolver(options) => matches!(
+      Self::RspackResolver(options) => matches!(
         options.enforce_extension,
-        oxc_resolver::EnforceExtension::Enabled
+        rspack_resolver::EnforceExtension::Enabled
       ),
     }
   }
 
   pub fn extensions(&self) -> impl Iterator<Item = &String> {
     match self {
-      Self::OxcResolver(options) => options.extensions.iter(),
+      Self::RspackResolver(options) => options.extensions.iter(),
     }
   }
 
   pub fn main_files(&self) -> impl Iterator<Item = &String> {
     match self {
-      Self::OxcResolver(options) => options.main_files.iter(),
+      Self::RspackResolver(options) => options.main_files.iter(),
     }
   }
 
   pub fn modules(&self) -> impl Iterator<Item = &String> {
     match self {
-      Self::OxcResolver(options) => options.modules.iter(),
+      Self::RspackResolver(options) => options.modules.iter(),
+    }
+  }
+
+  /// Whether a `resolve.alias` key applies to `request`, using the resolver's
+  /// matching rules: `key$` matches exactly, other keys match `key` or `key/...`.
+  pub fn has_alias_for(&self, request: &str) -> bool {
+    match self {
+      Self::RspackResolver(options) => {
+        options
+          .alias
+          .iter()
+          .any(|(key, _)| match key.strip_suffix('$') {
+            Some(key) => request == key,
+            None => request
+              .strip_prefix(key.as_str())
+              .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '\\'])),
+          })
+      }
     }
   }
 }
 
-/// Proxy to [oxc_resolver::Resolver]
+/// Proxy to [rspack_resolver::Resolver]
 ///
 /// Internal caches are shared.
 #[derive(Debug)]
-pub enum Resolver {
-  OxcResolver(oxc_resolver::Resolver),
+pub struct Resolver {
+  inner_fs: Arc<dyn ReadableFileSystem>,
+  resolver: rspack_resolver::ResolverGeneric<BoxFS>,
+  options_key: u64,
+  // Shared by all resolvers derived from the same factory, including existing instances.
+  cache: Arc<RwLock<Option<ResolverCache>>>,
 }
 
 impl Resolver {
-  pub fn new(options: Resolve) -> Self {
-    Self::new_oxc_resolver(options)
+  pub fn new(options: Resolve, fs: Arc<dyn ReadableFileSystem>) -> Self {
+    Self::new_rspack_resolver(options, fs)
   }
 
-  fn new_oxc_resolver(options: Resolve) -> Self {
-    let options = to_oxc_resolver_options(options, false, DependencyCategory::Unknown);
-    let resolver = oxc_resolver::Resolver::new(options);
-    Self::OxcResolver(resolver)
+  fn new_rspack_resolver(options: Resolve, fs: Arc<dyn ReadableFileSystem>) -> Self {
+    let mut hasher = FxHasher::default();
+    options.hash(&mut hasher);
+    let options_key = hasher.finish();
+    let options = to_rspack_resolver_options(options, false, DependencyCategory::Unknown);
+    let boxfs = BoxFS::new(fs.clone());
+    let resolver = rspack_resolver::ResolverGeneric::new_with_file_system(boxfs, options);
+    Self {
+      inner_fs: fs,
+      resolver,
+      options_key,
+      cache: Default::default(),
+    }
   }
 
   /// Clear cache for all resolver instances
   pub fn clear_cache(&self) {
-    match self {
-      Self::OxcResolver(resolver) => resolver.clear_cache(),
-    }
+    self.resolver.clear_cache();
   }
 
   /// Create a new resolver by cloning its internal cache.
@@ -104,111 +152,171 @@ impl Resolver {
     options: Resolve,
     options_with_dependency_type: &ResolveOptionsWithDependencyType,
   ) -> Self {
-    match self {
-      Self::OxcResolver(resolver) => {
-        let options = to_oxc_resolver_options(
-          options,
-          options_with_dependency_type.resolve_to_context,
-          options_with_dependency_type.dependency_category,
-        );
-        let resolver = resolver.clone_with_options(options);
-        Self::OxcResolver(resolver)
-      }
+    let mut hasher = FxHasher::default();
+    options.hash(&mut hasher);
+    options_with_dependency_type
+      .resolve_to_context
+      .hash(&mut hasher);
+    options_with_dependency_type
+      .dependency_category
+      .hash(&mut hasher);
+    let options_key = hasher.finish();
+    let resolver = &self.resolver;
+    let options = to_rspack_resolver_options(
+      options,
+      options_with_dependency_type.resolve_to_context,
+      options_with_dependency_type.dependency_category,
+    );
+
+    let resolver = resolver.clone_with_options(options);
+    Self {
+      inner_fs: self.inner_fs.clone(),
+      resolver,
+      options_key,
+      cache: Arc::clone(&self.cache),
     }
+  }
+
+  pub fn set_resolver_cache(&self, cache: Option<ResolverCache>) {
+    *self.cache.write() = cache;
   }
 
   /// Return the options from the resolver
   pub fn options(&self) -> ResolveInnerOptions<'_> {
-    match self {
-      Self::OxcResolver(resolver) => ResolveInnerOptions::OxcResolver(resolver.options()),
-    }
+    ResolveInnerOptions::RspackResolver(self.resolver.options())
   }
 
   /// Resolve a specifier to a given path.
-  pub fn resolve(&self, path: &Path, request: &str) -> Result<ResolveResult, ResolveInnerError> {
-    match self {
-      Self::OxcResolver(resolver) => match resolver.resolve(path, request) {
-        Ok(r) => Ok(ResolveResult::Resource(Resource {
-          path: r.path().to_path_buf(),
-          query: r.query().unwrap_or_default().to_string(),
-          fragment: r.fragment().unwrap_or_default().to_string(),
-          description_data: r
-            .package_json()
-            .map(|d| DescriptionData::new(d.directory().to_path_buf(), Arc::clone(d.raw_json()))),
-        })),
-        Err(oxc_resolver::ResolveError::Ignored(_)) => Ok(ResolveResult::Ignored),
-        Err(error) => Err(ResolveInnerError::OxcResolver(error)),
-      },
-    }
-  }
-
-  /// Resolve a specifier to a given path.
-  pub fn resolve_with_context(
+  pub async fn resolve(
     &self,
     path: &Path,
     request: &str,
-    resolve_context: &mut ResolveContext,
   ) -> Result<ResolveResult, ResolveInnerError> {
-    match self {
-      Self::OxcResolver(resolver) => {
-        let mut context = Default::default();
-        let result = resolver.resolve_with_context(path, request, &mut context);
-        resolve_context
-          .file_dependencies
-          .extend(context.file_dependencies);
-        resolve_context
-          .missing_dependencies
-          .extend(context.missing_dependencies);
-        match result {
-          Ok(r) => Ok(ResolveResult::Resource(Resource {
-            path: r.path().to_path_buf(),
-            query: r.query().unwrap_or_default().to_string(),
-            fragment: r.fragment().unwrap_or_default().to_string(),
-            description_data: r
-              .package_json()
-              .map(|d| DescriptionData::new(d.directory().to_path_buf(), Arc::clone(d.raw_json()))),
-          })),
-          Err(oxc_resolver::ResolveError::Ignored(_)) => Ok(ResolveResult::Ignored),
-          Err(error) => Err(ResolveInnerError::OxcResolver(error)),
-        }
-      }
+    match self.resolver.resolve(path, request).await {
+      Ok(r) => Ok(ResolveResult::Resource(Resource {
+        path: r.path().to_path_buf().assert_utf8(),
+        query: r.query().unwrap_or_default().to_string(),
+        fragment: r.fragment().unwrap_or_default().to_string(),
+        description_data: r
+          .package_json()
+          .map(|d| DescriptionData::from_package_json(d)),
+      })),
+      Err(rspack_resolver::ResolveError::Ignored(_)) => Ok(ResolveResult::Ignored),
+      Err(error) => Err(ResolveInnerError::RspackResolver(error)),
     }
+  }
+
+  async fn resolve_with_context_impl(
+    &self,
+    path: &Path,
+    request: &str,
+  ) -> (
+    Result<ResolveResult, ResolveInnerError>,
+    ResolveDependencies,
+  ) {
+    let resolver = &self.resolver;
+    let mut context = Default::default();
+    let result = resolver
+      .resolve_with_context(path, request, &mut context)
+      .await;
+    let dependencies = ResolveDependencies {
+      file_dependencies: context.file_dependencies,
+      missing_dependencies: context.missing_dependencies,
+    };
+    let result = match result {
+      Ok(r) => Ok(ResolveResult::Resource(Resource {
+        path: r.path().to_path_buf().assert_utf8(),
+        query: r.query().unwrap_or_default().to_string(),
+        fragment: r.fragment().unwrap_or_default().to_string(),
+        description_data: r
+          .package_json()
+          .map(|d| DescriptionData::from_package_json(d)),
+      })),
+      Err(rspack_resolver::ResolveError::Ignored(_)) => Ok(ResolveResult::Ignored),
+      Err(error) => Err(ResolveInnerError::RspackResolver(error)),
+    };
+    (result, dependencies)
+  }
+
+  /// Resolve a specifier to a given path.
+  pub fn resolve_with_context<'a>(
+    &'a self,
+    path: &'a Path,
+    request: &'a str,
+  ) -> BoxFuture<
+    'a,
+    (
+      Result<ResolveResult, ResolveInnerError>,
+      ResolveDependencies,
+    ),
+  > {
+    Box::pin(async move {
+      let cache = self.cache.read().clone();
+      match cache {
+        Some(cache) => {
+          cache
+            .use_cache(self.options_key, path, request, || {
+              self.resolve_with_context_impl(path, request)
+            })
+            .await
+        }
+        None => self.resolve_with_context_impl(path, request).await,
+      }
+    })
+  }
+
+  pub fn inner_fs(&self) -> Arc<dyn ReadableFileSystem> {
+    self.inner_fs.clone()
   }
 }
 
 impl ResolveInnerError {
-  pub fn into_resolve_error(self, args: &ResolveArgs<'_>) -> Box<dyn Diagnostic + Send + Sync> {
+  pub fn into_resolve_error(self, args: &ResolveArgs<'_>) -> Error {
     match self {
-      Self::OxcResolver(error) => map_oxc_resolver_error(error, args),
+      Self::RspackResolver(error) => map_rspack_resolver_error(error, args),
     }
   }
 }
 
-fn to_oxc_resolver_options(
+fn to_rspack_resolver_options(
   options: Resolve,
   resolve_to_context: bool,
   dependency_type: DependencyCategory,
-) -> oxc_resolver::ResolveOptions {
+) -> rspack_resolver::ResolveOptions {
   let options = options.merge_by_dependency(dependency_type);
   let tsconfig = options.tsconfig.map(|c| c.into());
-  let enforce_extension = oxc_resolver::EnforceExtension::Auto;
-  let description_files = vec!["package.json".to_string()];
-  let extensions = options.extensions.expect("should have extensions");
-  let alias = options
-    .alias
-    .unwrap_or_default()
-    .into_iter()
-    .map(|(key, value)| {
-      let value = value
-        .into_iter()
-        .map(|x| match x {
-          AliasMap::Path(target) => oxc_resolver::AliasValue::Path(target),
-          AliasMap::Ignore => oxc_resolver::AliasValue::Ignore,
-        })
-        .collect();
-      (key, value)
-    })
-    .collect();
+  let enforce_extension =
+    options
+      .enforce_extension
+      .map_or(rspack_resolver::EnforceExtension::Auto, |e| match e {
+        true => rspack_resolver::EnforceExtension::Enabled,
+        false => rspack_resolver::EnforceExtension::Disabled,
+      });
+  let description_files = options
+    .description_files
+    .unwrap_or_else(|| vec!["package.json".to_string()]);
+  let imports_fields = options
+    .imports_fields
+    .unwrap_or_else(|| vec![vec!["imports".to_string()]]);
+  let extensions = options
+    .extensions
+    .unwrap_or_else(|| vec![".js".to_string(), ".json".to_string(), ".wasm".to_string()]);
+  let alias = match options.alias.unwrap_or_default() {
+    Alias::OverwriteToNoAlias => vec![],
+    Alias::MergeAlias(alias) => alias
+      .into_iter()
+      .map(|(key, value)| {
+        let value = value
+          .into_iter()
+          .map(|x| match x {
+            AliasMap::Path(target) => rspack_resolver::AliasValue::Path(target),
+            AliasMap::Ignore => rspack_resolver::AliasValue::Ignore,
+          })
+          .collect();
+        (key, value)
+      })
+      .collect(),
+  };
   let prefer_relative = options.prefer_relative.unwrap_or(false);
   let prefer_absolute = options.prefer_absolute.unwrap_or(false);
   let symlinks = options.symlinks.unwrap_or(true);
@@ -224,24 +332,25 @@ fn to_oxc_resolver_options(
   let modules = options
     .modules
     .unwrap_or_else(|| vec!["node_modules".to_string()]);
-  let fallback = options
-    .fallback
-    .unwrap_or_default()
-    .into_iter()
-    .map(|(key, value)| {
-      let value = value
-        .into_iter()
-        .map(|x| match x {
-          AliasMap::Path(target) => oxc_resolver::AliasValue::Path(target),
-          AliasMap::Ignore => oxc_resolver::AliasValue::Ignore,
-        })
-        .collect();
-      (key, value)
-    })
-    .collect();
+  let fallback = match options.fallback.unwrap_or_default() {
+    Alias::OverwriteToNoAlias => vec![],
+    Alias::MergeAlias(items) => items
+      .into_iter()
+      .map(|(key, value)| {
+        let value = value
+          .into_iter()
+          .map(|x| match x {
+            AliasMap::Path(target) => rspack_resolver::AliasValue::Path(target),
+            AliasMap::Ignore => rspack_resolver::AliasValue::Ignore,
+          })
+          .collect();
+        (key, value)
+      })
+      .collect(),
+  };
   let fully_specified = options.fully_specified.unwrap_or_default();
   let exports_fields = options
-    .exports_field
+    .exports_fields
     .unwrap_or_else(|| vec![vec!["exports".to_string()]]);
   let extension_alias = options.extension_alias.unwrap_or_default();
   let alias_fields = options
@@ -251,7 +360,15 @@ fn to_oxc_resolver_options(
     .restrictions
     .unwrap_or_default()
     .into_iter()
-    .map(|s| oxc_resolver::Restriction::Path(PathBuf::from(s)))
+    .map(|s| match s {
+      crate::Restriction::Path(s) => rspack_resolver::Restriction::Path(s.into()),
+      crate::Restriction::Regex(r) => {
+        rspack_resolver::Restriction::Fn(Arc::new(move |path| match path.to_str() {
+          Some(path) => r.test(path),
+          None => false,
+        }))
+      }
+    })
     .collect();
   let roots = options
     .roots
@@ -259,7 +376,7 @@ fn to_oxc_resolver_options(
     .into_iter()
     .map(PathBuf::from)
     .collect();
-  oxc_resolver::ResolveOptions {
+  rspack_resolver::ResolveOptions {
     fallback,
     modules,
     extensions,
@@ -280,55 +397,120 @@ fn to_oxc_resolver_options(
     extension_alias,
     restrictions,
     roots,
-    builtin_modules: false,
-    imports_fields: vec![vec!["imports".to_string()]],
+    builtin_modules: options.builtin_modules,
+    imports_fields,
+    enable_pnp: options.pnp.unwrap_or(false),
+    node_path: false,
   }
 }
 
-fn map_oxc_resolver_error(
-  error: oxc_resolver::ResolveError,
+fn map_rspack_resolver_error(
+  error: rspack_resolver::ResolveError,
   args: &ResolveArgs<'_>,
-) -> Box<dyn Diagnostic + Send + Sync> {
+) -> Error {
   match error {
-    oxc_resolver::ResolveError::IOError(error) => diagnostic!("{}", error).boxed(),
-    oxc_resolver::ResolveError::Recursion => map_resolver_error(true, args),
-    oxc_resolver::ResolveError::NotFound(_) => map_resolver_error(false, args),
-    _ => diagnostic!("{}", error).boxed(),
+    rspack_resolver::ResolveError::IOError(error) => rspack_error::error!(error.to_string()),
+    rspack_resolver::ResolveError::Recursion => map_resolver_error(true, args),
+    rspack_resolver::ResolveError::NotFound(_) => map_resolver_error(false, args),
+    rspack_resolver::ResolveError::JSON(error) => {
+      if let Some(content) = &error.content {
+        let Some(offset) = byte_line_column_to_offset(content, error.line, error.column) else {
+          return rspack_error::error!(format!(
+            "JSON parse error: {:?} in '{}'",
+            error,
+            error.path.display()
+          ));
+        };
+
+        fn ceil_char_boundary(content: &str, mut index: usize) -> usize {
+          if index > content.len() {
+            return content.len();
+          }
+
+          while !content.is_char_boundary(index) {
+            if index == 0 {
+              return 0;
+            }
+            index = index.saturating_sub(1);
+          }
+
+          index
+        }
+
+        let offset = ceil_char_boundary(content, offset);
+
+        if content[offset..].starts_with('\u{feff}') {
+          return Error::from_string(
+            Some(content.clone()),
+            offset,
+            offset,
+            "JSON parse error".to_string(),
+            format!("BOM character found in '{}'", error.path.display()),
+          );
+        }
+
+        Error::from_string(
+          Some(content.clone()),
+          offset,
+          offset,
+          "JSON parse error".to_string(),
+          format!("{} in '{}'", error.message, error.path.display()),
+        )
+      } else {
+        rspack_error::error!(format!(
+          "JSON parse error: {:?} in '{}'",
+          error,
+          error.path.display()
+        ))
+      }
+    }
+    _ => Error::error(error.to_string()),
   }
 }
 
-fn map_resolver_error(
-  is_recursion: bool,
-  args: &ResolveArgs<'_>,
-) -> Box<dyn Diagnostic + Send + Sync> {
+fn map_resolver_error(is_recursion: bool, args: &ResolveArgs<'_>) -> Error {
   let request = &args.specifier;
   let context = &args.context;
 
   let importer = args.importer;
   if importer.is_none() {
-    return diagnostic!("Resolve error: Can't resolve '{request}' in '{context}'").boxed();
+    return rspack_error::error!(format!(
+      "Module not found: Can't resolve {} in {}",
+      yellow(&format!("'{request}'")),
+      cyan(&format!("'{context}'")),
+    ));
   }
 
-  let span = args.span.unwrap_or_default();
-  let message = format!("Can't resolve '{request}' in '{context}'");
-  TraceableError::from_empty_file(
-    span.start as usize,
-    span.end as usize,
-    "Resolve error".to_string(),
+  let message = format!(
+    "Can't resolve {} in {}",
+    yellow(&format!("'{request}'")),
+    cyan(&format!("'{context}'"))
+  );
+  let mut error = Error::from_string(
+    None,
+    args
+      .span
+      .as_ref()
+      .map(|span| span.start as usize)
+      .unwrap_or_default(),
+    args
+      .span
+      .as_ref()
+      .map(|span| span.end as usize)
+      .unwrap_or_default(),
+    "Module not found".to_string(),
     message,
-  )
-  .with_help(if is_recursion {
-    Some("maybe it had cyclic aliases")
+  );
+  error.help = if is_recursion {
+    Some("maybe it had cyclic aliases".into())
   } else {
     None
-  })
-  .with_severity(
-    // See: https://github.com/webpack/webpack/blob/6be4065ade1e252c1d8dcba4af0f43e32af1bdc1/lib/Compilation.js#L1796
-    if args.optional {
-      Severity::Warn
-    } else {
-      Severity::Error
-    },
-  )
-  .boxed()
+  };
+  // See: https://github.com/webpack/webpack/blob/6be4065ade1e252c1d8dcba4af0f43e32af1bdc1/lib/Compilation.js#L1796
+  error.severity = if args.optional {
+    Severity::Warning
+  } else {
+    Severity::Error
+  };
+  error
 }

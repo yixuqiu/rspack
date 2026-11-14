@@ -1,45 +1,63 @@
+use std::borrow::Cow;
+
 use rspack_core::{
-  get_chunk_from_ukey, impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  ChunkUkey, Compilation, RuntimeGlobals, RuntimeModule,
+  Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext, RuntimeTemplate,
+  impl_runtime_module,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
-pub struct BaseUriRuntimeModule {
-  id: Identifier,
-  chunk: Option<ChunkUkey>,
+#[derive(Debug)]
+pub struct BaseUriRuntimeModule {}
+
+impl BaseUriRuntimeModule {
+  pub fn new(runtime_template: &RuntimeTemplate) -> Self {
+    Self::with_default(runtime_template)
+  }
 }
-impl Default for BaseUriRuntimeModule {
-  fn default() -> Self {
-    BaseUriRuntimeModule {
-      id: Identifier::from("webpack/runtime/base_uri"),
-      chunk: None,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
+
+#[async_trait::async_trait]
+impl RuntimeModule for BaseUriRuntimeModule {
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
+  }
+
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define: { RuntimeGlobals::BASE_URI },
+      ..Default::default()
     }
   }
-}
 
-impl RuntimeModule for BaseUriRuntimeModule {
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
     let base_uri = self
-      .chunk
-      .and_then(|ukey| get_chunk_from_ukey(&ukey, &compilation.chunk_by_ukey))
-      .and_then(|chunk| chunk.get_entry_options(&compilation.chunk_group_by_ukey))
+      .chunk()
+      .and_then(|ukey| {
+        compilation
+          .build_chunk_graph_artifact
+          .chunk_by_ukey
+          .get(&ukey)
+      })
+      .and_then(|chunk| {
+        chunk.get_entry_options(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
+      })
       .and_then(|options| options.base_uri.as_ref())
-      .and_then(|base_uri| serde_json::to_string(base_uri).ok())
-      .unwrap_or_else(|| "undefined".to_string());
-    Ok(RawSource::from(format!("{} = {};\n", RuntimeGlobals::BASE_URI, base_uri)).boxed())
-  }
-
-  fn name(&self) -> Identifier {
-    self.id
-  }
-
-  fn attach(&mut self, chunk: ChunkUkey) {
-    self.chunk = Some(chunk);
+      .map_or_else(
+        || Cow::Borrowed("undefined"),
+        |base_uri| Cow::Owned(rspack_util::json_stringify_str(base_uri)),
+      );
+    Ok(format!(
+      "{} = {};\n",
+      context
+        .runtime_template
+        .render_runtime_global_definition(&RuntimeGlobals::BASE_URI),
+      base_uri.as_ref()
+    ))
   }
 }

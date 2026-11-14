@@ -1,39 +1,43 @@
 use rspack_core::{
+  Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext, RuntimeTemplate,
   impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Compilation, RuntimeGlobals, RuntimeModule,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
-pub struct SystemContextRuntimeModule {
-  id: Identifier,
+#[derive(Debug)]
+pub struct SystemContextRuntimeModule {}
+
+impl SystemContextRuntimeModule {
+  pub fn new(runtime_template: &RuntimeTemplate) -> Self {
+    Self::with_default(runtime_template)
+  }
 }
 
-impl Default for SystemContextRuntimeModule {
-  fn default() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/start_entry_point"),
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
+#[async_trait::async_trait]
+impl RuntimeModule for SystemContextRuntimeModule {
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
+  }
+
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define: { RuntimeGlobals::SYSTEM_CONTEXT },
+      ..Default::default()
     }
   }
-}
 
-impl RuntimeModule for SystemContextRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
-  }
-
-  fn generate(&self, _compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    Ok(
-      RawSource::from(format!(
-        "{} = __system_context__",
-        RuntimeGlobals::SYSTEM_CONTEXT
-      ))
-      .boxed(),
-    )
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    Ok(format!(
+      "{} = __system_context__",
+      context
+        .runtime_template
+        .render_runtime_global_definition(&RuntimeGlobals::SYSTEM_CONTEXT)
+    ))
   }
 }

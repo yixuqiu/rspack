@@ -1,0 +1,43 @@
+use rspack_collections::{IdentifierMap, IdentifierSet};
+
+use super::BuildModuleGraphArtifact;
+use crate::SharedBuildMeta;
+
+/// A toolkit for cutout to fix build meta
+///
+/// If a module rebuild failed, its build meta will be reset.
+/// This toolkit will restore build meta from successful build to keep importing state.
+#[derive(Debug, Default)]
+pub struct FixBuildMeta {
+  origin_module_build_meta: IdentifierMap<SharedBuildMeta>,
+}
+
+impl FixBuildMeta {
+  pub fn analyze_force_build_modules(
+    &mut self,
+    artifact: &BuildModuleGraphArtifact,
+    ids: &IdentifierSet,
+  ) {
+    let module_graph = artifact.get_module_graph();
+    for module_identifier in ids {
+      let module = module_graph
+        .module_by_identifier(module_identifier)
+        .expect("should have module");
+      self
+        .origin_module_build_meta
+        .insert(*module_identifier, module.freeze_build_meta().clone());
+    }
+  }
+
+  pub fn fix_artifact(self, artifact: &mut BuildModuleGraphArtifact) {
+    let module_graph = artifact.get_module_graph();
+    for (id, build_meta) in self.origin_module_build_meta {
+      if let Some(module) = module_graph.module_by_identifier(&id)
+        && let Some(module) = module.as_normal_module()
+        && module.error().is_some()
+      {
+        module.restore_build_meta(build_meta);
+      }
+    }
+  }
+}

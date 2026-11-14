@@ -1,259 +1,324 @@
-use std::fmt;
+use std::sync::LazyLock;
 
 use bitflags::bitflags;
-use swc_core::ecma::atoms::Atom;
+use heck::ToLowerCamelCase;
+use rspack_hash::{RspackHash, RspackHasher};
+use rustc_hash::FxHashMap;
 
-bitflags! {
-  #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-  pub struct RuntimeGlobals: u64 {
-    const REQUIRE_SCOPE = 1 << 0;
+#[rspack_cacheable::cacheable]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct RuntimeGlobals(u128);
 
-    const EXPORT_STAR = 1 << 1;
-    // port from webpack RuntimeGlobals
-
-    /**
-     * the internal module object
-     */
-    const MODULE = 1 << 3;
-
-    /**
-     * the internal module object
-     */
-    const MODULE_ID = 1 << 4;
-
-    /**
-     * the internal require function
-     */
-    const REQUIRE = 1 << 5;
-
-    /**
-     * the module cache
-     */
-    const MODULE_CACHE = 1 << 6;
-
-    /**
-     * the chunk ensure function
-     */
-    const ENSURE_CHUNK = 1 << 7;
-
-    /**
-     * an object with handlers to ensure a chunk
-     */
-    const ENSURE_CHUNK_HANDLERS = 1 << 8;
-
-    /**
-     * the bundle public path
-     */
-    const PUBLIC_PATH = 1 << 9;
-
-    /**
-     * the filename of the script part of the chunk
-     */
-    const GET_CHUNK_SCRIPT_FILENAME = 1 << 10;
-
-    /**
-     * the filename of the css part of the chunk
-     */
-    const GET_CHUNK_CSS_FILENAME = 1 << 11;
-
-    /**
-     * function to load a script tag.
-     * Arguments: (url: string, done: (event) => void), key?: string | number, chunkId?: string | number) => void
-     * done function is called when loading has finished or timeout occurred.
-     * It will attach to existing script tags with data-webpack == uniqueName + ":" + key or src == url.
-     */
-    const LOAD_SCRIPT = 1 << 12;
-
-    /**
-     * the shorthand for Object.prototype.hasOwnProperty
-     * using of it decreases the compiled bundle size
-     */
-    const HAS_OWN_PROPERTY = 1 << 13;
-
-    /**
-     * the module functions, with only write access
-     */
-    const MODULE_FACTORIES_ADD_ONLY = 1 << 14;
-
-    /**
-     * register deferred code, which will run when certain
-     * chunks are loaded.
-     * Signature: (chunkIds: Id[], fn: () => any, priority: int >= 0 = 0) => any
-     * Returned value will be returned directly when all chunks are already loaded
-     * When (priority & 1) it will wait for all other handlers with lower priority to
-     * be executed before itself is executed
-     */
-    const ON_CHUNKS_LOADED = 1 << 15;
-
-    /**
-     * global callback functions for installing chunks
-     */
-    const CHUNK_CALLBACK = 1 << 16;
-
-    /**
-     * the module functions
-     */
-    const MODULE_FACTORIES = 1 << 17;
-
-    /**
-     * interceptor for module executions
-     */
-    const INTERCEPT_MODULE_EXECUTION = 1 << 18;
-
-    /**
-     * function downloading the update manifest
-     */
-    const HMR_DOWNLOAD_MANIFEST = 1 << 19;
-
-    /**
-     * array with handler functions to download chunk updates
-     */
-    const HMR_DOWNLOAD_UPDATE_HANDLERS = 1 << 20;
-
-    /**
-     * the filename of the HMR manifest
-     */
-    const GET_UPDATE_MANIFEST_FILENAME = 1 << 21;
-
-    /**
-     * the filename of the script part of the hot update chunk
-     */
-    const GET_CHUNK_UPDATE_SCRIPT_FILENAME = 1 << 22;
-
-    /**
-     * the filename of the css part of the hot update chunk
-     */
-    const GET_CHUNK_UPDATE_CSS_FILENAME = 1 << 23;
-
-    /**
-     * object with all hmr module data for all modules
-     */
-    const HMR_MODULE_DATA = 1 << 24;
-
-    /**
-     * the prefix for storing state of runtime modules when hmr is enabled
-     */
-    const HMR_RUNTIME_STATE_PREFIX = 1 << 25;
-
-    /**
-     * method to install a chunk that was loaded somehow
-     * Signature: ({ id, ids, modules, runtime }) => void
-     */
-    const EXTERNAL_INSTALL_CHUNK = 1 << 26;
-
-    /**
-     * the webpack hash
-     */
-    const GET_FULL_HASH = 1 << 27;
-
-    /**
-     * the global object
-     */
-    const GLOBAL = 1 << 28;
-
-    /**
-     * runtime need to return the exports of the last entry module
-     */
-    const RETURN_EXPORTS_FROM_RUNTIME = 1 << 29;
-
-    /**
-     * instantiate a wasm instance from module exports object, id, hash and importsObject
-     */
-    const INSTANTIATE_WASM = 1 << 30;
-
-    /**
-     * Creates an async module. The body function must be a async function.
-     * "module.exports" will be decorated with an AsyncModulePromise.
-     * The body function will be called.
-     * To handle async dependencies correctly do this: "([a, b, c] = await handleDependencies([a, b, c]));".
-     * If "hasAwaitAfterDependencies" is truthy, "handleDependencies()" must be called at the end of the body function.
-     * Signature: function(
-     * module: Module,
-     * body: (handleDependencies: (deps: AsyncModulePromise[]) => Promise<any[]> & () => void,
-     * hasAwaitAfterDependencies?: boolean
-     * ) => void
-     */
-    const ASYNC_MODULE = 1 << 31;
-
-    /**
-     * the baseURI of current document
-     */
-    const BASE_URI = 1 << 32;
-
-    const MODULE_LOADED = 1 << 33;
-
-    const STARTUP_ENTRYPOINT = 1 << 34;
-
-    const CREATE_SCRIPT_URL = 1 << 35;
-
-    const CREATE_SCRIPT = 1 << 36;
-
-    const GET_TRUSTED_TYPES_POLICY = 1 << 37;
-
-    const DEFINE_PROPERTY_GETTERS = 1 << 38;
-
-    const ENTRY_MODULE_ID = 1 << 39;
-
-    const STARTUP_NO_DEFAULT = 1 << 40;
-
-    const ENSURE_CHUNK_INCLUDE_ENTRIES = 1 << 41;
-
-    const STARTUP = 1 << 42;
-
-    const MAKE_NAMESPACE_OBJECT = 1 << 43;
-
-    const EXPORTS = 1 << 44;
-
-    const COMPAT_GET_DEFAULT_EXPORT = 1 << 45;
-
-    const CREATE_FAKE_NAMESPACE_OBJECT = 1 << 46;
-
-    const NODE_MODULE_DECORATOR = 1 << 47;
-
-    const HARMONY_MODULE_DECORATOR = 1 << 48;
-
-    /**
-     * the System.register context object
-     */
-    const SYSTEM_CONTEXT = 1 << 49;
-
-    const THIS_AS_EXPORTS = 1 << 50;
-
-    const CURRENT_REMOTE_GET_SCOPE = 1 << 51;
-
-    const SHARE_SCOPE_MAP = 1 << 52;
-
-    const INITIALIZE_SHARING = 1 << 53;
-
-    const SCRIPT_NONCE = 1 << 54;
-
-    const RELATIVE_URL = 1 << 55;
-
-    const CHUNK_NAME = 1 << 56;
-
-    const RUNTIME_ID = 1 << 57;
-
-    // prefetch and preload
-    const PREFETCH_CHUNK = 1 << 58;
-
-    const PREFETCH_CHUNK_HANDLERS = 1 << 59;
-
-    const PRELOAD_CHUNK = 1 << 60;
-
-    const PRELOAD_CHUNK_HANDLERS = 1 << 61;
-
-    // rspack only
-    const RSPACK_VERSION = 1 << 62;
-
-    const HAS_CSS_MODULES = 1 << 63;
-  }
+macro_rules! define_runtime_globals {
+  (@step ($val:expr) ({$($acc:tt)*}) ($(#[$($attr:tt)+])* const $name:ident; $($rest:tt)*)) => {
+    define_runtime_globals! {
+      @step ($val << 1) ({
+        $($acc)*
+        $(#[$($attr)+])*
+        const $name = $val;
+      }) ($($rest)*)
+    }
+  };
+  (@step ($val:expr) ({$($acc:tt)*}) ()) => {
+    bitflags! {
+      impl RuntimeGlobals: u128 {
+        $($acc)*
+      }
+    }
+  };
+  ($($rest:tt)*) => {
+    define_runtime_globals! {
+      @step (1u128) ({}) ($($rest)*)
+    }
+  };
 }
 
-impl fmt::Display for RuntimeGlobals {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let name = self.name();
-    f.write_str(name)
-  }
+define_runtime_globals! {
+  const REQUIRE_SCOPE;
+
+  /**
+   * the internal module object
+   */
+  const MODULE;
+
+  /**
+   * the internal module object
+   */
+  const MODULE_ID;
+
+  /**
+   * the internal require function
+   */
+  const REQUIRE;
+
+  /**
+   * the module cache
+   */
+  const MODULE_CACHE;
+
+  /**
+   * the chunk ensure function
+   */
+  const ENSURE_CHUNK;
+
+  /**
+   * an object with handlers to ensure a chunk
+   */
+  const ENSURE_CHUNK_HANDLERS;
+
+  /**
+   * the bundle public path
+   */
+  const PUBLIC_PATH;
+
+  /**
+   * the filename of the script part of the chunk
+   */
+  const GET_CHUNK_SCRIPT_FILENAME;
+
+  /**
+   * the filename of the css part of the chunk
+   */
+  const GET_CHUNK_CSS_FILENAME;
+
+  /**
+   * function to load a script tag.
+   * Arguments: (url: string, done: (event) => void), key?: string | number, chunkId?: string | number) => void
+   * done function is called when loading has finished or timeout occurred.
+   * It will attach to existing script tags with data-webpack == uniqueName + ":" + key or src == url.
+   */
+  const LOAD_SCRIPT;
+
+  /**
+   * the shorthand for Object.prototype.hasOwnProperty
+   * using of it decreases the compiled bundle size
+   */
+  const HAS_OWN_PROPERTY;
+
+  /**
+   * the module functions, with only write access
+   */
+  const MODULE_FACTORIES_ADD_ONLY;
+
+  /**
+   * register deferred code, which will run when certain
+   * chunks are loaded.
+   * Signature: (chunkIds: Id[], fn: () => any, priority: int >= 0 = 0) => any
+   * Returned value will be returned directly when all chunks are already loaded
+   * When (priority & 1) it will wait for all other handlers with lower priority to
+   * be executed before itself is executed
+   */
+  const ON_CHUNKS_LOADED;
+
+  /**
+   * global callback functions for installing chunks
+   */
+  const CHUNK_CALLBACK;
+
+  /**
+   * the module functions
+   */
+  const MODULE_FACTORIES;
+
+  /**
+   * interceptor for module executions
+   */
+  const INTERCEPT_MODULE_EXECUTION;
+
+  /**
+   * function downloading the update manifest
+   */
+  const HMR_DOWNLOAD_MANIFEST;
+
+  /**
+   * array with handler functions to download chunk updates
+   */
+  const HMR_DOWNLOAD_UPDATE_HANDLERS;
+
+  const HMR_INVALIDATE_MODULE_HANDLERS;
+
+  /**
+   * the filename of the HMR manifest
+   */
+  const GET_UPDATE_MANIFEST_FILENAME;
+
+  /**
+   * the filename of the script part of the hot update chunk
+   */
+  const GET_CHUNK_UPDATE_SCRIPT_FILENAME;
+
+  /**
+   * the filename of the css part of the hot update chunk
+   */
+  const GET_CHUNK_UPDATE_CSS_FILENAME;
+
+  /**
+   * object with all hmr module data for all modules
+   */
+  const HMR_MODULE_DATA;
+
+  /**
+   * the prefix for storing state of runtime modules when hmr is enabled
+   */
+  const HMR_RUNTIME_STATE_PREFIX;
+
+  /**
+   * method to install a chunk that was loaded somehow
+   * Signature: ({ id, ids, modules, runtime }) => void
+   */
+  const EXTERNAL_INSTALL_CHUNK;
+
+  /**
+   * the webpack hash
+   */
+  const GET_FULL_HASH;
+
+  /**
+   * the global object
+   */
+  const GLOBAL;
+
+  /**
+   * runtime need to return the exports of the last entry module
+   */
+  const RETURN_EXPORTS_FROM_RUNTIME;
+
+  /**
+   * instantiate a wasm instance from module exports object, id, hash and importsObject
+   */
+  const INSTANTIATE_WASM;
+
+  /**
+   * compile a wasm module from id and hash
+   */
+  const COMPILE_WASM;
+
+  /**
+   * Creates an async module. The body function must be a async function.
+   * "module.exports" will be decorated with an AsyncModulePromise.
+   * The body function will be called.
+   * To handle async dependencies correctly do this: "([a, b, c] = await handleDependencies([a, b, c]));".
+   * If "hasAwaitAfterDependencies" is truthy, "handleDependencies()" must be called at the end of the body function.
+   * Signature: function(
+   * module: Module,
+   * body: (handleDependencies: (deps: AsyncModulePromise[]) => Promise<any[]> & () => void,
+   * hasAwaitAfterDependencies?: boolean
+   * ) => void
+   */
+  const ASYNC_MODULE;
+
+  /**
+   * the baseURI of current document
+   */
+  const BASE_URI;
+
+  const MODULE_LOADED;
+
+  const STARTUP_ENTRYPOINT;
+  const STARTUP_CHUNK_DEPENDENCIES;
+
+  const CREATE_SCRIPT_URL;
+
+  const CREATE_SCRIPT;
+
+  const GET_TRUSTED_TYPES_POLICY;
+
+  const DEFINE_PROPERTY_GETTERS;
+
+  const ENTRY_MODULE_ID;
+
+  const STARTUP_NO_DEFAULT;
+
+  const ENSURE_CHUNK_INCLUDE_ENTRIES;
+
+  const STARTUP;
+
+  const MAKE_NAMESPACE_OBJECT;
+
+  const EXPORTS;
+
+  const COMPAT_GET_DEFAULT_EXPORT;
+
+  const CREATE_FAKE_NAMESPACE_OBJECT;
+
+  const NODE_MODULE_DECORATOR;
+
+  const ESM_MODULE_DECORATOR;
+
+  /**
+   * the System.register context object
+   */
+  const SYSTEM_CONTEXT;
+
+  const THIS_AS_EXPORTS;
+
+  const CURRENT_REMOTE_GET_SCOPE;
+
+  const SHARE_SCOPE_MAP;
+
+  const INITIALIZE_SHARING;
+
+  const SCRIPT_NONCE;
+
+  const RELATIVE_URL;
+
+  const CHUNK_NAME;
+
+  const RUNTIME_ID;
+
+  // prefetch and preload
+  const PREFETCH_CHUNK;
+
+  const PREFETCH_CHUNK_HANDLERS;
+
+  const PRELOAD_CHUNK;
+
+  const PRELOAD_CHUNK_HANDLERS;
+
+  const UNCAUGHT_ERROR_HANDLER;
+
+  // rspack only
+  const RSPACK_VERSION;
+
+  const HAS_CSS_MODULES;
+
+  const CSS_INJECT_STYLE;
+
+  const CSS_STYLE_SHEET;
+
+  // rspack only
+  const RSPACK_UNIQUE_ID;
+
+  const HAS_FETCH_PRIORITY;
+
+  // amd module support
+  const AMD_DEFINE;
+  const AMD_OPTIONS;
+
+  const TO_BINARY;
+
+  // defer import support
+  const ASYNC_MODULE_EXPORT_SYMBOL;
+  const MAKE_DEFERRED_NAMESPACE_OBJECT;
+  const MAKE_OPTIMIZED_DEFERRED_NAMESPACE_OBJECT;
+  const DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES;
+  const DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES_SYMBOL;
+
+  // rspack only
+  const ASYNC_STARTUP;
+
+  // react server component
+  const RSC_MANIFEST;
+
+  // reexport
+  const REEXPORT;
+
+  // Exports objects shared by deferred namespaces and the module bootstrap.
+  const DEFERRED_MODULE_EXPORTS;
+
+  /// Expected JavaScript versions of asynchronously loadable chunks.
+  const HMR_CHUNK_VERSIONS;
+
 }
 
 impl Default for RuntimeGlobals {
@@ -262,110 +327,347 @@ impl Default for RuntimeGlobals {
   }
 }
 
-impl RuntimeGlobals {
-  pub const fn name(&self) -> &'static str {
-    use RuntimeGlobals as R;
-    match *self {
-      R::REQUIRE_SCOPE => "__webpack_require__.*",
-      R::EXPORT_STAR => "es",
-      R::MODULE => "module",
-      R::MODULE_ID => "module.id",
-      R::MODULE_LOADED => "module.loaded",
-      R::REQUIRE => "__webpack_require__",
-      R::MODULE_CACHE => "__webpack_require__.c",
-      R::ENSURE_CHUNK => "__webpack_require__.e",
-      R::ENSURE_CHUNK_HANDLERS => "__webpack_require__.f",
-      R::PUBLIC_PATH => "__webpack_require__.p",
-      R::GET_CHUNK_SCRIPT_FILENAME => "__webpack_require__.u",
-      R::GET_CHUNK_CSS_FILENAME => "__webpack_require__.k",
-      R::LOAD_SCRIPT => "__webpack_require__.l",
-      R::HAS_OWN_PROPERTY => "__webpack_require__.o",
-      R::MODULE_FACTORIES_ADD_ONLY => "__webpack_require__.m (add only)",
-      R::ON_CHUNKS_LOADED => "__webpack_require__.O",
-      R::CHUNK_CALLBACK => "webpackChunk",
-      R::MODULE_FACTORIES => "__webpack_require__.m",
-      R::INTERCEPT_MODULE_EXECUTION => "__webpack_require__.i",
-      R::HMR_DOWNLOAD_MANIFEST => "__webpack_require__.hmrM",
-      R::HMR_DOWNLOAD_UPDATE_HANDLERS => "__webpack_require__.hmrC",
-      R::GET_UPDATE_MANIFEST_FILENAME => "__webpack_require__.hmrF",
-      R::GET_CHUNK_UPDATE_SCRIPT_FILENAME => "__webpack_require__.hu",
-      R::GET_CHUNK_UPDATE_CSS_FILENAME => "__webpack_require__.hk",
-      R::HMR_MODULE_DATA => "__webpack_require__.hmrD",
-      R::HMR_RUNTIME_STATE_PREFIX => "__webpack_require__.hmrS",
-      R::EXTERNAL_INSTALL_CHUNK => "__webpack_require__.C",
-      R::GET_FULL_HASH => "__webpack_require__.h",
-      R::GLOBAL => "__webpack_require__.g",
-      R::RETURN_EXPORTS_FROM_RUNTIME => "return-exports-from-runtime",
-      R::INSTANTIATE_WASM => "__webpack_require__.v",
-      R::ASYNC_MODULE => "__webpack_require__.a",
-      R::BASE_URI => "__webpack_require__.b",
-      R::STARTUP_ENTRYPOINT => "__webpack_require__.X",
-      R::CREATE_SCRIPT_URL => "__webpack_require__.tu",
-      R::CREATE_SCRIPT => "__webpack_require__.ts",
-      R::GET_TRUSTED_TYPES_POLICY => "__webpack_require__.tt",
-      R::DEFINE_PROPERTY_GETTERS => "__webpack_require__.d",
-      R::ENTRY_MODULE_ID => "__webpack_require__.s",
-      R::STARTUP_NO_DEFAULT => "__webpack_require__.x (no default handler)",
-      R::ENSURE_CHUNK_INCLUDE_ENTRIES => "__webpack_require__.f (include entries)",
-      R::STARTUP => "__webpack_require__.x",
-      R::MAKE_NAMESPACE_OBJECT => "__webpack_require__.r",
-      R::EXPORTS => "__webpack_exports__",
-      R::COMPAT_GET_DEFAULT_EXPORT => "__webpack_require__.n",
-      R::CREATE_FAKE_NAMESPACE_OBJECT => "__webpack_require__.t",
-      R::HARMONY_MODULE_DECORATOR => "__webpack_require__.hmd",
-      R::NODE_MODULE_DECORATOR => "__webpack_require__.nmd",
-      R::SYSTEM_CONTEXT => "__webpack_require__.y",
-      R::THIS_AS_EXPORTS => "top-level-this-exports",
-      R::CURRENT_REMOTE_GET_SCOPE => "__webpack_require__.R",
-      R::SHARE_SCOPE_MAP => "__webpack_require__.S",
-      R::INITIALIZE_SHARING => "__webpack_require__.I",
-      R::SCRIPT_NONCE => "__webpack_require__.nc",
-      R::RELATIVE_URL => "__webpack_require__.U",
-      R::CHUNK_NAME => "__webpack_require__.cn",
-      R::RUNTIME_ID => "__webpack_require__.j",
-      R::PREFETCH_CHUNK => "__webpack_require__.E",
-      R::PREFETCH_CHUNK_HANDLERS => "__webpack_require__.F",
-      R::PRELOAD_CHUNK => "__webpack_require__.G",
-      R::PRELOAD_CHUNK_HANDLERS => "__webpack_require__.H",
-      // rspack only
-      R::RSPACK_VERSION => "__webpack_require__.rv",
-      R::HAS_CSS_MODULES => "has css modules",
-      _ => unreachable!(),
+pub static REQUIRE_SCOPE_GLOBALS: LazyLock<RuntimeGlobals> = LazyLock::new(|| {
+  let mut runtime_globals = RuntimeGlobals::all();
+  runtime_globals.remove(
+    RuntimeGlobals::MODULE
+      | RuntimeGlobals::MODULE_ID
+      | RuntimeGlobals::CHUNK_CALLBACK
+      | RuntimeGlobals::RETURN_EXPORTS_FROM_RUNTIME
+      | RuntimeGlobals::MODULE_LOADED
+      | RuntimeGlobals::EXPORTS
+      | RuntimeGlobals::THIS_AS_EXPORTS
+      | RuntimeGlobals::HAS_CSS_MODULES
+      | RuntimeGlobals::HAS_FETCH_PRIORITY
+      | RuntimeGlobals::STARTUP_NO_DEFAULT
+      | RuntimeGlobals::STARTUP_CHUNK_DEPENDENCIES
+      | RuntimeGlobals::ENSURE_CHUNK_INCLUDE_ENTRIES
+      | RuntimeGlobals::MODULE_FACTORIES_ADD_ONLY,
+  );
+  runtime_globals
+});
+
+pub static MODULE_GLOBALS: LazyLock<RuntimeGlobals> =
+  LazyLock::new(|| RuntimeGlobals::MODULE_ID | RuntimeGlobals::MODULE_LOADED);
+
+pub static BOOTSTRAP_RUNTIME_CONTEXT_GLOBALS: LazyLock<RuntimeGlobals> = LazyLock::new(|| {
+  RuntimeGlobals::REQUIRE
+    | RuntimeGlobals::INTERCEPT_MODULE_EXECUTION
+    | RuntimeGlobals::MODULE
+    | RuntimeGlobals::MODULE_FACTORIES
+    | RuntimeGlobals::MODULE_FACTORIES_ADD_ONLY
+    | RuntimeGlobals::MODULE_CACHE
+    | RuntimeGlobals::DEFERRED_MODULE_EXPORTS
+    | RuntimeGlobals::ON_CHUNKS_LOADED
+    | RuntimeGlobals::EXTERNAL_INSTALL_CHUNK
+    | RuntimeGlobals::STARTUP_ENTRYPOINT
+    | RuntimeGlobals::STARTUP
+    | RuntimeGlobals::CSS_INJECT_STYLE
+    | RuntimeGlobals::CSS_STYLE_SHEET
+});
+
+pub static INITIALIZE_OBJECT_GLOBALS: LazyLock<RuntimeGlobals> = LazyLock::new(|| {
+  RuntimeGlobals::ENSURE_CHUNK_HANDLERS
+    | RuntimeGlobals::PREFETCH_CHUNK_HANDLERS
+    | RuntimeGlobals::PRELOAD_CHUNK_HANDLERS
+    | RuntimeGlobals::HMR_DOWNLOAD_UPDATE_HANDLERS
+    | RuntimeGlobals::HMR_INVALIDATE_MODULE_HANDLERS
+    | RuntimeGlobals::HMR_MODULE_DATA
+});
+
+pub static INITIALIZE_ARRAY_GLOBALS: LazyLock<RuntimeGlobals> =
+  LazyLock::new(|| RuntimeGlobals::INTERCEPT_MODULE_EXECUTION);
+
+pub fn runtime_globals_property_name(runtime_globals: &RuntimeGlobals) -> Option<&'static str> {
+  Some(match *runtime_globals {
+    RuntimeGlobals::REQUIRE_SCOPE => "*",
+    RuntimeGlobals::MODULE_ID => "id",
+    RuntimeGlobals::MODULE_LOADED => "loaded",
+    RuntimeGlobals::MODULE_CACHE => "c",
+    RuntimeGlobals::DEFERRED_MODULE_EXPORTS => "zD",
+    RuntimeGlobals::ENSURE_CHUNK => "e",
+    RuntimeGlobals::ENSURE_CHUNK_HANDLERS => "f",
+    RuntimeGlobals::PUBLIC_PATH => "p",
+    RuntimeGlobals::GET_CHUNK_SCRIPT_FILENAME => "u",
+    RuntimeGlobals::GET_CHUNK_CSS_FILENAME => "k",
+    RuntimeGlobals::LOAD_SCRIPT => "l",
+    RuntimeGlobals::HAS_OWN_PROPERTY => "o",
+    RuntimeGlobals::MODULE_FACTORIES_ADD_ONLY => "m (add only)",
+    RuntimeGlobals::ON_CHUNKS_LOADED => "O",
+    RuntimeGlobals::CHUNK_CALLBACK => "global chunk callback",
+    RuntimeGlobals::MODULE_FACTORIES => "m",
+    RuntimeGlobals::INTERCEPT_MODULE_EXECUTION => "i",
+    RuntimeGlobals::HMR_DOWNLOAD_MANIFEST => "hmrM",
+    RuntimeGlobals::HMR_DOWNLOAD_UPDATE_HANDLERS => "hmrC",
+    RuntimeGlobals::HMR_CHUNK_VERSIONS => "hmrV",
+    RuntimeGlobals::HMR_INVALIDATE_MODULE_HANDLERS => "hmrI",
+    RuntimeGlobals::HMR_MODULE_DATA => "hmrD",
+    RuntimeGlobals::HMR_RUNTIME_STATE_PREFIX => "hmrS",
+    RuntimeGlobals::GET_UPDATE_MANIFEST_FILENAME => "hmrF",
+    RuntimeGlobals::GET_CHUNK_UPDATE_SCRIPT_FILENAME => "hu",
+    RuntimeGlobals::GET_CHUNK_UPDATE_CSS_FILENAME => "hk",
+    RuntimeGlobals::AMD_DEFINE => "amdD",
+    RuntimeGlobals::AMD_OPTIONS => "amdO",
+    RuntimeGlobals::EXTERNAL_INSTALL_CHUNK => "C",
+    RuntimeGlobals::GET_FULL_HASH => "h",
+    RuntimeGlobals::GLOBAL => "g",
+    RuntimeGlobals::RETURN_EXPORTS_FROM_RUNTIME => "return-exports-from-runtime",
+    RuntimeGlobals::INSTANTIATE_WASM => "v",
+    RuntimeGlobals::COMPILE_WASM => "vs",
+    RuntimeGlobals::ASYNC_MODULE => "a",
+    RuntimeGlobals::ASYNC_MODULE_EXPORT_SYMBOL => "aE",
+    RuntimeGlobals::BASE_URI => "b",
+    RuntimeGlobals::STARTUP_ENTRYPOINT => "X",
+    RuntimeGlobals::STARTUP_CHUNK_DEPENDENCIES => "x (chunk dependencies)",
+    RuntimeGlobals::CREATE_SCRIPT_URL => "tu",
+    RuntimeGlobals::CREATE_SCRIPT => "ts",
+    RuntimeGlobals::GET_TRUSTED_TYPES_POLICY => "tt",
+    RuntimeGlobals::DEFINE_PROPERTY_GETTERS => "d",
+    RuntimeGlobals::REEXPORT => "re",
+    RuntimeGlobals::ENTRY_MODULE_ID => "s",
+    RuntimeGlobals::STARTUP_NO_DEFAULT => "x (no default handler)",
+    RuntimeGlobals::ENSURE_CHUNK_INCLUDE_ENTRIES => "f (include entries)",
+    RuntimeGlobals::STARTUP => "x",
+    RuntimeGlobals::MAKE_NAMESPACE_OBJECT => "r",
+    RuntimeGlobals::MAKE_DEFERRED_NAMESPACE_OBJECT => "z",
+    RuntimeGlobals::MAKE_OPTIMIZED_DEFERRED_NAMESPACE_OBJECT => "zO",
+    RuntimeGlobals::DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES => "zT",
+    RuntimeGlobals::DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES_SYMBOL => "zS",
+    RuntimeGlobals::COMPAT_GET_DEFAULT_EXPORT => "n",
+    RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT => "t",
+    RuntimeGlobals::ESM_MODULE_DECORATOR => "hmd",
+    RuntimeGlobals::NODE_MODULE_DECORATOR => "nmd",
+    RuntimeGlobals::SYSTEM_CONTEXT => "y",
+    RuntimeGlobals::THIS_AS_EXPORTS => "top-level-this-exports",
+    RuntimeGlobals::CURRENT_REMOTE_GET_SCOPE => "R",
+    RuntimeGlobals::SHARE_SCOPE_MAP => "S",
+    RuntimeGlobals::INITIALIZE_SHARING => "I",
+    RuntimeGlobals::SCRIPT_NONCE => "nc",
+    RuntimeGlobals::RELATIVE_URL => "U",
+    RuntimeGlobals::CHUNK_NAME => "cn",
+    RuntimeGlobals::RUNTIME_ID => "j",
+    RuntimeGlobals::PREFETCH_CHUNK => "E",
+    RuntimeGlobals::PREFETCH_CHUNK_HANDLERS => "F",
+    RuntimeGlobals::PRELOAD_CHUNK => "G",
+    RuntimeGlobals::PRELOAD_CHUNK_HANDLERS => "H",
+    RuntimeGlobals::UNCAUGHT_ERROR_HANDLER => "oe",
+    // rspack only
+    RuntimeGlobals::RSPACK_VERSION => "rv",
+    RuntimeGlobals::RSPACK_UNIQUE_ID => "ruid",
+    RuntimeGlobals::HAS_CSS_MODULES => "has css modules",
+    RuntimeGlobals::CSS_INJECT_STYLE => "is",
+    RuntimeGlobals::CSS_STYLE_SHEET => "css",
+    RuntimeGlobals::ASYNC_STARTUP => "asyncStartup",
+    RuntimeGlobals::HAS_FETCH_PRIORITY => "has fetch priority",
+
+    RuntimeGlobals::RSC_MANIFEST => "rscM",
+    RuntimeGlobals::TO_BINARY => "tb",
+    _ => return None,
+  })
+}
+
+pub fn runtime_globals_to_string(runtime_globals: &RuntimeGlobals) -> String {
+  if runtime_globals == &RuntimeGlobals::EXPORTS {
+    return runtime_variable_name(&RuntimeVariable::Exports).to_string();
+  }
+
+  if runtime_globals == &RuntimeGlobals::REQUIRE {
+    return runtime_variable_name(&RuntimeVariable::Require).to_string();
+  }
+
+  if runtime_globals == &RuntimeGlobals::MODULE {
+    return "module".to_string();
+  }
+
+  let name = runtime_globals_property_name(runtime_globals)
+    .expect("runtime global should have a property name");
+  if REQUIRE_SCOPE_GLOBALS.contains(*runtime_globals) {
+    let require = runtime_variable_name(&RuntimeVariable::Require);
+    let mut result = String::with_capacity(require.len() + 1 + name.len());
+    result.push_str(require);
+    result.push('.');
+    result.push_str(name);
+    return result;
+  }
+  if MODULE_GLOBALS.contains(*runtime_globals) {
+    let mut result = String::with_capacity("module".len() + 1 + name.len());
+    result.push_str("module");
+    result.push('.');
+    result.push_str(name);
+    return result;
+  }
+  name.to_string()
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum RuntimeVariable {
+  Require,
+  Context,
+  Modules,
+  ModuleCache,
+  Module,
+  Exports,
+  StartupExec,
+}
+
+pub fn rspack_runtime_variable_name(runtime_variable: &RuntimeVariable) -> &'static str {
+  match *runtime_variable {
+    RuntimeVariable::Require => "__rspack_require",
+    RuntimeVariable::Context => "__rspack_context",
+    RuntimeVariable::Modules => "__rspack_modules",
+    RuntimeVariable::ModuleCache => "__rspack_module_cache",
+    RuntimeVariable::Exports => "__rspack_exports",
+    RuntimeVariable::Module => "__rspack_module",
+    RuntimeVariable::StartupExec => "__rspack_exec",
+  }
+}
+
+pub fn rspack_export_runtime_variable_name(runtime_variable: &RuntimeVariable) -> &'static str {
+  match *runtime_variable {
+    RuntimeVariable::Require => "rspackRequire",
+    RuntimeVariable::Context => "context",
+    RuntimeVariable::Modules => "modules",
+    RuntimeVariable::ModuleCache => "moduleCache",
+    RuntimeVariable::Exports => "exports",
+    RuntimeVariable::Module => "module",
+    RuntimeVariable::StartupExec => "startupExec",
+  }
+}
+
+pub fn runtime_variable_name(runtime_variable: &RuntimeVariable) -> &'static str {
+  match *runtime_variable {
+    RuntimeVariable::Require => "__webpack_require__",
+    RuntimeVariable::Context => "__rspack_context",
+    RuntimeVariable::Modules => "__webpack_modules__",
+    RuntimeVariable::ModuleCache => "__webpack_module_cache__",
+    RuntimeVariable::Exports => "__webpack_exports__",
+    RuntimeVariable::Module => "__webpack_module__",
+    RuntimeVariable::StartupExec => "__webpack_exec__",
+  }
+}
+
+type RuntimeGlobalMap = (
+  FxHashMap<RuntimeGlobals, &'static str>,
+  FxHashMap<&'static str, RuntimeGlobals>,
+  FxHashMap<&'static str, RuntimeGlobals>,
+  FxHashMap<RuntimeGlobals, String>,
+);
+
+static RUNTIME_GLOBAL_MAP: LazyLock<RuntimeGlobalMap> = LazyLock::new(|| {
+  let mut to_flag_name_map = FxHashMap::default();
+  let mut from_flag_name_map = FxHashMap::default();
+  let mut from_property_name_map = FxHashMap::default();
+  let mut to_lexical_name_map = FxHashMap::default();
+
+  for (name, value) in RuntimeGlobals::all().iter_names() {
+    to_flag_name_map.insert(value, name);
+    from_flag_name_map.insert(name, value);
+    to_lexical_name_map.insert(value, name.to_lower_camel_case());
+    if let Some(property_name) = runtime_globals_property_name(&value) {
+      from_property_name_map.insert(property_name, value);
     }
   }
-}
 
-impl From<RuntimeGlobals> for Atom {
-  fn from(value: RuntimeGlobals) -> Self {
-    value.name().into()
+  to_flag_name_map.shrink_to_fit();
+  from_flag_name_map.shrink_to_fit();
+  from_property_name_map.shrink_to_fit();
+  to_lexical_name_map.shrink_to_fit();
+  (
+    to_flag_name_map,
+    from_flag_name_map,
+    from_property_name_map,
+    to_lexical_name_map,
+  )
+});
+
+impl RuntimeGlobals {
+  pub fn property_name(&self) -> Option<&'static str> {
+    runtime_globals_property_name(self)
+  }
+
+  pub fn rspack_context_property_name(&self) -> Option<&'static str> {
+    if *self == RuntimeGlobals::MAKE_NAMESPACE_OBJECT {
+      Some("N")
+    } else {
+      self.property_name()
+    }
+  }
+
+  pub fn from_property_name(property_name: &str) -> Option<Self> {
+    RUNTIME_GLOBAL_MAP.2.get(property_name).copied()
+  }
+
+  pub fn from_rspack_context_property_name(property_name: &str) -> Option<Self> {
+    if property_name == "N" {
+      return Some(RuntimeGlobals::MAKE_NAMESPACE_OBJECT);
+    }
+    let runtime_global = Self::from_property_name(property_name)?;
+    (runtime_global != RuntimeGlobals::MAKE_NAMESPACE_OBJECT).then_some(runtime_global)
+  }
+
+  pub fn renderable_require_scope(self) -> Self {
+    self.intersection(*REQUIRE_SCOPE_GLOBALS)
+  }
+
+  pub fn with_require_scope(self) -> Self {
+    if !self.renderable_require_scope().is_empty() {
+      self | RuntimeGlobals::REQUIRE_SCOPE
+    } else {
+      self
+    }
+  }
+
+  pub fn to_lexical_name(&self) -> Option<&str> {
+    RUNTIME_GLOBAL_MAP.3.get(self).map(String::as_str)
+  }
+
+  pub fn to_rspack_export_setter_name(&self) -> Option<String> {
+    let name = self.to_lexical_name()?;
+    let mut setter = String::with_capacity(name.len() + 3);
+    setter.push_str("set");
+    setter.push(name.as_bytes()[0].to_ascii_uppercase() as char);
+    setter.push_str(&name[1..]);
+    Some(setter)
+  }
+
+  pub fn should_initialize_as_object(&self) -> bool {
+    !self.intersection(*INITIALIZE_OBJECT_GLOBALS).is_empty()
+  }
+
+  pub fn should_initialize_as_array(&self) -> bool {
+    !self.intersection(*INITIALIZE_ARRAY_GLOBALS).is_empty()
+  }
+
+  pub fn needs_bootstrap_runtime_context(&self) -> bool {
+    !self
+      .intersection(*BOOTSTRAP_RUNTIME_CONTEXT_GLOBALS)
+      .is_empty()
+  }
+
+  pub fn to_names(&self) -> Vec<&'static str> {
+    let mut res = vec![];
+
+    for (item, js_name) in RUNTIME_GLOBAL_MAP.0.iter() {
+      if self.contains(*item) {
+        res.push(*js_name);
+      }
+    }
+    res
+  }
+  pub fn from_names(names: &[String]) -> Self {
+    let mut res = Self::empty();
+
+    for name in names {
+      if let Some(value) = RUNTIME_GLOBAL_MAP.1.get(name.as_str()) {
+        res.insert(*value);
+      }
+    }
+    res
   }
 }
 
-#[cfg(test)]
-mod test {
-  use super::*;
-
-  #[test]
-  fn test_iter() {
-    let flags = RuntimeGlobals::PUBLIC_PATH | RuntimeGlobals::GET_CHUNK_CSS_FILENAME;
-    let flags: Vec<_> = flags.iter().collect();
-    assert_eq!(flags.len(), 2);
-    assert_eq!(flags[0], RuntimeGlobals::PUBLIC_PATH);
-    assert_eq!(flags[1], RuntimeGlobals::GET_CHUNK_CSS_FILENAME);
-  }
-
-  #[test]
-  fn test_pretty_print() {
-    let flags = RuntimeGlobals::PUBLIC_PATH;
-    assert_eq!(format!("{flags}"), "__webpack_require__.p");
-    let flags = RuntimeGlobals::GET_CHUNK_CSS_FILENAME;
-    assert_eq!(format!("{flags}"), "__webpack_require__.k");
-  }
-
-  #[test]
-  #[should_panic]
-  fn test_panic_when_print_multiple_flags() {
-    let flags = RuntimeGlobals::PUBLIC_PATH | RuntimeGlobals::GET_CHUNK_CSS_FILENAME;
-    print!("{flags}");
+impl RspackHash for RuntimeGlobals {
+  fn hash(&self, state: &mut RspackHasher) {
+    self.bits().hash(state);
   }
 }

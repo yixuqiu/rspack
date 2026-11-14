@@ -1,173 +1,185 @@
-use swc_core::ecma::ast::{ClassDecl, ExportDecl, ImportDecl, ImportSpecifier, ModuleExportName};
-use swc_core::ecma::ast::{Decl, DefaultDecl, ExportAll, ExportDefaultDecl, ExprStmt};
-use swc_core::ecma::ast::{ModuleDecl, ModuleItem, NamedExport, Stmt, VarDecl, VarDeclKind};
+use rspack_util::swc::AstSubRangeExt;
+use swc_next_ecma_ast::{
+  Decl, ExportDefaultDeclarationKindData, ExprData, GetSpan, NodeKindData, Stmt, StmtData,
+  SubRange, VariableDeclaration, VariableKind,
+};
 
-use super::JavascriptParser;
-use crate::parser_plugin::JavascriptParserPlugin;
+use super::{
+  JavascriptParser,
+  estree::{ExportDefaultDeclaration, ExportLocal, ExportNamedDeclaration},
+};
+use crate::{Atom, JS_DEFAULT_KEYWORD, parser_plugin::JavascriptParserPlugin};
 
-impl<'parser> JavascriptParser<'parser> {
-  pub fn block_pre_walk_module_declarations(&mut self, statements: &Vec<ModuleItem>) {
-    for statement in statements {
-      self.block_pre_walk_module_declaration(statement);
+impl JavascriptParser<'_> {
+  pub fn block_pre_walk_module_items(&mut self, statements: SubRange<Stmt>) {
+    let ast = self.ast.ast;
+    for statement in ast.nodes(statements) {
+      self.block_pre_walk_module_item(statement);
     }
   }
 
-  pub fn block_pre_walk_statements(&mut self, statements: &Vec<Stmt>) {
-    for statement in statements {
+  pub fn block_pre_walk_statements(&mut self, statements: SubRange<Stmt>) {
+    let ast = self.ast.ast;
+    for statement in ast.nodes(statements) {
       self.block_pre_walk_statement(statement);
     }
   }
 
-  fn block_pre_walk_module_declaration(&mut self, statement: &ModuleItem) {
-    match statement {
-      ModuleItem::ModuleDecl(decl) => {
-        // TODO: `hooks.block_pre_statement.call`
-        match decl {
-          ModuleDecl::Import(decl) => self.block_pre_walk_import_declaration(decl),
-          ModuleDecl::ExportAll(decl) => self.block_pre_walk_export_all_declaration(decl),
-          ModuleDecl::ExportDefaultDecl(decl) => {
-            self.block_pre_walk_export_default_declaration(decl)
-          }
-          ModuleDecl::ExportNamed(decl) => self.block_pre_walk_export_name_declaration(decl),
-          ModuleDecl::ExportDefaultExpr(_) => (),
-          ModuleDecl::ExportDecl(exp) => self.block_pre_walk_export_declaration(exp),
-          ModuleDecl::TsImportEquals(_)
-          | ModuleDecl::TsExportAssignment(_)
-          | ModuleDecl::TsNamespaceExport(_) => unreachable!(),
-        }
+  pub fn block_pre_walk_module_item(&mut self, statement: Stmt) {
+    let ast = self.ast.ast;
+    match ast.stmt_data(statement) {
+      StmtData::ImportDeclaration(_)
+      | StmtData::ExportAllDeclaration(_)
+      | StmtData::ExportNamedDeclaration(_)
+      | StmtData::ExportDefaultDeclaration(_) => {
+        let drive = self.plugin_drive();
+        self.enter_statement(
+          statement.span(ast),
+          statement,
+          |parser, node| {
+            drive
+              .block_pre_module_declaration(parser, node)
+              .unwrap_or_default()
+          },
+          |parser, node| match parser.ast.ast.stmt_data(node) {
+            StmtData::ExportNamedDeclaration(declaration) => {
+              parser.block_pre_walk_export_named_declaration(ExportNamedDeclaration(declaration))
+            }
+            StmtData::ExportDefaultDeclaration(declaration) => parser
+              .block_pre_walk_export_default_declaration(ExportDefaultDeclaration(declaration)),
+            _ => (),
+          },
+        );
       }
-      ModuleItem::Stmt(stmt) => self.block_pre_walk_statement(stmt),
+      _ => self.block_pre_walk_statement(statement),
     }
   }
 
-  fn block_pre_walk_statement(&mut self, stmt: &Stmt) {
-    // TODO: `hooks.block_pre_statement.call`
-    match stmt {
-      Stmt::Decl(stmt) => match stmt {
-        Decl::Class(decl) => self.block_pre_walk_class_declaration(decl),
-        Decl::Var(decl) => self.block_pre_walk_variable_declaration(decl),
-        Decl::Fn(_) | Decl::Using(_) => (),
-        Decl::TsInterface(_) | Decl::TsTypeAlias(_) | Decl::TsEnum(_) | Decl::TsModule(_) => {
-          unreachable!()
+  pub fn block_pre_walk_statement(&mut self, statement: Stmt) {
+    let drive = self.plugin_drive();
+    self.enter_statement(
+      statement.span(self.ast.ast),
+      statement,
+      |parser, node| drive.block_pre_statement(parser, node).unwrap_or_default(),
+      |parser, node| match parser.ast.ast.kind_data(node.node_id()) {
+        NodeKindData::VariableDeclaration(declaration) => {
+          parser.block_pre_walk_variable_declaration(declaration)
         }
+        NodeKindData::Function(function) => {
+          if parser.is_block_scoped_function(function)
+            && let Some(identifier) = function.id(parser.ast.ast)
+          {
+            // Semantic bindings are already active; run declaration hooks in
+            // the block so runtime-name collisions are handled in that scope.
+            parser.enter_ident(identifier, |_, _, _| {});
+          }
+        }
+        NodeKindData::ExpressionStatement(expression) => {
+          parser.block_pre_walk_expression_statement(expression)
+        }
+        _ => (),
       },
-      Stmt::Expr(expr) => self.block_pre_walk_expression_statement(expr),
-      _ => (),
+    );
+  }
+
+  fn block_pre_walk_expression_statement(
+    &mut self,
+    statement: swc_next_ecma_ast::ExpressionStatement,
+  ) {
+    let expression = statement.expression(self.ast.ast);
+    if let ExprData::AssignmentExpression(assignment) = self.ast.ast.expr_data(expression) {
+      self.pre_walk_assignment_expression(assignment);
     }
   }
 
-  fn block_pre_walk_expression_statement(&mut self, stmt: &ExprStmt) {
-    if let Some(assign) = stmt.expr.as_assign() {
-      self.pre_walk_assignment_expression(assign)
+  pub(super) fn block_pre_walk_variable_declaration(&mut self, declaration: VariableDeclaration) {
+    let kind = declaration.kind(self.ast.ast);
+    if kind == VariableKind::Var {
+      return;
     }
-  }
-
-  pub(super) fn block_pre_walk_variable_declaration(&mut self, decl: &VarDecl) {
-    if decl.kind != VarDeclKind::Var {
-      self._pre_walk_variable_declaration(decl);
-    }
-  }
-
-  fn block_pre_walk_export_name_declaration(&mut self, decl: &NamedExport) {
-    if let Some(source) = &decl.src {
+    if kind == VariableKind::AwaitUsing && self.is_top_level_scope() {
       self
-        .plugin_drive
-        .clone()
-        .named_export_import(self, decl, source.value.as_str());
+        .plugin_drive()
+        .top_level_await_using_declaration(self, declaration);
+    }
+    self._pre_walk_variable_declaration(declaration);
+  }
+
+  fn block_pre_walk_export_named_declaration(&mut self, export: ExportNamedDeclaration) {
+    let ast = self.ast.ast;
+    if export.source(ast).is_some() {
+      return;
+    }
+    let drive = self.plugin_drive();
+    drive.export(self, ExportLocal::Named(export));
+    if let Some(declaration) = export.0.declaration(ast) {
+      let statement = Stmt::Declaration(declaration);
+      let prev = self.prev_statement;
+      self.pre_walk_statement(statement);
+      self.prev_statement = prev;
+      self.block_pre_walk_statement(statement);
+      self.enter_declaration(declaration, |parser, identifier, name| {
+        let ast = parser.ast.ast;
+        let name = Atom::from(name);
+        drive.export_specifier(
+          parser,
+          ExportLocal::Named(export),
+          &name,
+          &name,
+          identifier.span(ast),
+        );
+      });
     } else {
-      // TODO: `hooks.export.call`
+      for (local, exported, span) in export.named_export_specifiers(ast) {
+        drive.export_specifier(self, ExportLocal::Named(export), &local, &exported, span);
+      }
     }
   }
 
-  fn block_pre_walk_export_declaration(&mut self, exp: &ExportDecl) {
-    // todo: move `hooks.export_decl.call` here
-    let decl = Stmt::Decl(exp.decl.clone());
-    self.pre_walk_statement(&decl);
-    self.block_pre_walk_statement(&decl);
-  }
-
-  fn block_pre_walk_class_declaration(&mut self, decl: &ClassDecl) {
-    self.define_variable(decl.ident.sym.to_string())
-  }
-
-  fn block_pre_walk_export_default_declaration(&mut self, decl: &ExportDefaultDecl) {
-    // FIXME: webpack use `self.pre_walk_statement(decl.decl)`
-    match &decl.decl {
-      DefaultDecl::Class(expr) => {
-        if let Some(ident) = &expr.ident {
-          self.define_variable(ident.sym.to_string())
+  fn block_pre_walk_export_default_declaration(&mut self, export: ExportDefaultDeclaration) {
+    let ast = self.ast.ast;
+    let drive = self.plugin_drive();
+    drive.export(self, ExportLocal::Default(export));
+    let declaration = export.declaration(ast);
+    match ast.export_default_declaration_kind_data(declaration) {
+      ExportDefaultDeclarationKindData::Class(class) => {
+        let statement = Stmt::Declaration(Decl::Class(class));
+        let prev = self.prev_statement;
+        self.pre_walk_statement(statement);
+        self.prev_statement = prev;
+        self.block_pre_walk_statement(statement);
+        if let Some(identifier) = class.id(ast) {
+          drive.export_specifier(
+            self,
+            ExportLocal::Default(export),
+            &Atom::from(ast.get_utf8(identifier.name(ast))),
+            &JS_DEFAULT_KEYWORD,
+            identifier.span(ast),
+          );
+        } else {
+          drive.export_expression(self, export, declaration);
         }
       }
-      DefaultDecl::Fn(expr) => {
-        if let Some(ident) = &expr.ident {
-          self.define_variable(ident.sym.to_string())
+      ExportDefaultDeclarationKindData::Function(function) => {
+        let statement = Stmt::Declaration(Decl::Function(function));
+        let prev = self.prev_statement;
+        self.pre_walk_statement(statement);
+        self.prev_statement = prev;
+        self.block_pre_walk_statement(statement);
+        if let Some(identifier) = function.id(ast) {
+          drive.export_specifier(
+            self,
+            ExportLocal::Default(export),
+            &Atom::from(ast.get_utf8(identifier.name(ast))),
+            &JS_DEFAULT_KEYWORD,
+            identifier.span(ast),
+          );
+        } else {
+          drive.export_expression(self, export, declaration);
         }
       }
-      DefaultDecl::TsInterfaceDecl(_) => unreachable!(),
-    }
-
-    // FIXME: webpack use `self.block_pre_walk_statement(decl.decl)`
-    // match &decl.decl {
-    //   DefaultDecl::Class(expr) => {
-    //     if let Some(ident) = &expr.ident {
-    //       self.define_variable(ident.sym.to_string())
-    //     }
-    //   }
-    //   DefaultDecl::Fn(expr) => {
-    //     if let Some(ident) = &expr.ident {
-    //       self.define_variable(ident.sym.to_string())
-    //     }
-    //   }
-    //   DefaultDecl::TsInterfaceDecl(_) => unreachable!(),
-    // }
-  }
-
-  fn block_pre_walk_export_all_declaration(&mut self, decl: &ExportAll) {
-    self
-      .plugin_drive
-      .clone()
-      .all_export_import(self, decl, decl.src.value.as_str());
-    // TODO: `hooks.export_import_specifier.call`
-  }
-
-  fn block_pre_walk_import_declaration(&mut self, decl: &ImportDecl) {
-    let drive = self.plugin_drive.clone();
-    let source = &decl.src.value;
-    drive.import(self, decl, source.as_str());
-
-    for specifier in &decl.specifiers {
-      match specifier {
-        ImportSpecifier::Named(named) => {
-          let identifier_name = named.local.sym.as_str();
-          let export_name = named.imported.as_ref().map(|imported| match imported {
-            ModuleExportName::Ident(ident) => ident.sym.as_str(),
-            ModuleExportName::Str(s) => s.value.as_str(),
-          });
-          if drive
-            .import_specifier(self, decl, source, export_name, identifier_name)
-            .unwrap_or_default()
-          {
-            self.define_variable(identifier_name.to_string())
-          }
-        }
-        ImportSpecifier::Default(default) => {
-          let identifier_name = default.local.sym.as_str();
-          if drive
-            .import_specifier(self, decl, source, Some("default"), identifier_name)
-            .unwrap_or_default()
-          {
-            self.define_variable(identifier_name.to_string())
-          }
-        }
-        ImportSpecifier::Namespace(namespace) => {
-          let identifier_name = namespace.local.sym.as_str();
-          if drive
-            .import_specifier(self, decl, source, None, identifier_name)
-            .unwrap_or_default()
-          {
-            self.define_variable(identifier_name.to_string())
-          }
-        }
+      _ => {
+        drive.export_expression(self, export, declaration);
       }
     }
   }

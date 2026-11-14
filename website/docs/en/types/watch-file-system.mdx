@@ -1,0 +1,82 @@
+<>
+
+```ts
+type WatchDependencies = Iterable<string> & {
+  added?: Iterable<string>;
+  removed?: Iterable<string>;
+};
+
+type FileSystemInfoEntry = {
+  safeTime: number;
+  timestamp?: number;
+  accuracy?: number;
+};
+
+// `{}` marks a path known to exist with no time info; `null` a watched path
+// that is absent on disk.
+type ExistenceOnlyTimeEntry = Record<string, never>;
+
+type TimeInfoEntries = Map<
+  string,
+  FileSystemInfoEntry | ExistenceOnlyTimeEntry | 'ignore' | null
+>;
+
+type WatcherInfo = {
+  changes: Set<string>;
+  removals: Set<string>;
+  fileTimeInfoEntries: TimeInfoEntries;
+  contextTimeInfoEntries: TimeInfoEntries;
+};
+
+type Watcher = {
+  close(): void;
+  pause(): void;
+  getInfo(): WatcherInfo;
+};
+
+type WatchFileSystemEvents = {
+  change: [filename: string, mtime: number];
+  remove: [filename: string];
+  aggregated: [changes: Set<string>, removals: Set<string>];
+};
+
+interface WatchFileSystem {
+  watch(
+    files: WatchDependencies,
+    directories: WatchDependencies,
+    missing: WatchDependencies,
+    startTime: number,
+    options: WatchOptions,
+    callback: (
+      error: Error | null,
+      fileTimeInfoEntries: TimeInfoEntries,
+      contextTimeInfoEntries: TimeInfoEntries,
+      changedFiles: Set<string>,
+      removedFiles: Set<string>,
+    ) => void,
+    callbackUndelayed: (fileName: string, changeTime: number) => void,
+  ): Watcher;
+
+  on?<E extends keyof WatchFileSystemEvents>(
+    event: E,
+    listener: (...args: WatchFileSystemEvents[E]) => void,
+  ): this;
+  once?<E extends keyof WatchFileSystemEvents>(
+    event: E,
+    listener: (...args: WatchFileSystemEvents[E]) => void,
+  ): this;
+  emit?<E extends keyof WatchFileSystemEvents>(
+    event: E,
+    ...args: WatchFileSystemEvents[E]
+  ): boolean;
+
+  getTimes?(): Record<string, number | null>;
+  getTimeInfoEntries?(): TimeInfoEntries;
+  collectTimeInfoEntries?(
+    fileTimestamps: TimeInfoEntries,
+    directoryTimestamps: TimeInfoEntries,
+  ): void;
+}
+```
+
+</>

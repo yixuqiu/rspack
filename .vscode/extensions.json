@@ -1,8 +1,10 @@
 {
   "recommendations": [
+    "rstack.rstack",
     "streetsidesoftware.code-spell-checker",
     "tamasfe.even-better-toml",
     "rust-lang.rust-analyzer",
-    "fabiospampinato.vscode-debug-launcher"
+    "fabiospampinato.vscode-debug-launcher",
+    "augustocdias.tasks-shell-input"
   ]
 }

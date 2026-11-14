@@ -1,0 +1,7 @@
+WARNING in ./index.js
+  ⚠ Module parse warning:
+  ╰─▶   ⚠ DefinePlugin warning: failed to parse "😄"
+         ╭────
+       1 │ 😄
+         · ──
+         ╰────

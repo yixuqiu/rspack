@@ -1,25 +1,47 @@
-#![feature(let_chains)]
-#![feature(if_let_guard)]
-#![feature(iter_intersperse)]
-#![feature(box_patterns)]
-#![feature(anonymous_lifetime_in_impl_trait)]
-#![feature(hash_raw_entry)]
-#![feature(option_get_or_insert_default)]
-#![feature(slice_group_by)]
+#![feature(unique_rc_arc)]
+
 use std::{fmt, sync::Arc};
+
+#[cfg(allocative)]
+pub use rspack_util::rspack_allocative;
+mod artifacts;
+mod binding;
+mod compilation;
+mod transient_cache;
+
+mod exports;
+pub mod legacy_cache;
+mod new_cache;
+mod value_cache_versions;
+pub use artifacts::*;
+pub use binding::*;
+pub use compilation::{
+  build_module_graph::{ExecuteModuleId, ForwardId, LazyUntil},
+  *,
+};
+pub use exports::*;
+pub use new_cache::{
+  Cache, CacheCounters, CacheFacade, CacheInfo, CacheRecord, CacheValue, CompilerCache, Etag,
+  FileSystemInfo, ItemCacheFacade, LoaderCache, MultiItemCache, Snapshot, SnapshotValidationResult,
+  create_cache,
+};
+pub use transient_cache::*;
+pub use value_cache_versions::ValueCacheVersions;
+mod concatenation_backend;
 mod dependencies_block;
+pub use concatenation_backend::*;
 pub mod diagnostics;
-mod update_hash;
+pub mod incremental;
 pub use dependencies_block::{
-  AsyncDependenciesBlock, AsyncDependenciesBlockIdentifier, DependenciesBlock, DependencyLocation,
+  AsyncDependenciesBlock, AsyncDependenciesBlockIdentifier, AsyncDependenciesBlockIdentifierMap,
+  AsyncDependenciesBlockIdentifierSet, AsyncDependenciesBlockRef, DependenciesBlock,
+  DependenciesBlockData, DependencyIds,
 };
 mod fake_namespace_object;
-mod template;
 pub use fake_namespace_object::*;
-pub use template::Template;
-mod module_profile;
-pub use module_profile::*;
-use rspack_database::Database;
+mod runtime_template;
+pub use runtime_template::*;
+use rustc_hash::FxHashMap;
 pub mod external_module;
 pub use external_module::*;
 mod logger;
@@ -28,21 +50,27 @@ pub mod cache;
 mod normal_module;
 mod raw_module;
 pub use raw_module::*;
-mod exports_info;
-pub use exports_info::*;
 pub mod module;
 pub mod parser_and_generator;
+pub use concatenated_module::*;
 pub use module::*;
 pub use parser_and_generator::*;
 mod runtime_globals;
 pub use normal_module::*;
-pub use runtime_globals::RuntimeGlobals;
+pub use runtime_globals::{
+  MODULE_GLOBALS, REQUIRE_SCOPE_GLOBALS, RuntimeGlobals, RuntimeVariable, runtime_variable_name,
+};
+mod runtime_module_source;
+pub use runtime_module_source::render_runtime_module_source;
 mod plugin;
 pub use plugin::*;
 mod context_module;
 pub use context_module::*;
 mod context_module_factory;
 pub use context_module_factory::*;
+mod glob_utils;
+pub(crate) use glob_utils::walk_dir;
+pub use glob_utils::*;
 mod init_fragment;
 pub use init_fragment::*;
 mod module_factory;
@@ -70,15 +98,12 @@ use ustr::Ustr;
 pub use utils::*;
 mod chunk_graph;
 pub use chunk_graph::*;
-mod build_chunk_graph;
 mod stats;
 pub use stats::*;
 mod runtime;
 mod runtime_module;
 pub use runtime::*;
 pub use runtime_module::*;
-mod code_generation_results;
-pub use code_generation_results::*;
 mod entrypoint;
 pub use entrypoint::*;
 mod loader;
@@ -91,76 +116,88 @@ mod ukey;
 pub use ukey::*;
 pub mod resolver;
 pub use resolver::*;
+pub use rspack_location::{
+  DependencyLocation, RealDependencyLocation, SourcePosition, SyntheticDependencyLocation,
+};
 pub mod concatenated_module;
 pub mod reserved_names;
-pub mod tree_shaking;
-
-pub use rspack_loader_runner::{get_scheme, ResourceData, Scheme, BUILTIN_LOADER_PREFIX};
+pub use inventory;
+use rspack_cacheable::{cacheable, with::AsPreset};
+use rspack_hash::{RspackHash, RspackHasher};
+pub use rspack_loader_runner::{
+  AdditionalData, BUILTIN_LOADER_PREFIX, ParseMeta, ResourceData, ResourceParsedData, Scheme,
+  get_scheme, parse_resource,
+};
 pub use rspack_macros::{impl_runtime_module, impl_source_map_config};
 pub use rspack_sources;
 
 #[cfg(debug_assertions)]
 pub mod debug_info;
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cacheable]
+#[derive(
+  Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rspack_macros::StringEnum,
+)]
+#[string_enum(rename_all = "kebab-case")]
 pub enum SourceType {
+  #[string_enum(rename = "javascript")]
   JavaScript,
   Css,
+  AssetUrl,
   Wasm,
   Asset,
   Expose,
   Remote,
   ShareInit,
   ConsumeShared,
-  Custom(Ustr),
+  ShareContainerShared,
+  #[string_enum(fallback)]
+  Custom(#[cacheable(with=AsPreset)] Ustr),
   #[default]
   Unknown,
   CssImport,
+  Runtime,
 }
+
+pub static NO_SOURCE_TYPE_LIST: &[SourceType; 0] = &[];
 
 impl std::fmt::Display for SourceType {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match self {
-      SourceType::JavaScript => write!(f, "javascript"),
-      SourceType::Css => write!(f, "css"),
-      SourceType::Wasm => write!(f, "wasm"),
-      SourceType::Asset => write!(f, "asset"),
-      SourceType::Expose => write!(f, "expose"),
-      SourceType::Remote => write!(f, "remote"),
-      SourceType::ShareInit => write!(f, "share-init"),
-      SourceType::ConsumeShared => write!(f, "consume-shared"),
-      SourceType::Unknown => write!(f, "unknown"),
-      SourceType::CssImport => write!(f, "css-import"),
-      SourceType::Custom(source_type) => f.write_str(source_type),
-    }
+    f.write_str(self.as_str())
   }
 }
 
-impl From<&str> for SourceType {
-  fn from(value: &str) -> Self {
+impl RspackHash for SourceType {
+  fn hash(&self, state: &mut RspackHasher) {
+    self.as_str().hash(state);
+  }
+}
+
+impl From<&ModuleType> for SourceType {
+  fn from(value: &ModuleType) -> Self {
     match value {
-      "javascript" => Self::JavaScript,
-      "css" => Self::Css,
-      "wasm" => Self::Wasm,
-      "asset" => Self::Asset,
-      "expose" => Self::Expose,
-      "remote" => Self::Remote,
-      "share-init" => Self::ShareInit,
-      "consume-shared" => Self::ConsumeShared,
-      "unknown" => Self::Unknown,
-      "css-import" => Self::CssImport,
-      other => SourceType::Custom(other.into()),
+      ModuleType::JsAuto | ModuleType::JsEsm | ModuleType::JsDynamic => Self::JavaScript,
+      ModuleType::Css | ModuleType::CssModule | ModuleType::CssAuto | ModuleType::CssGlobal => {
+        Self::Css
+      }
+      ModuleType::WasmSync | ModuleType::WasmAsync => Self::Wasm,
+      ModuleType::Asset | ModuleType::AssetInline | ModuleType::AssetResource => Self::Asset,
+      ModuleType::ConsumeShared => Self::ConsumeShared,
+      ModuleType::ShareContainerShared => Self::ShareContainerShared,
+      _ => Self::Unknown,
     }
   }
 }
 
+#[cacheable]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleType {
   Json,
   Css,
   CssModule,
   CssAuto,
-  Js,
+  CssGlobal,
+  JsAuto,
   JsDynamic,
   JsEsm,
   WasmSync,
@@ -168,25 +205,23 @@ pub enum ModuleType {
   AssetInline,
   AssetResource,
   AssetSource,
+  AssetBytes,
   Asset,
   Runtime,
   Remote,
   Fallback,
   ProvideShared,
   ConsumeShared,
+  ShareContainerShared,
   SelfReference,
-  Custom(Ustr),
+  Custom(#[cacheable(with=AsPreset)] Ustr),
 }
 
 impl ModuleType {
-  pub fn is_css_like(&self) -> bool {
-    matches!(self, Self::Css | Self::CssModule | Self::CssAuto)
-  }
-
   pub fn is_js_like(&self) -> bool {
     matches!(
       self,
-      ModuleType::Js | ModuleType::JsEsm | ModuleType::JsDynamic
+      ModuleType::JsAuto | ModuleType::JsEsm | ModuleType::JsDynamic
     )
   }
 
@@ -202,7 +237,7 @@ impl ModuleType {
   }
 
   pub fn is_js_auto(&self) -> bool {
-    matches!(self, ModuleType::Js)
+    matches!(self, ModuleType::JsAuto)
   }
 
   pub fn is_js_esm(&self) -> bool {
@@ -215,18 +250,19 @@ impl ModuleType {
 
   /// Webpack arbitrary determines the binary type from [NormalModule.binary](https://github.com/webpack/webpack/blob/1f99ad6367f2b8a6ef17cce0e058f7a67fb7db18/lib/NormalModule.js#L302)
   pub fn is_binary(&self) -> bool {
-    self.is_asset_like() || self.is_wasm_like()
+    matches!(self, ModuleType::AssetBytes) || self.is_asset_like() || self.is_wasm_like()
   }
 
-  pub fn as_str(&self) -> &str {
+  pub fn as_str(&self) -> &'static str {
     match self {
-      ModuleType::Js => "javascript/auto",
+      ModuleType::JsAuto => "javascript/auto",
       ModuleType::JsEsm => "javascript/esm",
       ModuleType::JsDynamic => "javascript/dynamic",
 
       ModuleType::Css => "css",
       ModuleType::CssModule => "css/module",
       ModuleType::CssAuto => "css/auto",
+      ModuleType::CssGlobal => "css/global",
 
       ModuleType::Json => "json",
 
@@ -237,14 +273,16 @@ impl ModuleType {
       ModuleType::AssetSource => "asset/source",
       ModuleType::AssetResource => "asset/resource",
       ModuleType::AssetInline => "asset/inline",
+      ModuleType::AssetBytes => "asset/bytes",
       ModuleType::Runtime => "runtime",
       ModuleType::Remote => "remote-module",
       ModuleType::Fallback => "fallback-module",
       ModuleType::ProvideShared => "provide-module",
       ModuleType::ConsumeShared => "consume-shared-module",
+      ModuleType::ShareContainerShared => "share-container-shared-module",
       ModuleType::SelfReference => "self-reference-module",
 
-      ModuleType::Custom(custom) => custom,
+      ModuleType::Custom(custom) => custom.as_str(),
     }
   }
 }
@@ -260,13 +298,14 @@ impl From<&str> for ModuleType {
     match value {
       "mjs" => Self::JsEsm,
       "cjs" => Self::JsDynamic,
-      "js" | "javascript" | "js/auto" | "javascript/auto" => Self::Js,
-      "js/dynamic" | "javascript/dynamic" => Self::JsDynamic,
-      "js/esm" | "javascript/esm" => Self::JsEsm,
+      "javascript/auto" => Self::JsAuto,
+      "javascript/dynamic" => Self::JsDynamic,
+      "javascript/esm" => Self::JsEsm,
 
       "css" => Self::Css,
       "css/module" => Self::CssModule,
       "css/auto" => Self::CssAuto,
+      "css/global" => Self::CssGlobal,
 
       "json" => Self::Json,
 
@@ -277,45 +316,154 @@ impl From<&str> for ModuleType {
       "asset/resource" => Self::AssetResource,
       "asset/source" => Self::AssetSource,
       "asset/inline" => Self::AssetInline,
+      "asset/bytes" => Self::AssetBytes,
 
       custom => Self::Custom(custom.into()),
     }
   }
 }
 
-pub type ChunkByUkey = Database<Chunk>;
-pub type ChunkGroupByUkey = Database<ChunkGroup>;
+pub type ModuleLayer = String;
+
 pub(crate) type SharedPluginDriver = Arc<PluginDriver>;
 
-pub fn get_chunk_group_from_ukey<'a>(
-  ukey: &ChunkGroupUkey,
-  chunk_group_by_ukey: &'a ChunkGroupByUkey,
-) -> Option<&'a ChunkGroup> {
-  if chunk_group_by_ukey.contains(ukey) {
-    Some(chunk_group_by_ukey.expect_get(ukey))
-  } else {
-    None
+#[derive(Debug, Default, Clone)]
+pub struct ChunkByUkey {
+  inner: FxHashMap<ChunkUkey, Chunk>,
+}
+
+impl ChunkByUkey {
+  pub(crate) fn reserve_capacity(&mut self, total: usize) {
+    self.inner.reserve(total.saturating_sub(self.inner.len()));
+  }
+
+  pub fn get(&self, ukey: &ChunkUkey) -> Option<&Chunk> {
+    self.inner.get(ukey)
+  }
+
+  pub fn get_mut(&mut self, ukey: &ChunkUkey) -> Option<&mut Chunk> {
+    self.inner.get_mut(ukey)
+  }
+
+  pub fn get_many_mut<const N: usize>(
+    &mut self,
+    ukeys: [&ChunkUkey; N],
+  ) -> [Option<&mut Chunk>; N] {
+    self.inner.get_disjoint_mut(ukeys)
+  }
+
+  pub fn expect_get(&self, ukey: &ChunkUkey) -> &Chunk {
+    self
+      .get(ukey)
+      .unwrap_or_else(|| panic!("Chunk({ukey:?}) not found in ChunkByUkey"))
+  }
+
+  pub fn expect_get_mut(&mut self, ukey: &ChunkUkey) -> &mut Chunk {
+    self
+      .get_mut(ukey)
+      .unwrap_or_else(|| panic!("Chunk({ukey:?}) not found in ChunkByUkey"))
+  }
+
+  pub fn add(&mut self, chunk: Chunk) -> &mut Chunk {
+    let ukey = chunk.ukey();
+    debug_assert!(!self.inner.contains_key(&ukey));
+    self.inner.entry(ukey).or_insert(chunk)
+  }
+
+  pub fn remove(&mut self, ukey: &ChunkUkey) -> Option<Chunk> {
+    self.inner.remove(ukey)
+  }
+
+  pub fn entry(
+    &mut self,
+    ukey: ChunkUkey,
+  ) -> std::collections::hash_map::Entry<'_, ChunkUkey, Chunk> {
+    self.inner.entry(ukey)
+  }
+
+  pub fn contains(&self, ukey: &ChunkUkey) -> bool {
+    self.inner.contains_key(ukey)
+  }
+
+  pub fn keys(&self) -> impl Iterator<Item = &ChunkUkey> {
+    self.inner.keys()
+  }
+
+  pub fn values(&self) -> impl Iterator<Item = &Chunk> {
+    self.inner.values()
+  }
+
+  pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Chunk> {
+    self.inner.values_mut()
+  }
+
+  pub fn iter(&self) -> impl Iterator<Item = (&ChunkUkey, &Chunk)> {
+    self.inner.iter()
+  }
+
+  pub fn iter_mut(&mut self) -> impl Iterator<Item = (&ChunkUkey, &mut Chunk)> {
+    self.inner.iter_mut()
+  }
+
+  #[allow(clippy::len_without_is_empty)]
+  pub fn len(&self) -> usize {
+    self.inner.len()
   }
 }
 
-pub fn get_chunk_from_ukey<'a>(
-  ukey: &ChunkUkey,
-  chunk_by_ukey: &'a ChunkByUkey,
-) -> Option<&'a Chunk> {
-  if chunk_by_ukey.contains(ukey) {
-    Some(chunk_by_ukey.expect_get(ukey))
-  } else {
-    None
-  }
+#[derive(Debug, Default, Clone)]
+pub struct ChunkGroupByUkey {
+  inner: FxHashMap<ChunkGroupUkey, ChunkGroup>,
 }
 
-pub fn get_mut_chunk_from_ukey<'a>(
-  ukey: &ChunkUkey,
-  chunk_by_ukey: &'a mut ChunkByUkey,
-) -> Option<&'a mut Chunk> {
-  if chunk_by_ukey.contains(ukey) {
-    Some(chunk_by_ukey.expect_get_mut(ukey))
-  } else {
-    None
+impl ChunkGroupByUkey {
+  pub(crate) fn reserve_capacity(&mut self, total: usize) {
+    self.inner.reserve(total.saturating_sub(self.inner.len()));
+  }
+
+  pub fn get(&self, ukey: &ChunkGroupUkey) -> Option<&ChunkGroup> {
+    self.inner.get(ukey)
+  }
+
+  pub fn get_mut(&mut self, ukey: &ChunkGroupUkey) -> Option<&mut ChunkGroup> {
+    self.inner.get_mut(ukey)
+  }
+
+  pub fn expect_get(&self, ukey: &ChunkGroupUkey) -> &ChunkGroup {
+    self
+      .get(ukey)
+      .unwrap_or_else(|| panic!("ChunkGroup({ukey:?}) not found in ChunkGroupByUkey"))
+  }
+
+  pub fn expect_get_mut(&mut self, ukey: &ChunkGroupUkey) -> &mut ChunkGroup {
+    self
+      .get_mut(ukey)
+      .unwrap_or_else(|| panic!("ChunkGroup({ukey:?}) not found in ChunkGroupByUkey"))
+  }
+
+  pub fn add(&mut self, chunk: ChunkGroup) -> &mut ChunkGroup {
+    let ukey = chunk.ukey();
+    debug_assert!(!self.inner.contains_key(&ukey));
+    self.inner.entry(ukey).or_insert(chunk)
+  }
+
+  pub fn remove(&mut self, ukey: &ChunkGroupUkey) -> Option<ChunkGroup> {
+    self.inner.remove(ukey)
+  }
+
+  pub fn contains(&self, ukey: &ChunkGroupUkey) -> bool {
+    self.inner.contains_key(ukey)
+  }
+
+  pub fn keys(&self) -> impl Iterator<Item = &ChunkGroupUkey> {
+    self.inner.keys()
+  }
+
+  pub fn values(&self) -> impl Iterator<Item = &ChunkGroup> {
+    self.inner.values()
+  }
+
+  pub fn iter(&self) -> impl Iterator<Item = (&ChunkGroupUkey, &ChunkGroup)> {
+    self.inner.iter()
   }
 }

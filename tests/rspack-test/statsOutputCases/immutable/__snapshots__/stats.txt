@@ -1,0 +1,2 @@
+asset xxx.js xx KiB [emitted] [immutable] (name: main)
+asset xxx.js xx bytes [emitted] [immutable]

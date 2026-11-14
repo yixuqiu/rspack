@@ -1,40 +1,122 @@
-import { ECompilerType } from "../type";
-import { getSimpleProcessorRunner } from "../test/simple";
-import {
-	IStatsAPITaskProcessorOptions,
-	StatsAPITaskProcessor
-} from "../processor";
+import type fs from 'node:fs';
+import type { Compiler, RspackOptions, Stats } from '@rspack/core';
+import { createFsFromVolume, Volume } from 'memfs';
+import { readTestFile } from '../helper/read-test-file';
+import { BasicCaseCreator } from '../test/creator';
+import type { ITestContext, ITestEnv, MaybePromise } from '../type';
 
 let addedSerializer = false;
 
-export type TStatsAPICaseConfig = Omit<
-	IStatsAPITaskProcessorOptions<ECompilerType.Rspack>,
-	"name" | "compilerType"
-> & {
-	description: string;
+export type TStatsAPICaseConfig = {
+  description: string;
+  options?: (context: ITestContext) => RspackOptions;
+  snapshotName?: string;
+  compiler?: (context: ITestContext, compiler: Compiler) => MaybePromise<void>;
+  build?: (context: ITestContext, compiler: Compiler) => MaybePromise<void>;
+  check?: (stats: Stats, compiler: Compiler) => MaybePromise<void>;
 };
 
-export function createStatsAPICase(
-	name: string,
-	src: string,
-	dist: string,
-	testConfig: string
-) {
-	if (!addedSerializer) {
-		StatsAPITaskProcessor.addSnapshotSerializer();
-		addedSerializer = true;
-	}
-	const caseConfig: TStatsAPICaseConfig = require(testConfig);
-	const runner = getSimpleProcessorRunner(src, dist);
+const creator = new BasicCaseCreator({
+  clean: true,
+  describe: true,
+  steps: ({ name, caseConfig }) => {
+    const config = caseConfig as TStatsAPICaseConfig;
+    return [
+      {
+        config: (context: ITestContext) => {
+          const compiler = context.getCompiler();
+          compiler.setOptions(options(context, config.options));
+        },
+        compiler: async (context: ITestContext) => {
+          const compilerManager = context.getCompiler();
+          compilerManager.createCompiler();
+          await compiler(
+            context,
+            compilerManager.getCompiler()!,
+            config.compiler,
+          );
+        },
+        build: async (context: ITestContext) => {
+          const compiler = context.getCompiler();
+          if (typeof config.build === 'function') {
+            await config.build(context, compiler.getCompiler()!);
+          } else {
+            await compiler.build();
+          }
+        },
+        run: async (env: ITestEnv, context: ITestContext) => {
+          // no need to run, just check the snapshot of diagnostics
+        },
+        check: async (env: ITestEnv, context: ITestContext) => {
+          await check(env, context, name, config.check);
+        },
+      },
+    ];
+  },
+  concurrent: true,
+});
 
-	it(caseConfig.description, async () => {
-		await runner(
-			name,
-			new StatsAPITaskProcessor({
-				name: name,
-				compilerType: ECompilerType.Rspack,
-				...caseConfig
-			})
-		);
-	});
+export function createStatsAPICase(
+  name: string,
+  src: string,
+  dist: string,
+  testConfig: string,
+) {
+  if (!addedSerializer) {
+    addedSerializer = true;
+  }
+  const caseConfig: TStatsAPICaseConfig = readTestFile(testConfig);
+  creator.create(name, src, dist, undefined, {
+    caseConfig,
+    description: () => caseConfig.description,
+  });
+}
+
+function options(
+  context: ITestContext,
+  custom?: (context: ITestContext) => RspackOptions,
+) {
+  const res = (custom?.(context) || {}) as RspackOptions;
+  res.output ??= {};
+  res.module ??= {};
+  res.module.defaultRules ??= ['...'];
+  res.module.defaultRules.push({
+    test: /\.css$/,
+    type: 'css/auto',
+  });
+  res.output!.bundlerInfo ??= {};
+  res.output!.bundlerInfo!.force ??= false;
+  if (!global.printLogger) {
+    res.infrastructureLogging = {
+      level: 'error',
+    };
+  }
+  return res;
+}
+
+async function compiler(
+  context: ITestContext,
+  compiler: Compiler,
+  custom?: (context: ITestContext, compiler: Compiler) => MaybePromise<void>,
+) {
+  if (custom) {
+    await custom(context, compiler);
+  }
+  if (compiler) {
+    compiler.outputFileSystem = createFsFromVolume(
+      new Volume(),
+    ) as unknown as typeof fs;
+  }
+}
+
+async function check(
+  env: ITestEnv,
+  context: ITestContext,
+  name: string,
+  custom?: (stats: Stats, compiler: Compiler) => MaybePromise<void>,
+) {
+  const manager = context.getCompiler();
+  const stats = manager.getStats()! as Stats;
+  env.expect(typeof stats).toBe('object');
+  await custom?.(stats, manager.getCompiler()!);
 }

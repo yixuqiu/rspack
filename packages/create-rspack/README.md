@@ -1,15 +1,23 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://lf3-static.bytednsdoc.com/obj/eden-cn/rjhwzy/ljhwZthlaukjlkulzlp/rspack-banner-1610-dark.png">
-  <img alt="Rspack Banner" src="https://lf3-static.bytednsdoc.com/obj/eden-cn/rjhwzy/ljhwZthlaukjlkulzlp/rspack-banner-1610.png">
+  <img alt="Rspack Banner" src="https://assets.rspack.rs/rspack/rspack-banner.png">
 </picture>
 
 # create-rspack
 
 Create a new rspack project.
 
+## Usage
+
+```bash
+npx create-rspack
+
+# Skip Git initialization
+npx create-rspack --no-git
+```
+
 ## Documentation
 
-See [https://rspack.dev](https://rspack.dev) for details.
+See [https://rspack.rs](https://rspack.rs) for details.
 
 ## License
 

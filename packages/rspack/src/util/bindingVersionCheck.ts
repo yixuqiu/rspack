@@ -1,141 +1,50 @@
-import { readdirSync, readFileSync } from "fs";
-import path from "path";
+import binding from '@rspack/binding';
 
-const NodePlatformArchToAbi: Record<
-	string,
-	Record<string, string | Record<string, string>>
-> = {
-	android: {
-		arm64: "",
-		arm: "eabi"
-	},
-	win32: {
-		x64: "msvc",
-		ia32: "msvc",
-		arm64: "msvc"
-	},
-	darwin: {
-		x64: "",
-		arm64: ""
-	},
-	freebsd: {
-		x64: ""
-	},
-	linux: {
-		x64: {
-			musl: "musl",
-			gnu: "gnu"
-		},
-		arm64: {
-			musl: "musl",
-			gnu: "gnu"
-		},
-		arm: "gnueabihf"
-	}
-};
-
-function isMusl() {
-	// For Node 10
-	if (!process.report || typeof process.report.getReport !== "function") {
-		try {
-			const lddPath = require("child_process")
-				.execSync("which ldd")
-				.toString()
-				.trim();
-			return readFileSync(lddPath, "utf8").includes("musl");
-		} catch (e) {
-			return true;
-		}
-	} else {
-		// @ts-expect-error getReport returns an object containing header object
-		const { glibcVersionRuntime } = process.report.getReport().header;
-		return !glibcVersionRuntime;
-	}
-}
-
-const BINDING_VERSION = require("@rspack/binding/package.json").version;
-const CORE_VERSION = require("../../package.json").version;
-
-const getAddonPlatformArchAbi = function () {
-	const { platform, arch } = process;
-	let binding = "";
-	binding += platform;
-
-	const abi = NodePlatformArchToAbi[platform][arch];
-	if (abi === undefined) return new Error(`unsupported cpu arch: ${arch}`);
-	binding += "-" + arch;
-
-	if (typeof abi === "string") {
-		binding += abi.length ? "-" + abi : "";
-	} else if (typeof abi === "object") {
-		binding += "-" + abi[isMusl() ? "musl" : "gnu"];
-	} else {
-		return new Error(`unsupported abi: ${abi}`);
-	}
-
-	return binding;
-};
-
-/**
- * Error: version checked with error
- * null: version checked without any error
- * undefined: version to be checked
- */
-let result: Error | undefined | null;
+const CORE_VERSION = RSPACK_VERSION;
 
 /**
  * Check if these version matches:
- * `@rspack/core`, `@rspack/binding`, `@rspack/binding-<platform>-<arch>-<abi>`
+ * `@rspack/core`, Binding version
  */
 export const checkVersion = () => {
-	if (result !== undefined) {
-		return result;
-	}
+  if (IS_BROWSER) {
+    // Why is IS_BROWSER used here:
+    // The Wasm binding and the core js runtime are bundled together in `@rspack/browser`,
+    // So the checkVersion is not needed.
+    return;
+  }
 
-	const platformArchAbi = getAddonPlatformArchAbi();
-	if (platformArchAbi instanceof Error) {
-		return (result = platformArchAbi);
-	}
+  if (CORE_VERSION === binding.EXPECTED_RSPACK_CORE_VERSION) {
+    return null;
+  }
 
-	let ADDON_VERSION;
-	try {
-		const BINDING_PKG_DIR = path.dirname(
-			require.resolve("@rspack/binding/package.json")
-		);
+  // In canary version, version bump is done after binding is built.
+  // And to export `EXPECTED_RSPACK_CORE_VERSION` in binding, it relies on the bumped version of @rspack/core.
+  // So we can't check the version of @rspack/core and @rspack/binding in canary version.
+  // Here we ignore version check for canary version.
+  if (CORE_VERSION.includes('canary')) {
+    return null;
+  }
 
-		const isLocal = readdirSync(BINDING_PKG_DIR).some(
-			item => item === `rspack.${platformArchAbi}.node`
-		);
+  return new Error(
+    errorMessage(CORE_VERSION, binding.EXPECTED_RSPACK_CORE_VERSION),
+  );
+};
 
-		if (isLocal) {
-			// Treat addon version the same as binding version if running locally
-			ADDON_VERSION = BINDING_VERSION;
-		} else {
-			// Fetch addon package if installed from remote
-			ADDON_VERSION = require(
-				require.resolve(`@rspack/binding-${platformArchAbi}/package.json`, {
-					paths: [BINDING_PKG_DIR]
-				})
-			).version;
-		}
-	} catch (error: any) {
-		if (error instanceof Error) {
-			return (result = new Error(
-				`${error.toString()}. Maybe you forget to install the correct addon package ${`@rspack/binding-${platformArchAbi}`} or forget to build binding locally?`
-			));
-		}
-		return (result = new Error(error));
-	}
+const errorMessage = (coreVersion: string, expectedCoreVersion: string) => {
+  if (process.env.RSPACK_BINDING) {
+    return `Unmatched version @rspack/core@${coreVersion} and binding version.
 
-	const isMatch = [CORE_VERSION, BINDING_VERSION, ADDON_VERSION].every(
-		(v, _, arr) => v === arr[0]
-	);
+Help:
+	Looks like you are using a custom binding (via environment variable 'RSPACK_BINDING=${process.env.RSPACK_BINDING}').
+	The expected version of @rspack/core to the current binding is ${expectedCoreVersion}.
+`;
+  }
 
-	if (!isMatch) {
-		return (result = new Error(
-			`Unmatched version @rspack/core@${CORE_VERSION}, @rspack/binding@${BINDING_VERSION}, @rspack/binding-${platformArchAbi}@${ADDON_VERSION}`
-		));
-	}
+  return `Unmatched version @rspack/core@${coreVersion} and @rspack/binding@${expectedCoreVersion}.
 
-	return (result = null);
+Help:
+	Please ensure the version of @rspack/binding and @rspack/core is the same.
+	The expected version of @rspack/core to the current binding is ${expectedCoreVersion}.
+`;
 };

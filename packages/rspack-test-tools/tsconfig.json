@@ -1,15 +1,15 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    "types": ["./rstest.d.ts"],
+    "noUnusedParameters": false
   },
-  "include": [
-    "src"
-  ],
-  "exclude": [
-    "viewer"
-  ],
+  "include": ["src"],
+  "exclude": ["viewer"],
   "references": [
     {
       "path": "../rspack"

@@ -1,19 +1,148 @@
+---
+description: 'Use, write, and publish Rspack plugins, including plugin structure, TypeScript support, and peer dependencies.'
+---
+
+import { Tabs, Tab } from '@theme';
+
 # Plugins
 
-If [loaders](/guide/features/loader) are the workhorse for file transformations (preprocessing), then plugins are the workhorse for the overall Rspack build process. Most of Rspack's native implementations rely on the Rust side of the plugin system. For Node users, you don't need to worry about interoperation issues with Rust, because Rspack takes care of those details for you automatically. You can just focus on how to use the plugins.
+If [loaders](/guide/features/loader) are the workhorse for file transformations, then plugins are the workhorse for the overall Rspack build process. Most of Rspack's native implementations rely on the Rust side of the plugin system.
 
-## Example
+For Node.js users, you don't need to worry about interoperability issues with Node.js and Rust, because Rspack takes care of those details for you automatically. You can just focus on how to use the plugins.
 
-### Authoring plugins
+## Plugin usage
 
-The structure of a plugin is very simple: just implement an `apply` method that accepts a `Compiler` instance. It will be called when the Rspack plugin is initialized. The detailed API can be found in the [Plugin API](/api/plugin-api/index).
+Rspack provides the [plugins](/config/plugins) configuration, which is used to register a set of Rspack or webpack plugins to customize the build process.
 
-```js
+Here is an example of using the [webpack-bundle-analyzer](https://github.com/webpack/webpack-bundle-analyzer) in Rspack configuration:
+
+<Tabs>
+  <Tab label="ESM">
+
+```js title="rspack.config.mjs"
+import { BundleAnalyzerPlugin } from 'webpack-bundle-analyzer';
+
+export default {
+  plugins: [
+    new BundleAnalyzerPlugin({
+      // options
+    }),
+  ],
+};
+```
+
+  </Tab>
+  <Tab label="CJS">
+
+```js title="rspack.config.cjs"
+const { BundleAnalyzerPlugin } = require('webpack-bundle-analyzer');
+
+module.exports = {
+  plugins: [
+    new BundleAnalyzerPlugin({
+      // options
+    }),
+  ],
+};
+```
+
+  </Tab>
+</Tabs>
+
+If you're looking for more Rspack plugins, have a look at the great list of [supported plugins](/plugins/).
+
+You can also refer to [Community plugin compatibility](/plugins/community-plugin-compatibility) for the list of webpack plugins that have passed Rspack compatibility tests.
+
+## Other plugins
+
+### Unplugin
+
+[unplugin](https://github.com/unjs/unplugin) is a unified plugin system for various build tools. You can use plugins implemented based on unplugin in Rspack, typically by importing the `/rspack` subpath of the plugin and registering it through `plugins`.
+
+Here is an example of using [unplugin-vue-components](https://www.npmjs.com/package/unplugin-vue-components):
+
+<Tabs>
+  <Tab label="ESM">
+
+```js title="rspack.config.mjs"
+import Components from 'unplugin-vue-components/rspack';
+
+export default {
+  plugins: [
+    Components({
+      // options
+    }),
+  ],
+};
+```
+
+  </Tab>
+  <Tab label="CJS">
+
+```js title="rspack.config.cjs"
+const Components = require('unplugin-vue-components/rspack');
+
+module.exports = {
+  plugins: [
+    Components.default({
+      // options
+    }),
+  ],
+};
+```
+
+  </Tab>
+</Tabs>
+
+### SWC plugins
+
+In the built-in [swc-loader](/guide/builtin-loaders/swc-loader) of Rspack, you can use SWC's Wasm plugins, see [jsc.experimental.plugins](/guide/builtin-loaders/swc-loader#jscexperimentalplugins).
+
+### Rsbuild plugins
+
+[Rsbuild](https://rsbuild.rs) is a build tool based on Rspack, and Rsbuild has its own plugin system.
+
+Please note that you cannot use Rsbuild plugins in Rspack, because Rspack is a more low-level tool, but you can use Rspack plugins in Rsbuild.
+
+Here is a comparison table for the plugins that can be used in Rspack and Rsbuild:
+
+| Tool used | Rspack plugins | webpack plugins | Rsbuild plugins | Unplugins | SWC plugins |
+| --------- | -------------- | --------------- | --------------- | --------- | ----------- |
+| Rspack    | ✅             | ✅              | ❌              | ✅        | ✅          |
+| Rsbuild   | ✅             | ✅              | ✅              | ✅        | ✅          |
+
+> Please refer to the [Rsbuild plugin documentation](https://rsbuild.rs/plugins/list/index) for more information.
+
+## Write a plugin
+
+### Plugin structure
+
+As a plugin author, the structure of a plugin is very simple: just implement an `apply` method that accepts a `Compiler` instance. It will be called when the Rspack plugin is initialized. The detailed API can be found in the [Plugin API](/api/plugin-api/).
+
+<Tabs>
+  <Tab label="ESM">
+
+```js title="MyPlugin.mjs"
+const PLUGIN_NAME = 'MyPlugin';
+
+export class MyPlugin {
+  apply(compiler) {
+    compiler.hooks.compilation.tap(PLUGIN_NAME, (compilation) => {
+      console.log('The Rspack build process is starting!');
+    });
+  }
+}
+```
+
+  </Tab>
+  <Tab label="CJS">
+
+```js title="MyPlugin.cjs"
 const PLUGIN_NAME = 'MyPlugin';
 
 class MyPlugin {
   apply(compiler) {
-    compiler.hooks.compilation.tap(PLUGIN_NAME, compilation => {
+    compiler.hooks.compilation.tap(PLUGIN_NAME, (compilation) => {
       console.log('The Rspack build process is starting!');
     });
   }
@@ -22,37 +151,63 @@ class MyPlugin {
 module.exports = MyPlugin;
 ```
 
-We use CommonJS style module exports so that plugins can be imported directly using `require` in `rspack.config.js`.
+  </Tab>
+</Tabs>
 
-### Consuming plugins
-
-Here's an example of how to use the already compatible [webpack-bundle-analyzer](https://github.com/webpack-contrib/webpack-bundle-analyzer) in `rspack.config.js`:
-
-```js title="rspack.config.js"
-const BundleAnalyzerPlugin =
-  require('webpack-bundle-analyzer').BundleAnalyzerPlugin;
-
-module.exports = {
-  plugins: [new BundleAnalyzerPlugin()],
-};
-```
-
-Please refer to [Plugin compat](/guide/compatibility/plugin) for the list of plugins that have passed Rspack compatibility tests.
-
-### Type definitions
+### Write with TypeScript
 
 If you use TypeScript to write Rspack plugins, you can import `Compiler` and `RspackPluginInstance` to declare the types of your plugins:
 
-```ts
+```ts title="MyPlugin.ts"
 import type { Compiler, RspackPluginInstance } from '@rspack/core';
 
 const PLUGIN_NAME = 'MyPlugin';
 
-class MyPlugin implements RspackPluginInstance {
+export class MyPlugin implements RspackPluginInstance {
   apply(compiler: Compiler) {
-    compiler.hooks.compilation.tap(PLUGIN_NAME, compilation => {
+    compiler.hooks.compilation.tap(PLUGIN_NAME, (compilation) => {
       console.log('The Rspack build process is starting!');
     });
+  }
+}
+```
+
+## Publishing plugins
+
+### Declaring peer dependencies
+
+When publishing a plugin as an npm package, declare the bundler packages it integrates with as optional peer dependencies. This documents the supported host bundlers without requiring users who only use one bundler to install the other.
+
+If the plugin is designed only for Rspack, declare `@rspack/core` as an optional peer dependency. Set the version range according to the APIs the plugin relies on. For example, if the plugin uses an API introduced in a newer Rspack release, set that release as the minimum supported version.
+
+```json title="package.json"
+{
+  "peerDependencies": {
+    "@rspack/core": "^1.0.0 || ^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@rspack/core": {
+      "optional": true
+    }
+  }
+}
+```
+
+If the plugin is designed to work with both Rspack and webpack, declare both `@rspack/core` and `webpack` as optional peer dependencies:
+
+```json title="package.json"
+{
+  "peerDependencies": {
+    "@rspack/core": "^1.0.0 || ^2.0.0",
+    "webpack": "^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@rspack/core": {
+      "optional": true
+    },
+    "webpack": {
+      "optional": true
+    }
   }
 }
 ```

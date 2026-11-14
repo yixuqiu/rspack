@@ -1,53 +1,69 @@
-use rspack_core::{
-  get_dependency_used_by_exports_condition, module_id, AsContextDependency, Dependency,
-  DependencyCategory, DependencyCondition, DependencyId, DependencyTemplate, DependencyType,
-  ErrorSpan, ModuleDependency, RuntimeGlobals, TemplateContext, TemplateReplaceSource,
-  UsedByExports,
-};
-use swc_core::ecma::atoms::Atom;
+use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+use concat_string::concat_string;
+use rspack_cacheable::{cacheable, cacheable_dyn, with::AsPreset};
+use rspack_core::{
+  AsContextDependency, CodeGenerationPublicPathAutoReplace, ConnectionState, Dependency,
+  DependencyCategory, DependencyCodeGeneration, DependencyCondition, DependencyConditionFn,
+  DependencyId, DependencyRange, DependencyTemplate, DependencyTemplateType, DependencyType,
+  ExportsInfoArtifact, JavascriptParserUrl, ModuleDependency, ModuleGraph,
+  ModuleGraphCacheArtifact, ModuleGraphConnection, RuntimeGlobals, RuntimeSpec,
+  SideEffectsStateArtifact, TemplateContext, TemplateReplaceSource, URLStaticMode, UsedByExports,
+};
+
+use crate::{Atom, connection_active_used_by_exports, runtime::AUTO_PUBLIC_PATH_PLACEHOLDER};
+
+#[cacheable]
+#[derive(Debug)]
 pub struct URLDependency {
-  start: u32,
-  end: u32,
-  outer_start: u32,
-  outer_end: u32,
   id: DependencyId,
+  #[cacheable(with=AsPreset)]
   request: Atom,
-  span: Option<ErrorSpan>,
-  used_by_exports: Option<UsedByExports>,
-  relative: bool,
+  range: DependencyRange,
+  range_url: DependencyRange,
+  used_by_exports: Option<Arc<UsedByExports>>,
+  mode: Option<JavascriptParserUrl>,
 }
 
 impl URLDependency {
   pub fn new(
-    start: u32,
-    end: u32,
-    outer_start: u32,
-    outer_end: u32,
     request: Atom,
-    span: Option<ErrorSpan>,
-    relative: bool,
+    range: DependencyRange,
+    range_url: DependencyRange,
+    mode: Option<JavascriptParserUrl>,
   ) -> Self {
     Self {
-      start,
-      end,
-      outer_start,
-      outer_end,
       id: DependencyId::new(),
       request,
-      span,
+      range,
+      range_url,
       used_by_exports: None,
-      relative,
+      mode,
     }
+  }
+
+  pub fn set_used_by_exports(&mut self, used_by_exports: Option<Arc<UsedByExports>>) {
+    self.used_by_exports = used_by_exports;
+  }
+
+  pub fn used_by_exports(&self) -> Option<&UsedByExports> {
+    self.used_by_exports.as_deref()
+  }
+
+  /// Replace the arguments of `new URL(request, import.meta.url)` with the given
+  /// request, keeping the `new URL(...)` call itself untouched.
+  pub fn replace_request(&self, source: &mut TemplateReplaceSource, request: String) {
+    source.replace(
+      self.range_url.start,
+      self.range_url.end,
+      concat_string!(request, ", import.meta.url"),
+      None,
+    );
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for URLDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "URLDependency"
-  }
-
   fn id(&self) -> &DependencyId {
     &self.id
   }
@@ -60,11 +76,20 @@ impl Dependency for URLDependency {
     &DependencyType::NewUrl
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    self.span
+  fn url_mode(&self) -> Option<JavascriptParserUrl> {
+    self.mode
+  }
+
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
   }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for URLDependency {
   fn request(&self) -> &str {
     &self.request
@@ -74,63 +99,120 @@ impl ModuleDependency for URLDependency {
     &self.request
   }
 
-  fn set_request(&mut self, request: String) {
-    self.request = request.into();
-  }
-
   fn get_condition(&self) -> Option<DependencyCondition> {
-    get_dependency_used_by_exports_condition(self.id, self.used_by_exports.as_ref())
+    Some(DependencyCondition::new(URLDependencyCondition))
   }
 }
 
-impl DependencyTemplate for URLDependency {
-  fn apply(
-    &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
-  ) {
-    let TemplateContext {
-      compilation,
-      runtime_requirements,
-      ..
-    } = code_generatable_context;
-
-    runtime_requirements.insert(RuntimeGlobals::REQUIRE);
-
-    if self.relative {
-      runtime_requirements.insert(RuntimeGlobals::RELATIVE_URL);
-      source.replace(
-        self.outer_start,
-        self.outer_end,
-        format!(
-          "/* asset import */ new {}({}({}))",
-          RuntimeGlobals::RELATIVE_URL,
-          RuntimeGlobals::REQUIRE,
-          module_id(compilation, &self.id, &self.request, false),
-        )
-        .as_str(),
-        None,
-      );
-    } else {
-      runtime_requirements.insert(RuntimeGlobals::BASE_URI);
-      source.replace(
-        self.start,
-        self.end,
-        format!(
-          "/* asset import */{}({}), {}",
-          RuntimeGlobals::REQUIRE,
-          module_id(compilation, &self.id, &self.request, false),
-          RuntimeGlobals::BASE_URI
-        )
-        .as_str(),
-        None,
-      );
-    }
-  }
-
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+#[cacheable_dyn]
+impl DependencyCodeGeneration for URLDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(URLDependencyTemplate::template_type())
   }
 }
 
 impl AsContextDependency for URLDependency {}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct URLDependencyTemplate;
+
+pub static URL_STATIC_PLACEHOLDER: &str = "RSPACK_AUTO_URL_STATIC_PLACEHOLDER_";
+
+impl URLDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::NewUrl)
+  }
+}
+
+impl DependencyTemplate for URLDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<URLDependency>()
+      .expect("URLDependencyTemplate should be used for URLDependency");
+    let TemplateContext {
+      compilation,
+      runtime_template,
+      ..
+    } = code_generatable_context;
+
+    match dep.mode {
+      Some(JavascriptParserUrl::Relative) => {
+        source.replace(
+          dep.range.start,
+          dep.range.end,
+          format!(
+            "/* asset import */ new {}({}({}))",
+            runtime_template.render_runtime_globals(&RuntimeGlobals::RELATIVE_URL),
+            runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+            runtime_template.module_id(compilation, &dep.id, &dep.request, false),
+          ),
+          None,
+        );
+      }
+      Some(JavascriptParserUrl::NewUrlRelative) => {
+        code_generatable_context.data.insert(URLStaticMode);
+        code_generatable_context
+          .data
+          .insert(CodeGenerationPublicPathAutoReplace(true));
+        source.replace(
+          dep.range.start,
+          dep.range.end,
+          format!(
+            "new URL({}, import.meta.url)",
+            rspack_util::json_stringify_str(&format!(
+              "{AUTO_PUBLIC_PATH_PLACEHOLDER}{URL_STATIC_PLACEHOLDER}{}",
+              &dep.id.as_u32()
+            )),
+          ),
+          None,
+        );
+      }
+      _ => {
+        source.replace(
+          dep.range_url.start,
+          dep.range_url.end,
+          format!(
+            "/* asset import */{}({}), {}",
+            runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+            runtime_template.module_id(compilation, &dep.id, &dep.request, false),
+            runtime_template.render_runtime_globals(&RuntimeGlobals::BASE_URI)
+          ),
+          None,
+        );
+      }
+    }
+  }
+}
+
+struct URLDependencyCondition;
+
+impl DependencyConditionFn for URLDependencyCondition {
+  fn get_connection_state(
+    &self,
+    connection: &ModuleGraphConnection,
+    runtime: Option<&RuntimeSpec>,
+    module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> ConnectionState {
+    let dependency = module_graph.dependency_by_id(&connection.dependency_id);
+    let dependency = dependency
+      .downcast_ref::<URLDependency>()
+      .expect("should be URLDependency");
+    ConnectionState::Active(connection_active_used_by_exports(
+      connection,
+      runtime,
+      module_graph,
+      exports_info_artifact,
+      dependency.used_by_exports.as_deref(),
+    ))
+  }
+}

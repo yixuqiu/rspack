@@ -1,0 +1,10 @@
+[
+  "plugin",
+  "loader",
+  "dev-server",
+  "asset-module",
+  "asset-base-path",
+  "module-resolution",
+  "web-workers",
+  "esm"
+]

@@ -1,92 +1,188 @@
+---
+description: 'Rspack configuration overview covering core options, output behavior, optimization, development, and tooling settings.'
+---
+
+import { PackageManagerTabs } from '@theme';
+import { Tabs, Tab } from '@theme';
+
 # Configure Rspack
 
 Rspack provides configurations similar to webpack. This chapter will show you how to use the Rspack configuration.
 
-## Configuration File
+:::tip
 
-When you run the Rspack CLI, Rspack automatically reads the `rspack.config.js` file in the current working directory.
+If you prefer not to write a Rspack configuration from scratch, you can choose a tool based on your project:
+
+- [Rsbuild](https://rsbuild.rs/) provides defaults for building web applications. See the [Rsbuild configuration guide](https://rsbuild.rs/guide/configuration/rsbuild).
+- [Rslib](https://rslib.rs/) provides defaults for building JavaScript libraries. See the [Rslib configuration guide](https://rslib.rs/guide/basic/configure-rslib).
+
+:::
+
+## Configuration file
+
+When you run the Rspack CLI, Rspack automatically reads the `rspack.config.*` file in the current working directory.
 
 A basic Rspack configuration file looks like this:
 
-```ts title="rspack.config.js"
-module.exports = {
+<Tabs>
+  <Tab label="ESM">
+
+```js title="rspack.config.mjs"
+import { defineConfig } from '@rspack/cli';
+
+export default defineConfig({
   entry: {
     main: './src/index.js',
   },
-};
+});
 ```
 
-### Supported configuration file formats
+  </Tab>
+  <Tab label="CJS">
 
-Rspack supports four types of configuration files, `.js`, `.ts`, `.cjs` and `.mjs` formats.
+```js title="rspack.config.cjs"
+const { defineConfig } = require('@rspack/cli');
 
-- `rspack.config.js`: defaults to `CommonJS` format, or `ES Module` format if the type of the package.json is module.
-- `rspack.config.ts`: `TypeScript` format, which is compiled internally to `.js` format using `ts-node`.
+module.exports = defineConfig({
+  entry: {
+    main: './src/index.js',
+  },
+});
+```
+
+  </Tab>
+  <Tab label="TypeScript">
+
+```ts title="rspack.config.ts"
+import { defineConfig } from '@rspack/cli';
+
+export default defineConfig({
+  entry: {
+    main: './src/index.js',
+  },
+});
+```
+
+  </Tab>
+</Tabs>
+
+## Configuration file formats
+
+Rspack supports these configuration file formats:
+
+- `rspack.config.ts`: `TypeScript` format, see [TypeScript configuration file](#typescript-configuration-file) for more details.
+- `rspack.config.js`: defaults to `CommonJS` format, or `ES modules` format if the type of the package.json is "module".
+- `rspack.config.mts`: Forced to `ES modules` + `TypeScript` format.
+- `rspack.config.mjs`: Forced to `ES modules` format.
+- `rspack.config.cts`: Forced to `CommonJS` + `TypeScript` format.
 - `rspack.config.cjs`: Forced to `CommonJS` format.
-- `rspack.config.mjs`: Forced to `ES module` format.
 
-See [ES Module](https://nodejs.org/api/esm.html#modules-ecmascript-modules) and [CommonJS](https://nodejs.org/api/modules.html) for the difference between `CommonJS` and `ES Module`
+Rspack resolves configuration files in the following order by default:
 
-### Type Checking
+`rspack.config.ts` > `rspack.config.js` > `rspack.config.mts` > `rspack.config.mjs` > `rspack.config.cts` > `rspack.config.cjs`
 
-`rspack.config.js` is a JavaScript file, you can use JSDoc to enable the IDE's Intellisense and TypeScript type checking.
+> See [ES modules](https://nodejs.org/api/esm.html#modules-ecmascript-modules) and [CommonJS](https://nodejs.org/api/modules.html) for the difference between `CommonJS` and `ES modules`.
 
-```js title="rspack.config.js"
+## Extending configurations
+
+See [Extending Configurations](/config/extends) for details on how to extend configurations from other files or packages.
+
+## TypeScript configuration file
+
+When using `rspack.config.ts`, you can choose from one of the following approaches:
+
+### Default behavior
+
+Starting from v1.5.0, Rspack CLI has built-in support for TypeScript configuration.
+
+By default, Rspack CLI uses `--configLoader=auto`:
+
+- JavaScript config files are loaded with the native runtime loader.
+- When the runtime supports native TypeScript, Rspack CLI tries the native loader first and falls back to [Jiti](https://github.com/unjs/jiti) if loading fails.
+- On runtimes without native TypeScript support, Rspack CLI loads TypeScript config files with Jiti directly.
+
+If you're using a Rspack CLI earlier than v1.5.0, it's recommended to upgrade to the latest version.
+
+### Native support
+
+If your JavaScript runtime already natively supports TypeScript, you can force the native loader to load the configuration file, ensuring that module resolution behavior is consistent with native behavior.
+
+For example, Node.js already natively supports TypeScript, you can use the following command to use the Node.js native loader to load the configuration file:
+
+- For Node.js v22.18+ and v24.3+ which support native TypeScript by default, you can run the following command to load the TS config:
+
+```json title="package.json"
+{
+  "scripts": {
+    "build": "rspack build --configLoader=native"
+  }
+}
+```
+
+See [Node.js - Running TypeScript Natively](https://nodejs.org/en/learn/typescript/run-natively#running-typescript-natively) for more details.
+
+### Jiti loader
+
+You can also force Rspack CLI to load TypeScript config files through Jiti:
+
+```json title="package.json"
+{
+  "scripts": {
+    "build": "rspack build --configLoader=jiti"
+  }
+}
+```
+
+## Type checking
+
+Use the `defineConfig` helper to enable auto-completion. For JavaScript configuration files, you can use the `// @ts-check` comment to enable type checking.
+
+<Tabs>
+  <Tab label="TypeScript">
+
+```ts title="rspack.config.ts"
+import { defineConfig } from '@rspack/cli';
+
+export default defineConfig({
+  entry: {
+    main: './src/index.js',
+  },
+});
+```
+
+  </Tab>
+  <Tab label="JavaScript">
+
+```js title="rspack.config.mjs"
 // @ts-check
+import { defineConfig } from '@rspack/cli';
 
+export default defineConfig({
+  entry: {
+    main: './src/index.js',
+  },
+});
+```
+
+  </Tab>
+</Tabs>
+
+Alternatively, you can use [JSDoc](https://jsdoc.app/) for type checking.
+
+```js title="rspack.config.mjs"
+// @ts-check
 /** @type {import('@rspack/cli').Configuration} */
 const config = {
   entry: {
     main: './src/index.js',
   },
 };
-module.exports = config;
+export default config;
 ```
 
-Alternatively, you can use the `defineConfig` helper, which provides auto-completion of the configuration:
+## Specify the configuration file
 
-```js title="rspack.config.js"
-// @ts-check
-
-const { defineConfig } = require('@rspack/cli');
-
-const config = defineConfig({
-  entry: {
-    main: './src/index.js',
-  },
-});
-module.exports = config;
-```
-
-Alternatively, you can use TypeScript as configuration file. The default TypeScript configuration file name is `rspack.config.ts`.
-
-```ts title="rspack.config.ts"
-import { Configuration } from '@rspack/cli';
-
-const config: Configuration = {
-  entry: {
-    main: './src/index.js',
-  },
-};
-
-export = config;
-```
-
-You need to install `ts-node` as `devDependencies` so that rspack can resolve the `ts` extension.
-
-```json title="package.json"
-{
-  "devDependencies": {
-    "ts-node": "^10.9.1"
-  }
-}
-```
-
-Note that rspack will first search JavaScript and then TypeScript if the JS file does not exist.
-
-## Specify the Configuration File
-
-You can specify the name of the configuration file using the `--config` option.
+Specify the name of the configuration file using the `--config` option.
 
 For example, if you need to use the `rspack.prod.config.js` file when running build, you can add the following scripts to `package.json`:
 
@@ -99,22 +195,22 @@ For example, if you need to use the `rspack.prod.config.js` file when running bu
 }
 ```
 
-You can also abbreviate the `--config` option to `-c`:
+Abbreviate the `--config` option to `-c`:
 
 ```bash
 $ rspack build -c rspack.prod.config.js
 ```
 
-## Exporting a Configuration Function
+## Exporting a configuration function
 
-Rspack supports exporting a function in `rspack.config.js`, you can dynamically compute the configuration in the function and return it to Rspack.
+Rspack supports exporting a function in Rspack configuration file, you can dynamically compute the configuration in the function and return it to Rspack.
 
-```js title="rspack.config.js"
-module.exports = function (env, argv) {
+```js title="rspack.config.mjs"
+export default function (env, argv) {
   return {
     devtool: env.production ? 'source-map' : 'eval',
   };
-};
+}
 ```
 
 As you can see from the example above, the function takes two input parameters:
@@ -122,15 +218,94 @@ As you can see from the example above, the function takes two input parameters:
 - The first argument is `env`, which corresponds to the value of the `--env` option when running the CLI command.
 - The second argument is `argv`, which contains all the options passed to the CLI.
 
-### Determine the Current Environment
+### Determine the current environment
 
 In addition to passing the `env` parameter, it is more common to use `process.env.NODE_ENV` to determine the current environment:
 
-```js title="rspack.config.js"
-module.exports = function (env, argv) {
+```js title="rspack.config.mjs"
+export default function (env, argv) {
   const isProduction = process.env.NODE_ENV === 'production';
   return {
     devtool: isProduction ? 'source-map' : 'eval',
   };
+}
+```
+
+## Merge configurations
+
+Use Rspack's [extends](/config/extends) option or [rspack-merge](https://github.com/rstackjs/rspack-merge) package to merge multiple Rspack configurations.
+
+### extends option
+
+When using [@rspack/cli](/api/cli), Rspack provides the `extends` option, allowing you to extend configurations from other files or packages.
+
+```js title="rspack.config.mjs"
+export default {
+  extends: './base.rspack.config.mjs',
+  output: {
+    filename: '[name].bundle.js',
+  },
 };
 ```
+
+> This option is only supported in `@rspack/cli`, see [extends](/config/extends) for more usage.
+
+### rspack-merge
+
+`rspack-merge` is a library for merging multiple Rspack configurations.
+
+First install `rspack-merge`:
+
+<PackageManagerTabs command="add rspack-merge -D" />
+
+Then you can use its `merge` function to merge configurations:
+
+```js title="rspack.config.mjs"
+import { merge } from 'rspack-merge';
+
+const isDev = process.env.NODE_ENV === 'development';
+const base = {};
+const dev = {
+  plugins: [new SomeDevPlugin()],
+};
+
+export default isDev ? merge(base, dev) : base;
+```
+
+> See [rspack-merge documentation](https://github.com/rstackjs/rspack-merge) for more details.
+
+## rspack-chain
+
+[rspack-chain](https://github.com/rstackjs/rspack-chain) is a library for creating and modifying Rspack configurations through a chainable API. You can assign names to rules, loaders, and plugins, then use those names to access and modify them without searching through configuration arrays.
+
+When a build tool such as Rsbuild generates a configuration, or multiple projects share one, these names provide a consistent convention for extending it. For example, if a build tool names its HTML plugin `html`, users can modify the plugin's options through that name without knowing its position in the `plugins` array.
+
+First install `rspack-chain`:
+
+<PackageManagerTabs command="add rspack-chain -D" />
+
+The following example adds an HTML plugin, then updates its options using the name `html`:
+
+```js title="rspack.config.mjs"
+import { rspack } from '@rspack/core';
+import { RspackChain } from 'rspack-chain';
+
+const config = new RspackChain();
+
+config.entry('main').add('./src/index.js');
+
+// Add a named plugin to the shared configuration
+config.plugin('html').use(rspack.HtmlRspackPlugin, [{ title: 'My app' }]);
+
+// Customize the existing plugin's options for this project
+config.plugin('html').tap((args) => {
+  args[0].title = 'My project';
+  return args;
+});
+
+export default config.toConfig();
+```
+
+Call `toConfig()` after making all changes to generate the configuration object that Rspack consumes. The names such as `html` are used by `rspack-chain` to locate configuration entries.
+
+> See [rspack-chain documentation](https://github.com/rstackjs/rspack-chain) for more details.

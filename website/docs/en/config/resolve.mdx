@@ -1,4 +1,8 @@
-import { ApiMeta } from '../../../components/ApiMeta';
+---
+description: 'Configure module resolution with aliases, extensions, package conditions, search directories, and TypeScript paths.'
+---
+
+import Attribution from '@components/Attribution';
 
 # Resolve
 
@@ -8,110 +12,324 @@ Used to configure the Rspack module resolution logic.
 
 ## resolve.alias
 
-- **Type:** `Record<string, false | string | (string | false)[]>`
-- **Default:** `{}`
+- **Type:**
 
-Path alias, e.g.
-
-```
-{
-  "@": path.resolve(__dirname, './src'),
-  "abc$": path.resolve(__dirname, './node_modules/abc/index.js'),
-}
+```ts
+type ResolveAlias = false | Record<string, false | string | (false | string)[]>;
 ```
 
-At this point:
-
-- `require("@/a")` will attempt to resolve `<root>/src/a`.
-- `require("abc")` will attempt to resolve `<root>/src/abc`.
-- `require("abc/file.js")` will not match, and it will attempt to resolve `node_modules/abc/file.js`.
-
-## resolve.aliasFields
-
-<ApiMeta addedVersion="0.5.1" />
-
-- **Type:** `string[]`
-- **Default:** `['browser']`
-
-Define a field, such as `browser`, that should be parsed in accordance with [this specification](https://github.com/defunctzombie/package-browser-field-spec).
-
-## resolve.browserField
-
-<ApiMeta deprecatedVersion="0.5.1" />
-
-- **Type:** `boolean`
-- **Default:** `true`
-
-Whether to resolve according to the [package-browser-filed-spec](https://github.com/defunctzombie/package-browser-field-spec) rule.
-
-Works the same with enhanced-resolve's `resolve.aliasFields = ["browser"]`.
-
-## resolve.conditionNames
-
-- **Type:** `string[]`
-- **Default:** `[]`
-
-Same as node's [conditionNames](https://nodejs.org/api/packages.html#conditional-exports) for the `exports` and `imports` fields in package.json.
-
-## resolve.extensions
-
-- **Type:** `string[]`
-- **Default:** `[".js", ".json", ".wasm"]`
-
-Parse modules in order, e.g. `require('. /index')`, will try to parse `'. /index.js'`, `'. /index.json'`...
-
-## resolve.extensionAlias
-
-- **Type:** `Record<string, string[] | string>`
 - **Default:** `{}`
 
-Define alias for the extension. e.g.
+Use `resolve.alias` to redirect module requests to other paths:
 
-```js
-// rspack.config.js
-module.exports = {
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
   resolve: {
-    extensionAlias: {
-      '.js': ['.ts', '.js'],
+    alias: {
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
 };
 ```
 
-`require('./index.js')` will try to parse `'./index.ts'`, `./index.js`.
+With this configuration, `import '@/a'` will attempt to resolve `<root>/src/a`.
 
-## resolve.fallback
+### Exact matching
 
-- **Type:** `Record<string, false | string>`
-- **Default:** `{}`
+Add `$` to the end of an alias key to match only the complete module request. The `$` is a special `resolve.alias` marker and is not part of the module request:
 
-Redirect in case of failed parsing.
+```js title="rspack.config.mjs"
+import path from 'node:path';
 
-## resolve.mainFields
+export default {
+  resolve: {
+    alias: {
+      abc$: path.resolve(import.meta.dirname, './src/abc'),
+    },
+  },
+};
+```
+
+With this configuration:
+
+- `import 'abc'` will attempt to resolve `<root>/src/abc`.
+- `import 'abc/file.js'` will not match the alias and will continue through normal module resolution, which typically attempts to resolve `node_modules/abc/file.js`.
+
+Without the `$`, an `abc` alias would also match subpath requests such as `import 'abc/file.js'`.
+
+### Impact on package resolution
+
+Using `resolve.alias` to redirect a package request such as `import 'lib'` to a file system path within a monorepo or `node_modules` changes how Rspack resolves that request:
+
+- **Without an alias**: `lib` is treated as a package request. Rspack reads the package's `package.json` and applies package resolution rules such as [`exports`](https://nodejs.org/api/packages.html#exports) to select an entry point or subpath.
+- **With an alias**: Rspack first replaces `lib` with the configured file system path. For example, after mapping `lib` to `./node_modules/lib`, Rspack resolves the replacement as a regular path, so the `exports` mappings for the package name `lib` no longer apply.
+
+This behavior follows the semantics of the `exports` field: it controls how package names and package subpaths are resolved, but does not apply to direct file system paths.
+
+### Monorepo usage
+
+If you want packages in a monorepo to resolve like regular npm dependencies, including support for `exports`, avoid using `alias` to map package names directly to their source directories.
+
+Instead, use your package manager's workspace feature to link the packages into `node_modules`, and continue importing them by package name. Rspack can then treat each request as a package request and apply the corresponding `package.json` resolution rules.
+
+### Disable aliases
+
+Set `resolve.alias` to `false` to clear all aliases from the merged resolve options. This is different from leaving it `undefined` or setting it to `{}`, which does not add aliases but still keeps aliases merged from other resolve options.
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    alias: false,
+  },
+};
+```
+
+## resolve.aliasFields
 
 - **Type:** `string[]`
-- **Default:**
-  - `target` is `["browser", "module", "main"]` when it is web
-  - `["module", "main"]` for others
+- **Default:** Depends on [target](/config/target) and [how modules are referenced](#resolvebydependency).
 
-Try to parse the fields in package.json, e.g.
+Specifies which `package.json` fields provide module aliases for replacing modules with alternative implementations.
 
-```json
-// package.json
+Common defaults are:
+
+| Scenario                                          | Default       |
+| ------------------------------------------------- | ------------- |
+| Module imports targeting `'web'` or `'webworker'` | `['browser']` |
+| Module imports targeting Node.js                  | `[]`          |
+| CSS `@import` or URL references                   | `[]`          |
+
+For example, this configuration uses the alias mappings in the `browser` field to replace modules with browser implementations provided by the package. The mappings follow the [browser field specification](https://github.com/defunctzombie/package-browser-field-spec).
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    aliasFields: ['browser'],
+  },
+};
+```
+
+For example, a package's `package.json` contains this mapping:
+
+```json title="package.json"
 {
-  "name": "lib",
-  "module": "es/index.js"
+  "browser": {
+    "./storage.js": "./storage.browser.js"
+  }
 }
 ```
 
-then `import value from 'lib'` results in `lib/es/index.js`.
+With the configuration above, `import './storage.js'` in the package's root-level `index.js` resolves to `storage.browser.js` in the same directory.
 
-## resolve.mainFiles
+## resolve.byDependency
+
+- **Type:** `Record<string, ResolveOptions>`
+
+Configure resolve options based on the dependency type, which describes how a module is referenced in source code, such as ES module imports, CommonJS `require`, or URL-based requests.
+
+It is useful when different request forms require different resolution strategies.
+
+Each key represents a dependency type, and the value is a set of standard `resolve` options applied only to requests of that type.
+
+### Dependency types
+
+Rspack supports the following dependency types:
+
+- `esm`: Modules referenced via `import` statements or dynamic `import()`.
+- `commonjs`: Modules referenced via CommonJS `require()`.
+- `amd`: Modules referenced using AMD-style definitions, such as `define()`.
+- `url`: Modules referenced via URLs, such as `new URL('./asset.png', import.meta.url)`.
+- `wasm`: WebAssembly modules referenced using ES module semantics.
+- `worker`: Modules referenced via `new Worker(new URL('./worker.js', import.meta.url))`.
+- `css-import`: CSS modules referenced via `@import`.
+- `unknown`: A fallback type used when the type cannot be determined.
+
+### Example
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    byDependency: {
+      esm: {
+        mainFields: ['browser', 'module'],
+      },
+      commonjs: {
+        aliasFields: ['browser'],
+      },
+      url: {
+        preferRelative: true,
+      },
+    },
+  },
+};
+```
+
+In this example:
+
+- ES module references prioritize the `browser` and `module` fields.
+- CommonJS references read aliases from the `browser` field.
+- URL-based references prefer relative paths during resolution.
+
+### Merge rules
+
+When a request matches an entry such as `resolve.byDependency.esm` or `resolve.byDependency.commonjs`, Rspack starts from the top-level `resolve` option and then applies that matching `byDependency` entry for the request type.
+
+- Object options follow normal object merging.
+- Array options replace the current value by default.
+- Use `'...'` in an array to insert the top-level value at that position.
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    extensions: ['.ts', '.tsx', '.js', '.json'],
+    byDependency: {
+      esm: {
+        extensions: ['.mjs'],
+        // final value for esm: ['.mjs']
+      },
+      commonjs: {
+        extensions: ['.cjs', '...'],
+        // final value for commonjs: ['.cjs', '.ts', '.tsx', '.js', '.json']
+      },
+    },
+  },
+};
+```
+
+## resolve.conditionNames
 
 - **Type:** `string[]`
-- **default:** `["index"]`
 
-The filename suffix when resolving directories, e.g. `require('. /dir/')` will try to resolve `'. /dir/index'`.
+Specifies the condition names used to match entry points in the [`exports` field](https://nodejs.org/api/packages.html#packages_exports) of a package.
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    conditionNames: ['require', 'node'],
+  },
+};
+```
+
+### Default value
+
+Rspack's default `conditionNames` are determined by [mode](/config/mode), [target](/config/target), and [dependency type](#resolvebydependency). Typical defaults are:
+
+```js
+// ES module requests
+['import', 'module', 'webpack', modeCondition, ...targetConditions];
+
+// CommonJS requests
+['require', 'module', 'webpack', modeCondition, ...targetConditions];
+
+// CSS @import requests
+[modeCondition, 'style'];
+```
+
+Here, `modeCondition` is `'development'` in development mode and `'production'` otherwise, including when `mode` is `'none'`.
+
+`targetConditions` depend on the target:
+
+| Target                                      | `targetConditions`                |
+| ------------------------------------------- | --------------------------------- |
+| `'web'`                                     | `['browser']`                     |
+| `'webworker'`                               | `['worker', 'browser']`           |
+| `'node'`                                    | `['node']`                        |
+| `'electron-main'`                           | `['node', 'electron']`            |
+| `'electron-preload'`, `'electron-renderer'` | `['node', 'browser', 'electron']` |
+| `'nwjs'`                                    | `['node', 'browser', 'nwjs']`     |
+| `false`, `'es2022'`                         | `[]`                              |
+
+CSS `@import` requests use their own condition names and do not include these platform conditions by default.
+
+### Example
+
+Rspack will match [export conditions](https://nodejs.org/api/packages.html#conditional-exports) that are listed within the `resolve.conditionNames` array.
+
+Note that the key order in the `exports` object determines priority. During condition matching, earlier entries have higher priority than later entries.
+
+For example:
+
+```json title="package.json"
+{
+  "name": "foo",
+  "exports": {
+    ".": {
+      "import": "./index-import.js",
+      "require": "./index-require.js",
+      "node": "./index-node.js"
+    },
+    "./bar": {
+      "node": "./bar-node.js",
+      "require": "./bar-require.js"
+    },
+    "./baz": {
+      "import": "./baz-import.js",
+      "node": "./baz-node.js"
+    }
+  }
+}
+```
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    conditionNames: ['require', 'node'],
+  },
+};
+```
+
+Importing:
+
+- `'foo'` will resolve to `'foo/index-require.js'`
+- `'foo/bar'` will resolve to `'foo/bar-node.js'` as the `"node"` key comes before `"require"` key in the conditional exports object.
+- `'foo/baz'` will resolve to `'foo/baz-node.js'`
+
+### Extend default value
+
+If you want to add your custom conditions names while still retaining the default Rspack values, you can use `"..."`:
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    conditionNames: ['my-custom-condition', '...'],
+  },
+};
+```
+
+The order of `conditionNames`, including the position of `'...'`, does not affect priority; the package's `exports` key order determines matching priority.
+
+## resolve.descriptionFiles
+
+- **Type:** `string[]`
+- **Default:** `['package.json']`
+
+The JSON files to use for descriptions.
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    descriptionFiles: ['package.json'],
+  },
+};
+```
+
+## resolve.enforceExtension
+
+- **Type:** `boolean`
+
+By default, It changes to `true` if [resolve.extensions](#resolveextensions) contains an empty string; otherwise, this value changes to `false`.
+
+If `true`, it will not allow extension-less files. So by default `require('./foo')` works if `./foo` has a `.js` extension, but with this enabled only `require('./foo.js')` will work.
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    enforceExtension: false,
+  },
+};
+```
 
 ## resolve.exportsFields
 
@@ -120,8 +338,7 @@ The filename suffix when resolving directories, e.g. `require('. /dir/')` will t
 
 Customize the `exports` field in package.json. e.g.
 
-```json
-// lib/package.json
+```json title="lib/package.json"
 {
   "name": "lib",
   "testExports": {
@@ -135,83 +352,449 @@ Customize the `exports` field in package.json. e.g.
 
 When this configuration is `["testExports", "exports"]`, the result of `import value from 'lib'` is `lib/test.js`.
 
+## resolve.extensionAlias
+
+- **Type:** `Record<string, string[] | string>`
+- **Default:** `{}`
+
+Define alias for the extension. e.g.
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    extensionAlias: {
+      '.js': ['.ts', '.js'],
+    },
+  },
+};
+```
+
+This is particularly useful for TypeScript projects, as TypeScript recommends using the `.js` extension to reference TypeScript files.
+
+```ts title="index.ts"
+import { foo } from './foo.js'; // actually refers to `foo.ts`
+```
+
+Rspack will try to resolve `'./foo.ts'` and `'./foo.js'` sequentially when resolving `import './foo.js'`.
+
+## resolve.extensions
+
+- **Type:** `string[]`
+- **Default:** depends on the dependency type. Typical JavaScript module requests use `[".js", ".json"]` by default, while CSS `@import` uses `[".css"]`.
+
+Automatically resolve file extensions when importing modules. This means you can import files without explicitly writing their extensions.
+
+For example, for a typical JavaScript module request, if importing `./index`, Rspack will try to resolve using the following order:
+
+- `./index.js`
+- `./index.json`
+
+For a CSS request like `@import './base'`, Rspack will try:
+
+- `./base.css`
+
+### Example
+
+Here's how to configure custom extensions including TypeScript and JSX files:
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    extensions: ['.ts', '.tsx', '.mjs', '.js', '.jsx', '.json'],
+  },
+};
+```
+
+When multiple files with the same name but different extensions exist, Rspack will resolve the file with the extension that appears first in the array.
+
+For example, if both `index.js` and `index.ts` exist in the same directory, and your configuration is `['.ts', '.js']`, then `import './index'` will resolve to `index.ts`.
+
+### Default value
+
+At the implementation level, the top-level `resolve.extensions` default is actually `[]`. Rspack still tries `.js`, `.json`, or `.css` in common cases because it applies defaults from [resolve.byDependency](#resolvebydependency) based on the request type.
+
+If you are not familiar with [resolve.byDependency](#resolvebydependency), you can read it as "different default `resolve` settings for different ways of referencing a module". For example:
+
+- `import`, `require()` use `[".js", ".json"]` by default
+- CSS `@import` uses `[".css"]` by default
+
+### Extend default value
+
+To add custom extensions while keeping Rspack's defaults for the current dependency type, use the spread syntax `'...'`:
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    // for typical JavaScript module requests, equivalent to ['.ts', '.js', '.json']
+    extensions: ['.ts', '...'],
+  },
+};
+```
+
+### Performance considerations
+
+- Avoid adding too many extensions as each one adds overhead to the resolution process. Keep the `extensions` array as short as possible to improve resolution performance.
+- Place the most commonly used extensions first in the array.
+
+## resolve.fallback
+
+- **Type:**
+
+```ts
+type ResolveFallback =
+  false | Record<string, false | string | (false | string)[]>;
+```
+
+- **Default:** `{}`
+
+Redirect module requests when normal resolving fails.
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  resolve: {
+    fallback: {
+      abc: false, // do not include a polyfill for abc
+      xyz: path.resolve(import.meta.dirname, 'path/to/file.js'), // include a polyfill for xyz
+    },
+  },
+};
+```
+
+Rspack does not polyfills Node.js core modules automatically which means if you use them in your code running in browsers or alike, you will have to install compatible modules from NPM and include them yourself.
+
+You could use [node-polyfill-webpack-plugin](https://www.npmjs.com/package/node-polyfill-webpack-plugin) to polyfill Node.js core API automatically.
+
+```js title="rspack.config.mjs"
+import NodePolyfillPlugin from 'node-polyfill-webpack-plugin';
+
+export default {
+  plugins: [new NodePolyfillPlugin()],
+};
+```
+
+Or refer to the list of Node.js polyfills used by webpack 4:
+
+```js title="rspack.config.mjs"
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+
+export default {
+  resolve: {
+    fallback: {
+      assert: require.resolve('assert'),
+      buffer: require.resolve('buffer'),
+      console: require.resolve('console-browserify'),
+      constants: require.resolve('constants-browserify'),
+      crypto: require.resolve('crypto-browserify'),
+      domain: require.resolve('domain-browser'),
+      events: require.resolve('events'),
+      http: require.resolve('stream-http'),
+      https: require.resolve('https-browserify'),
+      os: require.resolve('os-browserify/browser'),
+      path: require.resolve('path-browserify'),
+      punycode: require.resolve('punycode'),
+      process: require.resolve('process/browser'),
+      querystring: require.resolve('querystring-es3'),
+      stream: require.resolve('stream-browserify'),
+      string_decoder: require.resolve('string_decoder'),
+      sys: require.resolve('util'),
+      timers: require.resolve('timers-browserify'),
+      tty: require.resolve('tty-browserify'),
+      url: require.resolve('url'),
+      util: require.resolve('util'),
+      vm: require.resolve('vm-browserify'),
+      zlib: require.resolve('browserify-zlib'),
+    },
+  },
+};
+```
+
+## resolve.fullySpecified
+
+- **Type:** `boolean`
+
+Controls whether module import paths must include the full filename and extension.
+
+When set to `true`, Rspack will not complete import paths automatically:
+
+- To import a file, use `import './utils.js'`, not `import './utils'`.
+- To import a directory's entry file, use `import './components/index.js'`, not `import './components'`.
+
+Paths resolved through [resolve.mainFields](#resolvemainfields), [resolve.aliasFields](#resolvealiasfields), or [resolve.alias](#resolvealias) are not affected.
+
+### Default behavior
+
+The top-level `resolve.fullySpecified` defaults to `false`. The `resolve` options in module rules take precedence over the top-level configuration.
+
+To match [Node.js native ESM requirements for fully specified import paths](https://nodejs.org/api/esm.html#mandatory-file-extensions), Rspack's default module rules set `fullySpecified: true` for ESM imports in:
+
+- `.mjs` files.
+- `.js` files whose package declares `"type": "module"` in `package.json`.
+
+### Example
+
+If a third-party package causes build errors by omitting file extensions in its imports, use [module.rules[].resolve](/config/module-rules#rulesresolve) to allow these imports:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.m?js$/,
+        resolve: {
+          fullySpecified: false,
+        },
+      },
+    ],
+  },
+};
+```
+
+With this configuration, imports in `.js` and `.mjs` files can omit extensions or directory entry filenames. Rspack completes these paths using [resolve.extensions](#resolveextensions) and [resolve.mainFiles](#resolvemainfiles). Set `resolve.fullySpecified: false` in `module.rules` because the default ESM rules take precedence over the top-level configuration.
+
+## resolve.importsFields
+
+- **Type:** `string[]`
+- **Default:** `["imports"]`
+
+Customize the `imports` field in package.json which are used to provide the internal requests of a package (requests starting with `#` are considered internal).
+
+e.g.
+
+```json title="package.json"
+{
+  "name": "lib",
+  "imports": {
+    "#foo": "./src/foo.js",
+    "#common/*": "./src/common/*.js"
+  },
+  "testImports": {
+    "#foo": "./src/test/foo.js"
+  }
+}
+```
+
+When this configuration is `["testImports", "imports"]`, the result of `import value from '#foo'` in current package is `src/test/foo.js`.
+
+> See [Module resolution - package.json `imports`](/guide/features/module-resolution#packagejson-imports) for more details.
+
+## resolve.mainFields
+
+- **Type:** `string[]`
+- **Default:** Depends on [target](/config/target) and [dependency type](#resolvebydependency).
+
+Controls the priority of fields in a package.json used to locate a package's entry file. It is the ordered list of package.json fields Rspack will try when resolving an npm package's entry point.
+
+For JavaScript requests targeting `'web'` or `'webworker'`, the default is `["browser", "module", "main"]`.
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    mainFields: ['browser', 'module', 'main'],
+  },
+};
+```
+
+For Node.js, the default for JavaScript requests is `["module", "main"]`.
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    mainFields: ['module', 'main'],
+  },
+};
+```
+
+CSS `@import` requests default to `["style", "main"]`; URL requests default to `["main"]`. Use [resolve.byDependency](#resolvebydependency) to configure these separately.
+
+For example, consider an arbitrary library called `foo` with a `package.json` that contains the following fields:
+
+```json title="package.json"
+{
+  "name": "foo",
+  "browser": "./dist/browser.js",
+  "module": "./dist/module.js"
+}
+```
+
+With `mainFields: ['browser', 'module', 'main']`, `import foo from 'foo'` resolves to the module in the `browser` field, because that field has the highest priority in the array.
+
+Note that the [`exports` field](https://nodejs.org/api/packages.html#packages_exports) takes precedence over `mainFields`. If an entry is resolved via `exports`, Rspack ignores the `browser`, `module`, and `main` fields.
+
+For example, with the following package.json, `lib` is resolved via the `exports` field to `./dist/index.mjs`, and the `main` field is ignored.
+
+```json title="package.json"
+{
+  "name": "lib",
+  "main": "./dist/index.cjs",
+  "exports": {
+    ".": "./dist/index.mjs"
+  }
+}
+```
+
+## resolve.mainFiles
+
+- **Type:** `string[]`
+- **default:** `["index"]`
+
+The filename suffix when resolving directories, e.g. `require('. /dir/')` will try to resolve `'. /dir/index'`.
+
+Can configure multiple filename suffixes:
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    mainFiles: ['index', 'main'],
+  },
+};
+```
+
 ## resolve.modules
 
 - **Type:** `string[]`
 - **Default:** `["node_modules"]`
 
-The name of the directory to use when resolving dependencies.
+Specifies the directories Rspack searches when resolving bare module requests, such as `import 'react'` or `import 'utils/format'`. Relative requests such as `import './utils/format'` are resolved from the importing file and are not searched through `resolve.modules`.
 
-## resolve.preferRelative
+Entries are tried in array order, and can be directory names, relative paths, or absolute paths:
+
+- A directory name or relative path is searched from the directory containing the importing file, and then from each parent directory. For example, `node_modules` searches `<importer-directory>/node_modules`, then each ancestor's `node_modules` directory.
+- An absolute path refers to that exact directory; it is not resolved again from each ancestor.
+
+When resolving a package root such as `foo` or `@scope/foo` from a directory named `node_modules`, Rspack tries the package directory before sibling files with appended extensions, such as `foo.js`. If the directory has no resolvable entry, Rspack falls back to file resolution. Requests matched by `resolve.extensionAlias` retain their existing resolution order. Other module directories and package subpath requests keep file-first resolution.
+
+For example, the following configuration allows modules inside `src` to be imported with bare requests, while preserving the normal lookup of third-party packages from `node_modules`:
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  resolve: {
+    modules: [path.resolve(import.meta.dirname, 'src'), 'node_modules'],
+  },
+};
+```
+
+With this configuration, `import 'utils/format'` can resolve to `<project>/src/utils/format.js`. If a request is not found in `src`, Rspack continues with the `node_modules` lookup.
+
+Setting `resolve.modules` replaces the default array. Include `'node_modules'` explicitly when normal package lookup should remain enabled.
+
+## resolve.pnp
 
 - **Type:** `boolean`
-- **Default:** `false`
+- **Default:** `!!process.versions.pnp`
 
-When enabled, `require('file')` will first look for the `. /file` file in the current directory, not `<modules>/file`.
+When enabled, it will enable [Yarn PnP](https://yarnpkg.com/features/pnp) resolution.
+
+It's enabled by default if [`!!process.versions.pnp`](https://yarnpkg.com/advanced/pnpapi#processversionspnp) is `true`, which means the application is running in Yarn PnP environments.
+
+Example:
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    pnp: true,
+  },
+};
+```
 
 ## resolve.preferAbsolute
-
-<ApiMeta addedVersion="0.5.1" />
 
 - **Type:** `boolean`
 - **Default:** `false`
 
 Opt for absolute paths when resolving, in relation to `resolve.roots`.
 
-## resolve.tsConfigPath
+## resolve.preferRelative
 
-- **Type:** `string | undefined`
-- **Default:** `undefined`
+- **Type:** `boolean`
+- **Default:** `false`
 
-If you pass the path of `tsconfig.json` via the option, Rspack will try to resolve modules based on the `paths` and `baseUrl` of `tsconfig.json`, functionally equivalent to [tsconfig-paths-webpack-plugin](https://www.npmjs.com/package/tsconfig-paths-webpack-plugin).
+When enabled, `require('file')` will first look for the `./file` file in the current directory, not `<modules>/file`.
 
-```js rspack.config.js
-const path = require('path');
+## resolve.restrictions
 
-/** @type {import('@rspack/cli').Configuration} */
-const config = {
-  // ...
+- **Type:** `(string | RegExp)[]`
+- **Default:** `[]`
+
+A list of resolve restrictions to restrict the paths that a request can be resolved on.
+
+## resolve.roots
+
+- **Type:** `string[]`
+- **Default:** `[]`
+
+A list of directories where server-relative URLs (beginning with '/') are resolved. On systems other than Windows, these requests are initially resolved as an absolute path.
+
+For example, importing `'/static/app.js'` and expecting it to resolve relative to the project root:
+
+```js title="rspack.config.mjs"
+export default {
   resolve: {
-    tsConfigPath: path.resolve(__dirname, 'tsconfig.json'),
+    roots: [import.meta.dirname],
   },
-  // ...
 };
-module.exports = config;
 ```
 
-[Click to see the example](https://github.com/rspack-contrib/rspack-examples/tree/main/rspack/basic-ts).
+## resolve.symlinks
 
-:::warning
+- **Type:** `boolean`
+- **Default:** `true`
 
-`tsconfig.json#extends` is not supported.
+Whether to resolve symlinks to their symlinked location.
 
-:::
+When enabled, symlinked resources are resolved to their real path, not their symlinked location. Note that this may cause module resolution to fail when using tools that symlink packages (like `npm link`).
 
 ## resolve.tsConfig
 
-<ApiMeta addedVersion="0.3.7" />
-
-- **Type:** `object`
+- **Type:** `string | object | undefined`
 - **Default:** `undefined`
 
-```js title="rspack.config.js"
-module.exports = {
+The replacement of [tsconfig-paths-webpack-plugin](https://www.npmjs.com/package/tsconfig-paths-webpack-plugin) in Rspack.
+
+- string:
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
   resolve: {
-    tsconfig: {
-      configFile: path.resolve(__dirname, './tsconfig.json'),
+    // string
+    tsConfig: path.resolve(import.meta.dirname, './tsconfig.json'),
+  },
+};
+```
+
+- object:
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  resolve: {
+    tsConfig: {
+      configFile: path.resolve(import.meta.dirname, './tsconfig.json'),
       references: 'auto',
     },
   },
 };
 ```
 
+[Click to see the example](https://github.com/rstackjs/rstack-examples/tree/main/rspack/basic-ts).
+
 ### resolve.tsConfig.configFile
 
 - **Type:** `string`
 
-Same as [resolve.tsConfigPath](#resolvetsconfigpath).
-
 If you pass the path of `tsconfig.json` via the option, Rspack will try to resolve modules based on the `paths` and `baseUrl` of `tsconfig.json`, functionally equivalent to [tsconfig-paths-webpack-plugin](https://www.npmjs.com/package/tsconfig-paths-webpack-plugin).
+
+When `extends` is an array, later entries take precedence over earlier entries. The `paths` and `baseUrl` declared in the current tsconfig take precedence over inherited values.
+
+Path mappings are resolved relative to the final merged `baseUrl`. If no `baseUrl` is configured, they are relative to the directory of the tsconfig that declares `paths`.
 
 ### resolve.tsConfig.references
 
@@ -224,33 +807,70 @@ The list of tsconfig paths can be provided manually, or you may specify `auto` t
 
 This feature is disabled when the value is `undefined`.
 
-## resolve.fullySpecified
+#### Reference matching rules
 
-- **Type:** `boolean`
-- **Default:** `false`
+When resolving a non-relative request, Rspack checks the referenced tsconfig files one by one before falling back to the main tsconfig. They are checked in the order they appear in `references`, and the references of a referenced tsconfig are checked before that tsconfig itself:
 
-No longer resolve extensions, no longer resolve mainFiles in package.json (but does not affect requests from mainFiles, browser, alias).
+1. The base path of each reference defaults to the directory containing that tsconfig (or its `baseUrl`, if configured).
+2. The first reference whose base path contains the directory of the importing file wins. Rspack uses the `paths` of that reference and stops there, even if that reference defines no `paths`.
+3. Only when no reference matches does Rspack use the `paths` of the main tsconfig.
 
-## resolve.restrictions
+The match is based on directories only. Unlike `tsc`, Rspack does not read `include`, `files` or `exclude` to decide which project a file belongs to.
 
-<ApiMeta addedVersion="0.5.1" />
+For example, with the following layout:
 
-- **Type:** `string[]`
-- **Default:** `[]`
+```
+.
+├── tsconfig.json             # paths: { "@/*": ["./src/*"] }
+│                             # references: [{ "path": "./packages/ui" }, { "path": "./packages/utils" }]
+├── src/
+│   └── index.ts
+└── packages/
+    ├── ui/
+    │   ├── tsconfig.json     # paths: { "@ui/*": ["./src/*"] }
+    │   └── src/button.ts
+    └── utils/
+        ├── tsconfig.json     # no paths
+        └── src/format.ts
+```
 
-A list of resolve restrictions to restrict the paths that a request can be resolved on.
+| Importing file                 | Matched tsconfig                       | Result                                                   |
+| ------------------------------ | -------------------------------------- | -------------------------------------------------------- |
+| `src/index.ts`                 | `tsconfig.json` (no reference matches) | `@/*` resolves                                           |
+| `packages/ui/src/button.ts`    | `packages/ui/tsconfig.json`            | `@ui/*` resolves, `@/*` does not                         |
+| `packages/utils/src/format.ts` | `packages/utils/tsconfig.json`         | No alias resolves, not even `@/*` from the main tsconfig |
 
-## resolve.roots
+:::tip
+When using `references: 'auto'`, Rspack loads every entry in the `references` field of the tsconfig. Avoid placing multiple referenced tsconfig files (or a referenced tsconfig and the main tsconfig) in the same directory, because files in that directory can only match one of them. Instead, place each referenced tsconfig in the directory of the files it covers, as in the example above. This only affects how Rspack resolves `paths` aliases. Relative imports and `tsc` are not affected.
 
-<ApiMeta addedVersion="0.5.1" />
+For example, if several tsconfig files are placed side by side in the project root:
 
-- **Type:** `string[]`
-- **Default:** `[]`
+```
+.
+├── tsconfig.json         # references: [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }]
+├── tsconfig.app.json     # include: ["src"], paths: { "@/*": ["./src/*"] }
+├── tsconfig.node.json    # include: ["scripts"], paths: { "@scripts/*": ["./scripts/*"] }
+├── src/
+└── scripts/
+```
 
-A list of directories where server-relative URLs (beginning with '/') are resolved. It defaults to the `context` configuration option. On systems other than Windows, these requests are initially resolved as an absolute path.
+both references have the project root as their base path, so files under `src/` and under `scripts/` all match `tsconfig.app.json`, which comes first in `references`. As a result, `@/*` also resolves in `scripts/`, while `@scripts/*` from `tsconfig.node.json` and any `paths` in the main `tsconfig.json` never take effect.
 
-## resolve.byDependency
+If the layout cannot be changed, you can also set `references` to an array and list only the references whose directories do not overlap, so that the matched reference is explicit:
 
-- **Type:** `Record<string, Resolve>`.
+```js title="rspack.config.mjs"
+import path from 'node:path';
 
-Customize the Resolve configuration based on the module type.
+export default {
+  resolve: {
+    tsConfig: {
+      configFile: path.resolve(import.meta.dirname, './tsconfig.json'),
+      references: [path.resolve(import.meta.dirname, './tsconfig.app.json')],
+    },
+  },
+};
+```
+
+:::
+
+<Attribution url="https://webpack.js.org/configuration/resolve/" />

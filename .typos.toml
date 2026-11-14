@@ -1,5 +1,5 @@
 # https://github.com/crate-ci/typos
-# cargo install typos
+# cargo install typos-cli
 # typos
 
 [files]
@@ -7,12 +7,13 @@ extend-exclude = [
   "**/*.{css,map,json,txt,snap,bak,diff,html}",
   "**/tests/**",
   "**/mock/**",
+  # Imported rspack_sources test and benchmark data contains minified code and source-map mappings.
+  "crates/rspack_sources/**",
+  "xtask/benchmark/benches/fixtures/rspack_sources/**",
+  "xtask/benchmark/benches/groups/rspack_sources_*",
   "packages/rspack-test-tools",
   "packages/rspack/src/util/hash",
-  "webpack-examples",
-  "webpack-test",
-  "plugin-test",
-  "webpack-cli-test",
+  "tests/**",
   "**/CHANGELOG.md",
   "GOVERNANCE.md",
   "pnpm-lock.yaml",
@@ -22,10 +23,13 @@ extend-exclude = [
 
 [default.extend-identifiers]
 JSerFeng = "JSerFeng"
+fi3ework = "fi3ework"
 
 [default.extend-words]
+Colum    = "Colum"
 Nd       = "Nd"
+Pn       = "Pn"
 fo       = "fo"
 splitted = "splitted"
+styl     = "styl"
 ws       = "ws"
-Pn       = "Pn"

@@ -1,72 +1,76 @@
-use std::path::PathBuf;
-
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_collections::{IdentifierMap, IdentifierSet};
 use rspack_core::{
-  AsContextDependency, AsDependencyTemplate, ConnectionState, Dependency, DependencyCategory,
-  DependencyId, ModuleDependency, ModuleGraph, ModuleIdentifier,
+  AffectType, AsContextDependency, AsDependencyCodeGeneration, ConnectionState, Dependency,
+  DependencyCategory, DependencyId, DependencyRange, DependencyType, LoaderDependencies,
+  ModuleDependency, ModuleGraph, ModuleGraphCacheArtifact, ModuleLayer, ResourceIdentifier,
+  SideEffectsStateArtifact,
 };
-use rustc_hash::FxHashSet;
 
-use crate::css_module::DEPENDENCY_TYPE;
-
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct CssDependency {
-  pub id: DependencyId,
-  pub identifier: String,
-  pub content: String,
-  pub context: String,
-  pub media: String,
-  pub supports: String,
-  pub source_map: String,
+  pub(crate) id: DependencyId,
+  pub(crate) identifier: String,
+  pub(crate) module_layer: Option<ModuleLayer>,
+  pub(crate) content: String,
+  pub(crate) context: String,
+  pub(crate) media: Option<String>,
+  pub(crate) supports: Option<String>,
+  pub(crate) source_map: Option<String>,
+  pub(crate) css_layer: Option<String>,
 
   // One module can be split apart by using `@import` in the middle of one module
-  pub identifier_index: u32,
+  pub(crate) identifier_index: u32,
 
   // determine module's postOrderIndex
-  pub order_index: u32,
-
-  resource_identifier: String,
-
-  pub filepath: PathBuf,
+  range: DependencyRange,
+  resource_identifier: ResourceIdentifier,
+  pub(crate) cacheable: bool,
+  pub(crate) dependencies: LoaderDependencies,
 }
 
 impl CssDependency {
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     identifier: String,
+    module_layer: Option<ModuleLayer>,
+    css_layer: Option<String>,
     content: String,
     context: String,
-    media: String,
-    supports: String,
-    source_map: String,
+    media: Option<String>,
+    supports: Option<String>,
+    source_map: Option<String>,
     identifier_index: u32,
-    order_index: u32,
-    filepath: PathBuf,
+    range: DependencyRange,
+    cacheable: bool,
+    dependencies: LoaderDependencies,
   ) -> Self {
-    let resource_identifier = format!("css-module-{}-{}", &identifier, identifier_index);
+    let resource_identifier = format!("css-module-{}-{}", &identifier, identifier_index).into();
     Self {
       id: DependencyId::new(),
       identifier,
       content,
+      module_layer,
+      css_layer,
       context,
       media,
       supports,
       source_map,
       identifier_index,
-      order_index,
+      range,
       resource_identifier,
-      filepath,
+      cacheable,
+      dependencies,
     }
   }
 }
 
-impl AsDependencyTemplate for CssDependency {}
+impl AsDependencyCodeGeneration for CssDependency {}
 impl AsContextDependency for CssDependency {}
 
+#[cacheable_dyn]
 impl Dependency for CssDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "mini-extract-css-dependency"
-  }
-
   fn resource_identifier(&self) -> Option<&str> {
     Some(&self.resource_identifier)
   }
@@ -76,7 +80,7 @@ impl Dependency for CssDependency {
   }
 
   fn dependency_type(&self) -> &rspack_core::DependencyType {
-    &DEPENDENCY_TYPE
+    &DependencyType::ExtractCSS
   }
 
   fn category(&self) -> &DependencyCategory {
@@ -86,7 +90,10 @@ impl Dependency for CssDependency {
   fn get_module_evaluation_side_effects_state(
     &self,
     _module_graph: &ModuleGraph,
-    _module_chain: &mut FxHashSet<ModuleIdentifier>,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _side_effects_state_artifact: &SideEffectsStateArtifact,
+    _module_chain: &mut IdentifierSet,
+    _connection_state_cache: &mut IdentifierMap<ConnectionState>,
   ) -> ConnectionState {
     ConnectionState::TransitiveOnly
   }
@@ -96,14 +103,24 @@ impl Dependency for CssDependency {
   // it can keep the right order, but Rspack uses HashSet,
   // when determining the postOrderIndex, Rspack uses
   // dependency span to set correct order
-  fn span(&self) -> Option<rspack_core::ErrorSpan> {
-    Some(rspack_core::ErrorSpan {
-      start: self.order_index,
-      end: self.order_index + 1,
-    })
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
+  }
+
+  fn get_layer(&self) -> Option<&rspack_core::ModuleLayer> {
+    self.module_layer.as_ref()
+  }
+
+  fn could_affect_referencing_module(&self) -> AffectType {
+    AffectType::Transitive
+  }
+
+  fn is_module_executor_result(&self) -> bool {
+    true
   }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for CssDependency {
   fn request(&self) -> &str {
     &self.identifier

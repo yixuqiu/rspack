@@ -4,10 +4,6 @@
 
 # Rspack Project Owner is @hardfist
 
-# Default to no one
-
-# *
-
 # Ignore lock files
 
 Cargo.lock
@@ -15,35 +11,38 @@ pnpm-lock.yaml
 
 # Infra
 
-/.github/workflows @jerrykingxyz
-/benchcases @IWANABETHATGUY
-/scripts @jerrykingxyz
-
-# Webpack Tests
-
-/webpack-test
+Cargo.toml
+/.github/workflows @stormslowly
+/.github/actions @stormslowly
+/.github/ISSUE_TEMPLATE @chenjiahan
+/scripts @stormslowly
+/xtask @stormslowly
 
 # Crates in alphabetical order
 
-/crates/rspack
 /crates/node_binding
-/crates/rspack_ast_viewer
-/crates/rspack_base64
-/crates/rspack_binding_options
+/crates/rspack
+/crates/rspack_binding_api
+/crates/rspack_binding_build
+/crates/rspack_binding_builder
+/crates/rspack_binding_builder_macros
+/crates/rspack_binding_builder_testing
+/crates/rspack_browserslist @hardfist
+/crates/rspack_cacheable @ahabhgk
+/crates/rspack_cacheable_test @ahabhgk
 /crates/rspack_core
-/crates/rspack_core/src/compiler/make @jerrykingxyz
-/crates/rspack_database
 /crates/rspack_error
 /crates/rspack_fs
-/crates/rspack_fs_node
-/crates/rspack_futures
-/crates/rspack_identifier
+/crates/rspack_collections
 /crates/rspack_ids
-/crates/rspack_napi_shared
 
 # Loaders
 
+/crates/rspack_loader_lightningcss @intellild
 /crates/rspack_loader_swc
+/crates/rspack_loader_preact_refresh @LingyuCoder
+/crates/rspack_loader_react_refresh @ahabhgk
+/crates/rspack_loader_runner
 
 # Plugins
 
@@ -54,30 +53,34 @@ pnpm-lock.yaml
 /crates/rspack_plugin_devtool
 /crates/rspack_plugin_entry
 /crates/rspack_plugin_externals
-/crates/rspack_plugin_html
+/crates/rspack_plugin_html @LingyuCoder
 /crates/rspack_plugin_javascript
 /crates/rspack_plugin_json
 /crates/rspack_plugin_library
+/crates/rspack_plugin_mf @ahabhgk
 /crates/rspack_plugin_progress
 /crates/rspack_plugin_real_content_hash
 /crates/rspack_plugin_remove_empty_chunks
+/crates/rspack_plugin_rsdoctor @LingyuCoder
+/crates/rspack_plugin_rslib @LingyuCoder
+/crates/rspack_plugin_rstest @LingyuCoder
 /crates/rspack_plugin_runtime
 /crates/rspack_plugin_schemes
-/crates/rspack_plugin_split_chunks
+/crates/rspack_plugin_split_chunks @JSerFeng
 /crates/rspack_plugin_wasm
-/crates/rspack_regex @IWANABETHATGUY
-/crates/rspack_symbol @IWANABETHATGUY
-/crates/rspack_tracing
+/crates/rspack_tracing @hardfist
+/crates/rspack_tracing_perfetto @hardfist
 /crates/rspack_util
+/crates/swc_plugin_ts_collector @ahabhgk
 
-# Packages in alphabetical order
+# npm packages in alphabetical order
 
-/packages/create-rspack
-/packages/postcss-loader
-/packages/rspack
-/packages/rspack-cli
-/packages/rspack-dev-middleware
-/packages/rspack-dev-server
-/packages/rspack-plugin-html
-/packages/rspack-plugin-minify
-/packages/rspack-plugin-node-polyfill
+/packages/create-rspack @chenjiahan
+/packages/rspack @hardfist
+/packages/rspack-cli @hardfist
+/packages/rspack-test-tools/src @LingyuCoder
+
+# Tests
+
+/tests/e2e
+/tests/rspack-test

@@ -1,29 +1,51 @@
-use swc_core::ecma::atoms::Atom;
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsCacheable, AsOption, AsVec},
+};
+use rspack_util::json_stringify;
 
-use crate::{AsContextDependency, AsDependencyTemplate, Context};
-use crate::{ContextMode, ContextOptions, Dependency};
-use crate::{DependencyCategory, DependencyId, DependencyType};
-use crate::{ExtendedReferencedExport, ModuleDependency};
-use crate::{ModuleGraph, ReferencedExport, RuntimeSpec};
+use super::AffectType;
+use crate::{
+  AsContextDependency, AsDependencyCodeGeneration, Context, ContextNameSpaceObject, Dependency,
+  DependencyCategory, DependencyId, DependencyType, ExportsInfoArtifact, ImportAttributes,
+  ModuleDependency, ModuleGraph, ModuleGraphCacheArtifact, ModuleLayer, ReferencedExport,
+  ReferencedSpecifier, ResourceIdentifier, RuntimeSpec, create_exports_object_referenced,
+  create_referenced_exports_by_referenced_specifiers,
+};
 
-#[derive(Debug, PartialEq, Clone, Hash)]
+#[cacheable]
+#[derive(Debug)]
 pub struct ContextElementDependency {
   pub id: DependencyId,
-  // TODO remove this async dependency mark
-  pub options: ContextOptions,
+  pub weak: bool,
   pub request: String,
   pub user_request: String,
   pub category: DependencyCategory,
   pub context: Context,
-  pub resource_identifier: String,
-  pub referenced_exports: Option<Vec<Atom>>,
+  pub layer: Option<ModuleLayer>,
+  pub resource_identifier: ResourceIdentifier,
+  #[cacheable(with=AsOption<AsVec<AsCacheable>>)]
+  pub referenced_specifiers: Option<Vec<ReferencedSpecifier>>,
+  pub dependency_type: DependencyType,
+  pub attributes: Option<ImportAttributes>,
 }
 
-impl Dependency for ContextElementDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "ContextElementDependency"
+impl ContextElementDependency {
+  pub fn create_resource_identifier(
+    resource: &str,
+    path: &str,
+    attributes: Option<&ImportAttributes>,
+  ) -> ResourceIdentifier {
+    let mut ident = format!("context{resource}|{path}");
+    if let Some(attributes) = attributes {
+      ident += &json_stringify(&attributes);
+    }
+    ident.into()
   }
+}
 
+#[cacheable_dyn]
+impl Dependency for ContextElementDependency {
   fn id(&self) -> &DependencyId {
     &self.id
   }
@@ -33,18 +55,70 @@ impl Dependency for ContextElementDependency {
   }
 
   fn dependency_type(&self) -> &DependencyType {
-    &DependencyType::ContextElement
+    &self.dependency_type
   }
 
   fn get_context(&self) -> Option<&Context> {
     Some(&self.context)
   }
 
+  fn get_layer(&self) -> Option<&ModuleLayer> {
+    self.layer.as_ref()
+  }
+
+  fn get_attributes(&self) -> Option<&ImportAttributes> {
+    self.attributes.as_ref()
+  }
+
   fn resource_identifier(&self) -> Option<&str> {
     Some(&self.resource_identifier)
   }
+
+  fn get_referenced_exports(
+    &self,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+    _runtime: Option<&RuntimeSpec>,
+  ) -> Vec<ReferencedExport> {
+    if let Some(referenced_specifiers) = &self.referenced_specifiers {
+      let Some(parent_module) = module_graph
+        .get_parent_module(&self.id)
+        .and_then(|id| module_graph.module_by_identifier(id))
+        .and_then(|m| m.as_context_module())
+      else {
+        return create_exports_object_referenced();
+      };
+      let Some(imported_module) = module_graph.get_module_by_dependency_id(&self.id) else {
+        return create_exports_object_referenced();
+      };
+      let is_strict = matches!(
+        parent_module.get_context_options().namespace_object,
+        ContextNameSpaceObject::Strict
+      );
+      let exports_type = imported_module.get_exports_type(
+        module_graph,
+        module_graph_cache,
+        exports_info_artifact,
+        is_strict,
+      );
+      create_referenced_exports_by_referenced_specifiers(
+        referenced_specifiers,
+        exports_type,
+        exports_info_artifact,
+        exports_info_artifact.get_exports_info_data(&imported_module.identifier()),
+      )
+    } else {
+      create_exports_object_referenced()
+    }
+  }
+
+  fn could_affect_referencing_module(&self) -> AffectType {
+    AffectType::True
+  }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for ContextElementDependency {
   fn request(&self) -> &str {
     &self.request
@@ -55,28 +129,9 @@ impl ModuleDependency for ContextElementDependency {
   }
 
   fn weak(&self) -> bool {
-    matches!(
-      self.options.mode,
-      ContextMode::AsyncWeak | ContextMode::Weak
-    )
-  }
-
-  fn set_request(&mut self, request: String) {
-    self.request = request;
-  }
-
-  fn get_referenced_exports(
-    &self,
-    _module_graph: &ModuleGraph,
-    _runtime: Option<&RuntimeSpec>,
-  ) -> Vec<ExtendedReferencedExport> {
-    if let Some(referenced_exports) = &self.referenced_exports {
-      vec![ReferencedExport::new(referenced_exports.clone(), false).into()]
-    } else {
-      vec![ExtendedReferencedExport::Array(vec![])]
-    }
+    self.weak
   }
 }
 
-impl AsDependencyTemplate for ContextElementDependency {}
+impl AsDependencyCodeGeneration for ContextElementDependency {}
 impl AsContextDependency for ContextElementDependency {}

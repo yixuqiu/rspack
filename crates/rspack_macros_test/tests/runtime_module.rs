@@ -1,23 +1,24 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
-use rspack_core::{rspack_sources::Source, Compilation};
-use rspack_error::Result;
-use rspack_identifier::Identifier;
+use rspack_core::{RuntimeModule, RuntimeModuleGenerateContext};
 use rspack_macros::impl_runtime_module;
 
+#[allow(dead_code)]
 #[test]
 fn with_generic() {
   #[impl_runtime_module]
-  #[derive(Debug, Eq)]
+  #[derive(Debug)]
   struct Foo<T: std::fmt::Debug + Send + Sync + Eq + 'static> {
     marker: PhantomData<T>,
   }
 
-  impl<T: std::fmt::Debug + Send + Sync + Eq + 'static> Foo<T> {
-    fn name(&self) -> Identifier {
-      String::new().into()
+  #[async_trait::async_trait]
+  impl<T: std::fmt::Debug + Send + Sync + Eq + 'static> RuntimeModule for Foo<T> {
+    fn runtime_module_variables() -> &'static [&'static str] {
+      &[]
     }
-    fn generate_with_custom(&self, _compilation: &Compilation) -> Result<Arc<dyn Source>> {
+
+    async fn generate(&self, _: &RuntimeModuleGenerateContext<'_>) -> rspack_error::Result<String> {
       todo!()
     }
   }

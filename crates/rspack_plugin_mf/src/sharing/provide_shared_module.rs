@@ -1,16 +1,18 @@
-use std::{borrow::Cow, hash::Hash};
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_collections::{Identifiable, Identifier};
 use rspack_core::{
-  async_module_factory, impl_module_meta_info, impl_source_map_config, rspack_sources::Source,
-  sync_module_factory, AsyncDependenciesBlock, AsyncDependenciesBlockIdentifier, BoxDependency,
-  BuildContext, BuildInfo, BuildMeta, BuildResult, CodeGenerationResult, Compilation,
-  ConcatenationScope, Context, DependenciesBlock, DependencyId, FactoryMeta, LibIdentOptions,
-  Module, ModuleIdentifier, ModuleType, RuntimeGlobals, RuntimeSpec, SourceType,
+  AsyncDependenciesBlock, BoxDependency, BoxModule, BuildContext, BuildInfo, BuildMeta,
+  CodeGenerationResultBuilder, Compilation, Context, DependenciesBlock, DependenciesBlockData,
+  FactoryMetaStore, FreezeLock, LibIdentOptions, Module, ModuleCodeGenerationContext, ModuleGraph,
+  ModuleIdentifier, ModuleType, NeedBuildContext, RuntimeGlobals, RuntimeSpec, SourceType,
+  impl_module_meta_info, impl_source_map_config, module_update_hash, rspack_sources::BoxSource,
+  runtime_mode::RuntimeMode,
 };
-use rspack_error::{impl_empty_diagnosable_trait, Diagnostic, Result};
-use rspack_hash::RspackHash;
-use rspack_identifier::{Identifiable, Identifier};
+use rspack_error::{Result, impl_empty_diagnosable_trait};
+use rspack_hash::{RspackHashDigest, RspackHasher};
 use rspack_util::source_map::SourceMapKind;
 
 use super::{
@@ -20,52 +22,91 @@ use super::{
     CodeGenerationDataShareInit, DataInitInfo, ProvideSharedInfo, ShareInitData,
   },
 };
+use crate::{ConsumeVersion, ShareScope, utils::module_identifier_namespace};
 
 #[impl_source_map_config]
+#[cacheable]
 #[derive(Debug)]
 pub struct ProvideSharedModule {
-  blocks: Vec<AsyncDependenciesBlockIdentifier>,
-  dependencies: Vec<DependencyId>,
+  dependencies_block: DependenciesBlockData,
   identifier: ModuleIdentifier,
   lib_ident: String,
   readable_identifier: String,
   name: String,
-  share_scope: String,
+  share_scope: ShareScope,
   version: ProvideVersion,
   request: String,
   eager: bool,
-  factory_meta: Option<FactoryMeta>,
-  build_info: Option<BuildInfo>,
-  build_meta: Option<BuildMeta>,
+  singleton: Option<bool>,
+  required_version: Option<ConsumeVersion>,
+  strict_version: Option<bool>,
+  tree_shaking_mode: Option<String>,
+  factory_meta: FactoryMetaStore,
+  build_info: FreezeLock<BuildInfo>,
+  build_meta: FreezeLock<BuildMeta>,
 }
 
 impl ProvideSharedModule {
+  #[allow(clippy::too_many_arguments)]
   pub fn new(
-    share_scope: String,
+    share_scope: ShareScope,
     name: String,
     version: ProvideVersion,
     request: String,
     eager: bool,
+    singleton: Option<bool>,
+    required_version: Option<ConsumeVersion>,
+    strict_version: Option<bool>,
+    tree_shaking_mode: Option<String>,
+    runtime_mode: RuntimeMode,
   ) -> Self {
+    let scopes_key = share_scope.key();
+    let namespace = module_identifier_namespace(runtime_mode);
     let identifier = format!(
       "provide shared module ({}) {}@{} = {}",
-      &share_scope, &name, &version, &request
+      &scopes_key, &name, &version, &request
     );
     Self {
-      blocks: Vec::new(),
-      dependencies: Vec::new(),
-      identifier: ModuleIdentifier::from(identifier.clone()),
-      lib_ident: format!("webpack/sharing/provide/{}/{}", &share_scope, &name),
+      dependencies_block: Default::default(),
+      identifier: ModuleIdentifier::from(identifier.as_ref()),
+      lib_ident: format!("{namespace}/sharing/provide/{scopes_key}/{name}"),
       readable_identifier: identifier,
       name,
       share_scope,
       version,
       request,
       eager,
-      factory_meta: None,
-      build_info: None,
-      build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      singleton,
+      required_version,
+      strict_version,
+      tree_shaking_mode,
+      factory_meta: Default::default(),
+      build_info: BuildInfo {
+        strict: true,
+        ..Default::default()
+      }
+      .into(),
+      build_meta: Default::default(),
+      source_map_kind: SourceMapKind::empty(),
+    }
+  }
+
+  pub fn share_key(&self) -> &str {
+    &self.name
+  }
+
+  pub fn share_scope(&self) -> &ShareScope {
+    &self.share_scope
+  }
+
+  pub fn singleton(&self) -> Option<bool> {
+    self.singleton
+  }
+
+  pub fn version(&self) -> Option<&str> {
+    match &self.version {
+      ProvideVersion::Version(version) => Some(version),
+      ProvideVersion::False => None,
     }
   }
 }
@@ -77,115 +118,98 @@ impl Identifiable for ProvideSharedModule {
 }
 
 impl DependenciesBlock for ProvideSharedModule {
-  fn add_block_id(&mut self, block: AsyncDependenciesBlockIdentifier) {
-    self.blocks.push(block)
+  fn dependencies_block(&self) -> &DependenciesBlockData {
+    &self.dependencies_block
   }
 
-  fn get_blocks(&self) -> &[AsyncDependenciesBlockIdentifier] {
-    &self.blocks
-  }
-
-  fn add_dependency_id(&mut self, dependency: DependencyId) {
-    self.dependencies.push(dependency)
-  }
-
-  fn get_dependencies(&self) -> &[DependencyId] {
-    &self.dependencies
+  fn dependencies_block_mut(&mut self) -> &mut DependenciesBlockData {
+    &mut self.dependencies_block
   }
 }
 
+#[cacheable_dyn]
 #[async_trait]
 impl Module for ProvideSharedModule {
   impl_module_meta_info!();
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>) -> f64 {
     42.0
-  }
-
-  fn get_diagnostics(&self) -> Vec<Diagnostic> {
-    vec![]
   }
 
   fn module_type(&self) -> &ModuleType {
     &ModuleType::ProvideShared
   }
 
-  fn source_types(&self) -> &[SourceType] {
+  fn source_types(&self, _module_graph: &ModuleGraph) -> &[SourceType] {
     &[SourceType::ShareInit]
   }
 
-  fn original_source(&self) -> Option<&dyn Source> {
+  fn source(&self) -> Option<&BoxSource> {
     None
   }
 
-  fn readable_identifier(&self, _context: &Context) -> Cow<str> {
+  fn readable_identifier(&self, _context: &Context) -> Cow<'_, str> {
     self.readable_identifier.as_str().into()
   }
 
-  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<str>> {
+  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<'_, str>> {
     Some(self.lib_ident.as_str().into())
   }
 
-  async fn build(
-    &mut self,
-    build_context: BuildContext<'_>,
-    _: Option<&Compilation>,
-  ) -> Result<BuildResult> {
-    let mut hasher = RspackHash::from(&build_context.compiler_options.output);
-    self.update_hash(&mut hasher);
-    let hash = hasher.digest(&build_context.compiler_options.output.hash_digest);
-
-    let mut blocks = vec![];
-    let mut dependencies = vec![];
-    let dep = Box::new(ProvideForSharedDependency::new(self.request.clone()));
-    if self.eager {
-      dependencies.push(dep as BoxDependency);
-    } else {
-      let block = AsyncDependenciesBlock::new(self.identifier, None, None, vec![dep]);
-      blocks.push(block);
-    }
-
-    Ok(BuildResult {
-      build_info: BuildInfo {
-        hash: Some(hash),
-        strict: true,
-        ..Default::default()
-      },
-      build_meta: Default::default(),
-      dependencies,
-      blocks,
-      ..Default::default()
-    })
+  async fn need_build(&self, _context: &NeedBuildContext<'_>) -> Result<bool> {
+    Ok(self.build_info.frozen().is_none())
   }
 
-  #[allow(clippy::unwrap_in_result)]
-  fn code_generation(
+  async fn build(
+    mut self: Box<Self>,
+    _build_context: Arc<BuildContext>,
+    _: Option<&Compilation>,
+  ) -> Result<BoxModule> {
+    let mut blocks = vec![];
+    let mut dependencies = vec![];
+    let dep = BoxDependency::new(ProvideForSharedDependency::new(self.request.clone()));
+    if self.eager {
+      dependencies.push(dep);
+    } else {
+      let block = AsyncDependenciesBlock::new(self.identifier, None, None, vec![dep], None);
+      blocks.push(Box::new(block));
+    }
+
+    Ok(BoxModule::new(self).with_dependencies(
+      dependencies.into_iter().map(Into::into).collect(),
+      blocks.into_iter().map(Into::into).collect(),
+    ))
+  }
+
+  // #[tracing::instrument("ProvideSharedModule::code_generation", skip_all, fields(identifier = ?self.identifier()))]
+  async fn code_generation(
     &self,
-    compilation: &Compilation,
-    _runtime: Option<&RuntimeSpec>,
-    _: Option<ConcatenationScope>,
-  ) -> Result<CodeGenerationResult> {
-    let mut code_generation_result = CodeGenerationResult::default();
-    code_generation_result
-      .runtime_requirements
+    code_generation_context: &mut ModuleCodeGenerationContext,
+  ) -> Result<CodeGenerationResultBuilder> {
+    let ModuleCodeGenerationContext {
+      compilation,
+      runtime_template,
+      ..
+    } = code_generation_context;
+
+    let mut code_generation_result = CodeGenerationResultBuilder::default();
+    runtime_template
+      .runtime_requirements_mut()
       .insert(RuntimeGlobals::INITIALIZE_SHARING);
     let factory = if self.eager {
-      sync_module_factory(
-        &self.get_dependencies()[0],
+      runtime_template.sync_module_factory(
+        self
+          .get_dependency_ids()
+          .next()
+          .expect("should have shared dependency"),
         &self.request,
         compilation,
-        &mut code_generation_result.runtime_requirements,
       )
     } else {
-      async_module_factory(
-        &self.get_blocks()[0],
-        &self.request,
-        compilation,
-        &mut code_generation_result.runtime_requirements,
-      )
+      runtime_template.async_module_factory(&self.get_blocks()[0], &self.request, compilation)
     };
     code_generation_result
-      .data
+      .data_mut()
       .insert(CodeGenerationDataShareInit {
         items: vec![ShareInitData {
           share_scope: self.share_scope.clone(),
@@ -195,26 +219,25 @@ impl Module for ProvideSharedModule {
             version: self.version.clone(),
             factory,
             eager: self.eager,
+            singleton: self.singleton,
+            strict_version: self.strict_version,
+            required_version: self.required_version.clone(),
+            tree_shaking_mode: self.tree_shaking_mode.clone(),
           }),
         }],
       });
     Ok(code_generation_result)
   }
+
+  async fn get_runtime_hash(
+    &self,
+    compilation: &Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    let mut hasher = RspackHasher::from(&compilation.options.output);
+    module_update_hash(self, &mut hasher, compilation, runtime);
+    Ok(hasher.digest(&compilation.options.output.hash_digest))
+  }
 }
 
 impl_empty_diagnosable_trait!(ProvideSharedModule);
-
-impl Hash for ProvideSharedModule {
-  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    "__rspack_internal__ProvideSharedModule".hash(state);
-    self.identifier().hash(state);
-  }
-}
-
-impl PartialEq for ProvideSharedModule {
-  fn eq(&self, other: &Self) -> bool {
-    self.identifier() == other.identifier()
-  }
-}
-
-impl Eq for ProvideSharedModule {}

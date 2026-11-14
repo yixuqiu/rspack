@@ -1,64 +1,101 @@
 use rspack_core::{
-  impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  ChunkUkey, Compilation, FilenameTemplate, PathData, RuntimeGlobals, RuntimeModule,
+  Compilation, PathData, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext,
+  RuntimeTemplate, SourceType, impl_runtime_module,
 };
-use rspack_identifier::Identifier;
-use rspack_util::{infallible::ResultInfallibleExt as _, source_map::SourceMapKind};
 
 // TODO workaround for get_chunk_update_filename
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
-pub struct GetChunkUpdateFilenameRuntimeModule {
-  id: Identifier,
-  chunk: Option<ChunkUkey>,
+#[derive(Debug)]
+pub struct GetChunkUpdateFilenameRuntimeModule {}
+
+impl GetChunkUpdateFilenameRuntimeModule {
+  pub fn new(runtime_template: &RuntimeTemplate) -> Self {
+    Self::with_default(runtime_template)
+  }
 }
 
-impl Default for GetChunkUpdateFilenameRuntimeModule {
-  fn default() -> Self {
-    Self {
-      chunk: None,
-      id: Identifier::from("webpack/runtime/get_chunk_update_filename"),
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
+#[async_trait::async_trait]
+impl RuntimeModule for GetChunkUpdateFilenameRuntimeModule {
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
+  }
+
+  fn runtime_requirements(
+    &self,
+    compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      dependencies: {
+        if compilation
+          .options
+          .output
+          .hot_update_chunk_filename
+          .has_hash_placeholder()
+        {
+          RuntimeGlobals::GET_FULL_HASH
+        } else {
+          RuntimeGlobals::default()
+        }
+      },
+      define: { RuntimeGlobals::GET_CHUNK_UPDATE_SCRIPT_FILENAME },
+      ..Default::default()
     }
   }
-}
 
-impl RuntimeModule for GetChunkUpdateFilenameRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn template(&self) -> Vec<(String, String)> {
+    vec![(
+      self.id().to_string(),
+      include_str!("runtime/get_chunk_update_filename.ejs").to_string(),
+    )]
   }
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    if let Some(chunk_ukey) = self.chunk {
-      let chunk = compilation.chunk_by_ukey.expect_get(&chunk_ukey);
+
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
+    let runtime_template = context.runtime_template;
+    if let Some(chunk_ukey) = self.chunk() {
+      let chunk = compilation
+        .build_chunk_graph_artifact
+        .chunk_by_ukey
+        .expect_get(&chunk_ukey);
       let filename = compilation
         .get_path(
-          &FilenameTemplate::from(compilation.options.output.hot_update_chunk_filename.clone()),
+          &compilation.options.output.hot_update_chunk_filename,
           PathData::default()
-            .chunk(chunk)
-            .hash(format!("' + {}() + '", RuntimeGlobals::GET_FULL_HASH).as_str())
+            .chunk_hash_optional(chunk.rendered_hash(
+              &compilation.chunk_hashes_artifact,
+              compilation.options.output.hash_digest_length,
+            ))
+            .chunk_name_optional(chunk.name_for_filename_template())
+            .content_hash_optional(chunk.rendered_content_hash_by_source_type(
+              &compilation.chunk_hashes_artifact,
+              &SourceType::JavaScript,
+              compilation.options.output.hash_digest_length,
+            ))
+            .hash(
+              format!(
+                "' + {}() + '",
+                runtime_template.render_runtime_globals(&RuntimeGlobals::GET_FULL_HASH)
+              )
+              .as_str(),
+            )
             .id("' + chunkId + '")
-            .runtime(&chunk.runtime),
+            .runtime(chunk.runtime().as_str()),
         )
-        .always_ok();
-      Ok(
-        RawSource::from(format!(
-          "{} = function (chunkId) {{
-            return '{}';
-         }};
-        ",
-          RuntimeGlobals::GET_CHUNK_UPDATE_SCRIPT_FILENAME,
-          filename
-        ))
-        .boxed(),
-      )
+        .await?;
+
+      let source = runtime_template.render(
+        self.id(),
+        Some(serde_json::json!({
+          "_filename": format!("'{}'", filename),
+        })),
+      )?;
+
+      Ok(source)
     } else {
       unreachable!("should attach chunk for get_main_filename")
     }
-  }
-
-  fn attach(&mut self, chunk: ChunkUkey) {
-    self.chunk = Some(chunk);
   }
 }

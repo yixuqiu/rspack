@@ -1,40 +1,40 @@
 [package]
-edition    = "2021"
-license    = "MIT"
-name       = "rspack_node"
-publish    = false
-repository = "https://github.com/web-infra-dev/rspack"
-version    = "0.1.0"
+description       = "node binding"
+edition.workspace = true
+license           = "MIT"
+name              = "rspack_node"
+publish           = false
+repository        = "https://github.com/web-infra-dev/rspack"
+version.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
+test       = false
 
 [features]
-default = []
-plugin  = ["rspack_binding_options/plugin"]
+allocative       = ["rspack_binding_api/allocative"]
+browser          = ["rspack_binding_api/browser"]
+debug_tool       = ["rspack_binding_api/debug_tool"]
+info-level       = ["tracing/release_max_level_info"]
+perfetto         = ["rspack_binding_api/perfetto"]
+plugin           = ["rspack_binding_api/plugin"]
+sftrace-setup    = ["rspack_binding_api/sftrace-setup"]
+system-allocator = ["rspack_binding_api/system-allocator"]
+test-loader      = ["rspack_binding_api/test-loader"]
+tracy-client     = ["rspack_binding_api/tracy-client"]
+
+[package.metadata.cargo-shear]
+# Adding napi-derive as a dependency to workaround an issue where `dts` will no longer work without it.
+ignored = ["napi-derive", "tracing"]
 
 [dependencies]
-rspack_allocator       = { path = "../rspack_allocator" }
-rspack_binding_options = { path = "../rspack_binding_options" }
-rspack_binding_values  = { path = "../rspack_binding_values" }
-rspack_core            = { path = "../rspack_core" }
-rspack_error           = { path = "../rspack_error" }
-rspack_fs_node         = { path = "../rspack_fs_node" }
-rspack_hook            = { path = "../rspack_hook" }
-rspack_identifier      = { path = "../rspack_identifier" }
-rspack_napi            = { path = "../rspack_napi" }
-rspack_tracing         = { path = "../rspack_tracing" }
-tokio                  = { workspace = true, features = ["rt", "rt-multi-thread"] }
+rspack_binding_api = { workspace = true }
 
-async-trait = { workspace = true }
-once_cell   = { workspace = true }
+napi-derive = { workspace = true, features = ["compat-mode", "type-def"] }
 tracing     = { workspace = true }
 
-napi        = { workspace = true }
-napi-derive = { workspace = true }
-
-color-backtrace = "0.6"
-
-
 [build-dependencies]
-napi-build = { workspace = true }
+rspack_binding_build = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,90 +1,104 @@
 import {
-	RawContainerPluginOptions,
-	BuiltinPlugin,
-	BuiltinPluginName
-} from "@rspack/binding";
+  type BuiltinPlugin,
+  BuiltinPluginName,
+  type RawContainerPluginOptions,
+} from '@rspack/binding';
 import {
-	RspackBuiltinPlugin,
-	createBuiltinPlugin
-} from "../builtin-plugin/base";
-import {
-	EntryRuntime,
-	FilenameTemplate,
-	LibraryOptions,
-	getRawLibrary
-} from "../config";
-import { isNil } from "../util";
-import { parseOptions } from "../container/options";
-import { Compiler } from "../Compiler";
-import { ShareRuntimePlugin } from "../sharing/ShareRuntimePlugin";
+  createBuiltinPlugin,
+  RspackBuiltinPlugin,
+} from '../builtin-plugin/base';
+import type { Compiler } from '../Compiler';
+import type { EntryRuntime, FilenameTemplate, LibraryOptions } from '../config';
+import { parseOptions } from '../container/options';
+import { type ShareScope, validateShareScope } from '../sharing/SharePlugin';
+import { ShareRuntimePlugin } from '../sharing/ShareRuntimePlugin';
 
 export type ContainerPluginOptions = {
-	exposes: Exposes;
-	filename?: FilenameTemplate;
-	library?: LibraryOptions;
-	name: string;
-	runtime?: EntryRuntime;
-	shareScope?: string;
-	enhanced?: boolean;
+  exposes: Exposes;
+  filename?: FilenameTemplate;
+  library?: LibraryOptions;
+  name: string;
+  runtime?: EntryRuntime;
+  shareScope?: ShareScope;
+  enhanced?: boolean;
 };
 export type Exposes = (ExposesItem | ExposesObject)[] | ExposesObject;
 export type ExposesItem = string;
 export type ExposesItems = ExposesItem[];
 export type ExposesObject = {
-	[k: string]: ExposesConfig | ExposesItem | ExposesItems;
+  [k: string]: ExposesConfig | ExposesItem | ExposesItems;
 };
 export type ExposesConfig = {
-	import: ExposesItem | ExposesItems;
-	name?: string;
+  import: ExposesItem | ExposesItems;
+  name?: string;
 };
 
+function normalizeShareScope(
+  shareScope: ShareScope | undefined,
+  enhanced: boolean,
+): ShareScope {
+  if (!shareScope) return 'default';
+  validateShareScope(shareScope, enhanced, 'ContainerPlugin');
+
+  // Non-enhanced container code generation requires a string scope name.
+  // Validation ensures a single entry; enhanced mode preserves scope arrays.
+  return !enhanced && Array.isArray(shareScope) ? shareScope[0] : shareScope;
+}
+
 export class ContainerPlugin extends RspackBuiltinPlugin {
-	name = BuiltinPluginName.ContainerPlugin;
-	_options;
+  name = BuiltinPluginName.ContainerPlugin;
+  _options;
 
-	constructor(options: ContainerPluginOptions) {
-		super();
-		this._options = {
-			name: options.name,
-			shareScope: options.shareScope || "default",
-			library: options.library || {
-				type: "var",
-				name: options.name
-			},
-			runtime: options.runtime,
-			filename: options.filename,
-			exposes: parseOptions(
-				options.exposes,
-				item => ({
-					import: Array.isArray(item) ? item : [item],
-					name: undefined
-				}),
-				item => ({
-					import: Array.isArray(item.import) ? item.import : [item.import],
-					name: item.name || undefined
-				})
-			),
-			enhanced: options.enhanced ?? false
-		};
-	}
+  constructor(options: ContainerPluginOptions) {
+    super();
 
-	raw(compiler: Compiler): BuiltinPlugin {
-		const { name, shareScope, library, runtime, filename, exposes, enhanced } =
-			this._options;
-		if (!compiler.options.output.enabledLibraryTypes!.includes(library.type)) {
-			compiler.options.output.enabledLibraryTypes!.push(library.type);
-		}
-		new ShareRuntimePlugin(this._options.enhanced).apply(compiler);
+    if (typeof options.name !== 'string') {
+      throw new Error('[ContainerPlugin] name must be a string.');
+    }
 
-		const rawOptions: RawContainerPluginOptions = {
-			name,
-			shareScope,
-			library: getRawLibrary(library),
-			runtime,
-			filename,
-			exposes: exposes.map(([key, r]) => ({ key, ...r })),
-			enhanced
-		};
-		return createBuiltinPlugin(this.name, rawOptions);
-	}
+    const enhanced = options.enhanced ?? false;
+    const shareScope = normalizeShareScope(options.shareScope, enhanced);
+    this._options = {
+      name: options.name,
+      shareScope,
+      library: options.library || {
+        type: 'global',
+        name: options.name,
+      },
+      runtime: options.runtime,
+      filename: options.filename,
+      exposes: parseOptions(
+        options.exposes,
+        (item) => ({
+          import: Array.isArray(item) ? item : [item],
+          name: undefined,
+        }),
+        (item) => ({
+          import: Array.isArray(item.import) ? item.import : [item.import],
+          name: item.name || undefined,
+        }),
+      ),
+      enhanced,
+    };
+  }
+
+  raw(compiler: Compiler): BuiltinPlugin {
+    const { name, shareScope, library, runtime, filename, exposes, enhanced } =
+      this._options;
+    if (!compiler.options.output.enabledLibraryTypes!.includes(library.type)) {
+      compiler.options.output.enabledLibraryTypes!.push(library.type);
+    }
+    new ShareRuntimePlugin(this._options.enhanced).apply(compiler);
+
+    const rawOptions: RawContainerPluginOptions = {
+      name,
+      shareScope,
+      library,
+      runtime,
+      filename,
+      exposes: exposes.map(([key, r]) => ({ key, ...r })),
+      enhanced,
+    };
+    return createBuiltinPlugin(this.name, rawOptions);
+  }
 }

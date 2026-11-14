@@ -1,408 +1,321 @@
-#![allow(clippy::comparison_chain)]
+pub mod generator;
+pub(crate) mod hash;
+mod parser;
+mod source_builder;
+mod walker;
 
-use std::collections::HashMap;
+use std::{
+  borrow::Cow,
+  sync::{Arc, LazyLock},
+};
 
-use indexmap::IndexMap;
-use once_cell::sync::Lazy;
 use regex::Regex;
-use rkyv::{from_bytes, to_bytes, AlignedVec};
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsPreset, AsVec},
+};
 use rspack_core::{
-  diagnostics::map_box_diagnostics_to_module_parse_diagnostics,
-  rspack_sources::{
-    BoxSource, ConcatSource, MapOptions, RawSource, ReplaceSource, Source, SourceExt, SourceMap,
-    SourceMapSource, SourceMapSourceOptions,
-  },
-  BoxDependency, BuildExtraDataType, BuildMetaDefaultObject, BuildMetaExportsType, ChunkGraph,
-  CssExportsConvention, ErrorSpan, GenerateContext, LocalIdentName, Module, ModuleGraph,
-  ModuleType, ParseContext, ParseResult, ParserAndGenerator, SourceType, TemplateContext,
+  BuildMetaDefaultObject, BuildMetaExportsType, ChunkGraph, CodeGenerationDataItem, Compilation,
+  CssAutoOrModuleParserOptions, CssBuildInfo, CssExportType, DependencyType, ExportsInfoArtifact,
+  GenerateContext, Module, ModuleGraph, ModuleIdentifier, NO_SOURCE_TYPE_LIST, NormalModule,
+  ParseContext, ParseResult, ParserAndGenerator, ParserOptions, ResolvedModuleOptions, RuntimeSpec,
+  SourceType, UsageState,
+  rspack_sources::{BoxSource, Source},
 };
-use rspack_core::{ModuleInitFragments, RuntimeGlobals};
-use rspack_error::{IntoTWithDiagnosticArray, Result, TWithDiagnosticArray};
-use rspack_util::source_map::SourceMapKind;
+use rspack_error::{Result, TWithDiagnosticArray};
+use rspack_hash::{RspackHash, RspackHashDigest, RspackHasher};
+use rspack_intern::Atom;
+use rspack_util::fx_hash::FxIndexMap;
 use rustc_hash::FxHashSet;
-use swc_core::{
-  css::{parser::parser::ParserConfig, visit::VisitWith},
-  ecma::atoms::Atom,
-};
+use smol_str::SmolStr;
+pub(crate) use source_builder::CssSourceBuilder;
 
 use crate::{
-  dependency::{CssComposeDependency, CssModuleExportDependency},
-  swc_css_compiler::{SwcCssCompiler, SwcCssSourceMapGenConfig},
-  utils::css_modules_exports_to_concatenate_module_string,
-};
-use crate::{
-  utils::{css_modules_exports_to_string, ModulesTransformConfig},
-  visitors::ExportsAnalyzer,
-};
-use crate::{
-  utils::{export_locals_convention, stringify_css_modules_exports_elements},
-  visitors::analyze_dependencies,
+  css_exports::css_export_dependency,
+  dependency::CssIcssExportDependency,
+  parser_and_generator::{generator::CssModuleGenerator, parser::CssModuleParser},
+  utils::css_generator_options,
 };
 
-static REGEX_IS_MODULES: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"\.module(s)?\.[^.]+$").expect("Invalid regex"));
+static REGEX_IS_MODULES: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"\.module(s)?\.[^.]+$").expect("Invalid regex"));
 
-pub(crate) static CSS_MODULE_SOURCE_TYPE_LIST: &[SourceType; 2] =
-  &[SourceType::JavaScript, SourceType::Css];
+pub(crate) static CSS_MODULE_SOURCE_TYPE_LIST: &[SourceType; 1] = &[SourceType::Css];
+
+pub(crate) static CSS_MODULE_AND_JS_SOURCE_TYPE_LIST: &[SourceType; 2] =
+  &[SourceType::Css, SourceType::JavaScript];
 
 pub(crate) static CSS_MODULE_EXPORTS_ONLY_SOURCE_TYPE_LIST: &[SourceType; 1] =
   &[SourceType::JavaScript];
 
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[archive(check_bytes)]
-pub struct CssExport(pub String, pub ErrorSpan, pub Option<String>);
+pub type CssExportsRef<'a> = FxIndexMap<&'a str, &'a CssIcssExportDependency>;
 
-pub type CssExportsType = IndexMap<Vec<String>, Vec<CssExport>>;
-
-#[derive(Debug)]
+#[cacheable]
+#[derive(Debug, Default)]
 pub struct CssParserAndGenerator {
-  pub convention: CssExportsConvention,
-  pub local_ident_name: Option<LocalIdentName>,
+  pub hot: bool,
+  pub export_type: Option<CssExportType>,
+  pub runtime_public_path: bool,
   pub exports_only: bool,
-  pub named_exports: bool,
-  pub exports: Option<CssExportsType>,
+  pub es_module: bool,
 }
 
-impl ParserAndGenerator for CssParserAndGenerator {
-  fn source_types(&self) -> &[SourceType] {
-    if self.exports_only {
-      CSS_MODULE_EXPORTS_ONLY_SOURCE_TYPE_LIST
-    } else {
-      CSS_MODULE_SOURCE_TYPE_LIST
+impl CssParserAndGenerator {
+  pub fn new(module_options: Arc<ResolvedModuleOptions>) -> Self {
+    let parser_options = module_options
+      .parser_options()
+      .and_then(|options| options.get_css_module());
+    let export_type = parser_options.and_then(|options| options.export_type);
+    let generator_options = css_generator_options(module_options.generator_options());
+    let runtime_public_path = generator_options.runtime_public_path.unwrap_or(false);
+    let exports_only = generator_options
+      .exports_only
+      .expect("should have exports_only");
+    let es_module = generator_options.es_module.expect("should have es_module");
+
+    Self {
+      export_type,
+      runtime_public_path,
+      exports_only,
+      es_module,
+      ..Default::default()
     }
   }
 
-  fn size(&self, module: &dyn Module, source_type: &SourceType) -> f64 {
-    match source_type {
+  fn effective_export_type(&self, module: &dyn Module) -> Option<CssExportType> {
+    module
+      .build_info()
+      .css
+      .as_deref()
+      .and_then(|css| css.export_type)
+      .or(self.export_type)
+  }
+}
+
+fn is_css_module(module_type: &rspack_core::ModuleType, resource_path: Option<&str>) -> bool {
+  match module_type {
+    rspack_core::ModuleType::CssModule => true,
+    rspack_core::ModuleType::CssAuto => {
+      resource_path.is_some_and(|path| REGEX_IS_MODULES.is_match(path))
+    }
+    _ => false,
+  }
+}
+
+fn css_parser_options(parser_options: Option<&ParserOptions>) -> &CssAutoOrModuleParserOptions {
+  parser_options
+    .and_then(ParserOptions::get_css_module)
+    .expect("CssParserOptions should be normalized to CssAutoOrModule")
+}
+
+pub fn get_used_exports<'a>(
+  css_build_info: &'a CssBuildInfo,
+  module_graph: &'a ModuleGraph,
+  identifier: ModuleIdentifier,
+  runtime: Option<&RuntimeSpec>,
+  exports_info_artifact: &ExportsInfoArtifact,
+) -> Option<CssExportsRef<'a>> {
+  let exports = css_build_info.exports()?;
+  let exports_info = exports_info_artifact
+    .get_exports_info_optional(&identifier)
+    .map(|info| info.as_data(exports_info_artifact));
+
+  Some(
+    exports
+      .iter()
+      .filter(|(name, _)| {
+        let export_info = exports_info
+          .as_ref()
+          .map(|info| info.get_read_only_export_info(&Atom::from(name.as_str())));
+
+        if let Some(export_info) = export_info {
+          export_info.get_used(runtime) != UsageState::Unused
+        } else {
+          true
+        }
+      })
+      .map(|(name, id)| (name.as_str(), css_export_dependency(module_graph, id)))
+      .collect(),
+  )
+}
+
+#[cacheable]
+#[derive(Debug, Clone)]
+pub struct CodeGenerationDataUnusedLocalIdent {
+  #[cacheable(with=AsVec<AsPreset>)]
+  pub(crate) idents: FxHashSet<SmolStr>,
+}
+
+#[cacheable_dyn]
+impl CodeGenerationDataItem for CodeGenerationDataUnusedLocalIdent {}
+
+#[cacheable_dyn]
+#[async_trait::async_trait]
+impl ParserAndGenerator for CssParserAndGenerator {
+  fn source_types(&self, module: &dyn Module, module_graph: &ModuleGraph) -> &[SourceType] {
+    let export_type = self.effective_export_type(module);
+    if matches!(
+      export_type,
+      Some(CssExportType::Style | CssExportType::CssStyleSheet | CssExportType::Text)
+    ) {
+      return CSS_MODULE_EXPORTS_ONLY_SOURCE_TYPE_LIST;
+    }
+
+    if module.build_meta().is_css_module() {
+      return if self.exports_only {
+        CSS_MODULE_EXPORTS_ONLY_SOURCE_TYPE_LIST
+      } else {
+        CSS_MODULE_AND_JS_SOURCE_TYPE_LIST
+      };
+    }
+
+    let module_identifier = module.identifier();
+    let mut incoming_connections = module_graph.get_incoming_connections(&module_identifier);
+
+    if self.exports_only {
+      let is_root_only = incoming_connections
+        .next()
+        .is_some_and(|conn| conn.original_module_identifier.is_none())
+        && incoming_connections.all(|conn| conn.original_module_identifier.is_none());
+      return if is_root_only {
+        NO_SOURCE_TYPE_LIST
+      } else {
+        CSS_MODULE_EXPORTS_ONLY_SOURCE_TYPE_LIST
+      };
+    }
+
+    let no_need_js = incoming_connections.all(|conn| {
+      if conn.original_module_identifier.is_none() {
+        return true;
+      }
+
+      let dep = module_graph.dependency_by_id(&conn.dependency_id);
+      matches!(
+        dep.dependency_type(),
+        DependencyType::CssImport | DependencyType::EsmImport
+      )
+    });
+
+    if no_need_js {
+      CSS_MODULE_SOURCE_TYPE_LIST
+    } else {
+      CSS_MODULE_AND_JS_SOURCE_TYPE_LIST
+    }
+  }
+
+  fn size(&self, module: &dyn Module, source_type: Option<&SourceType>) -> f64 {
+    match source_type.unwrap_or(&SourceType::Css) {
       SourceType::JavaScript => 42.0,
-      SourceType::Css => module.original_source().map_or(0, |source| source.size()) as f64,
+      SourceType::Css => module.source().map_or(0, |source| source.size()) as f64,
       _ => unreachable!(),
     }
   }
 
-  fn parse(&mut self, parse_context: ParseContext) -> Result<TWithDiagnosticArray<ParseResult>> {
-    let ParseContext {
-      source,
-      module_context,
-      module_type,
-      module_user_request,
-      module_source_map_kind,
-      resource_data,
-      compiler_options,
-      build_info,
-      build_meta,
-      code_generation_dependencies,
-      loaders,
-      ..
-    } = parse_context;
+  async fn parse<'a>(
+    &mut self,
+    parse_context: ParseContext<'a>,
+  ) -> Result<TWithDiagnosticArray<ParseResult>> {
+    let generator_options = css_generator_options(parse_context.module_generator_options);
+    let parser_options = css_parser_options(parse_context.module_parser_options);
+    let named_exports = parser_options
+      .named_exports
+      .expect("should have named_exports");
 
-    build_info.strict = true;
-    build_meta.exports_type = if self.named_exports {
-      BuildMetaExportsType::Namespace
-    } else {
-      BuildMetaExportsType::Default
-    };
-    build_meta.default_object = if self.named_exports {
-      BuildMetaDefaultObject::False
-    } else {
-      BuildMetaDefaultObject::Redirect
-    };
-
-    let swc_compiler = SwcCssCompiler::default();
-
-    let mut source_code = source.source().into_owned();
-    let resource_path = &parse_context.resource_data.resource_path;
-
-    let is_enable_css_modules = match module_type {
-      ModuleType::CssModule => true,
-      ModuleType::CssAuto
-        if REGEX_IS_MODULES.is_match(resource_path.to_string_lossy().as_ref()) =>
-      {
-        true
-      }
-      _ => false,
-    };
-
-    let mut source_map = None;
-    let mut diagnostic_vec = vec![];
-
-    let mut exports_pairs = vec![];
-    let mut presentational_dependencies = None;
-    let mut exports = if is_enable_css_modules {
-      let mut stylesheet = swc_compiler.parse_file(
-        &resource_path.to_string_lossy(),
-        source_code.clone(),
-        ParserConfig {
-          css_modules: is_enable_css_modules,
-          legacy_ie: true,
-          ..Default::default()
-        },
-      )?;
-
-      let result = swc_core::css::modules::compile(
-        &mut stylesheet,
-        ModulesTransformConfig::new(
-          module_context,
-          resource_data,
-          self
-            .local_ident_name
-            .as_ref()
-            .expect("should have local_ident_name for module_type css/auto or css/module"),
-          compiler_options,
-        ),
-      );
-      let exports: IndexMap<Atom, _> = result.renamed.into_iter().collect();
-
-      let (code, map) = swc_compiler.codegen(
-        &stylesheet,
-        SwcCssSourceMapGenConfig {
-          enable: !matches!(module_source_map_kind, SourceMapKind::None),
-          inline_sources_content: false,
-          emit_columns: matches!(module_source_map_kind, SourceMapKind::SourceMap),
-        },
-      )?;
-      source_code = code;
-      source_map = map;
-      Some(exports)
-    } else {
-      None
-    };
-
-    let new_stylesheet_ast = SwcCssCompiler::default().parse_file(
-      &parse_context.resource_data.resource_path.to_string_lossy(),
-      source_code.clone(),
-      Default::default(),
-    )?;
-
-    if let Some(exports) = &mut exports {
-      let mut exports_analyzer = ExportsAnalyzer::new(&source_code);
-      new_stylesheet_ast.visit_with(&mut exports_analyzer);
-      presentational_dependencies = Some(exports_analyzer.presentation_deps);
-
-      for (key, value) in exports_analyzer.exports {
-        exports.insert(key, vec![value]);
-      }
-
-      exports.sort_keys();
-      let normalized_exports = IndexMap::from_iter(
-        exports
-          .iter()
-          .map(|(name, elements)| {
-            let mut names = export_locals_convention(name, &self.convention);
-            names.sort_unstable();
-            names.dedup();
-            (names, stringify_css_modules_exports_elements(elements))
-          })
-          .collect::<Vec<_>>(),
-      );
-
-      for (k, v) in normalized_exports.iter() {
-        for kk in k {
-          exports_pairs.push((kk.to_string(), v[0].0.to_owned()));
-        }
-      }
-
-      self.exports = Some(normalized_exports);
-    }
-
-    let mut dependencies = analyze_dependencies(
-      &new_stylesheet_ast,
-      code_generation_dependencies,
-      &mut diagnostic_vec,
-      &source_code,
-      module_user_request,
-    );
-    for (k, v) in exports_pairs {
-      dependencies.push(Box::new(CssModuleExportDependency::new(
-        k[1..k.len() - 1].to_owned(),
-        v,
-      )));
-    }
-
-    let dependencies = if let Some(locals) = &self.exports
-      && !locals.is_empty()
     {
-      let mut dep_set = FxHashSet::default();
-      let mut compose_deps = locals
-        .iter()
-        .flat_map(|(_, value)| value)
-        .filter_map(|CssExport(_, span, from)| {
-          if let Some(from) = from {
-            if dep_set.contains(&from) {
-              None
-            } else {
-              dep_set.insert(from);
-              Some(Box::new(CssComposeDependency::new(from.to_owned(), *span)) as BoxDependency)
-            }
-          } else {
-            None
-          }
-        })
-        .collect::<Vec<_>>();
+      let build_info = &mut *parse_context.build_info;
+      let build_meta = &mut *parse_context.build_meta;
 
-      compose_deps.sort_by(|a, b| match (a.span(), b.span()) {
-        (Some(span_a), Some(span_b)) => span_a.cmp(&span_b),
-        _ => unreachable!(),
-      });
-
-      dependencies.extend(compose_deps);
-      dependencies
-    } else {
-      dependencies
-    };
-
-    let new_source = if !matches!(module_source_map_kind, SourceMapKind::None) {
-      if let Some(source_map) = source_map {
-        SourceMapSource::new(SourceMapSourceOptions {
-          value: source_code,
-          name: module_user_request,
-          source_map: SourceMap::from_slice(&source_map)
-            .expect("should be able to generate source-map"),
-          // Safety: original source exists in code generation
-          original_source: Some(source.source().to_string()),
-          // Safety: original source exists in code generation
-          inner_source_map: source.map(&MapOptions::default()),
-          remove_original_source: false,
-        })
-        .boxed()
+      build_info.strict = true;
+      build_meta.set_is_css_module(is_css_module(
+        parse_context.module_type,
+        parse_context.resource_data.path().map(|path| path.as_str()),
+      ));
+      build_meta.set_need_id_in_concatenation(self.export_type == Some(CssExportType::Style));
+      build_meta.exports_type = if named_exports {
+        BuildMetaExportsType::Namespace
       } else {
-        source
-      }
-    } else {
-      RawSource::from(source_code).boxed()
-    };
+        BuildMetaExportsType::Default
+      };
+      build_meta.set_default_object(if named_exports {
+        BuildMetaDefaultObject::False
+      } else {
+        BuildMetaDefaultObject::Redirect
+      });
+    }
 
-    Ok(
-      ParseResult {
-        dependencies,
-        blocks: vec![],
-        presentational_dependencies: presentational_dependencies.unwrap_or_default(),
-        source: new_source,
-        analyze_result: Default::default(),
-        side_effects_bailout: None,
-      }
-      .with_diagnostic(map_box_diagnostics_to_module_parse_diagnostics(
-        diagnostic_vec,
-        loaders,
-      )),
-    )
+    CssModuleParser::new(generator_options, parser_options, parse_context)
+      .parse()
+      .await
   }
 
-  #[allow(clippy::unwrap_in_result)]
-  fn generate(
+  async fn generate(
     &self,
     source: &BoxSource,
     module: &dyn rspack_core::Module,
     generate_context: &mut GenerateContext,
   ) -> Result<BoxSource> {
-    let result = match generate_context.requested_source_type {
-      SourceType::Css => {
-        generate_context
-          .runtime_requirements
-          .insert(RuntimeGlobals::HAS_CSS_MODULES);
-
-        let mut source = ReplaceSource::new(source.clone());
-        let compilation = generate_context.compilation;
-        let mut init_fragments = ModuleInitFragments::default();
-        let mut context = TemplateContext {
-          compilation,
-          module,
-          runtime_requirements: generate_context.runtime_requirements,
-          runtime: generate_context.runtime,
-          init_fragments: &mut init_fragments,
-          concatenation_scope: generate_context.concatenation_scope.take(),
-        };
-
-        module.get_dependencies().iter().for_each(|id| {
-          if let Some(dependency) = compilation
-            .get_module_graph()
-            .dependency_by_id(id)
-            .expect("should have dependency")
-            .as_dependency_template()
-          {
-            dependency.apply(&mut source, &mut context)
-          }
-        });
-
-        if let Some(dependencies) = module.get_presentational_dependencies() {
-          dependencies
-            .iter()
-            .for_each(|dependency| dependency.apply(&mut source, &mut context));
-        };
-
-        generate_context.concatenation_scope = context.concatenation_scope.take();
-        Ok(source.boxed())
-      }
-      SourceType::JavaScript => {
-        let exports = if generate_context.concatenation_scope.is_some() {
-          let mut concate_source = ConcatSource::default();
-          if let Some(ref exports) = self.exports {
-            css_modules_exports_to_concatenate_module_string(
-              exports,
-              module,
-              generate_context,
-              &mut concate_source,
-            )?;
-          }
-          return Ok(concate_source.boxed());
-        } else if let Some(exports) = &self.exports {
-          css_modules_exports_to_string(
-            exports,
-            module,
-            generate_context.compilation,
-            generate_context.runtime_requirements,
-          )?
-        } else if generate_context.compilation.options.dev_server.hot {
-          format!(
-            "module.hot.accept();\n{}(module.exports = {{}});\n",
-            RuntimeGlobals::MAKE_NAMESPACE_OBJECT
-          )
-        } else {
-          format!(
-            "{}(module.exports = {{}})\n",
-            RuntimeGlobals::MAKE_NAMESPACE_OBJECT
-          )
-        };
-        generate_context
-          .runtime_requirements
-          .insert(RuntimeGlobals::MODULE);
-        generate_context
-          .runtime_requirements
-          .insert(RuntimeGlobals::MAKE_NAMESPACE_OBJECT);
-        Ok(RawSource::from(exports).boxed())
-      }
-      _ => panic!(
-        "Unsupported source type: {:?}",
-        generate_context.requested_source_type
-      ),
-    };
-
-    result
-  }
-
-  fn store(&self, extra_data: &mut HashMap<BuildExtraDataType, AlignedVec>) {
-    let data = self.exports.to_owned();
-    extra_data.insert(
-      BuildExtraDataType::CssParserAndGenerator,
-      to_bytes::<_, 1024>(&data).expect("Failed to store extra data"),
+    let build_info = module.build_info();
+    let css_build_info = build_info
+      .css
+      .as_deref()
+      .expect("CSS module should have build info");
+    let requested_source_type = generate_context.requested_source_type;
+    let generator = CssModuleGenerator::new(
+      source.clone(),
+      module,
+      css_build_info,
+      generate_context,
+      self.hot,
+      self.es_module,
     );
-  }
-
-  fn resume(&mut self, extra_data: &HashMap<BuildExtraDataType, AlignedVec>) {
-    if let Some(data) = extra_data.get(&BuildExtraDataType::CssParserAndGenerator) {
-      let data = from_bytes::<Option<CssExportsType>>(data).expect("Failed to resume extra data");
-      self.exports = data;
+    match requested_source_type {
+      SourceType::Css => generator.generate_css_source(),
+      SourceType::JavaScript => generator.generate_javascript_source(),
+      source_type => panic!("Unsupported source type: {source_type:?}"),
     }
   }
 
   fn get_concatenation_bailout_reason(
     &self,
-    _module: &dyn rspack_core::Module,
+    module: &dyn rspack_core::Module,
     _mg: &ModuleGraph,
     _cg: &ChunkGraph,
-  ) -> Option<String> {
-    Some(String::from(
-      "Module Concatenation is not implemented for CssParserAndGenerator",
-    ))
+  ) -> Option<Cow<'static, str>> {
+    if !self.es_module {
+      Some("Module Concatenation is not implemented for CommonJS css exports".into())
+    } else if self.effective_export_type(module) == Some(CssExportType::Style)
+      && module
+        .build_info()
+        .css
+        .as_deref()
+        .is_some_and(|css_build_info| css_build_info.has_render_conditions())
+    {
+      Some("Module Concatenation is not implemented for conditional css style exports".into())
+    } else if self.exports_only || self.effective_export_type(module).is_some() {
+      None
+    } else {
+      // CSS Module cannot be concatenated as it must appear in css chunk, if it's
+      // concatenated, it will be removed from module graph
+      Some("Module Concatenation is not implemented for CssParserAndGenerator".into())
+    }
+  }
+
+  async fn get_runtime_hash(
+    &self,
+    module: &NormalModule,
+    compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    let mut hasher = RspackHasher::from(&compilation.options.output);
+    self.es_module.hash(&mut hasher);
+    self.exports_only.hash(&mut hasher);
+    self.runtime_public_path.hash(&mut hasher);
+    self.effective_export_type(module).hash(&mut hasher);
+    hash::hash_css_modules(module, compilation, &mut hasher);
+    Ok(hasher.digest(&compilation.options.output.hash_digest))
+  }
+
+  fn has_runtime_hash(&self) -> bool {
+    true
   }
 }

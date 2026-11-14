@@ -1,51 +1,68 @@
-use std::{borrow::Cow, cmp::max, hash::Hash, sync::Arc};
+use std::{
+  borrow::Cow,
+  sync::{Arc, LazyLock},
+};
 
-use once_cell::sync::Lazy;
+use cow_utils::CowUtils;
 use regex::Regex;
+use rspack_cacheable::cacheable;
+use rspack_collections::{IdentifierMap, IdentifierSet};
 use rspack_core::{
-  rspack_sources::{ConcatSource, RawSource, SourceMap, SourceMapSource, WithoutOriginalOptions},
-  ApplyContext, AssetInfo, Chunk, ChunkGroupUkey, ChunkKind, ChunkUkey, Compilation,
+  AssetInfo, Chunk, ChunkGraph, ChunkGroupUkey, ChunkKind, ChunkUkey, Compilation,
   CompilationContentHash, CompilationParams, CompilationRenderManifest,
-  CompilationRuntimeRequirementInTree, CompilerCompilation, CompilerOptions, Filename, Module,
-  ModuleGraph, ModuleIdentifier, ModuleType, PathData, Plugin, PluginContext, RenderManifestEntry,
-  RuntimeGlobals, SourceType,
+  CompilationRuntimeRequirementInTree, CompilerCompilation, DependencyType, Filename,
+  ManifestAssetType, Module, ModuleGraph, ModuleIdentifier, ModuleType, NormalModuleFactoryParser,
+  ParserAndGenerator, ParserOptions, PathData, Plugin, RenderManifestEntry, RuntimeGlobals,
+  RuntimeModule, SourceType, get_undo_path, remove_bom,
+  rspack_sources::{
+    BoxSource, CachedSource, ConcatSource, RawStringSource, SourceExt, SourceMap, SourceMapSource,
+    WithoutOriginalOptions,
+  },
 };
 use rspack_error::{Diagnostic, Result};
-use rspack_hash::RspackHash;
+use rspack_hash::{RspackHash, RspackHasher};
 use rspack_hook::{plugin, plugin_hook};
+use rspack_plugin_javascript::{
+  BoxJavascriptParserPlugin, parser_and_generator::JavaScriptParserAndGenerator,
+};
 use rspack_plugin_runtime::GetChunkFilenameRuntimeModule;
+use rspack_util::placeholder::PlaceholderFinder;
 use rustc_hash::{FxHashMap, FxHashSet};
 use ustr::Ustr;
 
 use crate::{
-  css_module::{CssModule, CssModuleFactory, DEPENDENCY_TYPE},
-  parser_and_generator::CssExtractParserAndGenerator,
+  css_module::{CssModule, CssModuleFactory},
+  parser_plugin::PluginCssExtractParserPlugin,
   runtime::CssLoadingRuntimeModule,
 };
 pub static PLUGIN_NAME: &str = "css-extract-rspack-plugin";
 
-pub static MODULE_TYPE_STR: Lazy<Ustr> = Lazy::new(|| Ustr::from("css/mini-extract"));
-pub static MODULE_TYPE: Lazy<ModuleType> = Lazy::new(|| ModuleType::Custom(*MODULE_TYPE_STR));
-pub static SOURCE_TYPE: Lazy<[SourceType; 1]> =
-  Lazy::new(|| [SourceType::Custom(*MODULE_TYPE_STR)]);
+pub static MODULE_TYPE_STR: LazyLock<Ustr> = LazyLock::new(|| Ustr::from("css/mini-extract"));
 
-pub static AUTO_PUBLIC_PATH: &str = "__mini_css_extract_plugin_public_path_auto__";
-pub static AUTO_PUBLIC_PATH_RE: Lazy<Regex> =
-  Lazy::new(|| Regex::new(AUTO_PUBLIC_PATH).expect("should compile"));
+static MEDIA_RE: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r#";|\s*$"#).expect("should compile"));
+pub static MODULE_TYPE: LazyLock<ModuleType> =
+  LazyLock::new(|| ModuleType::Custom(*MODULE_TYPE_STR));
+pub static SOURCE_TYPE: LazyLock<[SourceType; 1]> =
+  LazyLock::new(|| [SourceType::Custom(*MODULE_TYPE_STR)]);
 
-pub static ABSOLUTE_PUBLIC_PATH: &str = "webpack:///mini-css-extract-plugin/";
-pub static ABSOLUTE_PUBLIC_PATH_RE: Lazy<Regex> =
-  Lazy::new(|| Regex::new(ABSOLUTE_PUBLIC_PATH).expect("should compile"));
+pub static BASE_URI: &str = "rspack-css-extract://";
+pub static ABSOLUTE_PUBLIC_PATH: &str = "rspack-css-extract:///css-extract-plugin/";
+pub static AUTO_PUBLIC_PATH: &str = "__css_extract_public_path_auto__";
+pub static SINGLE_DOT_PATH_SEGMENT: &str = "__css_extract_single_dot_path_segment__";
+pub(crate) const MINI_CSS_CHUNK_FILENAME_EXPORT_GLOBAL: &str =
+  "__rspack_get_mini_css_chunk_filename";
 
-pub static BASE_URI: &str = "webpack://";
-pub static BASE_URI_RE: Lazy<Regex> = Lazy::new(|| Regex::new(BASE_URI).expect("should compile"));
+static ABSOLUTE_PUBLIC_PATH_MATCHER: LazyLock<PlaceholderFinder> =
+  LazyLock::new(|| PlaceholderFinder::new(ABSOLUTE_PUBLIC_PATH));
+static SINGLE_DOT_PATH_SEGMENT_MATCHER: LazyLock<PlaceholderFinder> =
+  LazyLock::new(|| PlaceholderFinder::new(SINGLE_DOT_PATH_SEGMENT));
+static AUTO_PUBLIC_PATH_MATCHER: LazyLock<PlaceholderFinder> =
+  LazyLock::new(|| PlaceholderFinder::new(AUTO_PUBLIC_PATH));
+static BASE_URI_MATCHER: LazyLock<PlaceholderFinder> =
+  LazyLock::new(|| PlaceholderFinder::new(BASE_URI));
 
-pub static SINGLE_DOT_PATH_SEGMENT: &str = "__mini_css_extract_plugin_single_dot_path_segment__";
-pub static SINGLE_DOT_PATH_SEGMENT_RE: Lazy<Regex> =
-  Lazy::new(|| Regex::new(SINGLE_DOT_PATH_SEGMENT).expect("should compile"));
-
-static STARTS_WITH_AT_IMPORT_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new("^@import url").expect("should compile"));
+static STARTS_WITH_AT_IMPORT: &str = "@import url";
 
 struct CssOrderConflicts {
   chunk: ChunkUkey,
@@ -58,7 +75,7 @@ struct CssOrderConflicts {
 #[plugin]
 #[derive(Debug)]
 pub struct PluginCssExtract {
-  pub options: Arc<CssExtractOptions>,
+  pub(crate) options: Arc<CssExtractOptions>,
 }
 
 impl Eq for PluginCssExtractInner {}
@@ -79,6 +96,7 @@ pub struct CssExtractOptions {
   pub link_type: Option<String>,
   pub runtime: bool,
   pub pathinfo: bool,
+  pub enforce_relative: bool,
 }
 
 // impl PartialEq for CssExtractOptions {
@@ -104,6 +122,7 @@ pub struct CssExtractOptions {
 //   }
 // }
 
+#[cacheable]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum InsertType {
   Fn(String),
@@ -116,34 +135,47 @@ impl PluginCssExtract {
     Self::new_inner(Arc::new(options))
   }
 
-  // port from https://github.com/webpack-contrib/mini-css-extract-plugin/blob/d5e540baf8280442e523530ebbbe31c57a4c4336/src/index.js#L1127
+  // port from https://github.com/webpack/mini-css-extract-plugin/blob/d5e540baf8280442e523530ebbbe31c57a4c4336/src/index.js#L1127
   fn sort_modules<'comp>(
     &self,
     chunk: &Chunk,
-    modules: Vec<&dyn Module>,
+    modules: &[&dyn Module],
     compilation: &'comp Compilation,
-    module_graph: &'comp ModuleGraph<'comp>,
+    module_graph: &'comp ModuleGraph,
   ) -> (Vec<&'comp dyn Module>, Option<Vec<CssOrderConflicts>>) {
-    let mut module_deps_reasons: FxHashMap<
-      ModuleIdentifier,
-      FxHashMap<ModuleIdentifier, FxHashSet<ChunkGroupUkey>>,
-    > = modules
+    let mut module_deps_reasons: IdentifierMap<IdentifierMap<FxHashSet<ChunkGroupUkey>>> = modules
       .iter()
       .map(|m| (m.identifier(), Default::default()))
       .collect();
 
-    let mut module_dependencies: FxHashMap<ModuleIdentifier, FxHashSet<ModuleIdentifier>> = modules
+    let mut module_dependencies: IdentifierMap<IdentifierSet> = modules
       .iter()
-      .map(|module| (module.identifier(), FxHashSet::default()))
+      .map(|module| (module.identifier(), IdentifierSet::default()))
       .collect();
 
-    let mut groups = chunk.groups.iter().cloned().collect::<Vec<_>>();
-    groups.sort_unstable();
+    let mut groups = chunk.groups().iter().copied().collect::<Vec<_>>();
+    groups.sort_by(|a, b| {
+      let a = compilation
+        .build_chunk_graph_artifact
+        .chunk_group_by_ukey
+        .expect_get(a);
+      let b = compilation
+        .build_chunk_graph_artifact
+        .chunk_group_by_ukey
+        .expect_get(b);
+      match a.index.cmp(&b.index) {
+        std::cmp::Ordering::Equal => a.ukey.cmp(&b.ukey),
+        order_res => order_res,
+      }
+    });
 
     let mut modules_by_chunk_group = groups
       .iter()
       .map(|chunk_group| {
-        let chunk_group = compilation.chunk_group_by_ukey.expect_get(chunk_group);
+        let chunk_group = compilation
+          .build_chunk_graph_artifact
+          .chunk_group_by_ukey
+          .expect_get(chunk_group);
         let mut sorted_module = modules
           .iter()
           .map(|module| {
@@ -178,9 +210,9 @@ impl PluginCssExtract {
 
         sorted_module
       })
-      .collect::<Vec<Vec<(ModuleIdentifier, usize)>>>();
+      .collect::<Vec<Vec<(ModuleIdentifier, u32)>>>();
 
-    let mut used_modules: FxHashSet<ModuleIdentifier> = Default::default();
+    let mut used_modules: IdentifierSet = Default::default();
     let mut result: Vec<&dyn Module> = Default::default();
     let mut conflicts: Option<Vec<CssOrderConflicts>> = None;
 
@@ -204,7 +236,7 @@ impl PluginCssExtract {
           let failed_deps = deps
             .iter()
             .filter(|dep| !used_modules.contains(dep))
-            .cloned()
+            .copied()
             .collect::<Vec<_>>();
 
           let failed_count = failed_deps.len();
@@ -248,7 +280,7 @@ impl PluginCssExtract {
             .expect("should have dep reason");
 
           let new_conflict = CssOrderConflicts {
-            chunk: chunk.ukey,
+            chunk: chunk.ukey(),
             fallback_module,
             reasons: best_match_deps
               .into_iter()
@@ -261,7 +293,10 @@ impl PluginCssExtract {
                   reasons
                     .iter()
                     .filter_map(|cg| {
-                      let chunk_group = compilation.chunk_group_by_ukey.expect_get(cg);
+                      let chunk_group = compilation
+                        .build_chunk_graph_artifact
+                        .chunk_group_by_ukey
+                        .expect_get(cg);
 
                       chunk_group.name()
                     })
@@ -272,7 +307,13 @@ impl PluginCssExtract {
                 let good_chunk_groups = good_reasons.map(|reasons| {
                   reasons
                     .iter()
-                    .filter_map(|cg| compilation.chunk_group_by_ukey.expect_get(cg).name())
+                    .filter_map(|cg| {
+                      compilation
+                        .build_chunk_graph_artifact
+                        .chunk_group_by_ukey
+                        .expect_get(cg)
+                        .name()
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
                 });
@@ -301,19 +342,76 @@ impl PluginCssExtract {
     (result, conflicts)
   }
 
-  async fn render_content_asset<'comp>(
+  async fn render_content_asset(
     &self,
     chunk: &Chunk,
-    rendered_modules: Vec<&dyn Module>,
-    filename_template: &Filename,
-    compilation: &'comp Compilation,
-    path_data: PathData<'comp>,
-  ) -> Result<(RenderManifestEntry, Option<Vec<CssOrderConflicts>>)> {
+    rendered_modules: &[&dyn Module],
+    filename: &str,
+    compilation: &'_ Compilation,
+  ) -> (BoxSource, Vec<Diagnostic>) {
     let module_graph = compilation.get_module_graph();
     // mini-extract-plugin has different conflict order in some cases,
     // for compatibility, we cannot use experiments.css sorting algorithm
     let (used_modules, conflicts) =
-      self.sort_modules(chunk, rendered_modules, compilation, &module_graph);
+      self.sort_modules(chunk, rendered_modules, compilation, module_graph);
+
+    let mut diagnostics = Vec::new();
+    if let Some(conflicts) = conflicts {
+      diagnostics.extend(conflicts.into_iter().map(|conflict| {
+        let chunk = compilation
+          .build_chunk_graph_artifact
+          .chunk_by_ukey
+          .expect_get(&conflict.chunk);
+        let fallback_module = module_graph
+          .module_by_identifier(&conflict.fallback_module)
+          .expect("should have module");
+
+        let mut diagnostic = Diagnostic::warn(
+          String::new(),
+          format!(
+            r#"chunk {} [{PLUGIN_NAME}]
+Conflicting order. Following module has been added:
+ * {}
+despite it was not able to fulfill desired ordering with these modules:
+{}"#,
+            chunk
+              .name()
+              .or_else(|| chunk.id().map(|id| id.as_str()))
+              .unwrap_or_default(),
+            fallback_module.readable_identifier(&compilation.options.context),
+            conflict
+              .reasons
+              .iter()
+              .map(|(m, failed_reasons, good_reasons)| {
+                let m = module_graph
+                  .module_by_identifier(m)
+                  .expect("should have module");
+
+                format!(
+                  " * {}\n  - couldn't fulfill desired order of chunk group(s) {}{}",
+                  m.readable_identifier(&compilation.options.context),
+                  failed_reasons
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or_default(),
+                  good_reasons
+                    .as_ref()
+                    .map(|s| format!(
+                      "\n  - while fulfilling desired order of chunk group(s) {}",
+                      s.as_str()
+                    ))
+                    .unwrap_or_default(),
+                )
+              })
+              .collect::<Vec<_>>()
+              .join("\n")
+          ),
+        );
+        diagnostic.file = Some(filename.to_owned().into());
+        diagnostic.chunk = Some(chunk.ukey().as_u32());
+        diagnostic
+      }));
+    }
 
     let used_modules = used_modules
       .into_iter()
@@ -322,18 +420,23 @@ impl PluginCssExtract {
     let mut source = ConcatSource::default();
     let mut external_source = ConcatSource::default();
 
-    let (filename, _) = compilation.get_path_with_info(filename_template, path_data)?;
-
     for module in used_modules {
       let content = Cow::Borrowed(module.content.as_str());
       let readable_identifier = module.readable_identifier(&compilation.options.context);
-      let starts_with_at_import = STARTS_WITH_AT_IMPORT_REGEX.is_match(&content);
+      // Loaders such as dart-sass prepend a BOM. It only carries meaning at the head
+      // of a file: left in place it hides the `@import url` prefix from the check
+      // below, and it lands mid-chunk, where it invalidates the rule after it.
+      let without_bom = content.strip_prefix('\u{feff}').unwrap_or(content.as_ref());
+      let starts_with_at_import = without_bom.starts_with(STARTS_WITH_AT_IMPORT);
 
       let header = self.options.pathinfo.then(|| {
-        let req_str = readable_identifier.replace("*/", "*_/");
+        let req_str = readable_identifier.cow_replace("*/", "*_/");
         let req_str_star = "*".repeat(req_str.len());
-        RawSource::from(format!(
-          "/*!****{req_str_star}****!*\\\n  !*** {req_str} ***!\n  \\****{req_str_star}****/\n"
+        RawStringSource::from(format!(
+          r#"/*!****{req_str_star}****!*\
+  !*** {req_str} ***!
+  \****{req_str_star}****/
+"#
         ))
       });
 
@@ -341,84 +444,91 @@ impl PluginCssExtract {
         if let Some(header) = header {
           external_source.add(header);
         }
-        if !module.media.is_empty() {
-          static MEDIA_RE: Lazy<Regex> =
-            Lazy::new(|| Regex::new(r#";|\s*$"#).expect("should compile"));
-          let new_content = MEDIA_RE.replace_all(content.as_ref(), &module.media);
-          external_source.add(RawSource::from(new_content.to_string() + "\n"));
+        if let Some(media) = &module.media {
+          let new_content = MEDIA_RE.replace_all(without_bom, media);
+          external_source.add(RawStringSource::from(new_content.to_string() + "\n"));
         } else {
-          external_source.add(RawSource::from(content.to_string() + "\n"));
+          external_source.add(RawStringSource::from(without_bom.to_string() + "\n"));
         }
       } else {
+        let mut need_supports = false;
+        let mut need_media = false;
+
         if let Some(header) = header {
           source.add(header);
         }
-        if !module.supports.is_empty() {
-          source.add(RawSource::from(format!(
-            "@supports ({}) {{\n",
-            &module.supports
+
+        if let Some(supports) = &module.supports
+          && !supports.is_empty()
+        {
+          need_supports = true;
+          source.add(RawStringSource::from(format!(
+            "@supports ({supports}) {{\n"
           )));
         }
 
-        if !module.media.is_empty() {
-          source.add(RawSource::from(format!("@media {} {{\n", &module.media)));
+        if let Some(media) = &module.media
+          && !media.is_empty()
+        {
+          need_media = true;
+          source.add(RawStringSource::from(format!("@media {media} {{\n")));
         }
 
-        // TODO: layer support
+        if let Some(layer) = &module.css_layer {
+          source.add(RawStringSource::from(format!("@layer {layer} {{\n")));
+        }
 
+        // different from webpack, add `enforce_relative` to preserve './'
         let undo_path = get_undo_path(
-          &filename,
-          compilation
-            .options
-            .output
-            .path
-            .to_str()
-            .expect("should have output.path"),
-          false,
+          filename,
+          compilation.options.output.path.to_string(),
+          self.options.enforce_relative,
         );
 
-        let content = ABSOLUTE_PUBLIC_PATH_RE.replace_all(&content, "");
-        let content = SINGLE_DOT_PATH_SEGMENT_RE.replace_all(&content, ".");
-        let content = AUTO_PUBLIC_PATH_RE.replace_all(&content, &undo_path);
-        let content = BASE_URI_RE.replace_all(
+        let content = ABSOLUTE_PUBLIC_PATH_MATCHER.replace(&content, "");
+        let content = SINGLE_DOT_PATH_SEGMENT_MATCHER.replace(&content, ".");
+        let content = AUTO_PUBLIC_PATH_MATCHER.replace(&content, &undo_path);
+        let content = BASE_URI_MATCHER.replace(
           &content,
           chunk
-            .get_entry_options(&compilation.chunk_group_by_ukey)
+            .get_entry_options(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
             .and_then(|entry_options| entry_options.base_uri.as_ref())
             .unwrap_or(&undo_path),
         );
 
-        if !module.source_map.is_empty() {
-          source.add(SourceMapSource::new(WithoutOriginalOptions {
+        let rendered: BoxSource = if let Some(source_map) = &module.source_map {
+          SourceMapSource::new(WithoutOriginalOptions {
             value: content.to_string(),
             name: readable_identifier,
-            source_map: SourceMap::from_json(&module.source_map).expect("invalid sourcemap"),
-          }))
+            source_map: SourceMap::from_json(source_map.clone()).expect("invalid sourcemap"),
+          })
+          .boxed()
         } else {
-          source.add(RawSource::from(content.to_string()));
+          RawStringSource::from(content.to_string()).boxed()
+        };
+
+        // Stripped on the rendered source rather than on `content`, so that the
+        // module's source map columns move along with the removed bytes.
+        source.add(remove_bom(rendered));
+
+        source.add(RawStringSource::from_static("\n"));
+
+        if need_media {
+          source.add(RawStringSource::from_static("}\n"));
         }
 
-        source.add(RawSource::from("\n"));
-        if !module.media.is_empty() {
-          source.add(RawSource::from("}\n"));
+        if need_supports {
+          source.add(RawStringSource::from_static("}\n"));
         }
-        if !module.supports.is_empty() {
-          source.add(RawSource::from("}\n"));
+
+        if module.css_layer.is_some() {
+          source.add(RawStringSource::from_static("}\n"));
         }
       }
     }
 
     external_source.add(source);
-    Ok((
-      RenderManifestEntry::new(
-        Arc::new(external_source),
-        filename,
-        AssetInfo::default(),
-        false,
-        false,
-      ),
-      conflicts,
-    ))
+    (external_source.boxed(), diagnostics)
   }
 }
 
@@ -428,143 +538,131 @@ async fn compilation(
   compilation: &mut Compilation,
   _params: &mut CompilationParams,
 ) -> Result<()> {
-  compilation.set_dependency_factory(DEPENDENCY_TYPE.clone(), Arc::new(CssModuleFactory));
-
-  let (_, parser_and_generator) = compilation
-    .plugin_driver
-    .registered_parser_and_generator_builder
-    .remove(&ModuleType::Js)
-    .expect("No JavaScript parser registered");
-
-  compilation
-    .plugin_driver
-    .registered_parser_and_generator_builder
-    .insert(
-      ModuleType::Js,
-      Box::new(move |parser_opt, generator_opt| {
-        let parser = parser_and_generator(parser_opt, generator_opt);
-        Box::new(CssExtractParserAndGenerator::new(parser))
-      }),
-    );
+  compilation.set_dependency_factory(DependencyType::ExtractCSS, Arc::new(CssModuleFactory));
   Ok(())
 }
 
 #[plugin_hook(CompilationRuntimeRequirementInTree for PluginCssExtract)]
-fn runtime_requirements_in_tree(
+async fn runtime_requirement_in_tree(
   &self,
-  compilation: &mut Compilation,
+  compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
+  all_runtime_requirements: &RuntimeGlobals,
   runtime_requirements: &RuntimeGlobals,
   runtime_requirements_mut: &mut RuntimeGlobals,
+  runtime_modules_to_add: &mut Vec<(ChunkUkey, Box<dyn RuntimeModule>)>,
 ) -> Result<Option<()>> {
+  // different from webpack, Rspack can invoke this multiple times,
+  // each time with current runtime_globals, and records every mutation
+  // by `runtime_requirements_mut`, but this RuntimeModule depends on
+  // 2 runtimeGlobals, if check current runtime_requirements, we might
+  // insert CssLoadingRuntimeModule with with_loading: true but with_hmr: false
+  // for the first time, and with_loading: false but with_hmr: true for the
+  // second time
+  // For plugin that depends on 2 runtime_globals, should check all_runtime_requirements
   if !self.options.runtime {
     return Ok(None);
   }
 
-  let with_loading = runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK_HANDLERS) && {
-    let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+  let has_hot_update = runtime_requirements.contains(RuntimeGlobals::HMR_DOWNLOAD_UPDATE_HANDLERS);
 
-    chunk
-      .get_all_async_chunks(&compilation.chunk_group_by_ukey)
-      .iter()
-      .any(|chunk| {
-        !compilation
-          .chunk_graph
-          .get_chunk_modules_by_source_type(chunk, SOURCE_TYPE[0], &compilation.get_module_graph())
-          .is_empty()
-      })
-  };
-
-  let with_hmr = runtime_requirements.contains(RuntimeGlobals::HMR_DOWNLOAD_UPDATE_HANDLERS);
-
-  if with_loading || with_hmr {
-    if let Some(chunk_filename) = self.options.chunk_filename.template()
-      && chunk_filename.contains("hash")
-    {
-      runtime_requirements_mut.insert(RuntimeGlobals::GET_FULL_HASH);
-    }
-
-    runtime_requirements_mut.insert(RuntimeGlobals::PUBLIC_PATH);
-
+  if has_hot_update || runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK_HANDLERS) {
+    let full_hash = self.options.filename.has_full_hash_digest()
+      || self.options.chunk_filename.has_full_hash_digest();
     let filename = self.options.filename.clone();
     let chunk_filename = self.options.chunk_filename.clone();
+    let runtime_template = compilation.runtime_template.create_chunk_code_template();
+    let global = format!("{}.miniCssF", runtime_template.render_runtime_argument());
 
-    compilation.add_runtime_module(
-      chunk_ukey,
-      Box::new(GetChunkFilenameRuntimeModule::new(
-        "css",
-        "mini-css",
-        SOURCE_TYPE[0],
-        "__webpack_require__.miniCssF".into(),
-        |_| false,
-        move |chunk, compilation| {
-          chunk.content_hash.contains_key(&SOURCE_TYPE[0]).then(|| {
-            if chunk.can_be_initial(&compilation.chunk_group_by_ukey) {
-              filename.clone()
-            } else {
-              chunk_filename.clone()
-            }
-          })
-        },
-      )),
-    )?;
+    runtime_modules_to_add.push((
+      *chunk_ukey,
+      Box::new(
+        GetChunkFilenameRuntimeModule::new(
+          &compilation.runtime_template,
+          ("css", "mini-css"),
+          SOURCE_TYPE[0],
+          global,
+          move |runtime_requirements| {
+            runtime_requirements.contains(RuntimeGlobals::HMR_DOWNLOAD_UPDATE_HANDLERS)
+          },
+          move |chunk, compilation| {
+            chunk
+              .content_hash(&compilation.chunk_hashes_artifact)?
+              .contains_key(&SOURCE_TYPE[0])
+              .then(|| {
+                if chunk.can_be_initial(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
+                {
+                  filename.clone()
+                } else {
+                  chunk_filename.clone()
+                }
+              })
+          },
+          *chunk_ukey,
+        )
+        .with_full_hash(full_hash)
+        .with_rspack_export_global(MINI_CSS_CHUNK_FILENAME_EXPORT_GLOBAL),
+      ),
+    ));
 
-    compilation.add_runtime_module(
-      chunk_ukey,
+    runtime_modules_to_add.push((
+      *chunk_ukey,
       Box::new(CssLoadingRuntimeModule::new(
-        *chunk_ukey,
+        &compilation.runtime_template,
         self.options.attributes.clone(),
         self.options.link_type.clone(),
         self.options.insert.clone(),
-        with_loading,
-        with_hmr,
       )),
-    )?;
+    ));
+
+    runtime_requirements_mut.extend(CssLoadingRuntimeModule::get_runtime_requirements(
+      all_runtime_requirements,
+    ));
   }
 
   Ok(None)
 }
 
 #[plugin_hook(CompilationContentHash for PluginCssExtract)]
-fn content_hash(
+async fn content_hash(
   &self,
   compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
-  hashes: &mut FxHashMap<SourceType, RspackHash>,
+  hashes: &mut FxHashMap<SourceType, RspackHasher>,
 ) -> Result<()> {
   let module_graph = compilation.get_module_graph();
 
   let rendered_modules = compilation
+    .build_chunk_graph_artifact
     .chunk_graph
-    .get_chunk_modules_iterable_by_source_type(chunk_ukey, SOURCE_TYPE[0], &module_graph)
-    .collect::<Vec<_>>();
+    .get_chunk_modules_by_source_type(chunk_ukey, SOURCE_TYPE[0], module_graph);
 
   if rendered_modules.is_empty() {
     return Ok(());
   }
-  let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+  let chunk = compilation
+    .build_chunk_graph_artifact
+    .chunk_by_ukey
+    .expect_get(chunk_ukey);
 
-  let used_modules =
-    rspack_plugin_css::CssPlugin::get_modules_in_order(chunk, rendered_modules, compilation)
-      .0
-      .into_iter()
-      .filter_map(|module| module.downcast_ref::<CssModule>());
+  let (used_modules, diagnostics) =
+    self.sort_modules(chunk, &rendered_modules, compilation, module_graph);
 
-  let mut hasher = hashes
+  let hasher = hashes
     .entry(SOURCE_TYPE[0])
-    .or_insert_with(|| RspackHash::from(&compilation.options.output));
+    .or_insert_with(|| RspackHasher::from(&compilation.options.output));
 
   used_modules
-    .map(|m| {
-      m.build_info()
-        .expect("css module built")
-        .hash
-        .as_ref()
-        .expect("css module should have hash")
-    })
-    .for_each(|current| {
-      current.hash(&mut hasher);
+    .iter()
+    .map(|m| ChunkGraph::get_module_hash(compilation, m.identifier(), chunk.runtime()))
+    .for_each(|current| current.hash(hasher));
+
+  " ".hash(hasher);
+  if let Some(diagnostics) = diagnostics {
+    diagnostics.iter().for_each(|curr| {
+      curr.fallback_module.hash(hasher);
     });
+  }
 
   Ok(())
 }
@@ -578,173 +676,113 @@ async fn render_manifest(
   diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<()> {
   let module_graph = compilation.get_module_graph();
-  let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+  let chunk = compilation
+    .build_chunk_graph_artifact
+    .chunk_by_ukey
+    .expect_get(chunk_ukey);
 
-  if matches!(chunk.kind, ChunkKind::HotUpdate) {
+  if matches!(chunk.kind(), ChunkKind::HotUpdate) {
     return Ok(());
   }
 
   let rendered_modules = compilation
+    .build_chunk_graph_artifact
     .chunk_graph
-    .get_chunk_modules_iterable_by_source_type(chunk_ukey, SOURCE_TYPE[0], &module_graph)
-    .collect::<Vec<_>>();
+    .get_chunk_modules_by_source_type(chunk_ukey, SOURCE_TYPE[0], module_graph);
 
   if rendered_modules.is_empty() {
     return Ok(());
   }
 
-  let filename_template = if chunk.can_be_initial(&compilation.chunk_group_by_ukey) {
-    &self.options.filename
-  } else {
-    &self.options.chunk_filename
-  };
+  let filename_template =
+    if chunk.can_be_initial(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey) {
+      &self.options.filename
+    } else {
+      &self.options.chunk_filename
+    };
 
-  let (render_result, conflicts) = self
-    .render_content_asset(
-      chunk,
-      rendered_modules,
+  let mut asset_info =
+    AssetInfo::default().with_asset_type(ManifestAssetType::Custom("extract-css".into()));
+  let filename = compilation
+    .get_path_with_info(
       filename_template,
-      compilation,
-      PathData::default().chunk(chunk).content_hash_optional(
-        chunk
-          .content_hash
-          .get(&SOURCE_TYPE[0])
-          .map(|hash| hash.encoded()),
-      ),
+      PathData::default()
+        .chunk(*chunk_ukey, compilation)
+        .chunk_id_optional(chunk.id().map(|id| id.as_str()))
+        .chunk_hash_optional(chunk.rendered_hash(
+          &compilation.chunk_hashes_artifact,
+          compilation.options.output.hash_digest_length,
+        ))
+        .chunk_name_optional(chunk.name_for_filename_template())
+        .content_hash_optional(chunk.rendered_content_hash_by_source_type(
+          &compilation.chunk_hashes_artifact,
+          &SOURCE_TYPE[0],
+          compilation.options.output.hash_digest_length,
+        )),
+      &mut asset_info,
     )
     .await?;
 
-  if let Some(conflicts) = conflicts {
-    diagnostics.extend(conflicts.into_iter().map(|conflict| {
-      let chunk = compilation.chunk_by_ukey.expect_get(&conflict.chunk);
-      let fallback_module = module_graph
-        .module_by_identifier(&conflict.fallback_module)
-        .expect("should have module");
+  let (source, more_diagnostics) = compilation
+    .chunk_render_cache_artifact
+    .use_cache(compilation, chunk, &SOURCE_TYPE[0], &filename, || async {
+      let (source, diagnostics) = self
+        .render_content_asset(chunk, &rendered_modules, &filename, compilation)
+        .await;
+      Ok((CachedSource::new(source).boxed(), diagnostics))
+    })
+    .await?;
 
-      Diagnostic::warn(
-        "".into(),
-        format!(
-          "chunk {} [{PLUGIN_NAME}]\nConflicting order. Following module has been added:\n * {}
-despite it was not able to fulfill desired ordering with these modules:\n{}",
-          chunk
-            .name
-            .as_deref()
-            .unwrap_or(chunk.id.as_deref().unwrap_or_default()),
-          fallback_module.readable_identifier(&compilation.options.context),
-          conflict
-            .reasons
-            .iter()
-            .map(|(m, failed_reasons, good_reasons)| {
-              let m = module_graph
-                .module_by_identifier(m)
-                .expect("should have module");
-
-              format!(
-                " * {}\n  - couldn't fulfill desired order of chunk group(s) {}{}",
-                m.readable_identifier(&compilation.options.context),
-                failed_reasons
-                  .as_ref()
-                  .map(|s| s.as_str())
-                  .unwrap_or_default(),
-                good_reasons
-                  .as_ref()
-                  .map(|s| format!(
-                    "\n  - while fulfilling desired order of chunk group(s) {}",
-                    s.as_str()
-                  ))
-                  .unwrap_or_default(),
-              )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-        ),
-      )
-    }));
-  }
-  manifest.push(render_result);
+  diagnostics.extend(more_diagnostics);
+  manifest.push(RenderManifestEntry {
+    source,
+    filename,
+    has_filename: false,
+    info: asset_info,
+    auxiliary: false,
+  });
 
   Ok(())
 }
 
-#[async_trait::async_trait]
+#[plugin_hook(NormalModuleFactoryParser for PluginCssExtract)]
+async fn nmf_parser(
+  &self,
+  module_type: &ModuleType,
+  parser: &mut Box<dyn ParserAndGenerator>,
+  _parser_options: Option<&ParserOptions>,
+) -> Result<()> {
+  if module_type.is_js_like()
+    && let Some(parser) = parser.downcast_mut::<JavaScriptParserAndGenerator>()
+  {
+    parser.add_parser_plugin(
+      Box::<PluginCssExtractParserPlugin>::default() as BoxJavascriptParserPlugin
+    );
+  }
+  Ok(())
+}
+
 impl Plugin for PluginCssExtract {
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
     ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
-    ctx
-      .context
       .compilation_hooks
       .runtime_requirement_in_tree
-      .tap(runtime_requirements_in_tree::new(self));
+      .tap(runtime_requirement_in_tree::new(self));
     ctx
-      .context
       .compilation_hooks
       .content_hash
       .tap(content_hash::new(self));
     ctx
-      .context
       .compilation_hooks
       .render_manifest
       .tap(render_manifest::new(self));
 
+    ctx
+      .normal_module_factory_hooks
+      .parser
+      .tap(nmf_parser::new(self));
+
     Ok(())
-  }
-}
-
-#[allow(clippy::unwrap_used)]
-fn get_undo_path(filename: &str, output_path: &str, enforce_relative: bool) -> String {
-  let mut depth: isize = -1;
-  let mut append = "".into();
-
-  // eslint-disable-next-line no-param-reassign
-  let output_path = output_path.strip_suffix('\\').unwrap_or(output_path);
-  let mut output_path = output_path
-    .strip_suffix('/')
-    .unwrap_or(output_path)
-    .to_string();
-
-  static PATH_SEP: Lazy<Regex> = Lazy::new(|| Regex::new(r#"[\\/]+"#).expect("should compile"));
-
-  for part in PATH_SEP.split(filename) {
-    if part == ".." {
-      if depth > -1 {
-        depth -= 1;
-      } else {
-        let i = output_path.find('/');
-        let j = output_path.find('\\');
-        let pos = if i.is_none() {
-          j
-        } else if j.is_none() {
-          i
-        } else {
-          max(i, j)
-        };
-
-        if pos.is_none() {
-          return format!("{output_path}/");
-        }
-
-        append = format!("{}/{append}", &output_path[pos.unwrap() + 1..]);
-
-        output_path = output_path[0..pos.unwrap()].to_string();
-      }
-    } else if part != "." {
-      depth += 1;
-    }
-  }
-
-  if depth > 0 {
-    format!("{}{append}", "../".repeat(depth as usize))
-  } else if enforce_relative {
-    format!("./{append}")
-  } else {
-    append
   }
 }

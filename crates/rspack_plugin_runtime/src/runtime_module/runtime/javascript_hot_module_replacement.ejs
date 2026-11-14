@@ -1,0 +1,546 @@
+<%- var("hotCurrentUpdateChunks") %>;
+<%- var("hotCurrentUpdate") %>;
+<%- var("hotCurrentUpdateRemovedChunks") %>;
+<%- var("hotCurrentUpdateRuntime") %>;
+<%- var("hotCurrentUpdateFullChunks") %>;
+<%- fn("hotAddUpdateChunk") %>(chunkId, moreModules, runtime, updatedModulesList, full) {
+	if (full) {
+		hotCurrentUpdateFullChunks.push([chunkId, moreModules, runtime]);
+		return;
+	}
+	for (var moduleId in moreModules) {
+		if (<%- HAS_OWN_PROPERTY %>(moreModules, moduleId)) {
+			hotCurrentUpdate[moduleId] = moreModules[moduleId];
+			if (updatedModulesList) updatedModulesList.push(moduleId);
+		}
+	}
+	if (runtime) hotCurrentUpdateRuntime.push(runtime);
+}
+<%- fn("hotCheckChunk") %>(chunkIds, version) {
+	if (version === undefined) return;
+	for (var i = 0; i < chunkIds.length; i++) {
+		if (version !== <%- HMR_CHUNK_VERSIONS %>[chunkIds[i]]) {
+			var error = new Error("Chunk is from another build (" + version + ")");
+			error.name = "ChunkVersionError";
+			return error;
+		}
+	}
+}
+<%- fn("hotApplyHandler") %>(options) {
+	if (<%- weak(ENSURE_CHUNK_HANDLERS) %>) delete <%- weak(ENSURE_CHUNK_HANDLERS) %>.<%- _loading_method %>Hmr;
+	hotCurrentUpdateChunks = undefined;
+	var fullChunks = hotCurrentUpdateFullChunks;
+	hotCurrentUpdateFullChunks = undefined;
+	var fullChunkIds = fullChunks.map(function (chunk) { return chunk[0]; });
+	var updateRuntime = fullChunks.map(function (chunk) { return chunk[2]; }).filter(Boolean).concat(hotCurrentUpdateRuntime);
+	function getAffectedModuleEffects(updateModuleId) {
+		var outdatedModules = [updateModuleId];
+		var outdatedDependencies = {};
+		var queue = outdatedModules.map(function (id) {
+			return {
+				chain: [id],
+				id: id
+			};
+		});
+		while (queue.length > 0) {
+			var queueItem = queue.pop();
+			var moduleId = queueItem.id;
+			var chain = queueItem.chain;
+			var module = <%- MODULE_CACHE %>[moduleId];
+			if (
+				!module ||
+				(module.hot._selfAccepted && !module.hot._selfInvalidated)
+			) {
+				continue;
+			}
+
+			if (module.hot._selfDeclined) {
+				return {
+					type: "self-declined",
+					chain: chain,
+					moduleId: moduleId
+				};
+			}
+
+			if (module.hot._main) {
+				return {
+					type: "unaccepted",
+					chain: chain,
+					moduleId: moduleId
+				};
+			}
+
+			for (var i = 0; i < module.parents.length; i++) {
+				var parentId = module.parents[i];
+				var parent = <%- MODULE_CACHE %>[parentId];
+				if (!parent) {
+					continue;
+				}
+				if (parent.hot._declinedDependencies[moduleId]) {
+					return {
+						type: "declined",
+						chain: chain.concat([parentId]),
+						moduleId: moduleId,
+						parentId: parentId
+					};
+				}
+				if (outdatedModules.indexOf(parentId) !== -1) {
+					continue;
+				}
+				if (parent.hot._acceptedDependencies[moduleId]) {
+					if (!outdatedDependencies[parentId]) {
+						outdatedDependencies[parentId] = [];
+					}
+					addAllToSet(outdatedDependencies[parentId], [moduleId]);
+					continue;
+				}
+				delete outdatedDependencies[parentId];
+				outdatedModules.push(parentId);
+				queue.push({
+					chain: chain.concat([parentId]),
+					id: parentId
+				});
+			}
+		}
+
+		return {
+			type: "accepted",
+			moduleId: updateModuleId,
+			outdatedModules: outdatedModules,
+			outdatedDependencies: outdatedDependencies
+		};
+	}
+
+	function addAllToSet(a, b) {
+		for (var i = 0; i < b.length; i++) {
+			var item = b[i];
+			if (a.indexOf(item) === -1) a.push(item);
+		}
+	}
+
+	var outdatedDependencies = {};
+	var outdatedModules = [];
+	var appliedUpdate = {};
+
+	var warnUnexpectedRequire = function warnUnexpectedRequire(module) {
+		console.warn(
+			"[HMR] unexpected require(" + <%- MODULE_ID %> + ") to disposed module"
+		);
+		throw Error("RuntimeError: factory is undefined(" + <%- MODULE_ID %> + ")");
+	};
+
+	for (var moduleId in hotCurrentUpdate) {
+		if (<%- HAS_OWN_PROPERTY %>(hotCurrentUpdate, moduleId)) {
+			var newModuleFactory = hotCurrentUpdate[moduleId];
+			var result = newModuleFactory ? getAffectedModuleEffects(moduleId) : {
+				type: "disposed",
+				moduleId: moduleId
+			};
+			var abortError = false;
+			var doApply = false;
+			var doDispose = false;
+			var chainInfo = "";
+			if (result.chain) {
+				chainInfo = "\nUpdate propagation: " + result.chain.join(" -> ");
+			}
+			switch (result.type) {
+				case "self-declined":
+					if (options.onDeclined) options.onDeclined(result);
+					if (!options.ignoreDeclined)
+						abortError = new Error(
+							"Aborted because of self decline: " + result.moduleId + chainInfo
+						);
+					break;
+				case "declined":
+					if (options.onDeclined) options.onDeclined(result);
+					if (!options.ignoreDeclined)
+						abortError = new Error(
+							"Aborted because of declined dependency: " +
+							result.moduleId +
+							" in " +
+							result.parentId +
+							chainInfo
+						);
+					break;
+				case "unaccepted":
+					if (options.onUnaccepted) options.onUnaccepted(result);
+					if (!options.ignoreUnaccepted)
+						abortError = new Error(
+							"Aborted because " + moduleId + " is not accepted" + chainInfo
+						);
+					break;
+				case "accepted":
+					if (options.onAccepted) options.onAccepted(result);
+					doApply = true;
+					break;
+				case "disposed":
+					if (options.onDisposed) options.onDisposed(result);
+					doDispose = true;
+					break;
+				default:
+					throw new Error("Unexception type " + result.type);
+			}
+			if (abortError) {
+				return {
+					error: abortError
+				};
+			}
+			if (doApply) {
+				appliedUpdate[moduleId] = newModuleFactory;
+				addAllToSet(outdatedModules, result.outdatedModules);
+				for (moduleId in result.outdatedDependencies) {
+					if (<%- HAS_OWN_PROPERTY %>(result.outdatedDependencies, moduleId)) {
+						if (!outdatedDependencies[moduleId])
+							outdatedDependencies[moduleId] = [];
+						addAllToSet(
+							outdatedDependencies[moduleId],
+							result.outdatedDependencies[moduleId]
+						);
+					}
+				}
+			}
+			if (doDispose) {
+				addAllToSet(outdatedModules, [result.moduleId]);
+				appliedUpdate[moduleId] = warnUnexpectedRequire;
+			}
+		}
+	}
+	hotCurrentUpdate = undefined;
+
+	var outdatedSelfAcceptedModules = [];
+	for (var j = 0; j < outdatedModules.length; j++) {
+		var outdatedModuleId = outdatedModules[j];
+		var module = <%- MODULE_CACHE %>[outdatedModuleId];
+		if (
+			module &&
+			(module.hot._selfAccepted || module.hot._main) &&
+			// removed self-accepted modules should not be required
+			appliedUpdate[outdatedModuleId] !== warnUnexpectedRequire &&
+			// when called invalidate self-accepting is not possible
+			!module.hot._selfInvalidated
+		) {
+			outdatedSelfAcceptedModules.push({
+				module: outdatedModuleId,
+				require: module.hot._requireSelf,
+				errorHandler: module.hot._selfAccepted
+			});
+		}
+	}
+	<% if (_is_hot_test) { %>
+	if (self.__HMR_UPDATED_RUNTIME__) {
+		self.__HMR_UPDATED_RUNTIME__.javascript.outdatedModules = outdatedModules;
+		self.__HMR_UPDATED_RUNTIME__.javascript.outdatedDependencies = outdatedDependencies;
+	}
+	<% } %>
+
+	var moduleOutdatedDependencies;
+	return {
+		dispose: function () {
+			hotCurrentUpdateRemovedChunks.forEach(function (chunkId) {
+				delete <%- _installed_chunks %>[chunkId];
+			});
+			hotCurrentUpdateRemovedChunks = undefined;
+
+			var idx;
+			var queue = outdatedModules.slice();
+			while (queue.length > 0) {
+				var moduleId = queue.pop();
+				var module = <%- MODULE_CACHE %>[moduleId];
+				if (!module) continue;
+
+				var data = {};
+
+				// Call dispose handlers
+				var disposeHandlers = module.hot._disposeHandlers;
+				<% if (_is_hot_test) { %>
+ 				if (disposeHandlers.length > 0 && self.__HMR_UPDATED_RUNTIME__) {
+        	self.__HMR_UPDATED_RUNTIME__.javascript.disposedModules.push(moduleId);
+      	}
+				<% } %>
+				for (j = 0; j < disposeHandlers.length; j++) {
+					disposeHandlers[j].call(null, data);
+				}
+				<%- HMR_MODULE_DATA %>[moduleId] = data;
+
+				module.hot.active = false;
+
+				delete <%- MODULE_CACHE %>[moduleId];
+
+				delete outdatedDependencies[moduleId];
+
+				for (j = 0; j < module.children.length; j++) {
+					var child = <%- MODULE_CACHE %>[module.children[j]];
+					if (!child) continue;
+					idx = child.parents.indexOf(moduleId);
+					if (idx >= 0) {
+						child.parents.splice(idx, 1);
+					}
+				}
+			}
+
+			var dependency;
+			for (var outdatedModuleId in outdatedDependencies) {
+				if (<%- HAS_OWN_PROPERTY %>(outdatedDependencies, outdatedModuleId)) {
+					module = <%- MODULE_CACHE %>[outdatedModuleId];
+					if (module) {
+						moduleOutdatedDependencies = outdatedDependencies[outdatedModuleId];
+						for (j = 0; j < moduleOutdatedDependencies.length; j++) {
+							dependency = moduleOutdatedDependencies[j];
+							idx = module.children.indexOf(dependency);
+							if (idx >= 0) module.children.splice(idx, 1);
+						}
+					}
+				}
+			}
+		},
+		apply: function (reportError) {
+			// Supplement factories without invalidating module instances. Ordinary
+			// updates are installed afterwards and always take priority.
+			for (var i = 0; i < fullChunks.length; i++) {
+				var factories = fullChunks[i][1];
+				for (var moduleId in factories) {
+					if (<%- HAS_OWN_PROPERTY %>(factories, moduleId)) <%- MODULE_FACTORIES %>[moduleId] = factories[moduleId];
+				}
+			}
+			// insert new code
+			for (var updateModuleId in appliedUpdate) {
+				if (<%- HAS_OWN_PROPERTY %>(appliedUpdate, updateModuleId)) {
+					<%- MODULE_FACTORIES %>[updateModuleId] = appliedUpdate[updateModuleId];
+					<% if (_is_hot_test) { %>
+					if (self.__HMR_UPDATED_RUNTIME__) {
+						self.__HMR_UPDATED_RUNTIME__.javascript.updatedModules.push(updateModuleId);
+					}
+					<% } %>
+				}
+			}
+
+			// run new runtime modules
+			for (var i = 0; i < updateRuntime.length; i++) {
+				<% if (_is_hot_test) { %>
+				updateRuntime[i](new Proxy(<%- REQUIRE_SCOPE %>, {
+					set(target, prop, value, receiver) {
+						if (self.__HMR_UPDATED_RUNTIME__) {
+							self.__HMR_UPDATED_RUNTIME__.javascript.updatedRuntime.push(`<%- REQUIRE_SCOPE %>.${prop}`);
+						}
+						return Reflect.set(target, prop, value, receiver);
+					}
+				}));
+				<% } else { %>
+				updateRuntime[i](<%- REQUIRE_SCOPE %>);
+				<% } %>
+			}
+
+			// Factories and runtime are installed. Complete ordinary chunk loading
+			// with an empty factory payload to resolve imports and deferred startup.
+			if (fullChunkIds.length) <%- _install_full_chunks %>;
+
+			// call accept handlers
+			for (var outdatedModuleId in outdatedDependencies) {
+				if (<%- HAS_OWN_PROPERTY %>(outdatedDependencies, outdatedModuleId)) {
+					var module = <%- MODULE_CACHE %>[outdatedModuleId];
+					if (module) {
+						moduleOutdatedDependencies = outdatedDependencies[outdatedModuleId];
+						var callbacks = [];
+						var errorHandlers = [];
+						var dependenciesForCallbacks = [];
+						for (var j = 0; j < moduleOutdatedDependencies.length; j++) {
+							var dependency = moduleOutdatedDependencies[j];
+							var acceptCallback = module.hot._acceptedDependencies[dependency];
+							var errorHandler = module.hot._acceptedErrorHandlers[dependency];
+							if (acceptCallback) {
+								if (callbacks.indexOf(acceptCallback) !== -1) continue;
+								callbacks.push(acceptCallback);
+								errorHandlers.push(errorHandler);
+								<% if (_is_hot_test) { %>
+								if (self.__HMR_UPDATED_RUNTIME__) {
+									self.__HMR_UPDATED_RUNTIME__.javascript.acceptedModules.push(dependency);
+								}
+								<% } %>
+								dependenciesForCallbacks.push(dependency);
+							}
+						}
+						for (var k = 0; k < callbacks.length; k++) {
+							try {
+								callbacks[k].call(null, moduleOutdatedDependencies);
+							} catch (err) {
+								if (typeof errorHandlers[k] === "function") {
+									try {
+										errorHandlers[k](err, {
+											moduleId: outdatedModuleId,
+											dependencyId: dependenciesForCallbacks[k]
+										});
+									} catch (err2) {
+										if (options.onErrored) {
+											options.onErrored({
+												type: "accept-error-handler-errored",
+												moduleId: outdatedModuleId,
+												dependencyId: dependenciesForCallbacks[k],
+												error: err2,
+												originalError: err
+											});
+										}
+										if (!options.ignoreErrored) {
+											reportError(err2);
+											reportError(err);
+										}
+									}
+								} else {
+									if (options.onErrored) {
+										options.onErrored({
+											type: "accept-errored",
+											moduleId: outdatedModuleId,
+											dependencyId: dependenciesForCallbacks[k],
+											error: err
+										});
+									}
+									if (!options.ignoreErrored) {
+										reportError(err);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// Load self accepted modules
+			for (var o = 0; o < outdatedSelfAcceptedModules.length; o++) {
+				var item = outdatedSelfAcceptedModules[o];
+				var moduleId = item.module;
+				try {
+					item.require(moduleId);
+				} catch (err) {
+					if (typeof item.errorHandler === "function") {
+						try {
+							item.errorHandler(err, {
+								moduleId: moduleId,
+								module: <%- MODULE_CACHE %>[moduleId]
+							});
+						} catch (err1) {
+							if (options.onErrored) {
+								options.onErrored({
+									type: "self-accept-error-handler-errored",
+									moduleId: moduleId,
+									error: err1,
+									originalError: err
+								});
+							}
+							if (!options.ignoreErrored) {
+								reportError(err1);
+								reportError(err);
+							}
+						}
+					} else {
+						if (options.onErrored) {
+							options.onErrored({
+								type: "self-accept-errored",
+								moduleId: moduleId,
+								error: err
+							});
+						}
+						if (!options.ignoreErrored) {
+							reportError(err);
+						}
+					}
+				}
+			}
+
+			return outdatedModules;
+		}
+	};
+}
+
+<%- HMR_INVALIDATE_MODULE_HANDLERS %>.<%- _loading_method %> = function (moduleId, applyHandlers) {
+	if (!hotCurrentUpdate) {
+		hotCurrentUpdate = {};
+		hotCurrentUpdateRuntime = [];
+		hotCurrentUpdateFullChunks = [];
+		hotCurrentUpdateRemovedChunks = [];
+		applyHandlers.push(hotApplyHandler);
+	}
+	if (!<%- HAS_OWN_PROPERTY %>(hotCurrentUpdate, moduleId)) {
+		hotCurrentUpdate[moduleId] = <%- MODULE_FACTORIES %>[moduleId];
+	}
+};
+
+<%- HMR_DOWNLOAD_UPDATE_HANDLERS %>.<%- _loading_method %> = function (
+	chunkIds,
+	removedChunks,
+	removedModules,
+	promises,
+	applyHandlers,
+	updatedModulesList,
+	_css,
+	_miniCss,
+	load,
+	changed,
+	pendingChunkLoads
+) {
+	applyHandlers.push(function (options) {
+		// Finish selection after downloads, including chunks ensured during check.
+		// An update forwarded through an old owner must not revive a stale module.
+		Object.keys(changed || {}).forEach(function (moduleId) {
+			if (hotCurrentUpdate[moduleId] === false) return;
+			if (!<%- HAS_OWN_PROPERTY %>(<%- MODULE_FACTORIES %>, moduleId) && !<%- MODULE_CACHE %>[moduleId]) return;
+			if (changed[moduleId].some(function (chunkId) {
+				return preparedChunks[chunkId] !== false && (preparedChunks[chunkId] === true || <%- _installed_chunks %>[chunkId] === <%- _loaded_chunk_state %> || hotCurrentUpdateChunks[chunkId] === true);
+			})) return;
+			hotCurrentUpdate[moduleId] = false;
+		});
+		return hotApplyHandler(options);
+	});
+	hotCurrentUpdateChunks = {};
+	hotCurrentUpdateRemovedChunks = removedChunks;
+	hotCurrentUpdate = removedModules.reduce(function (obj, key) {
+		obj[key] = false;
+		return obj;
+	}, {});
+	hotCurrentUpdateRuntime = [];
+	hotCurrentUpdateFullChunks = [];
+	var preparedChunks = Object.create(null);
+	removedChunks.forEach(function (chunkId) { preparedChunks[chunkId] = false; });
+	function prepareFullChunk(chunkId, promises) {
+		if (<%- HAS_OWN_PROPERTY %>(preparedChunks, chunkId)) return;
+		preparedChunks[chunkId] = true;
+		if (<%- _installed_chunks %>[chunkId] === <%- _loaded_chunk_state %>) return;
+		promises.push(<%- _load_update_chunk %>(chunkId, undefined, true));
+		if (hotCurrentUpdateChunks[chunkId] === false) {
+			hotCurrentUpdateChunks[chunkId] = true;
+			promises.push(<%- _load_update_chunk %>(chunkId, updatedModulesList));
+		}
+	}
+	function prepareLoad(chunkId, promises) {
+		if (load && <%- HAS_OWN_PROPERTY %>(load, chunkId)) load[chunkId].forEach(function (id) { prepareFullChunk(id, promises); });
+	}
+	// Full payloads supplement chunks; deltas independently update changed modules.
+	Object.keys(load || {}).forEach(function (chunkId) {
+		if (preparedChunks[chunkId] === false) return;
+		var installed = <%- HAS_OWN_PROPERTY %>(<%- _installed_chunks %>, chunkId) && <%- _installed_chunks %>[chunkId] != null;
+		// The loader clears its state between version retries while the original import still waits.
+		if (installed || pendingChunkLoads[chunkId]) prepareLoad(chunkId, promises);
+	});
+	chunkIds.forEach(function (chunkId) {
+		if (
+			preparedChunks[chunkId] === true ||
+			(<%- HAS_OWN_PROPERTY %>(<%- _installed_chunks %>, chunkId) && <%- _installed_chunks %>[chunkId] != null)
+		) {
+			promises.push(<%- _load_update_chunk %>(chunkId, updatedModulesList));
+			hotCurrentUpdateChunks[chunkId] = true;
+		} else {
+			hotCurrentUpdateChunks[chunkId] = false;
+		}
+	});
+	if (<%- weak(ENSURE_CHUNK_HANDLERS) %>) {
+		<%- weak(ENSURE_CHUNK_HANDLERS) %>.<%- _loading_method %>Hmr = function (chunkId, promises) {
+			if (hotCurrentUpdateChunks) prepareLoad(chunkId, promises);
+			if (
+				hotCurrentUpdateChunks &&
+				<%- HAS_OWN_PROPERTY %>(hotCurrentUpdateChunks, chunkId) &&
+				!hotCurrentUpdateChunks[chunkId]
+			) {
+				promises.push(<%- _load_update_chunk %>(chunkId));
+				hotCurrentUpdateChunks[chunkId] = true;
+			}
+		};
+	}
+};

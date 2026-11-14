@@ -1,0 +1,26 @@
+<>
+
+```ts
+type InputFileSystem = {
+  readFile: ReadFile;
+  readFileSync?: ReadFileSync;
+  readlink: Readlink;
+  readlinkSync?: ReadlinkSync;
+  readdir: Readdir;
+  readdirSync?: ReaddirSync;
+  stat: Stat;
+  statSync?: StatSync;
+  lstat?: LStat;
+  lstatSync?: LStatSync;
+  realpath?: RealPath;
+  realpathSync?: RealPathSync;
+  readJson?: ReadJson;
+  readJsonSync?: ReadJsonSync;
+  purge?: Purge;
+  join?: (path1: string, path2: string) => string;
+  relative?: (from: string, to: string) => string;
+  dirname?: (path: string) => string;
+};
+```
+
+</>

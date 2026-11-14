@@ -1,363 +1,498 @@
+---
+description: 'Configure experimental Rspack features, including WebAssembly and HTTP imports, and review their stability restrictions.'
+---
+
 import { ApiMeta, Stability } from '../../../components/ApiMeta';
+import Attribution from '@components/Attribution';
+import PropertyType from '@components/PropertyType';
+import { Tabs, Tab } from '@theme';
 
 # Experiments
 
-Enable and try out some experimental features.
+Enables experimental features.
 
 - **Type:** `object`
 
-## experiments.incrementalRebuild
-
-<ApiMeta
-  deprecatedVersion="0.4.0"
-  removedVersion="0.5.0"
-  stability={Stability.Removed}
-/>
-
-Enable incremental rebuild. `true` will try to reuse the results of the last build when rebuild to improve build speed, supports configuration of different stages, the default is enabled.
-
-0.5 removed this options and internally enabled this feature.
-
-- **Type:** `boolean | { make?: boolean, emitAsset?: boolean }`
-- **Default:** `true`
-
-## experiments.outputModule
-
-- **Type:** `boolean`
-- **Default:** `true`
-
-Once enabled, Rspack will output ECMAScript module syntax whenever possible. For instance, `import()` to load chunks, ESM exports to expose chunk data, among others.
-
-```js
-module.exports = {
-  experiments: {
-    outputModule: true,
-  },
-};
-```
-
-## experiments.css
-
-- **Type:** `boolean`
-- **Default:** `true`
-
-Once enabled, Rspack will enable native CSS support, and CSS related parser and generator options.
-
-- [`module.parser["css/auto"]`](/config/module#moduleparsercssauto)
-- [`module.parser.css`](/config/module#moduleparsercss)
-- [`module.parser["css/module"]`](/config/module#moduleparsercssmodule)
-- [`module.generator["css/auto"]`](/config/module#modulegeneratorcssauto)
-- [`module.generator.css`](/config/module#modulegeneratorcss)
-- [`module.generator["css/module"]`](/config/module#modulegeneratorcssmodule)
-
-:::warning
-Note that if you're using `style-loader` and `css-loader`, you should disable this option because `style-loader` and `css-loader` will conflict with native CSS.
+:::tip
+In minor releases, Rspack may change the APIs of experimental features. If you're using experimental features, pay attention to the minor release notes for detailed explanations of changes.
 :::
 
-## experiments.topLevelAwait
-
-<ApiMeta addedVersion="0.3.8" />
-
-Enable support for [top level await](https://github.com/tc39/proposal-top-level-await), `top level await` can only be used in modules with [ModuleType](/config/module#ruletype) is `javascript/esm`.
-
-Enabled by default and can be turned off with this configuration.
-
-## experiments.rspackFuture
-
-<ApiMeta addedVersion="0.3.2" />
-
-- **Type:** `object`
-
-- **Default:** See options down below for details
-
-Used to control whether to enable Rspack future default options, check out the details [here](https://github.com/web-infra-dev/rspack/pull/4107).
-
-### experiments.rspackFuture.disableTransformByDefault
-
-<ApiMeta
-  addedVersion="0.3.5"
-  removedVersion="0.5.0"
-  stability={Stability.Removed}
-/>
+## experiments.asyncWebAssembly
 
 - **Type:** `boolean`
-- **Introduced in Version:** v0.3.5
-- **Enabled by Default in Version:** v0.4.0
-- **Removed in Version:** v0.5.0
-- **Description:**
+- **Default:** `true`
 
-  This feature primarily addresses three categories of problems: [builtins](/config/builtins) code transformation features, [target](/config/target), and custom [Rule.type](/config/module#ruletype).
+Supports the new WebAssembly according to the [updated specification](https://github.com/WebAssembly/esm-integration), making WebAssembly modules async.
 
-  1. **Removal of support for some [builtins](/config/builtins) features:**
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    asyncWebAssembly: true,
+  },
+};
+```
 
-  - [builtins.relay](/config/builtins#builtinsrelay)
-  - [builtins.react](/config/builtins#builtinsreact)
-  - [builtins.emotion](/config/builtins#builtinsemotion)
-  - [builtins.pluginImport](/config/builtins#builtinspluginimport)
-  - [builtins.decorator](/config/builtins#builtinsdecorator)
-  - [builtins.presetEnv](/config/builtins#builtinspresetenv)
+## experiments.buildHttp
 
-  These configuration items should apply to the selected corresponding modules. Using `builtins.(relay|react|emotion|pluginImport|decorator)` is equivalent to enabling them globally. This approach is not recommended, so it will be deprecated.
+<ApiMeta addedVersion="1.3.0" />
 
-  After enabling `disableTransformByDefault`, the aforementioned configuration items will become invalid. For a migration guide, refer to [builtin:swc-loader/options.rspackExperiments](/guide/features/loader#optionsrspackexperiments).
+- **Type:** `HttpUriOptions`
+- **Default:** `undefined`
 
-  For instance, if we want the `emotion` transformation to apply to all `jsx` files:
+```ts
+type HttpUriOptions = {
+  /**
+   * A list of allowed URIs
+   */
+  allowedUris: (string | RegExp)[];
+  /**
+   * Define the location to store the lockfile
+   */
+  lockfileLocation?: string;
+  /**
+   * Define the location for caching remote resources
+   */
+  cacheLocation?: string | false;
+  /**
+   * Detect changes to remote resources and upgrade them automatically
+   * @default false
+   */
+  upgrade?: boolean;
+  /**
+   * Freeze the remote resources and lockfile
+   * @default true in production mode, false otherwise
+   */
+  frozen?: boolean;
+  /**
+   * Custom http client
+   */
+  httpClient?: (
+    url: string,
+    headers: Record<string, string>,
+  ) => Promise<{
+    status: number;
+    headers: Record<string, string>;
+    body: Buffer;
+  }>;
+};
+```
 
-  ```js title="rspack.config.js"
-  module.exports = {
-    module: {
-      rules: [
-        {
-          test: /\.jsx$/,
-          loader: 'builtin:swc-loader',
-          options: {
-            jsc: {
-              parser: {
-                syntax: "ecmascript",
-                jsx: true
-              }
-            },
-            rspackExperiments: {
-              emotion: true // The same as `builtins`
-            }
-          }
-          type: 'javascript/auto',
-        },
-      ],
+After enabling this feature, Rspack can build remote resources that start with the `http(s):` protocol. Rspack will download the resources to the local machine and then bundle them.
+
+String entries in `allowedUris` must be valid absolute URLs. Rspack normalizes both the requested URL and each string entry before comparing their prefixes. For example, `'https://example.com'` is normalized to `'https://example.com/'`. Invalid string entries, such as `'https://'`, are ignored. Regular expressions are tested against the normalized URL; use `/^https:\/\//` if you intend to allow any HTTPS URL. Redirect targets must also match `allowedUris`.
+
+By default, Rspack will generate `rspack.lock` and `rspack.lock.data` in the [context](/config/context) folder as the locations of the Lockfile and the cache respectively. You can also configure them through `lockfileLocation` and `cacheLocation`.
+
+:::note
+You should commit the files at `lockfileLocation` and `cacheLocation` to the version control system so that production builds can use the cached content.
+:::
+
+Rspack checks cached content against the SHA-512 integrity recorded in the lockfile. `frozen` defaults to `true` in production mode and `false` otherwise. When frozen, missing lockfile entries, corrupted cached content, missing cache files, and changes to a resource's content, resolved URL, or content type cause a build error. The lockfile and its content cache are not updated. With `cacheLocation: false`, downloaded content must still match the locked entry.
+
+Older lockfiles may record a redirected import only under its final URL. If the original URL has no entry, a frozen build makes network requests to follow allowed redirects until it finds an existing locked entry, then verifies its content without rewriting the lockfile or cache. Imports that do not reach a locked resource still fail. If the original URL already has an entry, that entry remains authoritative.
+
+To populate the lockfile and cache, run a development build or explicitly set `frozen: false`. To check for remote updates, also set `upgrade: true`, then review and commit the resulting changes. `upgrade: false` prefers cached content; it does not prevent lockfile updates when content must be downloaded. An unfrozen build can also repair the lockfile to accept locally edited cache files, matching webpack's behavior.
+
+Resources recorded as `"no-cache"` or `"ignore"` are fetched without pinning their content, including in frozen mode. Integrity checks rely on a trusted lockfile and do not authenticate the first download. To prevent Git from changing the cached bytes' line endings, add `**/*rspack.lock.data/** -text` to `.gitattributes`, adapting the pattern if you use a custom cache location.
+
+For example:
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  experiments: {
+    buildHttp: {
+      allowedUris: ['https://example.com/'],
+      lockfileLocation: path.join(import.meta.dirname, 'my_project.lock'),
+      cacheLocation: path.join(import.meta.dirname, 'my_project.lock.data'),
     },
-    experiments: {
-      rspackFuture: {
-        disableTransformByDefault: true
-      }
-    }
-  };
-  ```
+  },
+};
+```
 
-  For the decorator configuration, you can find and replace in the SWC code, such as [legacyDecorator](https://swc.rs/docs/configuration/compilation#jsctransformlegacydecorator), [decoratorMetadata](https://swc.rs/docs/configuration/compilation#jsctransformlegacydecorator).
+With this feature enabled, you can import modules directly from URLs:
 
-  2. **[target](/config/target) will not downgrade user-side code**
+```js
+// Import from a remote URL
+import { something } from 'https://example.com/module.js';
 
-  In **previous** versions, we typically set `target: ["web", "es5"]` to produce web-compatible and downgraded code. Now, when the `disableTransformByDefault` configuration item is enabled, the `target` will only be used to control runtime code (except for user-written code, rspack generated code within node_modules, like chunk loading, etc.)
+// Or import assets
+import imageUrl from 'https://example.com/image.png';
+```
 
-  This aligns with webpack's plugin-based design philosophy. You can migrate using `builtin:swc-loader`'s [`env`](https://swc.rs/docs/configuration/compilation#env) or [`target`](https://swc.rs/docs/configuration/compilation#jsctarget), and precisely control the modules that need to be transpiled:
+## experiments.deferImport
 
-  ```js title="rspack.config.js"
-  module.exports = {
-    module: {
-      rules: [
-        {
-          test: /\.[cm]?js$/,
-          exclude: /node_modules/,
-          loader: 'builtin:swc-loader',
-          options: {
-            jsc: {
-              parser: {
-                syntax: "ecmascript"
-              },
-              target: "es5" // Notice: `jsc.target` and `env` cannot be set at the same time.
-            },
-            env: { //  Notice: `jsc.target` and `env` cannot be set at the same time.
-              targets: "chrome >= 48"
-            }
-          }
-          type: 'javascript/auto',
-        },
-      ],
+<ApiMeta addedVersion="1.6.0" />
+
+- **Type:** `boolean`
+- **Default:** `false`
+
+When enabled, Rspack will support bundling the [Deferred Imports Evaluation](https://github.com/tc39/proposal-defer-import-eval) proposal, which allows deferring the evaluation of a module until its first use. Rspack supports both `import defer * as ns from "./module"` and `import.defer()` syntax.
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    deferImport: true,
+  },
+};
+```
+
+:::info Known Limitation
+Currently, when using `output.module: true`, `defer import` syntax for external modules will be compiled to standard `import` syntax.
+
+For example, if `jquery` is configured as external:
+
+```js
+import defer * as $ from 'jquery';
+```
+
+It will generate:
+
+```js
+import * as __rspack_external_jquery from 'jquery';
+```
+
+This is because `defer import` syntax is not yet supported by any runtime. In the future, Rspack will support preserving `defer import` syntax based on the target configuration, generating the following code:
+
+```js
+import defer * as __rspack_external_jquery from 'jquery';
+```
+
+:::
+
+## experiments.sourceImport
+
+<ApiMeta stability={Stability.Experimental} addedVersion="2.0.8" />
+
+- **Type:** `boolean`
+- **Default:** `false`
+
+Enables support for the TC39 [Source Phase Imports](https://github.com/tc39/proposal-source-phase-imports) proposal.
+
+Source phase imports let you import a module before it is evaluated. In Rspack, this support is currently designed for WebAssembly modules: importing a `.wasm` module in the source phase returns a compiled [`WebAssembly.Module`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly/Module), so you can instantiate it yourself, instantiate it more than once with different imports, or transfer it to a worker.
+
+Enable `experiments.sourceImport`:
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    sourceImport: true,
+  },
+};
+```
+
+You can use the static source-phase syntax:
+
+```js
+import source wasmModule from './module.wasm';
+
+const instance = await WebAssembly.instantiate(wasmModule, {
+  // imports...
+});
+```
+
+Or the dynamic syntax:
+
+```js
+const wasmModule = await import.source('./module.wasm');
+const instance = await WebAssembly.instantiate(wasmModule);
+```
+
+:::note
+For a normal WebAssembly import, Rspack instantiates the module and exposes its exports. For a source phase import, Rspack returns the compiled `WebAssembly.Module` instead, and your code is responsible for calling `WebAssembly.instantiate`.
+:::
+
+## experiments.futureDefaults
+
+- **Type:** `boolean`
+- **Default:** `false`
+
+Uses defaults from the next major Rspack version and shows warnings for any problematic configuration.
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    futureDefaults: true,
+  },
+};
+```
+
+## experiments.nativeWatcher
+
+<ApiMeta addedVersion="1.4.7" />
+
+- **Type:** `boolean`
+- **Default:** `false`
+
+By default, Rspack uses Watchpack to monitor file changes, which generally works well in most scenarios.
+However, in certain specific environments, issues may arise. For example, Watchpack may experience performance problems when there are a large number of file changes.
+More detail see: [Watchpack issue #223](https://github.com/webpack/watchpack/issues/223).
+
+If you encounter performance issues with the default watcher, you can try enabling nativeWatcher.
+
+After enabling `nativeWatcher`, Rspack will use the Rust Native file system to monitor file changes, enabling incremental file change detection, which provides better performance and stability.
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    // Other watch options...
+  },
+  experiments: {
+    nativeWatcher: true,
+  },
+};
+```
+
+## experiments.newCache
+
+<ApiMeta stability={Stability.Experimental} />
+
+- **Type:** `boolean | NewCache`
+- **Default:** `false`
+
+Enables the experimental cache implementation. Set it to `true` to use the default cache stages, or pass an object to configure individual stages. `true` is equivalent to `{}`. Setting it to `false` keeps the existing cache implementation.
+
+[`cache`](/config/cache) controls whether caching is enabled and where entries are stored. Use `cache: true` or `cache: { type: 'memory' }` for memory cache, or `cache: { type: 'persistent' }` to reuse entries across processes. With `cache: false`, caching remains disabled even when `experiments.newCache` is enabled. Production and none modes disable `cache` by default, so you must enable it explicitly in those modes.
+
+```js title="rspack.config.mjs"
+export default {
+  cache: true,
+  experiments: {
+    newCache: true,
+  },
+};
+```
+
+This option is independent of [`incremental`](/config/incremental). Switching cache implementations does not change which incremental compilation stages are enabled.
+
+### Cache stages
+
+```ts
+type NewCache = {
+  codeGeneration?: boolean;
+  module?: boolean;
+  devtool?: boolean;
+  loader?: boolean;
+  minimize?: boolean;
+  resolver?: boolean;
+};
+```
+
+The following defaults apply when `newCache` is `true` or an object. Omitted properties keep their defaults.
+
+| Option           | Default | Description                                                                                                        |
+| ---------------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `codeGeneration` | `true`  | Caches module code generation results.                                                                             |
+| `module`         | `true`  | Caches module build results, including loader execution and parsing.                                               |
+| `devtool`        | `true`  | Caches source map assets generated by [SourceMapDevToolPlugin](/plugins/source-map-dev-tool-plugin).               |
+| `loader`         | `true`  | Enables per-loader caching for loaders configured with `cache: true`.                                              |
+| `minimize`       | `true`  | Caches JavaScript minification results from [SwcJsMinimizerRspackPlugin](/plugins/swc-js-minimizer-rspack-plugin). |
+| `resolver`       | `false` | Caches module and loader resolution results.                                                                       |
+
+For example, enable persistent cache and opt into resolution caching while keeping the other stages at their defaults:
+
+```js title="rspack.config.mjs"
+export default {
+  cache: {
+    type: 'persistent',
+  },
+  experiments: {
+    newCache: {
+      resolver: true,
     },
-    experiments: {
-      rspackFuture: {
-        disableTransformByDefault: true
-      }
-    }
-  };
-  ```
+  },
+};
+```
 
-  **Note**: When `disableTransformByDefault` is not enabled, the rspack's built-in transpiler will transpile all content under `node_modules`. Therefore, after enabling `disableTransformByDefault`, with `builtin:swc-loader` combined with `exclude: /node_modules/`, ensure the code in `node_modules` has been downgraded; otherwise, compatibility issues may arise.
+The new cache implementation does not currently support [`cache.maxAge`](/config/cache#maxage) or [`cache.portable`](/config/cache#portable).
 
-  3. **Removed non-webpack compatible [Rule.type](/config/module#ruletype)**
+## experiments.pureFunctions
 
-  These types have been removed:
+<ApiMeta addedVersion="2.0.0" />
 
-  - `"typescript"`
-  - `"jsx"`
-  - `"tsx"`
+- **Type:** `boolean`
+- **Default:** `true` in production mode, `false` otherwise
 
-  For JS-related types, only the following will be retained:
+Enables cross-module side-effect-free function call optimization, including the `/*#__NO_SIDE_EFFECTS__*/` annotation and [`module.parser.javascript.pureFunctions`](/config/module-parser#javascriptpurefunctions). Functions marked through annotations or user configuration are omitted from the output when they are not actually used.
 
-  - `"javascript/auto"`
-  - `"javascript/esm"`
-  - `"javascript/dynamic"`
+For more background, see [pureFunctions](/guide/optimization/tree-shaking#purefunctions) and [NO_SIDE_EFFECTS annotation](/guide/optimization/tree-shaking#no_side_effects-annotation).
 
-  With `disableTransformByDefault` enabled, rspack will only support input compliant with web standards, aligning with webpack's design philosophy.
+This capability is enabled by default in production mode. To disable pure-function analysis, set this option to `false`. To manually mark identifiers in matched modules — exported functions in a third-party module, or imports/locals in your own files — configure [`module.parser.javascript.pureFunctions`](/config/module-parser#javascriptpurefunctions) through `module.rules[i].parser` so the rule only applies to the intended modules.
 
-  After discussions with webpack, both webpack and rspack will offer more out-of-the-box configurations to support non-standard inputs like TypeScript.
-
-  Since files with the extensions `jsx`, `tsx`, and `ts` are implicitly set for transpilation, an error will be prompted when `disableTransformByDefault` is enabled. You can migrate like this:
-
-  ```js title="rspack.config.js"
-  module.exports = {
-    module: {
-      rules: [
-        {
-          test: /\.ts$/,
-          exclude: /node_modules/,
-          loader: 'builtin:swc-loader',
-          options: {
-            jsc: {
-              parser: {
-                syntax: "typescript"
-              }
-            }
-          }
-          type: 'javascript/auto',
-        },
-      ],
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    pureFunctions: true,
+  },
+  module: {
+    rules: [
       {
-        test: /\.tsx$/,
-        exclude: /node_modules/,
-        loader: 'builtin:swc-loader',
-        options: {
-          jsc: {
-            parser: {
-              syntax: "typescript",
-              tsx: true
-            }
-          }
-        }
-        type: 'javascript/auto',
+        test: /node_modules\/some-library\/index\.js$/,
+        parser: {
+          pureFunctions: ['isString'],
+        },
       },
-      {
-        test: /\.jsx$/,
-        exclude: /node_modules/,
-        loader: 'builtin:swc-loader',
-        options: {
-          jsc: {
-            parser: {
-              syntax: "ecmascript",
-              jsx: true
-            }
-          }
-        }
-      }
-    },
-    experiments: {
-      rspackFuture: {
-        disableTransformByDefault: true
-      }
-    }
-  };
-  ```
-
-### experiments.rspackFuture.newResolver
-
-<ApiMeta
-  addedVersion="0.3.7"
-  removedVersion="0.5.0"
-  stability={Stability.Removed}
-/>
-
-- **Type:** `boolean`
-- **Introduced in Version:** v0.3.7
-- **Enabled by Default in Version:** v0.4.0
-- **Removed in Version:** v0.5.0
-
-This feature enables the new resolver implementation provided by [oxc](https://github.com/web-infra-dev/oxc),
-which is 5 times faster than the previous resolver implementation.
-
-```js title="rspack.config.js"
-module.exports = {
-  experiments: {
-    rspackFuture: {
-      newResolver: true,
-    },
+    ],
   },
 };
 ```
 
-The new resolver also supports [tsconfig project references](https://www.typescriptlang.org/docs/handbook/project-references.html) defined in [tsconfig-paths-webpack-plugin](https://github.com/dividab/tsconfig-paths-webpack-plugin#references-_string-defaultundefined). See [resolve API](/config/resolve#resolvetsconfig) for details.
+:::warning
+This option depends on `optimization.sideEffects`. If you disable [`optimization.sideEffects`](/config/optimization#optimizationsideeffects), pure-function hints will not be analyzed.
+:::
 
-```js title="rspack.config.js"
-module.exports = {
-  resolve: {
-    tsconfig: {
-      configFile: path.resolve(__dirname, './tsconfig.json'),
-      references: 'auto'
-    },
-  }
+## experiments.runtimeMode
+
+<ApiMeta addedVersion="2.2.0" />
+
+- **Type:** `'webpack' | 'rspack'`
+- **Default:** `'webpack'`
+
+Setting `experiments.runtimeMode` to `'rspack'` enables an experimental output format for the Rspack runtime. This output mode is still under development, so use it with caution. It currently generates cleaner output when [`output.module`](/config/output#outputmodule) is `true` and [`output.library.type`](/config/output#outputlibrarytype) is `'modern-module'`. In this case, instead of exporting one `__webpack_require__` function with helper functions attached as properties, the Rspack runtime exports the loader, module factories, and helpers as named ESM bindings. Each output chunk can import only the bindings it needs.
+
+### Example
+
+```js title="rspack.config.mjs"
+export default {
   experiments: {
-    rspackFuture: {
-      newResolver: true
-    }
-  }
-}
-```
-
-### experiments.rspackFuture.newTreeshaking
-
-<ApiMeta addedVersion="0.4.2" />
-
-- **Type:** `boolean`
-- **Introduced in Version:** v0.4.2
-- **Enabled by Default in Version:** v0.6.0
-
-This feature enables the new treeshaking implementation the same as webpack, which would generate more efficient and smaller code
-
-```js title="rspack.config.js"
-module.exports = {
-  experiments: {
-    rspackFuture: {
-      newTreeshaking: true,
+    runtimeMode: 'rspack',
+  },
+  output: {
+    module: true,
+    library: {
+      type: 'modern-module',
     },
+  },
+  optimization: {
+    runtimeChunk: 'single',
   },
 };
 ```
 
-### experiments.rspackFuture.disableApplyEntryLazily
+The generated Rspack runtime and a chunk that consumes it are organized like this (simplified):
 
-<ApiMeta
-  addedVersion="0.4.5"
-  removedVersion="0.6.0"
-  stability={Stability.Removed}
-/>
-
-- **Type:** `boolean`
-- **Introduced in Version:** v0.4.5
-- **Enabled by Default in Version:** v0.5.0
-- **Removed in Version:** v0.6.0
-
-When this feature is not enabled, `options.entry` can still make valid changes after `compiler.hooks.afterEnvironment` is called.
-
-With this feature turned on, `options.entry` will no longer make valid changes after `compiler.hooks.afterEnvironment` call. This behavior is consistent with Webpack, so this configuration is unaffected for users developing applications in Rspack, but should be noted by developers of Rspack plugins or upper-level frameworks.
-
-A common scenario is to [prepend entries after the Compiler has been created](https://github.com/webpack/webpack-dev-server/blob/540c43852ea33f9cb18820e1cef05d5ddb86cc3e/lib/Server.js#L719-L783):
+<Tabs>
+  <Tab label="runtimeMode: 'webpack'">
 
 ```js
-const rspack = require('@rspack/core');
-const compiler = rspack(options);
-
-function prependEntry(compiler, additionalEntry) {
-  for (const key in compiler.options.entry) {
-    compiler.options.entry[key].import = [
-      additionalEntry,
-      ...(compiler.options.entry[key].import || []),
-    ];
-  }
+// runtime.js
+var __webpack_modules__ = {};
+function __webpack_require__(moduleId) {
+  /* ... */
 }
+__webpack_require__.m = __webpack_modules__;
+__webpack_require__.n = (module) => {
+  /* ... */
+};
 
-prependEntry(compiler, 'dev-client.js');
+export { __webpack_require__ };
+
+// main.js
+import { __webpack_require__ } from './runtime.js';
+
+const value = __webpack_require__(moduleId);
+const getDefault = __webpack_require__.n(value);
 ```
 
-Modifications will not take effect when this configuration is turned on, and you need to make the following changes:
+  </Tab>
+  <Tab label="runtimeMode: 'rspack'">
 
 ```js
-const rspack = require('@rspack/core');
-const compiler = rspack(options);
-
-function prependEntry(compiler, additionalEntry) {
-  new compiler.webpack.EntryPlugin(compiler.context, additionalEntry, {
-    name: undefined,
-  }).apply(compiler);
+// runtime.js
+var modules = {};
+function rspackRequire(moduleId) {
+  /* ... */
 }
+var moduleFactories = modules;
+var compatGetDefaultExport = (module) => {
+  /* ... */
+};
 
-prependEntry(compiler, 'dev-client.js');
+export { rspackRequire, moduleFactories, compatGetDefaultExport };
+
+// main.js
+import { rspackRequire, compatGetDefaultExport } from './runtime.js';
+
+const value = rspackRequire(moduleId);
+const getDefault = compatGetDefaultExport(value);
 ```
+
+  </Tab>
+</Tabs>
+
+## experiments.useInputFileSystem
+
+<ApiMeta addedVersion="1.3.14" />
+
+- **Type:** `false | RegExp[]`
+- **Default:** `false`
+
+By default, Rspack reads files from disk using a native file system.
+However, it is possible to change the file system using a different kind of file system.
+To accomplish this, one can change the inputFileSystem. For example, you can replace the default inputFileSystem with memfs to virtual Modules.
+
+But due to the overheads calling file system implemented in Node.js side, it will slow down Rspack a lot.
+So we make a trade off by providing the `useInputFileSystem` config, to tell rspack to read file from the native file system or from modified inputFileSystem.
+
+In below example, you can simply replace the default input file system to any file system satisfied the [`InputFileSystem`](/api/javascript-api/compiler#inputfilesystem-1) interface.
+
+:::info Note
+The replacing of `compiler.inputFileSystem` will only take effect before `compiler.run` called; Replacing after `compiler.run` will not take effect.
+:::
+
+More detailed case can be found [here](https://github.com/web-infra-dev/rspack/tree/main/tests/rspack-test/configCases/input-file-system/rspack.config.js)
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    index: './virtual_index.js',
+  },
+  plugins: [
+    {
+      apply: (compiler) => {
+        compiler.hooks.beforeCompile.tap('SimpleInputFileSystem', () => {
+          compiler.inputFileSystem = {
+            readFile(path, cb) {
+              cb(null, `// the file content`);
+            },
+            stat(p, cb) {
+              cb(null, fsState);
+            },
+          };
+        });
+      },
+    },
+  ],
+  experiments: {
+    useInputFileSystem: [/virtual_.*\.js/],
+  },
+};
+```
+
+### Work with webpack-virtual-modules
+
+```js title="rspack.config.mjs"
+import VirtualModulesPlugin from 'webpack-virtual-modules';
+
+const virtualModules = new VirtualModulesPlugin({
+  'virtual-entry.js': `
+    import "./src/another-virtual.js";
+    import "./src/disk-file.js";
+    `,
+  'src/another-virtual.js': 'export default 42;',
+});
+
+export default {
+  entry: './virtual-entry.js',
+  plugins: [virtualModules],
+  experiments: {
+    useInputFileSystem: [/.*virtual.*\.js$/],
+  },
+};
+```
+
+When access to `virtual-entry.js` and `src/another-virtual.js` which match the regular expressions of `experiments.useInputFileSystem`,
+Rspack will use the input file system wrapped by `VirtualModulesPlugin`; other than that, `src/disk-file.js` will be accessed by the native file system.
+
+<Attribution url="https://webpack.js.org/configuration/experiments/" />

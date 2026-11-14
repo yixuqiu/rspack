@@ -1,0 +1,503 @@
+---
+description: '生成 stats JSON，并查阅 compilation、资源、chunk、模块、入口、错误警告和日志字段。'
+---
+
+import Attribution from '@components/Attribution';
+
+# Stats JSON
+
+使用 Rspack 编译时，可通过如下命令生成统计模块信息的 JSON 文件，以分析应用的模块依赖关系：
+
+```bash
+# 生成名为 `compilation-stats.json` 的统计信息 JSON 文件
+$ rspack --json=compilation-stats.json
+```
+
+## 整体结构
+
+输出中包含的属性取决于 [Stats 配置](/config/stats)，顶层对象的已知字段如下：
+
+```ts
+type StatsCompilation = {
+  // 固定的模拟 webpack 版本号，用于兼容社区 webpack 插件
+  version?: string;
+  // 当前 rspack 版本号
+  rspackVersion?: string;
+  // 配置中的 `name`
+  name?: string;
+  // 编译的哈希值
+  hash?: string;
+  // 缓存统计信息
+  cacheInfo?: Record<string, StatsCacheInfo>;
+  // 启用 `stats.env` 时包含的环境信息
+  env?: any;
+  // 编译耗时（毫秒）
+  time?: number;
+  // 编译结束时间戳
+  builtAt?: number;
+  // 配置中的 `output.publicPath`
+  publicPath?: string;
+  // 输出目录路径
+  outputPath?: string;
+  // chunk 对应的输出文件列表
+  assetsByChunkName?: Record<string, string[]>;
+  // asset 对象列表，详细结构参考《Asset 对象结构》章节
+  assets?: StatsAsset[];
+  // 输出中省略的 asset 数量
+  filteredAssets?: number;
+  // chunk 对象列表，详细结构参考《Chunk 对象结构》章节
+  chunks?: StatsChunk[];
+  // module 对象列表，详细结构参考《Module 对象结构》章节
+  modules?: StatsModule[];
+  // entry 对象，详细结构参考《Entry/ChunkGroup 对象结构》章节
+  entrypoints?: Record<string, StatsChunkGroup>;
+  // chunk group 对象，详细结构参考《Entry/ChunkGroup 对象结构》章节
+  namedChunkGroups?: Record<string, StatsChunkGroup>;
+  // error 对象列表，详细结构参考《Error/Warning 对象结构》章节
+  errors?: StatsError[];
+  // 错误个数
+  errorsCount?: number;
+  // 输出中省略的错误详情数量
+  filteredErrorDetailsCount?: number;
+  // warning 对象列表，详细结构参考《Error/Warning 对象结构》章节
+  warnings?: StatsError[];
+  // 告警个数
+  warningsCount?: number;
+  // 输出中省略的警告详情数量
+  filteredWarningDetailsCount?: number;
+  // 输出中省略的 module 数量
+  filteredModules?: number;
+  // 子编译的统计信息
+  children?: StatsCompilation[];
+  // 按 logger 名称分组的编译日志
+  logging?: Record<string, StatsLogging>;
+} & Record<string, any>;
+```
+
+## cacheInfo
+
+- **版本：** `>= 2.3.0`
+
+启用 [stats.cacheInfo](/config/stats#statscacheinfo) 后，`cacheInfo` 会提供实验性 [experiments.newCache](/config/experiments#experimentsnewcache) 实现的统计信息。每个键都是包含编译器路径的完整缓存名称，例如 `web|Compilation/modules`。
+
+```ts
+type StatsCacheInfo = {
+  hits: number;
+  misses: number;
+  reused: number;
+  stores: number;
+};
+```
+
+| 字段     | 含义                                       |
+| -------- | ------------------------------------------ |
+| `hits`   | 查找时返回缓存值的次数。                   |
+| `misses` | 查找时未返回缓存值的次数。                 |
+| `reused` | 缓存值通过校验并被复用的次数。             |
+| `stores` | 缓存写入请求的次数，不代表已完成磁盘写入。 |
+
+计数表示当前编译中的缓存操作次数。命中不代表一定会复用，例如缓存的模块可能未通过依赖校验。
+
+## Asset 对象结构 \{#asset-object}
+
+启用 [stats.assets](/config/stats#statsassets) 后，`assets` 会包含编译产物的信息。以下类型描述单个产物，其中的可选字段取决于 stats 配置和该产物的元数据。
+
+启用产物分组后，`assets` 中也可能包含分组对象。其中，`children` 列出分组内的子项，`filteredChildren` 表示未展示的子项数量。
+
+Stats 中的产物对象提供文件大小、输出状态和关联的 chunk 信息。如需读取文件内容，可以调用 [compilation.getAsset()](/api/javascript-api/compilation#getasset)，通过返回对象的 `source` 属性访问。
+
+```ts
+type StatsAsset = {
+  // Stats 项目的类型，例如 "asset" 或相关产物的类型
+  type: string;
+  // 相对于输出目录的产物文件名
+  name: string;
+  // 产物的附加信息
+  info: StatsAssetInfo;
+  // 产物的文件大小（单位为字节）
+  size: number;
+  // 本次编译是否输出了该产物
+  emitted: boolean;
+  // 本次编译是否未输出该产物（其值与 `emitted` 相反）
+  cached: boolean;
+  // 启用 `stats.relatedAssets` 时包含的相关产物
+  related?: StatsAsset[];
+  // 启用 `stats.ids` 时包含的关联 chunk ID 列表
+  chunks?: Array<string | number | null | undefined>;
+  // 产物文件关联的 chunk 的名称列表
+  chunkNames?: string[];
+  // 产物文件关联的 chunk 的 idHint 列表
+  chunkIdHints?: string[];
+  // 引用此附属产物的 chunk ID 列表（需启用 `stats.ids`）
+  auxiliaryChunks?: Array<string | number | null | undefined>;
+  // 作为附属产物文件关联的 chunk 的名称列表
+  auxiliaryChunkNames?: string[];
+  // 作为附属产物文件关联的 chunk 的 idHint 列表
+  auxiliaryChunkIdHints?: string[];
+  // 输出中省略的相关产物数量
+  filteredRelated?: number;
+  // 产物体积是否超过 `performance.maxAssetSize`
+  // 仅在启用 `stats.performance` 时包含
+  isOverSizeLimit?: boolean;
+} & Record<string, any>;
+```
+
+### 产物信息 \{#asset-info}
+
+`info` 对象保存产物的元数据，由 Rspack 或插件设置。未设置的可选字段会被省略。
+
+这些字段也可以通过 [compilation.getAsset()](/api/javascript-api/compilation#getasset) 返回对象的 `info` 属性读取。在 Stats JSON 中，哈希值和关联文件名统一以数组表示。
+
+```ts
+type StatsAssetInfo = {
+  // 产物名称中包含哈希时，是否可进行长期缓存
+  immutable?: boolean;
+  // 产物是否经过代码压缩
+  minimized?: boolean;
+  // 产物使用的完整哈希值
+  fullhash: string[];
+  // 产物使用的 chunk 哈希值
+  chunkhash: string[];
+  // 产物使用的内容哈希值
+  contenthash: string[];
+  // 从源文件创建产物时的原始文件名
+  sourceFilename?: string;
+  // 产物是否由文件复制生成，例如通过 CopyRspackPlugin
+  copied?: boolean;
+  // 产物体积是否超过 `performance.maxAssetSize`
+  isOverSizeLimit?: boolean;
+  // 产物是否仅用于 development 环境
+  development?: boolean;
+  // 产物是否包含热模块替换所需的数据
+  hotModuleReplacement?: boolean;
+  // 产物是否为以 ES module 形式输出的 JavaScript
+  javascriptModule?: boolean;
+  // 按关联类型分组的相关产物文件名
+  related: Record<string, string[]>;
+} & Record<string, any>;
+```
+
+#### javascriptModule
+
+`javascriptModule` 为 `true` 时，表示该 JavaScript 产物采用 ES module 格式。Rspack 生成 JavaScript chunk 时，会根据 [output.module](/config/output#outputmodule) 设置此标记。
+
+并非每个 JavaScript 产物都包含此字段。例如，[CopyRspackPlugin](/plugins/copy-rspack-plugin) 可以将已有的 `public/vendor.js` 文件复制到 `dist/vendor.js`。该插件不会根据文件内容或扩展名判断模块格式，因此不会为这个新增的产物设置 `javascriptModule`。即使没有此字段，文件仍可能是 ES module。
+
+#### related
+
+`info.related` 按关联类型列出文件名。例如，`{ sourceMap: ['main.js.map'] }` 表示该产物的 source map 文件为 `main.js.map`。启用 [stats.relatedAssets](/config/stats#statsrelatedassets) 后，产物顶层的 `related` 字段还可以包含关联产物的统计对象。
+
+## Chunk 对象结构
+
+每个 chunk 对象对应一个编译过程中产生的 chunk，它的结构如下：
+
+```ts
+type StatsChunk = {
+  // Stats 项目的类型
+  type: string;
+  // chunk 包含的产物文件列表
+  files: string[];
+  // chunk 包含的附属产物文件列表
+  auxiliaryFiles: string[];
+  // chunk 的 ID
+  id?: string | number;
+  // chunk 的名称列表
+  names: string[];
+  // chunk 关联的 ID hint 列表
+  idHints: string[];
+  // chunk 所使用的 Rspack 运行时
+  runtime: string[];
+  // chunk 的大小（单位为字节）
+  size: number;
+  // chunk 根据模块类型细分的大小（单位为字节）
+  sizes: Record<string, number>;
+  // chunk 的哈希值
+  hash?: string;
+  // chunk 是否包含入口模块
+  entry: boolean;
+  // chunk 是否应被页面初始加载
+  initial: boolean;
+  // 本次编译是否为 chunk 渲染了产物
+  rendered: boolean;
+
+  // 父级 chunk 的 ID 列表
+  parents?: Array<string | number>;
+  // 子 chunk 的 ID 列表
+  children?: Array<string | number>;
+  // 同级 chunk 的 ID 列表
+  siblings?: Array<string | number>;
+  // 按加载顺序分组的子 chunk
+  childrenByOrder: Record<string, Array<string | number>>;
+
+  // 生成 chunk 的原因（需开启 optimization.splitChunks）
+  reason?: string;
+
+  // chunk 的引入来源列表
+  origins?: StatsChunkOrigin[];
+
+  // chunk 内包含的 module 列表，详细结构参考《Module 对象结构》章节
+  modules?: StatsModule[];
+  // 输出中省略的 module 数量
+  filteredModules?: number;
+} & Record<string, any>;
+
+type StatsChunkOrigin = {
+  // 来源 module 的标识符（`moduleIdentifier` 的兼容别名）
+  module: string;
+  // 来源 module 的内部标识符
+  moduleIdentifier: string;
+  // 来源 module 的可读名称
+  moduleName: string;
+  // 依赖在来源 module 中的位置
+  loc: string;
+  // 在来源 module 中的依赖标识
+  request: string;
+  // 来源 module 的 ID
+  moduleId?: string | number | null;
+} & Record<string, any>;
+```
+
+## Module 对象结构
+
+每个 module 对象对应一个编译过程中产生的模块，它的结构如下：
+
+```ts
+type StatsModule = {
+  // Stats 项目的类型
+  type: string;
+  // 模块的类型
+  moduleType: string;
+  // 模块所属的 layer
+  layer?: string;
+  // 模块的唯一标识
+  identifier?: string;
+  // 模块的相对路径
+  name?: string;
+  // 模块用于条件匹配的绝对路径
+  nameForCondition?: string;
+  // preOrderIndex 和 postOrderIndex 的兼容别名
+  index?: number;
+  index2?: number;
+  // 模块在 chunk group 中自顶向下和自底向上的序号
+  preOrderIndex?: number;
+  postOrderIndex?: number;
+  // 模块的大小（单位为字节）
+  size: number;
+  // 根据 source 类型细分的模块大小
+  sizes: Record<string, number>;
+  // 模块是否可被缓存
+  cacheable?: boolean;
+  // 模块是否经过编译阶段
+  built: boolean;
+  // 模块是否经过代码生成阶段
+  codeGenerated: boolean;
+  // 模块是否在构建时运行
+  buildTimeExecuted: boolean;
+  // 模块是否来自缓存
+  cached: boolean;
+  // 模块是否可选，若可选，当模块未找到时仅会出现警告
+  optional?: boolean;
+  // 模块是否未被任何 chunk 包含
+  orphan?: boolean;
+  // 模块的 ID
+  id?: string | number | null;
+  // 父模块的 ID
+  issuerId?: string | number | null;
+  // 包含模块的 chunk 的 ID 列表
+  chunks?: Array<string | number>;
+  // 模块生成的产物列表
+  assets?: string[];
+  // 模块是否仅作为其他模块的依赖被引入
+  dependent?: boolean;
+  // 父模块的唯一标识
+  issuer?: string;
+  // 父模块的相对路径
+  issuerName?: string;
+  // 从 entry 到当前模块的引用路径
+  issuerPath?: StatsModuleIssuer[];
+  // 模块是否编译失败
+  failed?: boolean;
+  // 模块包含的错误数量
+  errors?: number;
+  // 模块包含的警告数量
+  warnings?: number;
+  // 模块被引入的原因列表
+  reasons?: StatsModuleReason[];
+  // 输出中省略的模块引入原因数量
+  filteredReasons?: number;
+  // 被使用的模块导出（true 表示全部导出均被使用）
+  usedExports?: boolean | string[] | null;
+  // 模块导出的字段列表（需开启 optimization.providedExports 配置）
+  providedExports?: string[] | null;
+  // 模块优化降级信息（需开启 optimization.concatenateModules 配置）
+  optimizationBailout?: string[] | null;
+  // 模块在模块图中的层级
+  depth?: number;
+  // 若当前模块为作用域提升后生成的新模块，此字段为原始的模块列表（需开启 optimization.concatenateModules 配置）
+  modules?: StatsModule[];
+  // 输出中省略的嵌套 module 数量
+  filteredModules?: number;
+  // 模块的源代码
+  source?: string | Buffer;
+} & Record<string, any>;
+
+type StatsModuleIssuer = {
+  identifier: string;
+  name: string;
+  id?: string | number | null;
+} & Record<string, any>;
+
+type StatsModuleReason = {
+  moduleIdentifier?: string;
+  moduleName?: string;
+  resolvedModuleIdentifier?: string;
+  resolvedModule?: string;
+  type?: string;
+  active: boolean;
+  explanation?: string;
+  userRequest?: string;
+  loc?: string;
+  moduleId?: string | number | null;
+  resolvedModuleId?: string | number | null;
+} & Record<string, any>;
+```
+
+## Entry/ChunkGroup 对象结构
+
+每个 entrypoint 或 chunk group 对象表示一组 chunk 和产物，结构如下：
+
+```ts
+type StatsEntrypoints = Record<string, StatsChunkGroup>;
+type StatsNamedChunkGroups = Record<string, StatsChunkGroup>;
+
+type StatsChunkGroup = {
+  // chunk group 的名称
+  name: string;
+  // 包含的 chunk 的 ID 列表
+  chunks: Array<string | number>;
+  // chunk group 的产物文件
+  assets: Array<{
+    // 产物文件名
+    name: string;
+    // 产物文件大小
+    size: number;
+  }>;
+  // 仅存在于 entrypoint 和 named chunk group 对象中，嵌套的子 chunk group 不包含该字段
+  // 产物总数超过 `stats.chunkGroupMaxAssets` 时记录该总数，否则为 0
+  filteredAssets?: number;
+  // chunk group 总产物大小
+  assetsSize: number;
+  // chunk group 的附属产物文件，如 sourcemap
+  auxiliaryAssets?: Array<{
+    // 附属产物文件名
+    name: string;
+    // 附属产物文件大小
+    size: number;
+  }>;
+  // chunk group 的总附属产物大小，如 sourcemap
+  auxiliaryAssetsSize?: number;
+  // 子 chunk group 加载顺序，按照优先级排序
+  children?: {
+    // 需 preload 的 子 chunk group
+    preload?: StatsChunkGroup[];
+    // 需 prefetch 的 子 chunk group
+    prefetch?: StatsChunkGroup[];
+  };
+  // 子 chunk group 加载文件顺序，按照优先级排序
+  childAssets?: {
+    // 需 preload 的资源文件
+    preload?: string[];
+    // 需 prefetch 的资源文件
+    prefetch?: string[];
+  };
+  // 是否入口的产物体积超过了 performance.maxEntrypointSize
+  isOverSizeLimit?: boolean;
+} & Record<string, any>;
+```
+
+## Error/Warning 对象结构
+
+每个 error/warning 对象对应一个构建过程中产生的错误/警告，它的结构如下：
+
+```ts
+type StatsError = {
+  // 错误/警告的可视化提示信息
+  message: string;
+  // 便于程序识别的错误/警告代码
+  code?: StatsErrorCode | string;
+  // 与此错误/警告关联的自定义文件名
+  file?: string;
+  // 错误/警告的明细信息
+  details?: string;
+  // 因 `stats.errorsSpace` 或 `stats.warningsSpace` 限制而省略的详情行数
+  filteredDetails?: number;
+  // 错误/警告的栈信息
+  stack?: string;
+  /**
+   * 与此错误/警告相关的模块标识符
+   * 通常是绝对路径，可能包含内联的 loader request
+   * @example
+   * - `/path/to/project/src/index.js`
+   * - `!builtin:react-refresh-loader!/path/to/project/src/index.css`
+   */
+  moduleIdentifier?: string;
+  /**
+   * 与此错误/警告相关的模块可读名称
+   * 通常是相对路径，不包含内联的 loader request
+   * @example
+   * - `"./src/index.js"`
+   * - `"./src/index.css"`
+   */
+  moduleName?: string;
+  // 错误/警告在模块中的位置
+  loc?: string;
+  // 发生错误/警告的模块 ID
+  moduleId?: string | number | null;
+  // 错误/警告的模块引用路径
+  moduleTrace?: StatsModuleTraceItem[];
+
+  // 若在 chunk 生成时错误/警告，关联的 chunk 名称
+  chunkName?: string;
+  // 若在 chunk 生成时错误/警告，关联的 chunk 是否为 entry
+  chunkEntry?: boolean;
+  // 若在 chunk 生成时错误/警告，关联的 chunk 是否为 initial
+  chunkInitial?: boolean;
+  // 若在 chunk 生成时错误/警告，关联的 chunk ID
+  chunkId?: string;
+} & Record<string, any>;
+
+type StatsModuleTraceItem = {
+  originIdentifier: string;
+  originName: string;
+  moduleIdentifier: string;
+  moduleName: string;
+  originId?: string | number | null;
+  moduleId?: string | number | null;
+  dependencies: StatsModuleTraceDependency[];
+};
+
+type StatsModuleTraceDependency = {
+  loc: string;
+} & Record<string, any>;
+```
+
+## Logging 对象结构
+
+`StatsCompilation.logging` 的键是 logger 名称，值的结构如下：
+
+```ts
+type StatsLogging = {
+  entries: StatsLoggingEntry[];
+  filteredEntries: number;
+  debug: boolean;
+} & Record<string, any>;
+
+type StatsLoggingEntry = {
+  type: string;
+  message: string;
+  trace?: string[] | undefined;
+  children?: StatsLoggingEntry[] | undefined;
+} & Record<string, any>;
+```
+
+<Attribution url="https://webpack.docschina.org/api/stats/" />

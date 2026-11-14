@@ -1,44 +1,75 @@
-use rspack_core::{AsModuleDependency, ContextDependency};
-use rspack_core::{ContextOptions, Dependency, TemplateReplaceSource};
-use rspack_core::{DependencyCategory, DependencyId, DependencyTemplate};
-use rspack_core::{DependencyType, ErrorSpan, TemplateContext};
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_collections::Identifier;
+use rspack_core::{
+  AsModuleDependency, ContextDependency, ContextOptions, Dependency, DependencyCategory,
+  DependencyCodeGeneration, DependencyId, DependencyRange, DependencyTemplate,
+  DependencyTemplateType, DependencyType, ExportsInfoArtifact, ImportAttributes, ModuleGraph,
+  ModuleGraphCacheArtifact, ReferencedSpecifier, ResourceIdentifier, TemplateContext,
+  TemplateReplaceSource,
+};
+use rspack_error::Diagnostic;
+use rspack_util::json_stringify;
 
 use super::{
   context_dependency_template_as_require_call, create_resource_identifier_for_context_dependency,
 };
 
-#[derive(Debug, Clone)]
+fn create_resource_identifier(options: &ContextOptions) -> Identifier {
+  let mut resource_identifier =
+    create_resource_identifier_for_context_dependency(None, options).to_string();
+  if let Some(attributes) = &options.attributes {
+    resource_identifier.push_str(&json_stringify(attributes));
+  }
+  resource_identifier.into()
+}
+
+#[cacheable]
+#[derive(Debug)]
 pub struct ImportContextDependency {
-  callee_start: u32,
-  callee_end: u32,
-  args_end: u32,
   id: DependencyId,
   options: ContextOptions,
-  span: Option<ErrorSpan>,
-  resource_identifier: String,
+  range: DependencyRange,
+  value_range: DependencyRange,
+  resource_identifier: ResourceIdentifier,
+  optional: bool,
+  critical: rspack_core::DependencyCriticalState,
 }
 
 impl ImportContextDependency {
   pub fn new(
-    callee_start: u32,
-    callee_end: u32,
-    args_end: u32,
     options: ContextOptions,
-    span: Option<ErrorSpan>,
+    range: DependencyRange,
+    value_range: DependencyRange,
+    optional: bool,
   ) -> Self {
-    let resource_identifier = create_resource_identifier_for_context_dependency(None, &options);
     Self {
-      callee_start,
-      callee_end,
-      args_end,
-      options,
-      span,
       id: DependencyId::new(),
-      resource_identifier,
+      resource_identifier: create_resource_identifier(&options),
+      range,
+      value_range,
+      optional,
+      critical: Default::default(),
+      options,
     }
+  }
+
+  pub fn set_referenced_specifiers(
+    &mut self,
+    referenced_specifiers: Vec<ReferencedSpecifier>,
+    from_magic_comment: bool,
+  ) {
+    if !from_magic_comment && referenced_specifiers.is_empty() {
+      // If the referenced specifiers are empty, keep it as default (None), since this dependency can't eliminate by side effects optimization,
+      // so if we set it to Some(vec![]), and the dependency still executes, it will cause runtime error because the exports are all tree shaken.
+      // see test case `tests/rspack-test/configCases/tree-shaking/side-effects-free-dynamic-import`
+      return;
+    }
+    self.options.referenced_specifiers = Some(referenced_specifiers);
+    self.resource_identifier = create_resource_identifier(&self.options);
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for ImportContextDependency {
   fn id(&self) -> &DependencyId {
     &self.id
@@ -52,12 +83,32 @@ impl Dependency for ImportContextDependency {
     &DependencyType::ImportContext
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    self.span
+  fn get_phase(&self) -> rspack_core::ImportPhase {
+    self.options.phase.unwrap_or_default()
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "ImportContextDependency"
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
+  }
+
+  fn get_attributes(&self) -> Option<&ImportAttributes> {
+    self.options.attributes.as_ref()
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
+  }
+
+  fn get_diagnostics(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
+  ) -> Option<Vec<Diagnostic>> {
+    if let Some(critical) = self.critical() {
+      return Some(vec![critical]);
+    }
+    None
   }
 }
 
@@ -78,30 +129,60 @@ impl ContextDependency for ImportContextDependency {
     &self.resource_identifier
   }
 
-  fn set_request(&mut self, request: String) {
-    self.options.request = request;
+  fn get_optional(&self) -> bool {
+    self.optional
+  }
+
+  fn type_prefix(&self) -> rspack_core::ContextTypePrefix {
+    rspack_core::ContextTypePrefix::Import
+  }
+
+  fn critical(&self) -> Option<Diagnostic> {
+    self.critical.get()
+  }
+
+  fn set_critical(&self, critical: Option<Diagnostic>) {
+    self.critical.set(critical);
   }
 }
 
-impl DependencyTemplate for ImportContextDependency {
-  fn apply(
-    &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
-  ) {
-    context_dependency_template_as_require_call(
-      self,
-      source,
-      code_generatable_context,
-      self.callee_start,
-      self.callee_end,
-      self.args_end,
-    );
-  }
-
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+#[cacheable_dyn]
+impl DependencyCodeGeneration for ImportContextDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(ImportContextDependencyTemplate::template_type())
   }
 }
 
 impl AsModuleDependency for ImportContextDependency {}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct ImportContextDependencyTemplate;
+
+impl ImportContextDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::ImportContext)
+  }
+}
+
+impl DependencyTemplate for ImportContextDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<ImportContextDependency>()
+      .expect("ImportContextDependencyTemplate should be used for ImportContextDependency");
+
+    context_dependency_template_as_require_call(
+      dep,
+      source,
+      code_generatable_context,
+      &dep.range,
+      Some(&dep.value_range),
+    );
+  }
+}

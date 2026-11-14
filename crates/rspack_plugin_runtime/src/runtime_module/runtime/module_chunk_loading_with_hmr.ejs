@@ -1,0 +1,22 @@
+  <%- fn("moduleLoadUpdateChunk") %>(chunkId, updatedModulesList, full) {
+    return new Promise( <%- basicFunction("resolve, reject")  %> {
+      // start update chunk loading
+      var filename = <%- GET_CHUNK_UPDATE_SCRIPT_FILENAME %>(chunkId);
+      var url = <%- PUBLIC_PATH %> + filename + (full ? (/\.mjs$/.test(filename) ? ".full.mjs" : ".full.js") : "");
+      var onResolve = <%- basicFunction("obj") %> {
+        hotAddUpdateChunk(chunkId, obj.<%- _modules %>, obj.__rspack_esm_runtime, updatedModulesList, full);
+        resolve(obj);
+      };
+      var onReject = <%- basicFunction("error") %> {
+        var errorMsg = error.message || "unknown reason";
+        error.message = "Loading hot update chunk " + chunkId + " failed.\n(" + errorMsg + ")";
+        error.name = "ChunkLoadError";
+        reject(error);
+      };
+      var loadScript = <%- basicFunction("url, onResolve, onReject") %> {
+        return <%- _import_function_name %>(/* webpackIgnore: true */ url).then(onResolve).catch(onReject);
+      };
+      loadScript(url, onResolve, onReject);
+    }
+    );
+  }

@@ -1,5 +1,3 @@
-#![feature(box_patterns)]
-
 macro_rules! regex {
   // `()` indicates that the macro takes no argument.
   ($pat:literal) => {
@@ -34,5 +32,12 @@ mod test_regex {
     // ignore case
     assert!(ends_with_js_ignore_case.test(".js"));
     assert!(ends_with_js_ignore_case.test(".JS"));
+  }
+
+  #[test]
+  fn rust_regex_constructor() {
+    let regex = RspackRegex::new_rust_regex("^foo$", "").expect("should compile");
+    assert!(regex.test("foo"));
+    assert!(!regex.test("foobar"));
   }
 }

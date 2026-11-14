@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["cases", "*.ts"],
+  "compilerOptions": {
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "checkJs": false,
+    "composite": false,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "rootDir": ".."
+  }
+}

@@ -1,0 +1,9 @@
+ERROR in ./index.ts
+  × Module build failed (from builtin:swc-loader):
+  ╰─▶   × Syntax Error: Expected '{', got 'ident'
+         ╭────
+       1 │ export error;
+         ·        ─────
+         ╰────
+
+Rspack compiled with 1 error

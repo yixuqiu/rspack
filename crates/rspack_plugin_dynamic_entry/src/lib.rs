@@ -1,13 +1,16 @@
-use async_trait::async_trait;
-use derivative::Derivative;
+use std::sync::Arc;
+
+use atomic_refcell::AtomicRefCell;
+use derive_more::Debug;
 use futures::future::BoxFuture;
 use rspack_core::{
-  ApplyContext, BoxDependency, Compilation, CompilationParams, CompilerCompilation, CompilerMake,
-  CompilerOptions, Context, DependencyType, EntryDependency, EntryOptions, MakeParam, Plugin,
-  PluginContext,
+  Compilation, CompilationParams, CompilerCompilation, CompilerMake, Context, DependencyId,
+  DependencyRef, DependencyType, EntryDependency, EntryOptions, Plugin,
+  incremental::IncrementalPasses, internal,
 };
 use rspack_error::Result;
 use rspack_hook::{plugin, plugin_hook};
+use rspack_util::fx_hash::FxHashMap;
 
 pub struct EntryDynamicResult {
   pub import: Vec<String>,
@@ -23,17 +26,19 @@ pub struct DynamicEntryPluginOptions {
 }
 
 #[plugin]
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct DynamicEntryPlugin {
   context: Context,
-  #[derivative(Debug = "ignore")]
+  #[debug(skip)]
   entry: EntryDynamic,
+  // Need "cache" the dependency to tell incremental that this entry dependency is not changed
+  // so it can be reused and skip the module make
+  imported_dependencies: AtomicRefCell<FxHashMap<Arc<str>, FxHashMap<EntryOptions, DependencyId>>>,
 }
 
 impl DynamicEntryPlugin {
   pub fn new(options: DynamicEntryPluginOptions) -> Self {
-    Self::new_inner(options.context, options.entry)
+    Self::new_inner(options.context, options.entry, Default::default())
   }
 }
 
@@ -48,34 +53,86 @@ async fn compilation(
 }
 
 #[plugin_hook(CompilerMake for DynamicEntryPlugin)]
-async fn make(&self, compilation: &mut Compilation, params: &mut Vec<MakeParam>) -> Result<()> {
+async fn make(&self, compilation: &mut Compilation) -> Result<()> {
   let entry_fn = &self.entry;
   let decs = entry_fn().await?;
-  for EntryDynamicResult { import, options } in decs {
-    for entry in import {
-      let dependency: BoxDependency = Box::new(EntryDependency::new(entry, self.context.clone()));
-      let dependency_id = *dependency.id();
-      compilation.add_entry(dependency, options.clone()).await?;
 
-      params.push(MakeParam::new_force_build_dep_param(dependency_id, None));
+  if compilation
+    .incremental
+    .mutations_readable(IncrementalPasses::BUILD_MODULE_GRAPH)
+  {
+    let mut imported_dependencies = self.imported_dependencies.borrow_mut();
+    let mut next_imported_dependencies: FxHashMap<Arc<str>, FxHashMap<EntryOptions, DependencyId>> =
+      Default::default();
+
+    for EntryDynamicResult { import, options } in decs {
+      for entry in import {
+        let module_graph = compilation.get_module_graph();
+
+        let entry_dependency: DependencyRef = if let Some(map) =
+          imported_dependencies.get(entry.as_str())
+          && let Some(dependency_id) = map.get(&options)
+          && let Some(dependency) = internal::try_dependency_ref_by_id(module_graph, dependency_id)
+        {
+          next_imported_dependencies
+            .entry(entry.into())
+            .or_default()
+            .insert(options.clone(), *dependency_id);
+          dependency
+        } else {
+          let dependency = DependencyRef::new(EntryDependency::new(
+            entry.clone(),
+            self.context.clone(),
+            options.layer.clone(),
+            false,
+          ));
+          next_imported_dependencies
+            .entry(entry.into())
+            .or_default()
+            .insert(options.clone(), *dependency.id());
+          dependency
+        };
+        compilation
+          .add_entry(entry_dependency, options.clone())
+          .await?;
+      }
     }
+
+    *imported_dependencies = next_imported_dependencies;
+  } else {
+    // Cold branch must still seed `imported_dependencies` — otherwise the
+    // next Hot rebuild reallocates dep ids and breaks every downstream
+    // lookup that relies on dep id continuity across compiles.
+    let mut imported_dependencies = self.imported_dependencies.borrow_mut();
+    let mut next_imported_dependencies: FxHashMap<Arc<str>, FxHashMap<EntryOptions, DependencyId>> =
+      Default::default();
+    for EntryDynamicResult { import, options } in decs {
+      for entry in import {
+        let entry_dependency = DependencyRef::new(EntryDependency::new(
+          entry.clone(),
+          self.context.clone(),
+          options.layer.clone(),
+          false,
+        ));
+        next_imported_dependencies
+          .entry(entry.clone().into())
+          .or_default()
+          .insert(options.clone(), *entry_dependency.id());
+        compilation
+          .add_entry(entry_dependency, options.clone())
+          .await?;
+      }
+    }
+    *imported_dependencies = next_imported_dependencies;
   }
+
   Ok(())
 }
 
-#[async_trait]
 impl Plugin for DynamicEntryPlugin {
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
-    ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
-    ctx.context.compiler_hooks.make.tap(make::new(self));
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
+    ctx.compiler_hooks.make.tap(make::new(self));
     Ok(())
   }
 }

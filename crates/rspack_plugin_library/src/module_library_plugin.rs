@@ -1,32 +1,27 @@
-use std::hash::Hash;
-use std::sync::Arc;
-
-use rspack_core::rspack_sources::{ConcatSource, RawSource, SourceExt};
 use rspack_core::{
-  property_access, to_identifier, ApplyContext, ChunkUkey, Compilation, CompilationParams,
-  CompilerCompilation, CompilerOptions, LibraryOptions, Plugin, PluginContext,
+  ChunkUkey, Compilation, CompilationParams, CompilerCompilation, ExportProvided, ExportsType,
+  LibraryOptions, ModuleGraph, ModuleIdentifier, Plugin, RuntimeCodeTemplate, RuntimeVariable,
+  UsedNameItem, property_access,
+  rspack_sources::{ConcatSource, RawStringSource, SourceExt},
+  to_identifier, to_module_export_name,
 };
-use rspack_error::{error_bail, Result};
+use rspack_error::{Result, error_bail};
+use rspack_hash::{RspackHash, RspackHasher};
 use rspack_hook::{plugin, plugin_hook};
 use rspack_plugin_javascript::{
-  JavascriptModulesPluginPlugin, JsChunkHashArgs, JsPlugin, PluginJsChunkHashHookOutput,
-  PluginRenderJsStartupHookOutput, RenderJsStartupArgs,
+  JavascriptModulesChunkHash, JavascriptModulesRenderStartup, JsPlugin, RenderSource,
+  runtime::startup_awaits_entries,
 };
 
-use crate::utils::{get_options_for_chunk, COMMON_LIBRARY_NAME_MESSAGE};
+use crate::utils::{COMMON_LIBRARY_NAME_MESSAGE, get_options_for_chunk};
 
 const PLUGIN_NAME: &str = "rspack.ModuleLibraryPlugin";
 
 #[plugin]
 #[derive(Debug, Default)]
-pub struct ModuleLibraryPlugin {
-  js_plugin: Arc<ModuleLibraryJavascriptModulesPluginPlugin>,
-}
+pub struct ModuleLibraryPlugin;
 
-#[derive(Debug, Default)]
-struct ModuleLibraryJavascriptModulesPluginPlugin;
-
-impl ModuleLibraryJavascriptModulesPluginPlugin {
+impl ModuleLibraryPlugin {
   fn parse_options(&self, library: &LibraryOptions) -> Result<()> {
     if library.name.is_some() {
       error_bail!("Library name must be unset. {COMMON_LIBRARY_NAME_MESSAGE}")
@@ -46,70 +41,119 @@ impl ModuleLibraryJavascriptModulesPluginPlugin {
   }
 }
 
-impl JavascriptModulesPluginPlugin for ModuleLibraryJavascriptModulesPluginPlugin {
-  fn render_startup(&self, args: &RenderJsStartupArgs) -> PluginRenderJsStartupHookOutput {
-    let Some(_) = self.get_options_for_chunk(args.compilation, args.chunk)? else {
-      return Ok(None);
-    };
-    let mut source = ConcatSource::default();
-    let module_graph = args.compilation.get_module_graph();
-    source.add(args.source.clone());
-    let mut exports = vec![];
-    if args.compilation.options.is_new_tree_shaking() {
-      let exports_info = module_graph.get_exports_info(&args.module);
-      for id in exports_info.get_ordered_exports() {
-        let info = id.get_export_info(&module_graph);
-        let info_name = info.name.as_ref().expect("name can't be empty").as_str();
-        let name = to_identifier(info_name);
-        let var_name = format!("__webpack_exports__{name}");
-        source.add(RawSource::from(format!(
-          "var {var_name} = __webpack_exports__{};\n",
-          property_access(&vec![info_name], 0)
-        )));
-        exports.push(format!("{var_name} as {}", info_name));
-      }
-    } else if let Some(analyze_results) = args
-      .compilation
-      .optimize_analyze_result_map
-      .get(&args.module)
-    {
-      use rspack_core::tree_shaking::webpack_ext::ExportInfoExt;
-      for info in analyze_results.ordered_exports() {
-        let name = to_identifier(info.name.as_ref());
-        let var_name = format!("__webpack_exports__{}", name);
-        source.add(RawSource::from(format!(
-          "var {var_name} = __webpack_exports__{};\n",
-          property_access(&vec![&info.name], 0)
-        )));
-        exports.push(format!("{var_name} as {}", info.name));
-      }
-    }
-    if !exports.is_empty() {
-      source.add(RawSource::from(format!(
-        "export {{ {} }};\n",
-        exports.join(", ")
-      )));
-    }
-    Ok(Some(source.boxed()))
-  }
-
-  fn js_chunk_hash(&self, args: &mut JsChunkHashArgs) -> PluginJsChunkHashHookOutput {
-    let Some(_) = self.get_options_for_chunk(args.compilation, args.chunk_ukey)? else {
-      return Ok(());
-    };
-    PLUGIN_NAME.hash(&mut args.hasher);
-    Ok(())
-  }
-}
-
 #[plugin_hook(CompilerCompilation for ModuleLibraryPlugin)]
 async fn compilation(
   &self,
   compilation: &mut Compilation,
   _params: &mut CompilationParams,
 ) -> Result<()> {
-  let mut drive = JsPlugin::get_compilation_drives_mut(compilation);
-  drive.add_plugin(self.js_plugin.clone());
+  let hooks = JsPlugin::get_compilation_hooks_mut(compilation.id());
+  let mut hooks = hooks.write().await;
+  hooks.render_startup.tap(render_startup::new(self));
+  hooks.chunk_hash.tap(js_chunk_hash::new(self));
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesRenderStartup for ModuleLibraryPlugin)]
+async fn render_startup(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  module: &ModuleIdentifier,
+  render_source: &mut RenderSource,
+  runtime_template: &RuntimeCodeTemplate,
+) -> Result<()> {
+  let Some(_) = self.get_options_for_chunk(compilation, chunk_ukey)? else {
+    return Ok(());
+  };
+  let exports_name = runtime_template.render_runtime_variable(&RuntimeVariable::Exports);
+  let mut source = ConcatSource::default();
+  let is_async = ModuleGraph::is_async(&compilation.async_modules_artifact, module);
+  let module_graph = compilation.get_module_graph();
+  source.add(render_source.source.clone());
+  // export { local as exported }
+  let mut exports: Vec<(String, Option<String>)> = vec![];
+  if is_async && !startup_awaits_entries(compilation, chunk_ukey) {
+    source.add(RawStringSource::from(format!(
+      "{exports_name} = await {exports_name};\n"
+    )));
+  }
+  let exports_info = compilation
+    .exports_info_artifact
+    .get_exports_info_data(module);
+  let boxed_module = module_graph
+    .module_by_identifier(module)
+    .expect("should have build meta");
+  let exports_type = boxed_module.get_exports_type(
+    module_graph,
+    &compilation.module_graph_cache_artifact,
+    &compilation.exports_info_artifact,
+    boxed_module.build_info().strict,
+  );
+  for export_info in exports_info.exports().values() {
+    if matches!(export_info.provided(), Some(ExportProvided::NotProvided)) {
+      continue;
+    };
+
+    let chunk = compilation
+      .build_chunk_graph_artifact
+      .chunk_by_ukey
+      .expect_get(chunk_ukey);
+    let info_name = export_info.name().expect("should have name");
+    let var_name = format!("{exports_name}{}", to_identifier(info_name));
+
+    if info_name == "default"
+      && matches!(
+        exports_type,
+        ExportsType::DefaultOnly | ExportsType::DefaultWithNamed | ExportsType::Dynamic
+      )
+    {
+      source.add(RawStringSource::from(format!(
+        "var {var_name} = {exports_name};\n",
+      )));
+    } else {
+      // Skip exports unused in this runtime (matches webpack's `if (!exportInfo.provided) continue;`).
+      let Some(used_name) = export_info.get_used_name(Some(info_name), Some(chunk.runtime()))
+      else {
+        continue;
+      };
+      source.add(RawStringSource::from(format!(
+        "var {var_name} = {};\n",
+        match used_name {
+          UsedNameItem::Str(used_name) =>
+            format!("{exports_name}{}", property_access(vec![used_name], 0)),
+          UsedNameItem::Inlined(inlined) => inlined.render(""),
+        }
+      )));
+    }
+
+    exports.push((var_name, Some(to_module_export_name(info_name))))
+  }
+  if !exports.is_empty() {
+    let exports_string = match exports_type {
+      ExportsType::DefaultOnly => render_as_default_only_export(&exports),
+      ExportsType::DefaultWithNamed | ExportsType::Dynamic => {
+        render_as_default_with_named_exports(&exports)
+      }
+      ExportsType::Namespace => render_as_named_exports(&exports),
+    };
+    source.add(RawStringSource::from(exports_string));
+  }
+  render_source.source = source.boxed();
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesChunkHash for ModuleLibraryPlugin)]
+async fn js_chunk_hash(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  hasher: &mut RspackHasher,
+) -> Result<()> {
+  let Some(_) = self.get_options_for_chunk(compilation, chunk_ukey)? else {
+    return Ok(());
+  };
+  PLUGIN_NAME.hash(hasher);
   Ok(())
 }
 
@@ -118,16 +162,75 @@ impl Plugin for ModuleLibraryPlugin {
     PLUGIN_NAME
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
-    ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
     Ok(())
   }
+}
+
+pub fn render_as_default_only_export(exports: &[(String, Option<String>)]) -> String {
+  render_as_default_export_impl(exports)
+}
+
+pub fn render_as_named_exports(exports: &[(String, Option<String>)]) -> String {
+  render_as_named_exports_impl(exports, false)
+}
+
+pub fn render_as_default_with_named_exports(exports: &[(String, Option<String>)]) -> String {
+  format!(
+    "{}\n{}",
+    render_as_named_exports_impl(exports, true),
+    render_as_default_only_export(exports),
+  )
+}
+
+fn render_as_named_exports_impl(
+  exports: &[(String, Option<String>)],
+  ignore_default: bool,
+) -> String {
+  format!(
+    "export {{ {} }};\n",
+    exports
+      .iter()
+      .filter(|(_, exported)| {
+        if ignore_default {
+          !matches!(exported.as_deref(), Some("default"))
+        } else {
+          true
+        }
+      })
+      .map(|(local, exported)| {
+        if let Some(exported) = exported {
+          format!("{local} as {exported}")
+        } else {
+          local.clone()
+        }
+      })
+      .collect::<Vec<_>>()
+      .join(", ")
+  )
+}
+
+fn render_as_default_export_impl(exports: &[(String, Option<String>)]) -> String {
+  if let Some((local, _)) = exports
+    .iter()
+    .find(|(_, exported)| matches!(exported.as_deref(), Some("default")))
+  {
+    return format!("export {{ {local} as default }};\n",);
+  }
+
+  format!(
+    "var __rspack_exports_default = {{ {} }};\nexport default __rspack_exports_default;\n",
+    exports
+      .iter()
+      .map(|(local, exported)| {
+        if let Some(exported) = exported {
+          format!("{exported}: {local}")
+        } else {
+          local.clone()
+        }
+      })
+      .collect::<Vec<_>>()
+      .join(", ")
+  )
 }

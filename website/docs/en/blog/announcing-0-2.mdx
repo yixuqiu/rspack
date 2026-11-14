@@ -1,14 +1,25 @@
 ---
+description: 'Rspack 0.2 is out, introducing many new features, such as support for realContentHash, DataURI, and the ESM format, and more.'
 date: 2023-06-02 13:11:00
+sidebar: false
+authors:
+  - name: Rspack Team
+    avatar: 'https://assets.rspack.rs/rspack/rspack-logo-with-background.png'
+    title: '@rspack_dev'
+    x: 'https://x.com/rspack_dev'
 ---
 
-# Announcing Rspack v0.2
+import { BlogAuthors } from '@rstackjs/doc-ui/blog-authors';
 
-> June 02, 2023
+# Announcing Rspack 0.2
+
+_June 02, 2023_
+
+<BlogAuthors />
 
 It has been almost three months since the release of Rspack 0.1. We have received so much attention and feedback from the community, and we are grateful.
 
-In version 0.2, we have added many features, such as: realContentHash, DataURI, support for ESM format, strengthened compatibility with webpack, and optimized many details. In addition, thanks to compatibility with the webpack API, we have also further achieved compatibility with the surrounding ecosystem. Completing tests for compatibility with vue-loader versions 17 (corresponding to Vue3) and 15 (corresponding to Vue2). You can now try using Rspack in Vue2/3 projects.
+In version 0.2, we have added many features, such as: realContentHash, DataURI, support for ESM format, strengthened compatibility with webpack, and optimized many details. In addition, thanks to compatibility with the webpack API, we have also further achieved compatibility with the surrounding ecosystem. Completing tests for compatibility with vue-loader versions 17 (corresponding to Vue 3) and 15 (corresponding to Vue 2). You can now try using Rspack in Vue 2/3 projects.
 
 We look forward to you experiencing these new improvements in version 0.2, and welcome your feedback.
 
@@ -16,9 +27,9 @@ We look forward to you experiencing these new improvements in version 0.2, and w
 
 ### Loader
 
-Version 0.2 has completed compatibility with most of the loader APIs, including: inline match resource, pitching loader, and inline loader. More APIs have further improved compatibility with webpack loaders, details of which can be found in our webpack compatibility updates [Loader API](/api/loader-api/index).
+Version 0.2 has completed compatibility with most of the loader APIs, including: inline match resource, pitching loader, and inline loader. More APIs have further improved compatibility with webpack loaders, details of which can be found in our webpack compatibility updates [Loader API](/api/loader-api/).
 
-### Plugin Hooks
+### Plugin hooks
 
 New hooks for plugins have been added.
 
@@ -52,12 +63,8 @@ We have implemented optimization.realContentHash, which calculates the Hash base
 
 In the new version, System/ESM products can be generated, and the configuration for outputting ESM products is as follows:
 
-```js title="rspack.config.js"
-module.exports = {
-  // …
-  experiments: {
-    outputModule: true,
-  },
+```js title="rspack.config.mjs"
+export default {
   output: {
     chunkFormat: 'module',
     chunkLoading: 'import',
@@ -92,8 +99,8 @@ import x from 'data:text/javascript,export default 42';
 
 In addition, we have supported `mimetype` and `scheme` as two types of module rule conditions. For example, you can make resources with `scheme` as `'data'` no longer treated as inline processing, but as separate resource files through the following method:
 
-```js title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   module: {
     rules: [
       {
@@ -105,14 +112,14 @@ module.exports = {
 };
 ```
 
-## Breaking Changes
+## Breaking changes
 
 - Alignment of Filename Generation Logic
 
   In version 0.1.12, we further aligned the file name generation logic with webpack, and refactored the implementation of file name generation. However, the [ext] in `output.filename`, `output.chunkFilename`, `output.cssFilename`, and `output.cssChunkFilename` will no longer be replaced. This behavior is now consistent with webpack but is a breaking change for versions of Rspack prior to 0.1.12. If you used [ext] in the above 4 filename configurations, you need to change it to the corresponding `.js` or `.css`, for example:
 
-  ```diff title="rspack.config.js"
-  module.exports = {
+  ```diff title="rspack.config.mjs"
+  export default {
     output: {
   -    filename: "[name][ext]",
   +    filename: "[name].js",
@@ -143,7 +150,7 @@ module.exports = {
 
   Details: https://github.com/web-infra-dev/rspack/pull/3358
 
-## Webpack Compatibility Updates
+## Webpack compatibility updates
 
 As we support more webpack APIs, we are also compatible with more community plugins and loaders. We have adapted some plugins and loaders that have a high demand in the community.
 
@@ -157,41 +164,39 @@ A widely reported community demand is support for extracting licenses from code.
 
 ### style-loader & css-loader
 
-Although Rspack supports and enables the `experiments.css` feature of webpack by default, there are still many communities that strongly depend on [style-loader](https://github.com/webpack-contrib/style-loader) & [css-loader](https://github.com/webpack-contrib/css-loader). We have completed support for style-loader and css-loader in 0.2.0, which also allows us to better adapt to frameworks such as Svelte and Vue.
+Although Rspack supports and enables the `experiments.css` feature of webpack by default, there are still many communities that strongly depend on [style-loader](https://github.com/webpack/style-loader) & [css-loader](https://github.com/webpack/css-loader). We have completed support for style-loader and css-loader in 0.2.0, which also allows us to better adapt to frameworks such as Svelte and Vue.
 
 ### node-loader
 
 When using Rspack to package Node applications like NestJS, a common requirement is to package libraries containing addons. These libraries' native dependencies cannot be directly packaged into js, so they need special treatment. Rspack has adapted [node-loader](https://github.com/webpack-contrib/node-loader), so you can now use Rspack to build node applications.
 
-Rspack has additional adaptation of webpack's plugins. We have tracked the adapted plugins and loaders in [loader-compat](https://github.com/rspack-contrib/rspack-examples/tree/main/rspack/loader-compat) and [plugin-compat](https://github.com/rspack-contrib/rspack-examples/tree/main/rspack/plugin). If you find that a community plugin or loader you are using is also compatible, welcome to submit it to us so we can list it in our compatibility matrix.
+Rspack has additional adaptation of webpack's plugins. We have tracked the adapted plugins and loaders in [loader-compat](https://github.com/rstackjs/rstack-examples/tree/main/rspack/loader-compat) and [plugin-compat](https://github.com/rstackjs/rstack-examples/tree/main/rspack/plugin). If you find that a community plugin or loader you are using is also compatible, welcome to submit it to us so we can list it in our compatibility matrix.
 
-## Framework Ecosystem Updates
+## Framework ecosystem updates
 
 ### Modern.js Framework
 
-Thanks to the close collaboration and parallel iteration of the [Modern.js framework](https://modernjs.dev/en/) and Rspack, **Modern.js Rspack mode has covered 85% of the framework's capabilities**, supporting SSR, BFF, micro front-end scenarios, and aligning with TypeScript type checking, code compatibility detection and other features.
+Thanks to the close collaboration and parallel iteration of the [Modern.js framework](https://modernjs.dev/) and Rspack, **Modern.js Rspack mode has covered 85% of the framework's capabilities**, supporting SSR, BFF, micro front-end scenarios, and aligning with TypeScript type checking, code compatibility detection and other features.
 
 At ByteDance, more than 80 projects are using the Modern.js Rspack mode. Some of the projects have been deployed into production and have seen a 10x improvement in build performance.
 
 ### Modern.js Doc
 
-In addition to the Modern.js framework, the document site solution under the Modern.js system - [Modern.js Doc](https://modernjs.dev/doc-tools/) - has also switched the bundler from webpack to Rspack, and rewritten the MDX compilation process based on Rust.
+In addition to the Modern.js framework, the document site solution under the Modern.js system - Modern.js Doc - has also switched the bundler from webpack to Rspack, and rewritten the MDX compilation process based on Rust.
 
 Compared to previous versions using webpack, the current version's build speed can be reduced to seconds. Using the Modern.js official website documentation as an example, the project's startup and build time has been reduced from 30 seconds to less than 2 seconds. In the future, we plan to rename Modern.js Doc to **Rspress** as the official documentation site solution for Rspack and maintain it through a separate repository.
 
-> Welcome to visit the [Modern.js code repository](https://github.com/web-infra-dev/modern.js) and experience the above content.
-
 ### Vue
 
-Rspack 0.2 has achieved compatibility with vue-loader! For Vue3 projects, you can use Rspack's native CSS and TS processors to improve the compilation speed of Vue projects. All you need to do is upgrade vue-loader to version 17.2.2 or above and set `experimentalInlineMatchResource: true`. For more information on Vue3/Vue2 support, please refer to [guide-vue](/guide/tech/vue).
+Rspack 0.2 has achieved compatibility with vue-loader! For Vue 3 projects, you can use Rspack's native CSS and TS processors to improve the compilation speed of Vue projects. All you need to do is upgrade vue-loader to version 17.2.2 or above and set `experimentalInlineMatchResource: true`. For more information on Vue 3/Vue 2 support, please refer to [guide-vue](/guide/integrations/vue).
 
 ### Svelte
 
-Thanks to Rspack's excellent support for the Loader API and the excellent design of [svelte-loader](https://github.com/sveltejs/svelte-loader), Rspack has fully adapted [svelte-loader](https://github.com/sveltejs/svelte-loader). Therefore, you can directly use [svelte-loader](https://github.com/sveltejs/svelte-loader) in Rspack for svelte application development. You can refer to [example-svelte](https://github.com/rspack-contrib/rspack-examples/tree/main/rspack/svelte) to complete the svelte-loader related configuration.
+Thanks to Rspack's excellent support for the Loader API and the excellent design of [svelte-loader](https://github.com/sveltejs/svelte-loader), Rspack has fully adapted [svelte-loader](https://github.com/sveltejs/svelte-loader). Therefore, you can directly use [svelte-loader](https://github.com/sveltejs/svelte-loader) in Rspack for svelte application development. You can refer to [example-svelte](https://github.com/rstackjs/rstack-examples/tree/main/rspack/svelte) to complete the svelte-loader related configuration.
 
 ### Storybook
 
-With the help of the Storybook team, Rspack has completed support for the Storybook React version. You can follow the [migrate Storybook](/guide/migration/storybook.html) method to migrate from the webpack version to the Rspack version. In actual projects, tests have shown that the Rspack version is 5-10 times faster than the Webpack version when the docgen feature is not turned on. When docgen is turned on, since Rspack still relies on babel to handle docgen, the performance is affected, but there is still a 2-3 times improvement.
+With the help of the Storybook team, Rspack has completed support for the Storybook React version. You can follow the [migrate Storybook](/guide/migration/storybook.html) method to migrate from the webpack version to the Rspack version. In actual projects, tests have shown that the Rspack version is 5-10 times faster than the webpack version when the docgen feature is not turned on. When docgen is turned on, since Rspack still relies on babel to handle docgen, the performance is affected, but there is still a 2-3 times improvement.
 
 ### Angular
 
@@ -200,15 +205,6 @@ With the help of the [Valor](https://valor-software.com/) team, Rspack has compl
 ### NestJS
 
 With the help of [Rosa](https://rosa.be/), [Nx](https://nx.dev/), and [Valor](https://valor-software.com/), Rspack has completed the compilation support for [NestJS](https://nestjs.com/). You can use Rspack to package NestJS applications, and in actual projects, tests have shown that Rspack has a 5-10 times build performance improvement compared to the webpack version.
-
-## Benchmark
-
-Added a benchmark comparison with esbuild. Please refer to the following link for more details: https://github.com/web-infra-dev/performance-compare
-
-<img
-  src="https://raw.githubusercontent.com/web-infra-dev/performance-compare/main/assets/benchmark.png"
-  alt="benchmark"
-></img>
 
 ## Dev guide
 
@@ -228,7 +224,7 @@ In order to ship with confidence, we are currently:
 - Running all tests on Node 14, 16 and 18
 - Maintaining a separate ecosystem-ci repository for integration tests
 
-## Nightly Release
+## Nightly release
 
 In order to expedite iteration, Rspack is released daily with the "@nightly" tag to npm.
 
@@ -240,7 +236,7 @@ Special thanks to:
 
 - [@TheLarkInn](https://github.com/TheLarkInn) and [@alexander-akait](https://github.com/alexander-akait), for answering and resolving many of Rspack team's questions about Webpack.
 - [@zackarychapple](https://github.com/zackarychapple), [@valorkin](https://github.com/valorkin), [@edusperoni](https://github.com/edusperoni), and [@Coly101](https://github.com/Coly010) for assisting the Rspack team with basic support for Angular and [@zackarychapple](https://github.com/zackarychapple) for reviewing this release blog.
-- [@suxin2017](https://github.com/suxin2017), for supporting System.js format and optional-dependency functionality in Rspack, as well as contributing a lot in terms of Windows compatibility.
+- [@xin2017338](https://github.com/xin2017338), for supporting System.js format and optional-dependency functionality in Rspack, as well as contributing a lot in terms of Windows compatibility.
 - [@faga295](https://github.com/faga295), for supporting the decompression code comment feature and rspack preview feature in Rspack.
 - [@lippzhang](https://github.com/lippzhang), for making numerous contributions in aligning Rspack's behavior with Webpack.
 - [@HerringtonDarkholme](https://github.com/HerringtonDarkholme), for allowing Rspack to use rspack.config.ts as a configuration file.

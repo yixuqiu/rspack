@@ -1,0 +1,27 @@
+<>
+
+```ts
+type Entrypoint = {
+  readonly name: string | undefined; // 名称
+  readonly index: number | undefined; // 索引序
+  readonly chunks: Chunk[]; // 包含的 chunk 列表
+  readonly origins: Array<{
+    // entrypoint 被引入的来源
+    module?: Module;
+    request?: string;
+    loc?: string | RealDependencyLocation;
+  }>;
+  readonly childrenIterable: ChunkGroup[];
+  isInitial(): boolean; // 是否在页面初始加载
+  getFiles(): string[]; // 关联的文件列表
+  getParents(): ChunkGroup[]; // 父 chunk group 列表
+  // 获取当前入口使用的 Rspack 运行时所在的 chunk。
+  // 默认与入口 chunk 相同；配置 dependOn 或 optimization.runtimeChunk 时可能不同。
+  getRuntimeChunk(): Chunk;
+  getEntrypointChunk(): Chunk; // 获取该 entrypoint 的 entrypoint chunk（指包含 entry 模块的 chunk）
+  getModulePreOrderIndex(module: Module): number | null;
+  getModulePostOrderIndex(module: Module): number | null;
+};
+```
+
+</>

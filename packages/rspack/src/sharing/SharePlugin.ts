@@ -1,94 +1,159 @@
-import { Compiler } from "../Compiler";
-import { parseOptions } from "../container/options";
-import { ConsumeSharedPlugin } from "./ConsumeSharedPlugin";
-import { ProvideSharedPlugin } from "./ProvideSharedPlugin";
-import { isRequiredVersion } from "./utils";
+import type { Compiler } from '../Compiler';
+import { parseOptions } from '../container/options';
+import { ConsumeSharedPlugin } from './ConsumeSharedPlugin';
+import { ProvideSharedPlugin } from './ProvideSharedPlugin';
+import { isRequiredVersion } from './utils';
+
+export type ShareScope = string | string[];
+
+export function validateShareScope(
+  shareScope: ShareScope,
+  enhanced: boolean,
+  pluginName: string,
+): void {
+  if (!Array.isArray(shareScope)) return;
+  if (shareScope.length === 0) {
+    throw new Error(
+      `[${pluginName}] shareScope array must contain at least one entry`,
+    );
+  }
+  if (shareScope.length > 1 && !enhanced) {
+    throw new Error(
+      `[${pluginName}] shareScope as an array with multiple entries requires enhanced=true, got: ${JSON.stringify(shareScope)}`,
+    );
+  }
+}
 
 export type SharePluginOptions = {
-	shareScope?: string;
-	shared: Shared;
-	enhanced: boolean;
+  /**
+   * Share scope(s) used for modules that do not specify their own `shareScope`.
+   * @default 'default'
+   */
+  shareScope?: ShareScope;
+  /**
+   * Modules to consume from a share scope and provide as local fallbacks.
+   * Set a module's `import` to `false` to consume it without a local fallback.
+   */
+  shared: Shared;
+  /**
+   * Whether to generate sharing code for the enhanced Module Federation runtime.
+   * @default false
+   */
+  enhanced?: boolean;
 };
 export type Shared = (SharedItem | SharedObject)[] | SharedObject;
 export type SharedItem = string;
 export type SharedObject = {
-	[k: string]: SharedConfig | SharedItem;
+  [k: string]: SharedConfig | SharedItem;
 };
+export type TreeShakingConfig = {
+  usedExports?: string[];
+  mode?: 'server-calc' | 'runtime-infer';
+  filename?: string;
+};
+
 export type SharedConfig = {
-	eager?: boolean;
-	import?: false | SharedItem;
-	packageName?: string;
-	requiredVersion?: false | string;
-	shareKey?: string;
-	shareScope?: string;
-	singleton?: boolean;
-	strictVersion?: boolean;
-	version?: false | string;
+  eager?: boolean;
+  import?: false | SharedItem;
+  packageName?: string;
+  requiredVersion?: false | string;
+  shareKey?: string;
+  shareScope?: ShareScope;
+  singleton?: boolean;
+  strictVersion?: boolean;
+  version?: false | string;
+  treeShaking?: TreeShakingConfig;
 };
 
+export type NormalizedSharedOptions = [string, SharedConfig][];
+
+export function normalizeSharedOptions(
+  shared: Shared,
+): NormalizedSharedOptions {
+  return parseOptions(
+    shared,
+    (item, key) => {
+      if (typeof item !== 'string')
+        throw new Error('Unexpected array in shared');
+      const config: SharedConfig =
+        item === key || !isRequiredVersion(item)
+          ? {
+              import: item,
+            }
+          : {
+              import: key,
+              requiredVersion: item,
+            };
+      return config;
+    },
+    (item) => item,
+  );
+}
+
+export function createProvideShareOptions(
+  normalizedSharedOptions: NormalizedSharedOptions,
+) {
+  return normalizedSharedOptions
+    .filter(([, options]) => options.import !== false)
+    .map(([key, options]) => ({
+      [options.import || key]: {
+        shareKey: options.shareKey || key,
+        shareScope: options.shareScope,
+        version: options.version,
+        eager: options.eager,
+        singleton: options.singleton,
+        requiredVersion: options.requiredVersion,
+        strictVersion: options.strictVersion,
+        treeShakingMode: options.treeShaking?.mode,
+      },
+    }));
+}
+
+export function createConsumeShareOptions(
+  normalizedSharedOptions: NormalizedSharedOptions,
+) {
+  return normalizedSharedOptions.map(([key, options]) => ({
+    [key]: {
+      import: options.import,
+      shareKey: options.shareKey || key,
+      shareScope: options.shareScope,
+      requiredVersion: options.requiredVersion,
+      strictVersion: options.strictVersion,
+      singleton: options.singleton,
+      packageName: options.packageName,
+      eager: options.eager,
+      treeShakingMode: options.treeShaking?.mode,
+    },
+  }));
+}
 export class SharePlugin {
-	_shareScope;
-	_consumes;
-	_provides;
-	_enhanced;
+  _shareScope;
+  _consumes;
+  _provides;
+  _enhanced;
+  _sharedOptions;
 
-	constructor(options: SharePluginOptions) {
-		const sharedOptions = parseOptions(
-			options.shared,
-			(item, key) => {
-				if (typeof item !== "string")
-					throw new Error("Unexpected array in shared");
-				const config: SharedConfig =
-					item === key || !isRequiredVersion(item)
-						? {
-								import: item
-							}
-						: {
-								import: key,
-								requiredVersion: item
-							};
-				return config;
-			},
-			item => item
-		);
-		const consumes = sharedOptions.map(([key, options]) => ({
-			[key]: {
-				import: options.import,
-				shareKey: options.shareKey || key,
-				shareScope: options.shareScope,
-				requiredVersion: options.requiredVersion,
-				strictVersion: options.strictVersion,
-				singleton: options.singleton,
-				packageName: options.packageName,
-				eager: options.eager
-			}
-		}));
-		const provides = sharedOptions
-			.filter(([, options]) => options.import !== false)
-			.map(([key, options]) => ({
-				[options.import || key]: {
-					shareKey: options.shareKey || key,
-					shareScope: options.shareScope,
-					version: options.version,
-					eager: options.eager
-				}
-			}));
-		this._shareScope = options.shareScope;
-		this._consumes = consumes;
-		this._provides = provides;
-		this._enhanced = options.enhanced ?? false;
-	}
+  constructor(options: SharePluginOptions) {
+    const sharedOptions = normalizeSharedOptions(options.shared);
+    const consumes = createConsumeShareOptions(sharedOptions);
+    const provides = createProvideShareOptions(sharedOptions);
+    this._shareScope = options.shareScope;
+    this._consumes = consumes;
+    this._provides = provides;
+    this._enhanced = options.enhanced ?? false;
+    this._sharedOptions = sharedOptions;
+  }
 
-	apply(compiler: Compiler) {
-		new ConsumeSharedPlugin({
-			shareScope: this._shareScope,
-			consumes: this._consumes,
-			enhanced: this._enhanced
-		}).apply(compiler);
-		new ProvideSharedPlugin({
-			shareScope: this._shareScope,
-			provides: this._provides,
-			enhanced: this._enhanced
-		}).apply(compiler);
-	}
+  apply(compiler: Compiler) {
+    new ConsumeSharedPlugin({
+      shareScope: this._shareScope,
+      consumes: this._consumes,
+      enhanced: this._enhanced,
+    }).apply(compiler);
+    new ProvideSharedPlugin({
+      shareScope: this._shareScope,
+      provides: this._provides,
+      enhanced: this._enhanced,
+    }).apply(compiler);
+  }
 }

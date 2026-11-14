@@ -1,0 +1,233 @@
+use std::{borrow::Cow, sync::Arc};
+
+use async_trait::async_trait;
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_collections::{Identifiable, Identifier};
+use rspack_core::{
+  BoxDependency, BoxModule, BuildContext, BuildInfo, BuildMeta, CodeGenerationResultBuilder,
+  Compilation, Context, DependenciesBlock, DependenciesBlockData, FactoryMetaStore, FreezeLock,
+  LibIdentOptions, Module, ModuleArgument, ModuleCodeGenerationContext, ModuleDependency,
+  ModuleGraph, ModuleId, ModuleType, NeedBuildContext, RuntimeSpec, SourceType,
+  StaticExportsDependency, StaticExportsSpec, ValueCacheVersions, impl_module_meta_info,
+  impl_source_map_config, module_update_hash,
+  rspack_sources::{BoxSource, OriginalSource, RawStringSource},
+};
+use rspack_error::{Result, impl_empty_diagnosable_trait};
+use rspack_hash::{RspackHash, RspackHashDigest, RspackHasher};
+use rspack_util::{json_stringify, source_map::ModuleSourceMapConfig};
+
+use super::delegated_source_dependency::DelegatedSourceDependency;
+use crate::{DllManifestContentItem, DllManifestContentItemExports};
+
+pub type SourceRequest = String;
+
+#[impl_source_map_config]
+#[cacheable]
+#[derive(Debug, Default)]
+pub struct DelegatedModule {
+  source_request: SourceRequest,
+  request: Option<ModuleId>,
+  delegation_type: String,
+  user_request: String,
+  original_request: Option<String>,
+  delegate_data: DllManifestContentItem,
+  dependencies_block: DependenciesBlockData,
+  factory_meta: FactoryMetaStore,
+  build_info: FreezeLock<BuildInfo>,
+  build_meta: FreezeLock<BuildMeta>,
+}
+
+impl DelegatedModule {
+  pub fn new(
+    source_request: SourceRequest,
+    data: DllManifestContentItem,
+    delegation_type: String,
+    user_request: String,
+    original_request: Option<String>,
+  ) -> Self {
+    Self {
+      source_request,
+      request: data.id.clone(),
+      delegation_type,
+      user_request,
+      original_request,
+      delegate_data: data,
+      ..Default::default()
+    }
+  }
+}
+
+#[cacheable_dyn]
+#[async_trait]
+impl Module for DelegatedModule {
+  impl_module_meta_info!();
+
+  fn module_type(&self) -> &ModuleType {
+    &ModuleType::JsDynamic
+  }
+
+  fn source_types(&self, _module_graph: &ModuleGraph) -> &[SourceType] {
+    &[SourceType::JavaScript]
+  }
+
+  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<'_, str>> {
+    self.original_request.as_ref().map(|request| request.into())
+  }
+
+  fn source(&self) -> Option<&BoxSource> {
+    None
+  }
+
+  fn readable_identifier(&self, _context: &Context) -> Cow<'_, str> {
+    format!(
+      "delegated {} from {}",
+      self.user_request, self.source_request
+    )
+    .into()
+  }
+
+  fn size(&self, _source_type: Option<&SourceType>) -> f64 {
+    42.0
+  }
+
+  async fn build(
+    mut self: Box<Self>,
+    _build_context: Arc<BuildContext>,
+    _compilation: Option<&Compilation>,
+  ) -> Result<BoxModule> {
+    let dependencies = vec![
+      BoxDependency::new(DelegatedSourceDependency::new(self.source_request.clone())),
+      BoxDependency::new(StaticExportsDependency::new(
+        match self.delegate_data.exports.clone() {
+          Some(exports) => match exports {
+            DllManifestContentItemExports::True => StaticExportsSpec::True,
+            DllManifestContentItemExports::Vec(vec) => StaticExportsSpec::Array(vec),
+          },
+          None => StaticExportsSpec::True,
+        },
+        false,
+      )),
+    ];
+    self.build_meta = self.delegate_data.build_meta.clone().into();
+    Ok(
+      BoxModule::new(self)
+        .with_dependencies(dependencies.into_iter().map(Into::into).collect(), vec![]),
+    )
+  }
+
+  async fn code_generation(
+    &self,
+    code_generation_context: &mut ModuleCodeGenerationContext,
+  ) -> Result<CodeGenerationResultBuilder> {
+    let ModuleCodeGenerationContext {
+      compilation,
+      runtime_template,
+      ..
+    } = code_generation_context;
+
+    let mut code_generation_result = CodeGenerationResultBuilder::default();
+
+    let dep = self
+      .get_dependencies()
+      .first()
+      .expect("should have source dependency");
+    let mg = compilation.get_module_graph();
+    let source_module = mg.get_module_by_dependency_id(dep.id());
+    let dependency = dep
+      .downcast_ref::<DelegatedSourceDependency>()
+      .expect("Should be module dependency");
+
+    let str = match source_module {
+      Some(_) => {
+        let mut s = format!(
+          "{}.exports = ({})",
+          runtime_template.render_module_argument(ModuleArgument::Module),
+          runtime_template.module_raw(compilation, dep.id(), dependency.request(), false,)
+        );
+
+        let request = json_stringify(
+          self
+            .request
+            .as_ref()
+            .expect("manifest content should have `id`."),
+        );
+
+        match self.delegation_type.as_ref() {
+          "require" => {
+            s += &format!("({request})");
+          }
+          "object" => {
+            s += &format!("[{request}]");
+          }
+          _ => panic!("delegation_type should be 'require' or 'object'"),
+        }
+
+        s += ";";
+
+        s
+      }
+      None => runtime_template.throw_missing_module_error_block(&self.source_request),
+    };
+
+    let source_map = self.get_source_map_kind();
+
+    let source: BoxSource = if source_map.source_map() || source_map.simple_source_map() {
+      Arc::new(OriginalSource::new(str, self.identifier().to_string()))
+    } else {
+      let raw_source: RawStringSource = str.into();
+      Arc::new(raw_source)
+    };
+
+    code_generation_result.add(SourceType::JavaScript, source);
+
+    Ok(code_generation_result)
+  }
+
+  fn need_build_for_incremental(&self, _value_cache_versions: &ValueCacheVersions) -> bool {
+    false
+  }
+
+  async fn need_build(&self, _context: &NeedBuildContext<'_>) -> Result<bool> {
+    Ok(self.build_meta.frozen().is_none())
+  }
+
+  async fn get_runtime_hash(
+    &self,
+    compilation: &Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    let mut hasher = RspackHasher::from(&compilation.options.output);
+    self.delegation_type.hash(&mut hasher);
+    self.request.hash(&mut hasher);
+    module_update_hash(self, &mut hasher, compilation, runtime);
+
+    Ok(hasher.digest(&compilation.options.output.hash_digest))
+  }
+}
+
+impl Identifiable for DelegatedModule {
+  fn identifier(&self) -> Identifier {
+    format!(
+      "delegated {} from {}",
+      self
+        .request
+        .as_ref()
+        .map(|r| r.to_string())
+        .unwrap_or_default(),
+      self.source_request
+    )
+    .into()
+  }
+}
+
+impl DependenciesBlock for DelegatedModule {
+  fn dependencies_block(&self) -> &DependenciesBlockData {
+    &self.dependencies_block
+  }
+
+  fn dependencies_block_mut(&mut self) -> &mut DependenciesBlockData {
+    &mut self.dependencies_block
+  }
+}
+
+impl_empty_diagnosable_trait!(DelegatedModule);

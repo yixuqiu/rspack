@@ -1,7 +1,69 @@
+---
+description: 'Compiler 使用 ContextModuleFactory 模块从 require.context API 生成依赖关系。'
+---
+
+import { Collapse, CollapsePanel } from '@components/Collapse';
+
 # ContextModuleFactory 钩子
+
+`Compiler` 使用 `ContextModuleFactory` 模块从 [require.context](/api/runtime-api/module-methods#requirecontext) API 生成依赖关系。它会解析请求的目录，为每个文件生成请求，并依据传递来的 regExp 进行过滤。最后匹配成功的依赖关系将被传入 [NormalModuleFactory](/api/plugin-api/normal-module-factory-hooks)。
+
+## `beforeResolve`
+
+`AsyncSeriesWaterfallHook<[BeforeResolveResult], BeforeResolveResult | void>`
+
+在解析请求的目录之前调用。
+
+回调可以返回解析数据，也可以直接修改解析数据而不返回值。返回 `false` 会忽略该请求。
+
+<Collapse>
+  <CollapsePanel
+    className="collapse-code-panel"
+    header="BeforeResolveResult.ts"
+    key="BeforeResolveResult"
+  >
+```ts
+type BeforeResolveData = {
+  context: string;
+  request: string;
+  regExp: RegExp | undefined;
+  recursive: boolean;
+}
+
+export type BeforeResolveResult =
+  | false
+  | BeforeResolveData;
+```
+  </CollapsePanel>
+</Collapse>
 
 ## `afterResolve`
 
-`AsyncSeriesBailHook<[ResolveData]>`
+`AsyncSeriesWaterfallHook<[AfterResolveResult], AfterResolveResult | void>`
 
-在请求的目录解析后调用。
+在请求的目录解析完成后调用。
+
+回调可以返回解析数据，也可以直接修改解析数据而不返回值。返回 `false` 会忽略该请求。
+
+<Collapse>
+  <CollapsePanel
+    className="collapse-code-panel"
+    header="AfterResolveResult.ts"
+    key="AfterResolveResult"
+  >
+```ts
+type AfterResolveData = {
+  resource: string;
+  context: string;
+  request: string;
+  regExp: RegExp | undefined;
+  recursive: boolean;
+  dependencies: Dependency[];
+}
+
+export type AfterResolveResult = 
+  | false
+  | AfterResolveData;
+```
+  </CollapsePanel>
+</Collapse>

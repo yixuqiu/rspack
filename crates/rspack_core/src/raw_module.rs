@@ -1,55 +1,65 @@
-use std::borrow::Cow;
-use std::hash::Hash;
+use std::{borrow::Cow, sync::Arc};
 
-use rspack_error::{impl_empty_diagnosable_trait, Diagnostic, Result};
-use rspack_hash::RspackHash;
-use rspack_identifier::Identifiable;
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsOption, AsPreset},
+};
+use rspack_collections::{Identifiable, IdentifierMap, IdentifierSet};
+use rspack_error::{Result, impl_empty_diagnosable_trait};
+use rspack_hash::{RspackHash, RspackHashDigest, RspackHasher};
 use rspack_macros::impl_source_map_config;
-use rspack_sources::{BoxSource, RawSource, Source, SourceExt};
-use rspack_util::source_map::SourceMapKind;
+use rspack_sources::{BoxSource, OriginalSource, RawStringSource, SourceExt};
+use rspack_util::source_map::{ModuleSourceMapConfig, SourceMapKind};
 
 use crate::{
-  dependencies_block::AsyncDependenciesBlockIdentifier, impl_module_meta_info, BuildContext,
-  BuildInfo, BuildMeta, BuildResult, CodeGenerationResult, Context, DependenciesBlock,
-  DependencyId, Module, ModuleIdentifier, ModuleType, RuntimeGlobals, RuntimeSpec, SourceType,
+  BoxModule, BuildContext, BuildInfo, BuildMeta, CodeGenerationResultBuilder, Compilation,
+  ConnectionState, Context, DependenciesBlock, DependenciesBlockData, FactoryMetaStore, FreezeLock,
+  Module, ModuleCodeGenerationContext, ModuleGraph, ModuleGraphCacheArtifact, ModuleIdentifier,
+  ModuleType, NeedBuildContext, RuntimeGlobals, RuntimeSpec, SideEffectsStateArtifact, SourceType,
+  impl_module_meta_info, module_declared_side_effect_free, module_update_hash,
 };
-use crate::{Compilation, ConcatenationScope, FactoryMeta};
 
 #[impl_source_map_config]
+#[cacheable]
 #[derive(Debug)]
 pub struct RawModule {
-  blocks: Vec<AsyncDependenciesBlockIdentifier>,
-  dependencies: Vec<DependencyId>,
-  source: BoxSource,
+  dependencies_block: DependenciesBlockData,
+  source_str: String,
+  #[cacheable(with=AsOption<AsPreset>)]
+  source: Option<BoxSource>,
   identifier: ModuleIdentifier,
   readable_identifier: String,
   runtime_requirements: RuntimeGlobals,
-  factory_meta: Option<FactoryMeta>,
-  build_info: Option<BuildInfo>,
-  build_meta: Option<BuildMeta>,
+  factory_meta: FactoryMetaStore,
+  build_info: FreezeLock<BuildInfo>,
+  build_meta: FreezeLock<BuildMeta>,
 }
 
 static RAW_MODULE_SOURCE_TYPES: &[SourceType] = &[SourceType::JavaScript];
 
 impl RawModule {
   pub fn new(
-    source: String,
+    source_str: String,
     identifier: ModuleIdentifier,
     readable_identifier: String,
     runtime_requirements: RuntimeGlobals,
   ) -> Self {
     Self {
-      blocks: Default::default(),
-      dependencies: Default::default(),
-      // TODO: useSourceMap, etc...
-      source: RawSource::from(source).boxed(),
+      dependencies_block: Default::default(),
+      source_str,
+      source: None,
       identifier,
       readable_identifier,
       runtime_requirements,
-      factory_meta: None,
-      build_info: None,
-      build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      factory_meta: Default::default(),
+      build_info: BuildInfo {
+        cacheable: true,
+        strict: true,
+        ..Default::default()
+      }
+      .into(),
+      build_meta: Default::default(),
+      source_map_kind: SourceMapKind::empty(),
     }
   }
 }
@@ -61,101 +71,100 @@ impl Identifiable for RawModule {
 }
 
 impl DependenciesBlock for RawModule {
-  fn add_block_id(&mut self, block: AsyncDependenciesBlockIdentifier) {
-    self.blocks.push(block)
+  fn dependencies_block(&self) -> &DependenciesBlockData {
+    &self.dependencies_block
   }
 
-  fn get_blocks(&self) -> &[AsyncDependenciesBlockIdentifier] {
-    &self.blocks
-  }
-
-  fn add_dependency_id(&mut self, dependency: DependencyId) {
-    self.dependencies.push(dependency)
-  }
-
-  fn get_dependencies(&self) -> &[DependencyId] {
-    &self.dependencies
+  fn dependencies_block_mut(&mut self) -> &mut DependenciesBlockData {
+    &mut self.dependencies_block
   }
 }
 
+#[cacheable_dyn]
 #[async_trait::async_trait]
 impl Module for RawModule {
   impl_module_meta_info!();
 
-  fn get_diagnostics(&self) -> Vec<Diagnostic> {
-    vec![]
-  }
-
   fn module_type(&self) -> &ModuleType {
-    &ModuleType::Js
+    &ModuleType::JsAuto
   }
 
-  fn source_types(&self) -> &[SourceType] {
+  fn source_types(&self, _module_graph: &ModuleGraph) -> &[SourceType] {
     RAW_MODULE_SOURCE_TYPES
   }
 
-  fn original_source(&self) -> Option<&dyn Source> {
-    Some(self.source.as_ref())
+  fn source(&self) -> Option<&BoxSource> {
+    self.source.as_ref()
   }
 
-  fn readable_identifier(&self, _context: &Context) -> Cow<str> {
+  fn readable_identifier(&self, _context: &Context) -> Cow<'_, str> {
     Cow::Borrowed(&self.readable_identifier)
   }
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
-    f64::max(1.0, self.source.size() as f64)
+  fn size(&self, _source_type: Option<&SourceType>) -> f64 {
+    f64::max(1.0, self.source_str.len() as f64)
+  }
+
+  // #[tracing::instrument("RawModule::code_generation", skip_all, fields(identifier = ?self.identifier()))]
+  async fn code_generation(
+    &self,
+    code_generation_context: &mut ModuleCodeGenerationContext,
+  ) -> Result<CodeGenerationResultBuilder> {
+    let mut cgr = CodeGenerationResultBuilder::default();
+    code_generation_context
+      .runtime_template
+      .runtime_requirements_mut()
+      .insert(self.runtime_requirements);
+    if self.get_source_map_kind().enabled() {
+      cgr.add(
+        SourceType::JavaScript,
+        OriginalSource::new(self.source_str.clone(), self.identifier.to_string()).boxed(),
+      );
+    } else {
+      cgr.add(
+        SourceType::JavaScript,
+        RawStringSource::from(self.source_str.clone()).boxed(),
+      );
+    };
+    Ok(cgr)
+  }
+
+  async fn get_runtime_hash(
+    &self,
+    compilation: &Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    let mut hasher = RspackHasher::from(&compilation.options.output);
+    self.source_str.hash(&mut hasher);
+    module_update_hash(self, &mut hasher, compilation, runtime);
+    Ok(hasher.digest(&compilation.options.output.hash_digest))
+  }
+
+  fn get_side_effects_connection_state(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _side_effects_state_artifact: &SideEffectsStateArtifact,
+    _module_chain: &mut IdentifierSet,
+    _connection_state_cache: &mut IdentifierMap<ConnectionState>,
+  ) -> ConnectionState {
+    if let Some(side_effect_free) = module_declared_side_effect_free(self) {
+      return ConnectionState::Active(!side_effect_free);
+    }
+    ConnectionState::Active(true)
+  }
+
+  async fn need_build(&self, _context: &NeedBuildContext<'_>) -> Result<bool> {
+    Ok(self.build_meta.frozen().is_none())
   }
 
   async fn build(
-    &mut self,
-    build_context: BuildContext<'_>,
-    _: Option<&Compilation>,
-  ) -> Result<BuildResult> {
-    let mut hasher = RspackHash::from(&build_context.compiler_options.output);
-    self.update_hash(&mut hasher);
-    Ok(BuildResult {
-      build_info: BuildInfo {
-        hash: Some(hasher.digest(&build_context.compiler_options.output.hash_digest)),
-        cacheable: true,
-        ..Default::default()
-      },
-      dependencies: vec![],
-      ..Default::default()
-    })
-  }
-
-  fn code_generation(
-    &self,
-    compilation: &crate::Compilation,
-    _runtime: Option<&RuntimeSpec>,
-    _: Option<ConcatenationScope>,
-  ) -> Result<CodeGenerationResult> {
-    let mut cgr = CodeGenerationResult::default();
-    cgr.runtime_requirements.insert(self.runtime_requirements);
-    cgr.add(SourceType::JavaScript, self.source.clone());
-    cgr.set_hash(
-      &compilation.options.output.hash_function,
-      &compilation.options.output.hash_digest,
-      &compilation.options.output.hash_salt,
-    );
-    Ok(cgr)
+    self: Box<Self>,
+    _build_context: Arc<BuildContext>,
+    _compilation: Option<&Compilation>,
+  ) -> Result<BoxModule> {
+    Ok(BoxModule::new(self))
   }
 }
 
 impl_empty_diagnosable_trait!(RawModule);
-
-impl Hash for RawModule {
-  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    "__rspack_internal__RawModule".hash(state);
-    self.identifier().hash(state);
-    self.source.hash(state);
-  }
-}
-
-impl PartialEq for RawModule {
-  fn eq(&self, other: &Self) -> bool {
-    self.identifier() == other.identifier()
-  }
-}
-
-impl Eq for RawModule {}

@@ -1,0 +1,50 @@
+<%- var("hotWaitingUpdateResolves") %> = Object.create(null);
+<%- fn("jsonpLoadUpdateChunk") %>(chunkId, updatedModulesList, full) {
+	var pending = hotWaitingUpdateResolves[chunkId];
+	// Both files use the same callback and chunk id. Finish one response before
+	// requesting the other so it can be routed to its own staging area.
+	if (pending) return pending.promise.then(function () { return jsonpLoadUpdateChunk(chunkId, updatedModulesList, full); });
+	pending = {};
+	var promise = new Promise(<%- basicFunction("resolve, reject") %> {
+		pending.resolve = function (moreModules, runtime) {
+			hotAddUpdateChunk(chunkId, moreModules, runtime, updatedModulesList, full);
+			resolve();
+		};
+		hotWaitingUpdateResolves[chunkId] = pending;
+		// start update chunk loading
+		var filename = <%- GET_CHUNK_UPDATE_SCRIPT_FILENAME %>(chunkId);
+		var url = <%- PUBLIC_PATH %> + filename + (full ? (/\.mjs$/.test(filename) ? ".full.mjs" : ".full.js") : "");
+		// create error before stack unwound to get useful stacktrace later
+		var error = new Error();
+		var loadingEnded = <%- basicFunction("event") %> {
+			if (hotWaitingUpdateResolves[chunkId] === pending) {
+				hotWaitingUpdateResolves[chunkId] = undefined;
+				var errorType =
+					event && (event.type === 'load' ? 'missing' : event.type);
+				var realSrc = event && event.target && event.target.src;
+				error.message =
+					'Loading hot update chunk ' +
+					chunkId +
+					' failed.\n(' +
+					errorType +
+					': ' +
+					realSrc +
+					')';
+				error.name = 'ChunkLoadError';
+				error.type = errorType;
+				error.request = realSrc;
+				reject(error);
+			}
+		};
+		<%- LOAD_SCRIPT %>(url, loadingEnded);
+	});
+	pending.promise = promise;
+	return promise;
+}
+
+<%- _global_object %>[<%- _hot_update_global %>] = <%- basicFunction("chunkId, moreModules, runtime") %> {
+	if (hotWaitingUpdateResolves[chunkId]) {
+		hotWaitingUpdateResolves[chunkId].resolve(moreModules, runtime);
+		hotWaitingUpdateResolves[chunkId] = undefined;
+	}
+};

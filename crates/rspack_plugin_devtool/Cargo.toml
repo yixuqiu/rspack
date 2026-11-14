@@ -1,27 +1,38 @@
 [package]
-edition    = "2021"
-license    = "MIT"
-name       = "rspack_plugin_devtool"
-repository = "https://github.com/web-infra-dev/rspack"
-version    = "0.1.0"
-
+description       = "rspack devtool plugin"
+edition.workspace = true
+license           = "MIT"
+name              = "rspack_plugin_devtool"
+repository        = "https://github.com/web-infra-dev/rspack"
+version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-trait              = { workspace = true }
-dashmap                  = { workspace = true }
-derivative               = { workspace = true }
+cow-utils                = { workspace = true }
+derive_more              = { workspace = true, features = ["debug"] }
 futures                  = { workspace = true }
-once_cell                = { workspace = true }
-pathdiff                 = { workspace = true }
-rayon                    = { workspace = true }
+itertools                = { workspace = true }
+memchr                   = { workspace = true }
 regex                    = { workspace = true }
-rspack_base64            = { path = "../rspack_base64" }
-rspack_core              = { path = "../rspack_core" }
-rspack_error             = { path = "../rspack_error" }
-rspack_hash              = { path = "../rspack_hash" }
-rspack_hook              = { path = "../rspack_hook" }
-rspack_plugin_javascript = { path = "../rspack_plugin_javascript" }
-rspack_util              = { path = "../rspack_util" }
+rspack_collections       = { workspace = true }
+rspack_core              = { workspace = true }
+rspack_error             = { workspace = true }
+rspack_hash              = { workspace = true }
+rspack_hook              = { workspace = true }
+rspack_parallel          = { workspace = true }
+rspack_paths             = { workspace = true }
+rspack_plugin_javascript = { workspace = true }
+rspack_util              = { workspace = true }
 rustc-hash               = { workspace = true }
-serde_json               = { workspace = true }
+sugar_path               = { workspace = true }
+tracing                  = { workspace = true }
+url                      = { workspace = true }
+
+[package.metadata.cargo-shear]
+ignored = ["tracing"]
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false

@@ -1,41 +1,108 @@
-use rspack_core::{module_namespace_promise, DependencyType, ErrorSpan, ImportDependencyTrait};
-use rspack_core::{AsContextDependency, Dependency};
-use rspack_core::{DependencyCategory, DependencyId, DependencyTemplate};
-use rspack_core::{ModuleDependency, TemplateContext, TemplateReplaceSource};
-use swc_core::ecma::atoms::Atom;
+use std::sync::{Arc, LazyLock};
 
-#[derive(Debug, Clone)]
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsCacheable, AsOption, AsPreset, AsVec},
+};
+use rspack_core::{
+  AsContextDependency, ConnectionState, Dependency, DependencyCategory, DependencyCodeGeneration,
+  DependencyCondition, DependencyConditionFn, DependencyId, DependencyRange, DependencyTemplate,
+  DependencyTemplateType, DependencyType, ExportsInfoArtifact, ImportAttributes, ImportPhase,
+  ModuleDependency, ModuleGraph, ModuleGraphCacheArtifact, ModuleGraphConnection,
+  ReferencedSpecifier, ResourceIdentifier, RuntimeSpec, SideEffectsStateArtifact, TemplateContext,
+  TemplateReplaceSource, UsedByExports, UsedByExportsCondition, create_exports_object_referenced,
+  create_referenced_exports_by_referenced_specifiers,
+};
+
+use super::{ImportEagerDependency, create_resource_identifier_for_esm_dependency};
+use crate::{
+  Atom, connection_active_used_by_exports,
+  dependency::{DependencyBranchGuard, compose_dependency_condition},
+};
+
+#[cacheable]
+#[derive(Debug)]
 pub struct ImportDependency {
-  start: u32,
-  end: u32,
-  id: DependencyId,
+  pub id: DependencyId,
+  #[cacheable(with=AsPreset)]
   request: Atom,
-  span: Option<ErrorSpan>,
-  referenced_exports: Option<Vec<Atom>>,
+  pub range: DependencyRange,
+  #[cacheable(with=AsOption<AsVec<AsCacheable>>)]
+  referenced_specifiers: Option<Vec<ReferencedSpecifier>>,
+  attributes: Option<ImportAttributes>,
+  phase: ImportPhase,
+  pub comments: Vec<(bool, String)>,
+  resource_identifier: ResourceIdentifier,
+  optional: bool,
+  used_by_exports: Option<Arc<UsedByExports>>,
+  #[cacheable(with=AsOption<AsCacheable>)]
+  branch_guard: Option<DependencyBranchGuard>,
 }
 
 impl ImportDependency {
   pub fn new(
-    start: u32,
-    end: u32,
     request: Atom,
-    span: Option<ErrorSpan>,
-    referenced_exports: Option<Vec<Atom>>,
+    range: DependencyRange,
+    attributes: Option<ImportAttributes>,
+    phase: ImportPhase,
+    optional: bool,
+    comments: Vec<(bool, String)>,
   ) -> Self {
+    let resource_identifier =
+      create_resource_identifier_for_esm_dependency(request.as_str(), phase, attributes.as_ref());
     Self {
-      start,
-      end,
       request,
-      span,
+      range,
       id: DependencyId::new(),
-      referenced_exports,
+      referenced_specifiers: None,
+      attributes,
+      phase,
+      resource_identifier,
+      optional,
+      comments,
+      used_by_exports: None,
+      branch_guard: None,
     }
+  }
+
+  pub fn set_referenced_specifiers(
+    &mut self,
+    referenced_specifiers: Vec<ReferencedSpecifier>,
+    from_magic_comment: bool,
+  ) {
+    if !from_magic_comment && referenced_specifiers.is_empty() {
+      // If the referenced specifiers are empty, keep it as default (None), since this dependency can't eliminate by side effects optimization,
+      // so if we set it to Some(vec![]), and the dependency still executes, it will cause runtime error because the exports are all tree shaken.
+      // see test case `tests/rspack-test/configCases/tree-shaking/side-effects-free-dynamic-import`
+      return;
+    }
+    self.referenced_specifiers = Some(referenced_specifiers);
+  }
+
+  pub fn set_branch_guard(&mut self, guard: DependencyBranchGuard) {
+    self.branch_guard = Some(match self.branch_guard.take() {
+      Some(old_guard) => old_guard.and(guard),
+      None => guard,
+    });
+  }
+
+  pub fn set_used_by_exports(&mut self, used_by_exports: Option<Arc<UsedByExports>>) {
+    self.used_by_exports = used_by_exports;
+  }
+
+  pub(super) fn used_by_exports(&self) -> Option<&UsedByExports> {
+    self.used_by_exports.as_deref()
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for ImportDependency {
   fn id(&self) -> &DependencyId {
     &self.id
+  }
+
+  fn resource_identifier(&self) -> Option<&str> {
+    Some(&self.resource_identifier)
   }
 
   fn category(&self) -> &DependencyCategory {
@@ -46,15 +113,59 @@ impl Dependency for ImportDependency {
     &DependencyType::DynamicImport
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    self.span
+  fn get_attributes(&self) -> Option<&ImportAttributes> {
+    self.attributes.as_ref()
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "ImportDependency"
+  fn get_phase(&self) -> ImportPhase {
+    self.phase
+  }
+
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
+  }
+
+  fn get_referenced_exports(
+    &self,
+    module_graph: &rspack_core::ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+    _runtime: Option<&rspack_core::RuntimeSpec>,
+  ) -> Vec<rspack_core::ReferencedExport> {
+    if let Some(referenced_specifiers) = &self.referenced_specifiers {
+      let module = module_graph
+        .get_module_by_dependency_id(&self.id)
+        .expect("should have module");
+      let parent_module = module_graph
+        .get_parent_module(&self.id)
+        .expect("should have parent module");
+      let strict = module_graph
+        .module_by_identifier(parent_module)
+        .expect("should have parent module")
+        .get_strict_esm_module();
+      let exports_type = module.get_exports_type(
+        module_graph,
+        module_graph_cache,
+        exports_info_artifact,
+        strict,
+      );
+      create_referenced_exports_by_referenced_specifiers(
+        referenced_specifiers,
+        exports_type,
+        exports_info_artifact,
+        exports_info_artifact.get_exports_info_data(&module.identifier()),
+      )
+    } else {
+      create_exports_object_referenced()
+    }
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
   }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for ImportDependency {
   fn request(&self) -> &str {
     &self.request
@@ -64,44 +175,119 @@ impl ModuleDependency for ImportDependency {
     &self.request
   }
 
-  fn set_request(&mut self, request: String) {
-    self.request = request.into();
+  fn get_optional(&self) -> bool {
+    self.optional
+  }
+
+  fn get_condition(&self) -> Option<DependencyCondition> {
+    let inner_graph_condition =
+      get_import_dependency_inner_graph_condition(self.used_by_exports.as_deref());
+    compose_dependency_condition(inner_graph_condition, self.branch_guard.as_ref())
   }
 }
 
-impl ImportDependencyTrait for ImportDependency {
-  fn referenced_exports(&self) -> Option<&Vec<Atom>> {
-    self.referenced_exports.as_ref()
-  }
-}
+struct ImportDependencyCondition;
 
-impl DependencyTemplate for ImportDependency {
-  fn apply(
-    &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
-  ) {
-    let module_graph = code_generatable_context.compilation.get_module_graph();
-    let block = module_graph.get_parent_block(&self.id);
-    source.replace(
-      self.start,
-      self.end,
-      module_namespace_promise(
-        code_generatable_context,
-        &self.id,
-        block,
-        &self.request,
-        self.dependency_type().as_str().as_ref(),
-        false,
+static IMPORT_DEPENDENCY_CONDITION: LazyLock<DependencyCondition> =
+  LazyLock::new(|| DependencyCondition::new(ImportDependencyCondition));
+
+pub(super) fn get_import_dependency_inner_graph_condition(
+  used_by_exports: Option<&UsedByExports>,
+) -> Option<DependencyCondition> {
+  used_by_exports
+    // Bool(true) remains active even when a deferred purity check is impure, so wrapping it in a
+    // condition only sends an unconditional connection through runtime condition machinery.
+    .filter(|used_by_exports| {
+      !matches!(
+        used_by_exports.condition(),
+        UsedByExportsCondition::Bool(true)
       )
-      .as_str(),
-      None,
-    );
-  }
+    })
+    .map(|_| IMPORT_DEPENDENCY_CONDITION.clone())
+}
 
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+impl DependencyConditionFn for ImportDependencyCondition {
+  fn get_connection_state(
+    &self,
+    connection: &ModuleGraphConnection,
+    runtime: Option<&RuntimeSpec>,
+    module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> ConnectionState {
+    let dependency = module_graph.dependency_by_id(&connection.dependency_id);
+    let used_by_exports = if let Some(dependency) = dependency.downcast_ref::<ImportDependency>() {
+      dependency.used_by_exports()
+    } else {
+      dependency
+        .downcast_ref::<ImportEagerDependency>()
+        .expect("should be ImportDependency or ImportEagerDependency")
+        .used_by_exports()
+    };
+    ConnectionState::Active(connection_active_used_by_exports(
+      connection,
+      runtime,
+      module_graph,
+      exports_info_artifact,
+      used_by_exports,
+    ))
+  }
+}
+
+#[cacheable_dyn]
+impl DependencyCodeGeneration for ImportDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(ImportDependencyTemplate::template_type())
   }
 }
 
 impl AsContextDependency for ImportDependency {}
+
+#[cacheable]
+#[derive(Debug, Default)]
+pub struct ImportDependencyTemplate;
+
+impl ImportDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::DynamicImport)
+  }
+}
+
+impl DependencyTemplate for ImportDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<ImportDependency>()
+      .expect("ImportDependencyTemplate can only be applied to ImportDependency");
+    let range = dep.range().expect("ImportDependency should have range");
+    let module_graph = code_generatable_context.compilation.get_module_graph();
+    let block = module_graph.get_parent_block(dep.id());
+    let mut content = code_generatable_context
+      .runtime_template
+      .module_namespace_promise(
+        code_generatable_context.compilation,
+        code_generatable_context.module.identifier(),
+        dep.id(),
+        block,
+        dep.request(),
+        dep.dependency_type().as_str(),
+        false,
+        dep.get_phase(),
+      );
+    if dep.get_phase().is_source() {
+      content = format!(
+        "{content}.then({})",
+        code_generatable_context
+          .runtime_template
+          .returning_function("m[\"default\"]", "m")
+      );
+    }
+    source.replace(range.start, range.end, content, None);
+  }
+}

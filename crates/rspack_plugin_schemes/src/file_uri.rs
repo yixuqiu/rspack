@@ -1,9 +1,15 @@
+use std::sync::Arc;
+
 use rspack_core::{
-  ApplyContext, CompilerOptions, ModuleFactoryCreateData, NormalModuleFactoryResolveForScheme,
-  Plugin, PluginContext, ResourceData,
+  Content, ModuleFactoryCreateData, NormalModuleFactoryResolveForScheme, NormalModuleReadResource,
+  Plugin, ResourceData, Scheme,
 };
-use rspack_error::{error, Result};
+use rspack_error::{Result, ToStringResultToRspackResultExt, error};
+use rspack_fs::ReadableFileSystem;
 use rspack_hook::{plugin, plugin_hook};
+use rspack_paths::AssertUtf8;
+#[cfg(all(not(target_family = "wasm"), not(feature = "codspeed")))]
+use tokio::task::spawn_blocking;
 use url::Url;
 
 #[plugin]
@@ -15,47 +21,77 @@ async fn normal_module_factory_resolve_for_scheme(
   &self,
   _data: &mut ModuleFactoryCreateData,
   resource_data: &mut ResourceData,
+  scheme: &Scheme,
 ) -> Result<Option<bool>> {
-  if resource_data.get_scheme().is_file() {
-    let url = Url::parse(&resource_data.resource).map_err(|e| error!(e.to_string()))?;
+  if scheme.is_file() {
+    let url = Url::parse(resource_data.resource()).to_rspack_result()?;
     let path = url
       .to_file_path()
-      .map_err(|_| error!("Failed to get file path of {url}"))?;
+      .map_err(|_| error!("Failed to get file path of {url}"))?
+      .assert_utf8();
     let query = url.query().map(|q| format!("?{q}"));
     let fragment = url.fragment().map(|f| format!("#{f}"));
-    let new_resource_data = ResourceData::new(
-      format!(
-        "{}{}{}",
-        path.to_string_lossy(),
-        query.as_deref().unwrap_or(""),
-        fragment.as_deref().unwrap_or("")
-      ),
+    let resource = format!(
+      "{}{}{}",
       path,
-    )
-    .query_optional(query)
-    .fragment_optional(fragment);
-    *resource_data = new_resource_data;
+      query.as_deref().unwrap_or(""),
+      fragment.as_deref().unwrap_or("")
+    );
+    *resource_data = ResourceData::new_with_path(resource, path, query, fragment);
     return Ok(Some(true));
   }
   Ok(None)
 }
 
-#[async_trait::async_trait]
+#[plugin_hook(NormalModuleReadResource for FileUriPlugin,tracing=false)]
+async fn read_resource(
+  &self,
+  resource_data: &ResourceData,
+  fs: &Arc<dyn ReadableFileSystem>,
+) -> Result<Option<Content>> {
+  let scheme = resource_data.get_scheme();
+  if scheme.is_none()
+    && let Some(resource_path) = resource_data.path()
+    && !resource_path.as_str().is_empty()
+  {
+    let resource_path_owned = resource_path.to_owned();
+    let fs = fs.clone();
+    #[cfg(all(not(target_family = "wasm"), not(feature = "codspeed")))]
+    let result = {
+      // Avoid blocking the Tokio worker thread on native targets.
+      spawn_blocking(move || fs.read_sync(resource_path_owned.as_path()))
+        .await
+        .map_err(|e| error!("{e}, spawn task failed"))?
+    };
+    #[cfg(all(not(target_family = "wasm"), feature = "codspeed"))]
+    // Keep CodSpeed benchmark file reads on the current runtime thread to avoid
+    // Tokio blocking-pool scheduling noise in simulation measurements.
+    let result = fs.read_sync(resource_path_owned.as_path());
+    #[cfg(target_family = "wasm")]
+    // Keep WASI filesystem access on the current thread. Under node:wasi,
+    // blocking workers may observe a different host-side WASI environment.
+    let result = fs.read(resource_path_owned.as_path()).await;
+    let result = result.map_err(|e| error!("{e}, failed to read {resource_path}"))?;
+    return Ok(Some(Content::from(result)));
+  }
+
+  Ok(None)
+}
+
 impl Plugin for FileUriPlugin {
   fn name(&self) -> &'static str {
     "rspack.FileUriPlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
     ctx
-      .context
       .normal_module_factory_hooks
       .resolve_for_scheme
       .tap(normal_module_factory_resolve_for_scheme::new(self));
+    ctx
+      .normal_module_hooks
+      .read_resource
+      .tap(read_resource::new(self));
     Ok(())
   }
 }

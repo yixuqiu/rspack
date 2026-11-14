@@ -1,110 +1,157 @@
-import { AsyncSeriesBailHook, HookMap, SyncHook } from "tapable";
-import util from "util";
-import { Compilation } from "./Compilation";
-import { LoaderContext } from "./config";
+import binding from '@rspack/binding';
+import * as liteTapable from '@rspack/lite-tapable';
+import { type Compilation, getOrCreateCompilationHooks } from './Compilation';
+import type { LoaderContext } from './config';
+import { Module } from './Module';
+import { COMPILATION_HOOKS_MAP_SYMBOL } from './util/symbols';
 
-const compilationHooksMap = new WeakMap<
-	Compilation,
-	{
-		loader: SyncHook<[LoaderContext]>;
-		readResourceForScheme: any;
-		readResource: HookMap<
-			AsyncSeriesBailHook<[LoaderContext], string | Buffer>
-		>;
-	}
->();
+export interface NormalModuleCompilationHooks {
+  loader: liteTapable.SyncHook<[LoaderContext, Module]>;
+  readResource: liteTapable.HookMap<
+    liteTapable.AsyncSeriesBailHook<[LoaderContext], string | Buffer>
+  >;
+}
 
-const createFakeHook = <T extends Record<string, any>>(
-	fakeHook: T,
-	message?: string,
-	code?: string
-): FakeHook<T> => {
-	if (message && code) {
-		fakeHook = deprecateAllProperties(fakeHook, message, code);
-	}
-	return Object.freeze(Object.assign(fakeHook, { _fakeHook: true }));
-};
-type FakeHook<T> = {
-	_fakeHook: true;
-} & T;
-const deprecateAllProperties = <O extends object>(
-	obj: O,
-	message: string,
-	code: string
-) => {
-	const newObj: any = {};
-	const descriptors = Object.getOwnPropertyDescriptors(obj);
-	for (const name of Object.keys(descriptors)) {
-		const descriptor = descriptors[name];
-		if (typeof descriptor.value === "function") {
-			Object.defineProperty(newObj, name, {
-				...descriptor,
-				value: util.deprecate(descriptor.value, message, code)
-			});
-		} else if (descriptor.get || descriptor.set) {
-			Object.defineProperty(newObj, name, {
-				...descriptor,
-				get: descriptor.get && util.deprecate(descriptor.get, message, code),
-				set: descriptor.set && util.deprecate(descriptor.set, message, code)
-			});
-		} else {
-			let value = descriptor.value;
-			Object.defineProperty(newObj, name, {
-				configurable: descriptor.configurable,
-				enumerable: descriptor.enumerable,
-				get: util.deprecate(() => value, message, code),
-				set: descriptor.writable
-					? util.deprecate((v: any) => (value = v), message, code)
-					: undefined
-			});
-		}
-	}
-	return newObj;
-};
-// Actually it is just a NormalModule proxy, used for hooks api alignment
-// Maybe we can 1:1 align to webpack NormalModule once we found a better way to reduce communicate overhead between rust and js
-export class NormalModule {
-	constructor() {}
-	static getCompilationHooks(compilation: Compilation) {
-		if (!(compilation instanceof Compilation)) {
-			throw new TypeError(
-				"The 'compilation' argument must be an instance of Compilation"
-			);
-		}
-		let hooks = compilationHooksMap.get(compilation);
-		if (hooks === undefined) {
-			hooks = {
-				loader: new SyncHook(["loaderContext"]),
-				// beforeLoaders: new SyncHook(["loaders", "module", "loaderContext"]),
-				// beforeParse: new SyncHook(["module"]),
-				// beforeSnapshot: new SyncHook(["module"]),
-				// TODO webpack 6 deprecate
-				readResourceForScheme: new HookMap(scheme => {
-					const hook = hooks!.readResource.for(scheme);
-					return createFakeHook({
-						tap: (options: string, fn: any) =>
-							hook.tap(options, (loaderContext: LoaderContext) =>
-								fn(loaderContext.resource)
-							),
-						tapAsync: (options: string, fn: any) =>
-							hook.tapAsync(
-								options,
-								(loaderContext: LoaderContext, callback: any) =>
-									fn(loaderContext.resource, callback)
-							),
-						tapPromise: (options: string, fn: any) =>
-							hook.tapPromise(options, (loaderContext: LoaderContext) =>
-								fn(loaderContext.resource)
-							)
-					});
-				}),
-				readResource: new HookMap(
-					() => new AsyncSeriesBailHook(["loaderContext"])
-				)
-				// needBuild: new AsyncSeriesBailHook(["module", "context"])
-			};
-			compilationHooksMap.set(compilation, hooks);
-		}
-		return hooks;
-	}
+export class NormalModule extends Module {
+  #resource: string | null = null;
+  #request: string | null = null;
+  #userRequest: string | null = null;
+  #rawRequest: string | null = null;
+  #resourceResolveData: Readonly<binding.JsResourceData> | undefined | null =
+    null;
+  #loaders: binding.JsLoaderItem[] | null = null;
+
+  static readonly #properties: PropertyDescriptorMap = {
+    resource: {
+      enumerable: true,
+      configurable: true,
+      get(this: NormalModule): string {
+        if (this.#resource === null) {
+          this.#resource = binding.normalModuleGetResource(this);
+        }
+        return this.#resource;
+      },
+      set(this: NormalModule, value: string) {
+        this.#resource = value;
+      },
+    },
+    request: {
+      enumerable: true,
+      configurable: true,
+      get(this: NormalModule): string {
+        if (this.#request === null) {
+          this.#request = binding.normalModuleGetRequest(this);
+        }
+        return this.#request;
+      },
+      set(this: NormalModule, value: string) {
+        this.#request = value;
+      },
+    },
+    userRequest: {
+      enumerable: true,
+      configurable: true,
+      get(this: NormalModule): string {
+        if (this.#userRequest === null) {
+          this.#userRequest = binding.normalModuleGetUserRequest(this);
+        }
+        return this.#userRequest;
+      },
+      set(this: NormalModule, value: string) {
+        this.#userRequest = value;
+      },
+    },
+    rawRequest: {
+      enumerable: true,
+      configurable: true,
+      get(this: NormalModule): string {
+        if (this.#rawRequest === null) {
+          this.#rawRequest = binding.normalModuleGetRawRequest(this);
+        }
+        return this.#rawRequest;
+      },
+      set(this: NormalModule, value: string) {
+        this.#rawRequest = value;
+      },
+    },
+    resourceResolveData: {
+      enumerable: true,
+      configurable: true,
+      get(this: NormalModule): Readonly<binding.JsResourceData> | undefined {
+        if (this.#resourceResolveData === null) {
+          this.#resourceResolveData =
+            binding.normalModuleGetResourceResolveData(this);
+        }
+        return this.#resourceResolveData;
+      },
+      set(
+        this: NormalModule,
+        value: Readonly<binding.JsResourceData> | undefined,
+      ) {
+        this.#resourceResolveData = value;
+      },
+    },
+    loaders: {
+      enumerable: true,
+      configurable: true,
+      get(this: NormalModule): binding.JsLoaderItem[] {
+        if (this.#loaders === null) {
+          this.#loaders = binding.normalModuleGetLoaders(this);
+        }
+        return this.#loaders;
+      },
+      set(this: NormalModule, value: binding.JsLoaderItem[]) {
+        this.#loaders = value;
+      },
+    },
+    matchResource: {
+      enumerable: true,
+      configurable: true,
+      get(this: NormalModule): string | undefined {
+        return binding.normalModuleGetMatchResource(this);
+      },
+      set(this: NormalModule, value: string | undefined) {
+        binding.normalModuleSetMatchResource(this, value);
+      },
+    },
+    error: {
+      enumerable: true,
+      configurable: true,
+      get(this: NormalModule): binding.RspackError | undefined {
+        return binding.normalModuleGetError(this);
+      },
+    },
+  };
+
+  declare readonly resource: string;
+  declare readonly request: string;
+  declare readonly userRequest: string;
+  declare readonly rawRequest: string;
+  declare readonly resourceResolveData:
+    Readonly<binding.JsResourceData> | undefined;
+  declare readonly loaders: binding.JsLoaderItem[];
+  declare matchResource: string | undefined;
+  declare readonly error: binding.RspackError | undefined;
+
+  constructor() {
+    super();
+    Object.defineProperties(this, NormalModule.#properties);
+  }
+
+  static getCompilationHooks(
+    compilation: Compilation,
+  ): NormalModuleCompilationHooks {
+    if (!(COMPILATION_HOOKS_MAP_SYMBOL in compilation)) {
+      throw new TypeError(
+        "The 'compilation' argument must be an instance of Compilation",
+      );
+    }
+
+    return getOrCreateCompilationHooks(compilation, compilation, () => ({
+      loader: new liteTapable.SyncHook(['loaderContext', 'module']),
+      readResource: new liteTapable.HookMap(
+        () => new liteTapable.AsyncSeriesBailHook(['loaderContext']),
+      ),
+    }));
+  }
 }

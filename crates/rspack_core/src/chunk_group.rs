@@ -1,21 +1,24 @@
 use std::fmt::{self, Display};
 
 use itertools::Itertools;
-use rspack_database::DatabaseItem;
-use rspack_error::{error, Result};
-use rspack_identifier::IdentifierMap;
-use rustc_hash::FxHashSet as HashSet;
+use rspack_cacheable::cacheable;
+use rspack_collections::IdentifierMap;
+use rspack_error::{Result, error};
+use rspack_hash::{RspackHash, RspackHasher};
+use rspack_util::fx_hash::FxIndexSet;
+use rustc_hash::FxHashSet;
 
 use crate::{
-  get_chunk_from_ukey, Chunk, ChunkByUkey, ChunkGroupByUkey, ChunkGroupUkey, FilenameTemplate,
+  Chunk, ChunkByUkey, ChunkGroupByUkey, ChunkGroupUkey, ChunkLoading, ChunkUkey, Compilation,
+  DependencyLocation, DynamicImportFetchPriority, Filename, LibraryOptions, ModuleIdentifier,
+  ModuleLayer, PublicPath, WasmLoading,
 };
-use crate::{ChunkLoading, ChunkUkey, Compilation};
-use crate::{LibraryOptions, ModuleIdentifier, PublicPath};
 
-impl DatabaseItem for ChunkGroup {
-  fn ukey(&self) -> rspack_database::Ukey<Self> {
-    self.ukey
-  }
+#[derive(Debug, Clone)]
+pub struct OriginRecord {
+  pub module: Option<ModuleIdentifier>,
+  pub loc: Option<DependencyLocation>,
+  pub request: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,26 +27,53 @@ pub struct ChunkGroup {
   pub kind: ChunkGroupKind,
   pub chunks: Vec<ChunkUkey>,
   pub index: Option<u32>,
-  pub parents: HashSet<ChunkGroupUkey>,
-  pub(crate) module_pre_order_indices: IdentifierMap<usize>,
-  pub(crate) module_post_order_indices: IdentifierMap<usize>,
-  pub(crate) children: HashSet<ChunkGroupUkey>,
-  async_entrypoints: HashSet<ChunkGroupUkey>,
+  pub parents: FxHashSet<ChunkGroupUkey>,
+  pub(crate) module_pre_order_indices: IdentifierMap<u32>,
+  pub(crate) module_post_order_indices: IdentifierMap<u32>,
+
+  // keep order for children
+  pub children: FxIndexSet<ChunkGroupUkey>,
+  async_entrypoints: FxHashSet<ChunkGroupUkey>,
   // ChunkGroupInfo
-  pub(crate) next_pre_order_index: usize,
-  pub(crate) next_post_order_index: usize,
+  pub(crate) next_pre_order_index: u32,
+  pub(crate) next_post_order_index: u32,
   // Entrypoint
   pub(crate) runtime_chunk: Option<ChunkUkey>,
-  pub(crate) entry_point_chunk: Option<ChunkUkey>,
+  pub(crate) entrypoint_chunk: Option<ChunkUkey>,
+  origins: Vec<OriginRecord>,
+  pub(crate) is_over_size_limit: Option<bool>,
+}
+
+/// Chunk groups usually hold a handful of modules, so reserving a small amount of
+/// space up front avoids repeated rehashing for the many small groups while the
+/// extra memory stays bounded for large ones.
+const MODULE_ORDER_INDEX_CAPACITY: usize = 16;
+
+impl Default for ChunkGroup {
+  fn default() -> Self {
+    Self::new(ChunkGroupKind::Normal {
+      options: Default::default(),
+    })
+  }
 }
 
 impl ChunkGroup {
+  pub fn ukey(&self) -> ChunkGroupUkey {
+    self.ukey
+  }
+
   pub fn new(kind: ChunkGroupKind) -> Self {
     Self {
       ukey: ChunkGroupUkey::new(),
       chunks: vec![],
-      module_post_order_indices: Default::default(),
-      module_pre_order_indices: Default::default(),
+      module_post_order_indices: IdentifierMap::with_capacity_and_hasher(
+        MODULE_ORDER_INDEX_CAPACITY,
+        Default::default(),
+      ),
+      module_pre_order_indices: IdentifierMap::with_capacity_and_hasher(
+        MODULE_ORDER_INDEX_CAPACITY,
+        Default::default(),
+      ),
       parents: Default::default(),
       children: Default::default(),
       async_entrypoints: Default::default(),
@@ -51,8 +81,10 @@ impl ChunkGroup {
       next_pre_order_index: 0,
       next_post_order_index: 0,
       runtime_chunk: None,
-      entry_point_chunk: None,
+      entrypoint_chunk: None,
       index: None,
+      origins: vec![],
+      is_over_size_limit: None,
     }
   }
 
@@ -60,7 +92,19 @@ impl ChunkGroup {
     self.parents.iter()
   }
 
-  pub fn module_post_order_index(&self, module_identifier: &ModuleIdentifier) -> Option<usize> {
+  pub fn module_pre_order_index(&self, module_identifier: &ModuleIdentifier) -> Option<u32> {
+    // A module could split into another ChunkGroup, which doesn't have the module_post_order_indices of the module
+    self
+      .module_pre_order_indices
+      .get(module_identifier)
+      .copied()
+  }
+
+  pub fn children_iterable(&self) -> impl Iterator<Item = &ChunkGroupUkey> {
+    self.children.iter()
+  }
+
+  pub fn module_post_order_index(&self, module_identifier: &ModuleIdentifier) -> Option<u32> {
     // A module could split into another ChunkGroup, which doesn't have the module_post_order_indices of the module
     self
       .module_post_order_indices
@@ -72,36 +116,69 @@ impl ChunkGroup {
     self
       .chunks
       .iter()
-      .flat_map(|chunk_ukey| {
-        chunk_by_ukey
-          .expect_get(chunk_ukey)
-          .files
-          .iter()
-          .map(|file| file.to_string())
-      })
+      .flat_map(|chunk_ukey| chunk_by_ukey.expect_get(chunk_ukey).files().iter().cloned())
       .collect()
   }
 
   pub(crate) fn connect_chunk(&mut self, chunk: &mut Chunk) {
-    self.chunks.push(chunk.ukey);
+    self.chunks.push(chunk.ukey());
     chunk.add_group(self.ukey);
   }
 
-  pub fn unshift_chunk(&mut self, chunk: &mut Chunk) -> bool {
-    if let Ok(index) = self.chunks.binary_search(&chunk.ukey) {
+  pub fn unshift_chunk(&mut self, chunk: ChunkUkey) -> bool {
+    if let Ok(index) = self.chunks.binary_search(&chunk) {
       if index > 0 {
         self.chunks.remove(index);
-        self.chunks.insert(0, chunk.ukey);
+        self.chunks.insert(0, chunk);
       }
       false
     } else {
-      self.chunks.insert(0, chunk.ukey);
+      self.chunks.insert(0, chunk);
       true
     }
   }
 
   pub fn is_initial(&self) -> bool {
     matches!(self.kind, ChunkGroupKind::Entrypoint { initial, .. } if initial)
+  }
+
+  /// Chunks requested by an import, in loading order.
+  pub fn get_loading_chunks<'a>(
+    &'a self,
+    compilation: &'a Compilation,
+  ) -> impl DoubleEndedIterator<Item = &'a Chunk> {
+    let graph = &compilation.build_chunk_graph_artifact;
+    self
+      .chunks
+      .iter()
+      .map(|key| graph.chunk_by_ukey.expect_get(key))
+      .filter(|chunk| !chunk.has_runtime(&graph.chunk_group_by_ukey) && chunk.id().is_some())
+  }
+
+  /// The last chunk can represent the group unless it also represents a different
+  /// loading plan. Ambiguous groups keep their explicit chunk lists in codegen.
+  pub fn get_hmr_loading_chunk<'a>(&'a self, compilation: &'a Compilation) -> Option<&'a Chunk> {
+    self.kind.get_normal_options()?;
+    let last = self.get_loading_chunks(compilation).next_back()?;
+    let graph = &compilation.build_chunk_graph_artifact;
+    for key in last.groups() {
+      let other = graph.chunk_group_by_ukey.expect_get(key);
+      if other.ukey != self.ukey
+        && other.kind.get_normal_options().is_some()
+        && other
+          .get_loading_chunks(compilation)
+          .next_back()
+          .map(Chunk::ukey)
+          == Some(last.ukey())
+        && !self
+          .get_loading_chunks(compilation)
+          .map(Chunk::ukey)
+          .eq(other.get_loading_chunks(compilation).map(Chunk::ukey))
+      {
+        return None;
+      }
+    }
+    Some(last)
   }
 
   pub fn set_runtime_chunk(&mut self, chunk_ukey: ChunkUkey) {
@@ -117,7 +194,10 @@ impl ChunkGroup {
             return parent.get_runtime_chunk(chunk_group_by_ukey);
           }
         }
-        panic!("Entrypoint should set_runtime_chunk at build_chunk_graph before get_runtime_chunk")
+        panic!(
+          "Entrypoint({:?}) should set_runtime_chunk at build_chunk_graph before get_runtime_chunk",
+          self.name()
+        )
       }),
       ChunkGroupKind::Normal { .. } => {
         unreachable!("Normal chunk group doesn't have runtime chunk")
@@ -125,14 +205,14 @@ impl ChunkGroup {
     }
   }
 
-  pub fn set_entry_point_chunk(&mut self, chunk_ukey: ChunkUkey) {
-    self.entry_point_chunk = Some(chunk_ukey);
+  pub fn set_entrypoint_chunk(&mut self, chunk_ukey: ChunkUkey) {
+    self.entrypoint_chunk = Some(chunk_ukey);
   }
 
-  pub fn get_entry_point_chunk(&self) -> ChunkUkey {
+  pub fn get_entrypoint_chunk(&self) -> ChunkUkey {
     match self.kind {
       ChunkGroupKind::Entrypoint { .. } => self
-        .entry_point_chunk
+        .entrypoint_chunk
         .expect("EntryPoint runtime chunk not set"),
       ChunkGroupKind::Normal { .. } => {
         unreachable!("Normal chunk group doesn't have runtime chunk")
@@ -148,9 +228,9 @@ impl ChunkGroup {
     self.async_entrypoints.iter()
   }
 
-  pub fn ancestors(&self, chunk_group_by_ukey: &ChunkGroupByUkey) -> HashSet<ChunkGroupUkey> {
+  pub fn ancestors(&self, chunk_group_by_ukey: &ChunkGroupByUkey) -> FxHashSet<ChunkGroupUkey> {
     let mut queue = vec![];
-    let mut ancestors = HashSet::default();
+    let mut ancestors = FxHashSet::default();
 
     queue.extend(self.parents.iter().copied());
 
@@ -200,16 +280,16 @@ impl ChunkGroup {
   }
 
   pub fn replace_chunk(&mut self, old_chunk: &ChunkUkey, new_chunk: &ChunkUkey) -> bool {
-    if let Some(runtime_chunk) = self.runtime_chunk {
-      if runtime_chunk == *old_chunk {
-        self.runtime_chunk = Some(*new_chunk);
-      }
+    if let Some(runtime_chunk) = self.runtime_chunk
+      && runtime_chunk == *old_chunk
+    {
+      self.runtime_chunk = Some(*new_chunk);
     }
 
-    if let Some(entry_point_chunk) = self.entry_point_chunk {
-      if entry_point_chunk == *old_chunk {
-        self.entry_point_chunk = Some(*new_chunk);
-      }
+    if let Some(entry_point_chunk) = self.entrypoint_chunk
+      && entry_point_chunk == *old_chunk
+    {
+      self.entrypoint_chunk = Some(*new_chunk);
     }
 
     match self.chunks.iter().position(|x| x == old_chunk) {
@@ -246,19 +326,13 @@ impl ChunkGroup {
       .chunks
       .iter()
       .filter_map(|chunk| {
-        get_chunk_from_ukey(chunk, &compilation.chunk_by_ukey).and_then(|item| item.id.as_ref())
+        compilation
+          .build_chunk_graph_artifact
+          .chunk_by_ukey
+          .get(chunk)
+          .and_then(|item| item.id())
       })
       .join("+")
-  }
-
-  pub fn get_parents<'a>(
-    &'a self,
-    chunk_group_by_ukey: &'a ChunkGroupByUkey,
-  ) -> Vec<&'a ChunkGroup> {
-    self
-      .parents_iterable()
-      .map(|ukey| chunk_group_by_ukey.expect_get(ukey))
-      .collect_vec()
   }
 
   pub fn name(&self) -> Option<&str> {
@@ -275,12 +349,28 @@ impl ChunkGroup {
   }
 
   pub fn add_parent(&mut self, parent_group: ChunkGroupUkey) -> bool {
-    if self.parents.contains(&parent_group) {
-      false
-    } else {
-      self.parents.insert(parent_group);
-      true
-    }
+    self.parents.insert(parent_group)
+  }
+
+  pub fn add_origin(
+    &mut self,
+    module_id: Option<ModuleIdentifier>,
+    loc: Option<DependencyLocation>,
+    request: Option<String>,
+  ) {
+    self.origins.push(OriginRecord {
+      module: module_id,
+      loc,
+      request,
+    });
+  }
+
+  pub fn origins(&self) -> &[OriginRecord] {
+    &self.origins
+  }
+
+  pub fn set_is_over_size_limit(&mut self, v: bool) {
+    self.is_over_size_limit = Some(v);
   }
 }
 
@@ -326,6 +416,7 @@ impl ChunkGroupKind {
   }
 }
 
+#[cacheable]
 #[derive(Debug, Default, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EntryRuntime {
   String(String),
@@ -345,28 +436,41 @@ impl From<String> for EntryRuntime {
   }
 }
 
-impl EntryRuntime {
-  pub fn as_string(&self) -> Option<&str> {
+impl EntryRuntime {}
+
+impl RspackHash for EntryRuntime {
+  fn hash(&self, state: &mut RspackHasher) {
     match self {
-      EntryRuntime::String(s) => Some(s),
-      EntryRuntime::False => None,
+      EntryRuntime::String(s) => s.hash(state),
+      EntryRuntime::False => "false".hash(state),
+    }
+  }
+}
+
+impl Display for EntryRuntime {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      EntryRuntime::String(s) => f.write_str(s),
+      EntryRuntime::False => f.write_str("false"),
     }
   }
 }
 
 // pub type EntryRuntime = String;
-
-#[derive(Debug, Default, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[cacheable]
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq, rspack_hash::RspackHash)]
 pub struct EntryOptions {
   pub name: Option<String>,
   pub runtime: Option<EntryRuntime>,
   pub chunk_loading: Option<ChunkLoading>,
+  pub wasm_loading: Option<WasmLoading>,
   pub async_chunks: Option<bool>,
   pub public_path: Option<PublicPath>,
   pub base_uri: Option<String>,
-  pub filename: Option<FilenameTemplate>,
+  pub filename: Option<Filename>,
   pub library: Option<LibraryOptions>,
   pub depend_on: Option<Vec<String>>,
+  pub layer: Option<ModuleLayer>,
 }
 
 impl EntryOptions {
@@ -385,12 +489,14 @@ impl EntryOptions {
     merge_field!(name);
     merge_field!(runtime);
     merge_field!(chunk_loading);
+    merge_field!(wasm_loading);
     merge_field!(async_chunks);
     merge_field!(public_path);
     merge_field!(base_uri);
     merge_field!(filename);
     merge_field!(library);
     merge_field!(depend_on);
+    merge_field!(layer);
     Ok(())
   }
 
@@ -424,23 +530,27 @@ impl Display for ChunkGroupOrderKey {
   }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cacheable]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, rspack_hash::RspackHash)]
 pub struct ChunkGroupOptions {
   pub name: Option<String>,
-  pub preload_order: Option<u32>,
-  pub prefetch_order: Option<u32>,
+  pub preload_order: Option<i32>,
+  pub prefetch_order: Option<i32>,
+  pub fetch_priority: Option<DynamicImportFetchPriority>,
 }
 
 impl ChunkGroupOptions {
   pub fn new(
     name: Option<String>,
-    preload_order: Option<u32>,
-    prefetch_order: Option<u32>,
+    preload_order: Option<i32>,
+    prefetch_order: Option<i32>,
+    fetch_priority: Option<DynamicImportFetchPriority>,
   ) -> Self {
     Self {
       name,
       preload_order,
       prefetch_order,
+      fetch_priority,
     }
   }
   pub fn name_optional(mut self, name: Option<String>) -> Self {
@@ -449,10 +559,26 @@ impl ChunkGroupOptions {
   }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[cacheable]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupOptions {
   Entrypoint(Box<EntryOptions>),
   ChunkGroup(ChunkGroupOptions),
+}
+
+impl RspackHash for GroupOptions {
+  fn hash(&self, state: &mut RspackHasher) {
+    match self {
+      GroupOptions::Entrypoint(options) => {
+        "entrypoint".hash(state);
+        options.hash(state);
+      }
+      GroupOptions::ChunkGroup(options) => {
+        "chunk-group".hash(state);
+        options.hash(state);
+      }
+    }
+  }
 }
 
 impl GroupOptions {

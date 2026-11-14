@@ -1,0 +1,317 @@
+use std::{
+  borrow::Cow,
+  fmt::{Display, Formatter},
+  sync::atomic::AtomicU32,
+};
+
+use either::Either;
+use rspack_cacheable::{
+  cacheable,
+  with::{AsPreset, AsVec},
+};
+use rspack_hash::RspackHasher;
+use rspack_intern::Atom;
+use rspack_util::{json_stringify, ryu_js};
+use rustc_hash::FxHashSet as HashSet;
+
+use crate::{DependencyId, property_access};
+
+pub static NEXT_EXPORTS_INFO_UKEY: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug, Clone, Hash)]
+pub struct ExportInfoTargetValue {
+  pub dependency: Option<DependencyId>,
+  pub export: Option<Vec<Atom>>,
+  pub priority: u8,
+}
+
+pub enum ProvidedExports {
+  Unknown,
+  ProvidedAll,
+  ProvidedNames(Vec<Atom>),
+}
+
+pub enum UsedExports {
+  Unknown,
+  UsedNamespace(bool),
+  UsedNames(Vec<Atom>),
+}
+
+#[cacheable]
+#[derive(Debug, Clone)]
+pub enum EvaluatedInlinableValue {
+  Null,
+  Undefined,
+  Boolean(bool),
+  Number(f64),
+  String(#[cacheable(with=AsPreset)] Atom),
+}
+
+impl std::hash::Hash for EvaluatedInlinableValue {
+  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    std::mem::discriminant(self).hash(state);
+    match self {
+      EvaluatedInlinableValue::Boolean(v) => {
+        v.hash(state);
+      }
+      EvaluatedInlinableValue::Number(v) => {
+        v.to_bits().hash(state);
+      }
+      EvaluatedInlinableValue::String(atom) => {
+        atom.hash(state);
+      }
+      _ => {}
+    }
+  }
+}
+
+impl rspack_hash::RspackHash for EvaluatedInlinableValue {
+  fn hash(&self, state: &mut RspackHasher) {
+    self.render("").hash(state);
+  }
+}
+
+impl EvaluatedInlinableValue {
+  pub const SHORT_SIZE: usize = 6;
+
+  pub fn new_null() -> Self {
+    Self::Null
+  }
+
+  pub fn new_undefined() -> Self {
+    Self::Undefined
+  }
+
+  pub fn new_boolean(v: bool) -> Self {
+    Self::Boolean(v)
+  }
+
+  pub fn new_number(v: f64) -> Self {
+    Self::Number(v)
+  }
+
+  pub fn new_string(v: Atom) -> Self {
+    Self::String(v)
+  }
+
+  pub fn render(&self, comment: &str) -> String {
+    let mut number_buffer = ryu_js::Buffer::new();
+    let s: Cow<str> = match self {
+      Self::Null => "null".into(),
+      Self::Undefined => "undefined".into(),
+      Self::Boolean(v) => if *v { "true" } else { "false" }.into(),
+      Self::Number(v) => ryu_js::format_number_literal(&mut number_buffer, *v).into(),
+      Self::String(v) => json_stringify(v.as_str()).into(),
+    };
+    format!("({comment}{s})")
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CanInlineUse {
+  // Must have this initial state to get the correct dependency condition of inline value
+  // at flag_dependency_usage_plugin. If it's just bool and the initial state is true like
+  // mangleExports, then the dependency condition of inline value will be false and the
+  // flag_dependency_usage_plugin will not collect the usage of these dependency.
+  HasInfo,
+  Yes,
+  No,
+}
+
+#[derive(Debug, Clone, Hash)]
+pub enum UsedNameItem {
+  Str(Atom),
+  Inlined(EvaluatedInlinableValue),
+}
+
+impl rspack_hash::RspackHash for UsedNameItem {
+  fn hash(&self, state: &mut RspackHasher) {
+    match self {
+      UsedNameItem::Str(value) => value.hash(state),
+      UsedNameItem::Inlined(value) => value.hash(state),
+    }
+  }
+}
+
+#[derive(Debug, Clone, rspack_hash::RspackHash)]
+pub struct InlinedUsedName {
+  value: EvaluatedInlinableValue,
+  suffix: Vec<Atom>,
+}
+
+impl InlinedUsedName {
+  pub fn new(value: EvaluatedInlinableValue) -> Self {
+    Self {
+      value,
+      suffix: Vec::new(),
+    }
+  }
+
+  pub fn render(&self, comment: &str) -> String {
+    let mut inlined = self.value.render(comment);
+    inlined.push_str(&property_access(&self.suffix, 0));
+    inlined
+  }
+
+  pub fn inlined_value(&self) -> &EvaluatedInlinableValue {
+    &self.value
+  }
+
+  pub fn suffix_ids(&self) -> &[Atom] {
+    &self.suffix
+  }
+}
+
+#[derive(Debug, Clone)]
+pub enum UsedName {
+  Normal(Vec<Atom>),
+  Inlined(InlinedUsedName),
+}
+
+impl UsedName {
+  pub fn append(&mut self, item: impl IntoIterator<Item = Atom>) {
+    match self {
+      UsedName::Normal(vec) => vec.extend(item),
+      UsedName::Inlined(inlined) => inlined.suffix.extend(item),
+    }
+  }
+}
+
+#[derive(Debug, Hash, Clone, Copy)]
+pub enum ExportProvided {
+  /// The export can be statically analyzed, and it is provided
+  Provided,
+  /// The export can be statically analyzed, and the it is not provided
+  NotProvided,
+  /// The export is unknown, we don't know if module really has this export, eg. cjs module
+  Unknown,
+}
+
+impl rspack_hash::RspackHash for ExportProvided {
+  fn hash(&self, state: &mut RspackHasher) {
+    self.as_str().hash(state);
+  }
+}
+
+impl Display for ExportProvided {
+  fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+impl ExportProvided {
+  fn as_str(&self) -> &'static str {
+    match self {
+      ExportProvided::Provided => "provided",
+      ExportProvided::NotProvided => "not-provided",
+      ExportProvided::Unknown => "unknown",
+    }
+  }
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Default, Clone)]
+pub struct UsageKey(pub Vec<Either<Box<UsageKey>, UsageState>>);
+
+impl UsageKey {
+  pub fn add(&mut self, value: Either<Box<UsageKey>, UsageState>) {
+    self.0.push(value);
+  }
+}
+
+#[derive(Debug, PartialEq, Copy, Clone, Default, Hash, PartialOrd, Ord, Eq)]
+pub enum UsageState {
+  Unused = 0,
+  OnlyPropertiesUsed = 1,
+  NoInfo = 2,
+  #[default]
+  Unknown = 3,
+  Used = 4,
+}
+
+impl rspack_hash::RspackHash for UsageState {
+  fn hash(&self, state: &mut RspackHasher) {
+    self.as_str().hash(state);
+  }
+}
+
+impl Display for UsageState {
+  fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+impl UsageState {
+  fn as_str(&self) -> &'static str {
+    match self {
+      UsageState::Unused => "unused",
+      UsageState::OnlyPropertiesUsed => "only-properties-used",
+      UsageState::NoInfo => "no-info",
+      UsageState::Unknown => "unknown",
+      UsageState::Used => "used",
+    }
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsedByExports {
+  condition: UsedByExportsCondition,
+  #[cacheable(with=AsVec)]
+  deferred_pure_checks: Vec<UsedByExportsDeferredPureCheck>,
+}
+
+impl UsedByExports {
+  pub fn set(exports: HashSet<Atom>) -> Self {
+    Self {
+      condition: UsedByExportsCondition::Set(exports),
+      deferred_pure_checks: Vec::new(),
+    }
+  }
+
+  pub fn bool(used: bool) -> Self {
+    Self {
+      condition: UsedByExportsCondition::Bool(used),
+      deferred_pure_checks: Vec::new(),
+    }
+  }
+
+  pub fn with_deferred_pure_checks(
+    mut self,
+    deferred_pure_checks: Vec<UsedByExportsDeferredPureCheck>,
+  ) -> Self {
+    self.deferred_pure_checks = deferred_pure_checks;
+    self
+  }
+
+  pub fn condition(&self) -> &UsedByExportsCondition {
+    &self.condition
+  }
+
+  pub fn deferred_pure_checks(&self) -> &[UsedByExportsDeferredPureCheck] {
+    &self.deferred_pure_checks
+  }
+
+  pub fn has_deferred_pure_checks(&self) -> bool {
+    !self.deferred_pure_checks.is_empty()
+  }
+
+  pub fn is_false_without_deferred_pure_checks(&self) -> bool {
+    matches!(&self.condition, UsedByExportsCondition::Bool(false))
+      && !self.has_deferred_pure_checks()
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsedByExportsCondition {
+  Set(#[cacheable(with=AsVec<AsPreset>)] HashSet<Atom>),
+  Bool(bool),
+}
+
+#[cacheable]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UsedByExportsDeferredPureCheck {
+  pub dep_id: DependencyId,
+  #[cacheable(with=AsPreset)]
+  pub atom: Atom,
+}

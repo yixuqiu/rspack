@@ -1,92 +1,93 @@
-export { RspackBuiltinPlugin } from "./base";
-
-export * from "./DefinePlugin";
-export * from "./ProvidePlugin";
-export * from "./BannerPlugin";
-export * from "./IgnorePlugin";
-export * from "./ProgressPlugin";
-export * from "./EntryPlugin";
-export * from "./DynamicEntryPlugin";
-export * from "./ExternalsPlugin";
-export * from "./NodeTargetPlugin";
-export * from "./ElectronTargetPlugin";
-export * from "./HttpExternalsRspackPlugin";
-export * from "./EnableChunkLoadingPlugin";
-export * from "./EnableLibraryPlugin";
-export * from "./EnableWasmLoadingPlugin";
-export * from "./ChunkPrefetchPreloadPlugin";
-export * from "./ArrayPushCallbackChunkFormatPlugin";
-export * from "./CommonJsChunkFormatPlugin";
-export * from "./ModuleChunkFormatPlugin";
-export * from "./HotModuleReplacementPlugin";
-export * from "./WebWorkerTemplatePlugin";
-export * from "./WorkerPlugin";
-export * from "./LimitChunkCountPlugin";
-export * from "./MergeDuplicateChunksPlugin";
-export * from "./SplitChunksPlugin";
-export * from "./NamedModuleIdsPlugin";
-export * from "./DeterministicModuleIdsPlugin";
-export * from "./NamedChunkIdsPlugin";
-export * from "./DeterministicChunkIdsPlugin";
-export * from "./RealContentHashPlugin";
-export * from "./RemoveEmptyChunksPlugin";
-export * from "./EnsureChunkConditionsPlugin";
-export * from "./WarnCaseSensitiveModulesPlugin";
-export * from "./DataUriPlugin";
-export * from "./FileUriPlugin";
-export * from "./RuntimePlugin";
-export * from "./JsonModulesPlugin";
-export * from "./InferAsyncModulesPlugin";
-export * from "./JavascriptModulesPlugin";
-export * from "./AsyncWebAssemblyModulesPlugin";
-export * from "./AssetModulesPlugin";
-export * from "./SourceMapDevToolPlugin";
-export * from "./EvalSourceMapDevToolPlugin";
-export * from "./EvalDevToolModulePlugin";
-export * from "./SideEffectsFlagPlugin";
-export * from "./FlagDependencyExportsPlugin";
-export * from "./FlagDependencyUsagePlugin";
-export * from "./MangleExportsPlugin";
-export * from "./BundlerInfoRspackPlugin";
-export * from "./ModuleConcatenationPlugin";
-export * from "./CssModulesPlugin";
-export * from "./APIPlugin";
-export * from "./RuntimeChunkPlugin";
-
-export * from "./HtmlRspackPlugin";
-export * from "./CopyRspackPlugin";
-export * from "./SwcJsMinimizerPlugin";
-export * from "./SwcCssMinimizerPlugin";
-
-export * from "./JsLoaderRspackPlugin";
-export * from "./css-extract";
-
-///// DEPRECATED /////
-import { RawBuiltins } from "@rspack/binding";
-import { RspackOptionsNormalized } from "..";
-
-function resolveTreeShaking(
-	treeShaking: Builtins["treeShaking"],
-	production: boolean
-): string {
-	return treeShaking !== undefined
-		? treeShaking.toString()
-		: production
-			? "true"
-			: "false";
-}
-
-export interface Builtins {
-	treeShaking?: boolean | "module";
-}
-
-export function deprecated_resolveBuiltins(
-	builtins: Builtins,
-	options: RspackOptionsNormalized
-): RawBuiltins {
-	const production = options.mode === "production" || !options.mode;
-
-	return {
-		treeShaking: resolveTreeShaking(builtins.treeShaking, production)
-	};
-}
+export * from './APIPlugin';
+export * from './ArrayPushCallbackChunkFormatPlugin';
+export * from './AssetModulesPlugin';
+export * from './AsyncWebAssemblyModulesPlugin';
+export * from './BannerPlugin';
+export * from './BundlerInfoRspackPlugin';
+export { createNativePlugin } from './base';
+export * from './CaseSensitivePlugin';
+export * from './ChunkPrefetchPreloadPlugin';
+export * from './CircularModulesInfoPlugin';
+export * from './CircularCheckRspackPlugin';
+export * from './CircularDependencyRspackPlugin';
+export * from './CommonJsChunkFormatPlugin';
+export * from './CompactHashedChunkIdsPlugin';
+export * from './CompactHashedModuleIdsPlugin';
+export * from './ContextReplacementPlugin';
+export * from './CopyRspackPlugin';
+export * from './CssChunkingPlugin';
+export * from './CssHttpExternalsRspackPlugin';
+export * from './CssModulesPlugin';
+export * from './css-extract/index';
+export * from './DataUriPlugin';
+export * from './DefinePlugin';
+export * from './DeterministicChunkIdsPlugin';
+export * from './DeterministicModuleIdsPlugin';
+export * from './DllEntryPlugin';
+export * from './DllReferenceAgencyPlugin';
+export * from './DynamicEntryPlugin';
+export * from './ElectronTargetPlugin';
+export * from './EnableChunkLoadingPlugin';
+export * from './EnableLibraryPlugin';
+export * from './EnableWasmLoadingPlugin';
+export * from './EnsureChunkConditionsPlugin';
+export * from './EntryPlugin';
+export * from './EsmLibraryPlugin';
+export * from './EsmNodeTargetPlugin';
+export * from './EvalDevToolModulePlugin';
+export * from './EvalSourceMapDevToolPlugin';
+export * from './ExternalsPlugin';
+export * from './FetchCompileAsyncWasmPlugin';
+export * from './FileUriPlugin';
+export * from './FlagDependencyExportsPlugin';
+export * from './FlagDependencyUsagePlugin';
+export * from './HashedModuleIdsPlugin';
+export * from './HotModuleReplacementPlugin';
+export * from './HttpExternalsRspackPlugin';
+export * from './HttpUriPlugin';
+export * from './html-plugin/index';
+export * from './IgnorePlugin';
+export * from './InferAsyncModulesPlugin';
+export * from './ImportedByDeferModulesPlugin';
+export * from './InlineExportsPlugin';
+export * from './JavascriptModulesPlugin';
+export * from './JsLoaderRspackPlugin';
+export * from './JsonModulesPlugin';
+export * from './LibManifestPlugin';
+export * from './LightningCssMinimizerRspackPlugin';
+export * from './LightningCssMinimizerRspackPlugin';
+export * from './LimitChunkCountPlugin';
+export * from './lazy-compilation/middleware';
+export * from './MangleExportsPlugin';
+export * from './MergeDuplicateChunksPlugin';
+export * from './ModuleChunkFormatPlugin';
+export * from './ModuleConcatenationPlugin';
+export * from './ModuleInfoHeaderPlugin';
+export * from './NamedChunkIdsPlugin';
+export * from './NamedModuleIdsPlugin';
+export * from './NaturalChunkIdsPlugin';
+export * from './NaturalModuleIdsPlugin';
+export * from './NodeTargetPlugin';
+export * from './NoEmitOnErrorsPlugin';
+export * from './NormalModuleReplacementPlugin';
+export * from './OccurrenceChunkIdsPlugin';
+export * from './ProgressPlugin';
+export * from './ProvidePlugin';
+export * from './RealContentHashPlugin';
+export * from './RemoveDuplicateModulesPlugin';
+export * from './RemoveEmptyChunksPlugin';
+export * from './RsdoctorPlugin';
+export * from './RslibPlugin';
+export * from './RstestPlugin';
+export * from './RuntimeChunkPlugin';
+export * from './RuntimePlugin';
+export { rsc } from './rsc';
+export * from './SideEffectsFlagPlugin';
+export * from './SizeLimitsPlugin';
+export * from './SourceMapDevToolPlugin';
+export * from './SplitChunksPlugin';
+export * from './SubresourceIntegrityPlugin';
+export * from './SwcJsMinimizerPlugin';
+export * from './SyncModuleIdsPlugin';
+export * from './URLPlugin';
+export * from './WorkerPlugin';

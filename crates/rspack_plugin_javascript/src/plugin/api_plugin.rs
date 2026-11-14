@@ -1,49 +1,18 @@
-use std::sync::Arc;
+#![allow(clippy::too_many_arguments)]
 
 use rspack_core::{
-  ApplyContext, Compilation, CompilationParams, CompilerCompilation, CompilerOptions,
-  InitFragmentExt, InitFragmentKey, InitFragmentStage, NormalInitFragment, Plugin, PluginContext,
+  ChunkInitFragments, ChunkUkey, Compilation, CompilationParams, CompilerCompilation,
+  InitFragmentExt, InitFragmentKey, InitFragmentStage, Module, NormalInitFragment, Plugin,
+  RuntimeCodeTemplate, RuntimeGlobals,
 };
 use rspack_error::Result;
 use rspack_hook::{plugin, plugin_hook};
 
-use crate::{
-  JavascriptModulesPluginPlugin, JsPlugin, PluginRenderJsModuleContentOutput,
-  RenderJsModuleContentArgs,
-};
-
-#[derive(Debug, Default)]
-struct APIJavascriptModulesPluginPlugin;
-
-impl JavascriptModulesPluginPlugin for APIJavascriptModulesPluginPlugin {
-  fn render_module_content<'a>(
-    &'a self,
-    mut args: RenderJsModuleContentArgs<'a>,
-  ) -> PluginRenderJsModuleContentOutput<'a> {
-    if let Some(build_info) = &args.module.build_info()
-      && build_info.need_create_require
-    {
-      args.chunk_init_fragments.push(
-        NormalInitFragment::new(
-          "import { createRequire as __WEBPACK_EXTERNAL_createRequire } from 'module';\n"
-            .to_string(),
-          InitFragmentStage::StageHarmonyImports,
-          0,
-          InitFragmentKey::ExternalModule("node-commonjs".to_string()),
-          None,
-        )
-        .boxed(),
-      );
-    }
-    Ok(args)
-  }
-}
+use crate::{JavascriptModulesRenderModuleContent, JsPlugin, RenderSource};
 
 #[plugin]
 #[derive(Debug, Default)]
-pub struct APIPlugin {
-  js_plugin: Arc<APIJavascriptModulesPluginPlugin>,
-}
+pub struct APIPlugin;
 
 #[plugin_hook(CompilerCompilation for APIPlugin)]
 async fn compilation(
@@ -51,8 +20,57 @@ async fn compilation(
   compilation: &mut Compilation,
   _params: &mut CompilationParams,
 ) -> Result<()> {
-  let mut drive = JsPlugin::get_compilation_drives_mut(compilation);
-  drive.add_plugin(self.js_plugin.clone());
+  let hooks = JsPlugin::get_compilation_hooks_mut(compilation.id());
+  hooks
+    .write()
+    .await
+    .render_module_content
+    .tap(render_module_content::new(self));
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesRenderModuleContent for APIPlugin,tracing=false)]
+async fn render_module_content(
+  &self,
+  compilation: &Compilation,
+  _chunk_ukey: &ChunkUkey,
+  module: &dyn Module,
+  _source: &mut RenderSource,
+  _runtime_requirements: &mut RuntimeGlobals,
+  init_fragments: &mut ChunkInitFragments,
+  _runtime_template: &RuntimeCodeTemplate,
+) -> Result<()> {
+  if module.build_info().need_create_require {
+    let need_prefix = compilation
+      .options
+      .output
+      .environment
+      .supports_node_prefix_for_core_modules();
+
+    init_fragments.push(
+      NormalInitFragment::new(
+        format!(
+          "import {{ createRequire as __rspack_createRequire }} from \"{}\";\n{} __rspack_createRequire_require = __rspack_createRequire({}.url);\n",
+          if need_prefix { "node:module" } else { "module" },
+          if compilation.options.output.environment.supports_const() {
+            "const"
+          } else {
+            "var"
+          },
+          compilation.options.output.import_meta_name
+        ),
+        InitFragmentStage::StageESMImports,
+        0,
+        InitFragmentKey::ModuleExternal("node-commonjs".to_string()),
+        None,
+      )
+      .with_top_level_decl_symbols(vec![
+        "__rspack_createRequire".into(),
+        "__rspack_createRequire_require".into(),
+      ])
+      .boxed(),
+    );
+  }
   Ok(())
 }
 
@@ -61,16 +79,8 @@ impl Plugin for APIPlugin {
     "rspack.APIPlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
-    ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
     Ok(())
   }
 }

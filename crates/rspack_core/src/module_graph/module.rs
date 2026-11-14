@@ -1,104 +1,107 @@
-use rustc_hash::FxHashSet as HashSet;
+use std::fmt;
 
-use crate::ExportsInfoId;
-use crate::{
-  module_graph::ConnectionId, ChunkGraph, DependencyId, ModuleIdentifier, ModuleIssuer,
-  ModuleProfile, ModuleSyntax, ModuleType,
-};
+use rspack_cacheable::{cacheable, with::Skip};
+use rustc_hash::FxHashSet;
 
+use crate::{DependencyId, ModuleGraphConnectionId, ModuleIdentifier, ModuleIssuer};
+
+#[cacheable]
+#[derive(Debug, Clone)]
+pub enum OptimizationBailoutItem {
+  Message(String),
+  SideEffects {
+    node_type: String,
+    loc: String,
+    short_id: String,
+  },
+}
+
+impl fmt::Display for OptimizationBailoutItem {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Message(msg) => write!(f, "{msg}"),
+      Self::SideEffects {
+        node_type,
+        loc,
+        short_id,
+      } => {
+        write!(
+          f,
+          "{node_type} with side_effects in source code at {short_id}:{loc}"
+        )
+      }
+    }
+  }
+}
+
+#[cacheable]
 #[derive(Debug, Clone)]
 pub struct ModuleGraphModule {
   // edges from module to module
-  outgoing_connections: HashSet<ConnectionId>,
-  incoming_connections: HashSet<ConnectionId>,
+  outgoing_connections: FxHashSet<ModuleGraphConnectionId>,
+  // incoming connections will regenerate by persistent cache recovery.
+  #[cacheable(with=Skip)]
+  incoming_connections: FxHashSet<ModuleGraphConnectionId>,
 
   issuer: ModuleIssuer,
 
   // pub exec_order: usize,
   pub module_identifier: ModuleIdentifier,
-  // TODO remove this since its included in module
-  pub module_type: ModuleType,
-  // TODO: remove this once we drop old treeshaking
-  pub(crate) __deprecated_all_dependencies: Vec<DependencyId>,
+  // an quick way to get a module's all dependencies (including its blocks' dependencies)
+  // and it is ordered by dependency creation order
+  all_dependencies: Vec<DependencyId>,
   pub(crate) pre_order_index: Option<u32>,
   pub post_order_index: Option<u32>,
-  pub module_syntax: ModuleSyntax,
-  pub exports: ExportsInfoId,
-  pub profile: Option<Box<ModuleProfile>>,
-  pub is_async: bool,
   pub depth: Option<usize>,
-  pub optimization_bailout: Vec<String>,
+  pub optimization_bailout: Vec<OptimizationBailoutItem>,
 }
 
 impl ModuleGraphModule {
-  pub fn new(
-    module_identifier: ModuleIdentifier,
-    module_type: ModuleType,
-    exports_info_id: ExportsInfoId,
-  ) -> Self {
+  pub fn new(module_identifier: ModuleIdentifier) -> Self {
     Self {
       outgoing_connections: Default::default(),
       incoming_connections: Default::default(),
       issuer: ModuleIssuer::Unset,
       // exec_order: usize::MAX,
       module_identifier,
-      __deprecated_all_dependencies: Default::default(),
-      module_type,
+      all_dependencies: Default::default(),
       pre_order_index: None,
       post_order_index: None,
-      module_syntax: ModuleSyntax::empty(),
-      exports: exports_info_id,
-      profile: None,
-      is_async: false,
       depth: None,
       optimization_bailout: vec![],
     }
   }
 
-  pub fn id<'chunk_graph>(&self, chunk_graph: &'chunk_graph ChunkGraph) -> &'chunk_graph str {
-    let c = chunk_graph.get_module_id(self.module_identifier).as_ref();
-    c.unwrap_or_else(|| panic!("{} module id not found", self.module_identifier))
-      .as_str()
-  }
-
-  pub fn add_incoming_connection(&mut self, connection_id: ConnectionId) {
+  pub fn add_incoming_connection(&mut self, connection_id: ModuleGraphConnectionId) {
     self.incoming_connections.insert(connection_id);
   }
 
-  pub fn remove_incoming_connection(&mut self, connection_id: &ConnectionId) {
+  pub fn remove_incoming_connection(&mut self, connection_id: &ModuleGraphConnectionId) {
     self.incoming_connections.remove(connection_id);
   }
 
-  pub fn add_outgoing_connection(&mut self, connection_id: ConnectionId) {
+  pub fn add_outgoing_connection(&mut self, connection_id: ModuleGraphConnectionId) {
     self.outgoing_connections.insert(connection_id);
   }
 
-  pub fn remove_outgoing_connection(&mut self, connection_id: &ConnectionId) {
+  pub fn remove_outgoing_connection(&mut self, connection_id: &ModuleGraphConnectionId) {
     self.outgoing_connections.remove(connection_id);
   }
 
-  pub fn incoming_connections(&self) -> &HashSet<ConnectionId> {
+  pub fn incoming_connections(&self) -> &FxHashSet<ModuleGraphConnectionId> {
     &self.incoming_connections
   }
 
-  pub fn outgoing_connections(&self) -> &HashSet<ConnectionId> {
+  pub fn outgoing_connections(&self) -> &FxHashSet<ModuleGraphConnectionId> {
     &self.outgoing_connections
   }
 
-  pub fn get_incoming_connections_unordered(&self) -> &HashSet<ConnectionId> {
-    &self.incoming_connections
+  pub fn all_dependencies(&self) -> &[DependencyId] {
+    &self.all_dependencies
   }
 
-  pub fn get_outgoing_connections_unordered(&self) -> &HashSet<ConnectionId> {
-    &self.outgoing_connections
-  }
-
-  pub fn set_profile(&mut self, profile: Box<ModuleProfile>) {
-    self.profile = Some(profile);
-  }
-
-  pub fn get_profile(&self) -> Option<&ModuleProfile> {
-    self.profile.as_deref()
+  pub(crate) fn all_dependencies_mut(&mut self) -> &mut Vec<DependencyId> {
+    &mut self.all_dependencies
   }
 
   pub fn set_issuer_if_unset(&mut self, issuer: Option<ModuleIdentifier>) {
@@ -111,11 +114,11 @@ impl ModuleGraphModule {
     self.issuer = issuer;
   }
 
-  pub fn get_issuer(&self) -> &ModuleIssuer {
+  pub fn issuer(&self) -> &ModuleIssuer {
     &self.issuer
   }
 
-  pub(crate) fn optimization_bailout_mut(&mut self) -> &mut Vec<String> {
+  pub(crate) fn optimization_bailout_mut(&mut self) -> &mut Vec<OptimizationBailoutItem> {
     &mut self.optimization_bailout
   }
 }

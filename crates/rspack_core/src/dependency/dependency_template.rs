@@ -1,48 +1,83 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
-use dyn_clone::{clone_trait_object, DynClone};
-use rspack_sources::{BoxSource, ReplaceSource};
+use rspack_cacheable::cacheable_dyn;
+use rspack_hash::RspackHasher;
+use rspack_sources::ReplaceSource;
 use rspack_util::ext::AsAny;
 
 use crate::{
-  AsDependency, Compilation, ConcatenationScope, DependencyId, Module, ModuleInitFragments,
-  RuntimeGlobals, RuntimeSpec,
+  ChunkInitFragments, CodeGenerationData, CodeGenerationDataChunkInitFragments, Compilation,
+  ConcatenationScope, DependencyType, Module, ModuleCodeTemplate, ModuleInitFragments, RuntimeSpec,
 };
 
-pub struct TemplateContext<'a, 'b, 'c> {
+pub struct TemplateContext<'a, 'b> {
   pub compilation: &'a Compilation,
   pub module: &'a dyn Module,
-  pub runtime_requirements: &'a mut RuntimeGlobals,
-  pub init_fragments: &'a mut ModuleInitFragments<'b>,
+  pub init_fragments: &'a mut ModuleInitFragments,
   pub runtime: Option<&'a RuntimeSpec>,
-  pub concatenation_scope: Option<&'c mut ConcatenationScope>,
+  pub concatenation_scope: Option<&'b mut ConcatenationScope>,
+  pub data: &'a mut CodeGenerationData,
+  pub runtime_template: &'a mut ModuleCodeTemplate,
 }
 
-pub type TemplateReplaceSource = ReplaceSource<BoxSource>;
+impl TemplateContext<'_, '_> {
+  pub fn chunk_init_fragments(&mut self) -> &mut ChunkInitFragments {
+    if !self.data.contains::<CodeGenerationDataChunkInitFragments>() {
+      self
+        .data
+        .insert(CodeGenerationDataChunkInitFragments::default());
+    }
+    self
+      .data
+      .get_mut::<CodeGenerationDataChunkInitFragments>()
+      .expect("chunk init fragments should exist")
+      .inner_mut()
+  }
+}
 
-clone_trait_object!(DependencyTemplate);
+pub type TemplateReplaceSource = ReplaceSource;
 
-// Align with https://github.com/webpack/webpack/blob/671ac29d462e75a10c3fdfc785a4c153e41e749e/lib/DependencyTemplate.js
-pub trait DependencyTemplate: Debug + DynClone + Sync + Send + AsDependency + AsAny {
-  fn apply(
+// Align with https://github.com/webpack/webpack/blob/671ac29d462e75a10c3fdfc785a4c153e41e749e/lib/DependencyCodeGeneration.js
+#[cacheable_dyn]
+pub trait DependencyCodeGeneration: Debug + Sync + Send + AsAny {
+  fn update_hash(
     &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
-  );
+    _hasher: &mut RspackHasher,
+    _compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+  ) {
+  }
 
-  fn dependency_id(&self) -> Option<DependencyId>;
-}
-
-pub type BoxDependencyTemplate = Box<dyn DependencyTemplate>;
-
-pub trait AsDependencyTemplate {
-  fn as_dependency_template(&self) -> Option<&dyn DependencyTemplate> {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
     None
   }
 }
 
-impl<T: DependencyTemplate> AsDependencyTemplate for T {
-  fn as_dependency_template(&self) -> Option<&dyn DependencyTemplate> {
+pub type DependencyCodeGenerationRef = Arc<dyn DependencyCodeGeneration>;
+
+pub trait AsDependencyCodeGeneration {
+  fn as_dependency_code_generation(&self) -> Option<&dyn DependencyCodeGeneration> {
+    None
+  }
+}
+
+impl<T: DependencyCodeGeneration> AsDependencyCodeGeneration for T {
+  fn as_dependency_code_generation(&self) -> Option<&dyn DependencyCodeGeneration> {
     Some(self)
   }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum DependencyTemplateType {
+  Dependency(DependencyType),
+  Custom(&'static str),
+}
+
+pub trait DependencyTemplate: Debug + Sync + Send {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut ReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  );
 }

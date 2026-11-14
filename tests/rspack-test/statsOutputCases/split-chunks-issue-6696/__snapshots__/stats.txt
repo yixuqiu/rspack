@@ -1,0 +1,12 @@
+default:
+  Entrypoint main xx KiB = main.js
+  chunk (runtime: main) async-b.js (async-b) xx bytes <{889}> [rendered]
+    > ./b ./index.js 3:1-48
+    ./b.js xx bytes [built] [code generated]
+  chunk (runtime: main) async-a.js (async-a) xx bytes <{889}> [rendered]
+    > ./a ./index.js 2:1-48
+    ./a.js xx bytes [built] [code generated]
+  chunk (runtime: main) main.js (main) xx bytes (javascript) xx KiB (runtime) >{701}< >{724}< [entry] [rendered]
+    > ./ main
+    ./index.js xx bytes [built] [code generated]
+  default (Rspack x.x.x) compiled successfully

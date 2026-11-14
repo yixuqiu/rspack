@@ -1,41 +1,60 @@
+use rspack_cacheable::{cacheable, cacheable_dyn};
 use rspack_core::{
-  module_id, AsContextDependency, Dependency, DependencyCategory, DependencyId, DependencyTemplate,
-  DependencyType, ErrorSpan, ExtendedReferencedExport, ModuleDependency, ModuleGraph, RuntimeSpec,
-  TemplateContext, TemplateReplaceSource,
+  AsContextDependency, Context, Dependency, DependencyCategory, DependencyCodeGeneration,
+  DependencyId, DependencyRange, DependencyTemplate, DependencyTemplateType, DependencyType,
+  ExportsInfoArtifact, ModuleDependency, ModuleGraph, ModuleGraphCacheArtifact, ReferencedExport,
+  ResourceIdentifier, RuntimeSpec, TemplateContext, TemplateReplaceSource,
 };
 
-#[derive(Debug, Clone)]
+use super::create_resource_identifier_for_contextual_commonjs_dependency;
+
+#[cacheable]
+#[derive(Debug)]
 pub struct RequireResolveDependency {
-  pub start: u32,
-  pub end: u32,
   pub id: DependencyId,
   pub request: String,
   pub weak: bool,
-  span: ErrorSpan,
+  range: DependencyRange,
   optional: bool,
+  context: Option<Context>,
+  resource_identifier: ResourceIdentifier,
 }
 
 impl RequireResolveDependency {
-  pub fn new(
-    start: u32,
-    end: u32,
-    request: String,
-    weak: bool,
-    span: ErrorSpan,
-    optional: bool,
-  ) -> Self {
+  pub fn new(request: String, range: DependencyRange, weak: bool, optional: bool) -> Self {
     Self {
-      start,
-      end,
+      range,
       request,
       weak,
-      span,
-      id: DependencyId::new(),
       optional,
+      id: DependencyId::new(),
+      context: None,
+      resource_identifier: Default::default(),
+    }
+  }
+
+  pub fn new_contextual(
+    request: String,
+    range: DependencyRange,
+    weak: bool,
+    optional: bool,
+    context: Context,
+  ) -> Self {
+    let resource_identifier = create_resource_identifier_for_contextual_commonjs_dependency(
+      "require.resolve",
+      &context,
+      &request,
+    )
+    .into();
+    Self {
+      context: Some(context),
+      resource_identifier,
+      ..Self::new(request, range, weak, optional)
     }
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for RequireResolveDependency {
   fn id(&self) -> &DependencyId {
     &self.id
@@ -49,15 +68,37 @@ impl Dependency for RequireResolveDependency {
     &DependencyType::RequireResolve
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    Some(self.span)
+  fn get_context(&self) -> Option<&Context> {
+    self.context.as_ref()
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "RequireResolveDependency"
+  fn resource_identifier(&self) -> Option<&str> {
+    self
+      .context
+      .as_ref()
+      .map(|_| self.resource_identifier.as_str())
+  }
+
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
+  }
+
+  fn get_referenced_exports(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
+    _runtime: Option<&RuntimeSpec>,
+  ) -> Vec<ReferencedExport> {
+    vec![]
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
   }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for RequireResolveDependency {
   fn request(&self) -> &str {
     &self.request
@@ -74,43 +115,49 @@ impl ModuleDependency for RequireResolveDependency {
   fn get_optional(&self) -> bool {
     self.optional
   }
-
-  fn set_request(&mut self, request: String) {
-    self.request = request;
-  }
-
-  fn get_referenced_exports(
-    &self,
-    _module_graph: &ModuleGraph,
-    _runtime: Option<&RuntimeSpec>,
-  ) -> Vec<ExtendedReferencedExport> {
-    vec![]
-  }
 }
 
-impl DependencyTemplate for RequireResolveDependency {
-  fn apply(
-    &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
-  ) {
-    source.replace(
-      self.start,
-      self.end,
-      module_id(
-        code_generatable_context.compilation,
-        &self.id,
-        &self.request,
-        self.weak,
-      )
-      .as_str(),
-      None,
-    );
-  }
-
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+#[cacheable_dyn]
+impl DependencyCodeGeneration for RequireResolveDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(RequireResolveDependencyTemplate::template_type())
   }
 }
 
 impl AsContextDependency for RequireResolveDependency {}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct RequireResolveDependencyTemplate;
+
+impl RequireResolveDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::RequireResolve)
+  }
+}
+
+impl DependencyTemplate for RequireResolveDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<RequireResolveDependency>()
+      .expect("RequireResolveDependencyTemplate should only be used for RequireResolveDependency");
+
+    source.replace(
+      dep.range.start,
+      dep.range.end,
+      code_generatable_context.runtime_template.module_id(
+        code_generatable_context.compilation,
+        &dep.id,
+        &dep.request,
+        dep.weak,
+      ),
+      None,
+    );
+  }
+}

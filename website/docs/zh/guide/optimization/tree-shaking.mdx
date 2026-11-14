@@ -1,392 +1,281 @@
-import WebpackLicense from '@components/webpack-license';
+---
+description: 'Rspack 支持 tree shaking 功能，这是一个在 JavaScript 生态中广泛使用的术语，主要用于去除未被访问的代码，俗称“死代码”。'
+---
 
-<WebpackLicense from="https://webpack.js.org/guides/tree-shaking" />
+import Attribution from '@components/Attribution';
 
 # Tree shaking
 
-Rspack 支持 tree shaking，这是在 JavaScript 上下文中常用的术语，用于描述死代码的删除。
+Rspack 支持 [tree shaking](https://developer.mozilla.org/zh-CN/docs/Glossary/Tree_shaking) 功能，这是一个在 JavaScript 生态中广泛使用的术语，主要用于去除未被访问的代码，俗称“死代码”。当一个模块的某些导出未被使用且不存在副作用时，这部分代码就可以被安全地删除，以减小最终产物的体积。
 
-它依赖于 import 和 export 语句来检测代码模块是否被导出和导入以在 JavaScript 文件之间使用。
+## 什么是 tree shaking
 
-当你将 `mode` 设置为 `production` 时，Rspack 将默认启用 tree shaking。
+你可以将应用程序想象成一棵树。绿色表示实际用到的源码和库，是树上活的树叶。灰色表示未引用代码，是秋天树上枯萎的树叶。为了除去死去的树叶，你必须摇动（shake）这棵树，使它们落下。
 
-## Basic tree shaking
+需要注意的是，Rspack 本身不直接删除死代码，而是标记未使用的导出为潜在的"死代码"。这些代码能被后续的压缩工具识别并处理。因此，如果 [压缩功能](/config/optimization#optimizationminimize) 被关闭，你将不会看到代码有任何实际的删除效果。
 
-```js title=rspack.config.js
-/**
- * @type {import('@rspack/core').Configuration}
- */
-const config = {
-  mode: 'development',
-  entry: {
-    index: './src/index.js',
-  },
-  output: {},
-};
+:::tip 什么是死代码
+[死代码（dead code）](https://en.wikipedia.org/wiki/Dead_code) 是指程序中一段已经不会被执行的代码，通常是因为重构、优化或者逻辑错误导致的。这些代码可能是之前版本的遗留物，或者某些条件下永远不会被执行的代码。
+:::
 
-module.exports = config;
-```
+## 前置条件
 
-```js title=./src/index.js
-import { cube } from './math.js';
+为了有效利用 tree shaking 功能，你需要：
 
-function component() {
-  const element = document.createElement('pre');
+- 将 Rspack 的 [mode](/config/mode) 设置为 `production` 以启用相关优化。
+  - 在执行生产环境构建时，`mode` 默认为 `production`。
+- 使用 ES modules 语法（即 `import` 和 `export`）。
+  - 使用 SWC 或 Babel 等编译器时，确保它们保留 ES modules 语法。例如，将 [@babel/preset-env](https://babeljs.io/docs/en/babel-preset-env) 中的 `modules` 选项设置为 `false`。
 
-  element.innerHTML = ['Hello webpack!', '5 cubed is equal to ' + cube(5)].join(
-    '\n\n',
-  );
-
-  return element;
-}
-
-document.body.appendChild(component());
-```
-
-```js title=./src/math.js
-export function square(x) {
-  return x * x;
-}
-
-export function cube(x) {
-  return x * x * x;
-}
-```
-
-注意到，我们没有从 **src/math.js** 模块导入 `square` 方法。该函数是“死代码”，表示应该被删除的未使用的导出。现在构建我们的项目
-将产生以下构建结果：
-
-```js
-// ... 省略一些不重要的代码
-var __webpack_modules__ = {
-  './src/index.js': function (module, exports, __webpack_require__) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    var _mathJs = __webpack_require__('./src/math.js');
-    function component() {
-      const element = document.createElement('pre');
-      element.innerHTML = [
-        'Hello webpack!',
-        '5 cubed is equal to ' + (0, _mathJs.cube)(5),
-      ].join('\n\n');
-      return element;
-    }
-    document.body.appendChild(component());
-  },
-  './src/math.js': function (module, exports, __webpack_require__) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    function _export(target, all) {
-      for (var name in all)
-        Object.defineProperty(target, name, {
-          enumerable: true,
-          get: all[name],
-        });
-    }
-    _export(exports, {
-      square: function () {
-        return square;
-      },
-      cube: function () {
-        return cube;
-      },
-    });
-    function square(x) {
-      return x * x;
-    }
-    function cube(x) {
-      return x * x * x;
-    }
-  },
-};
-// ...
-```
-
-正如你所看到的，如果我们不启用 treeShaking，所有代码都保持不变，只是将代码包裹了一层运行时代码。
-现在，我们切换到 `production` 模式，重新构建项目，为了让产物更加可读，我们同时关闭 `minimize` 选项 以及切换 `moduleIds` 为 `named`，为了和后面章节对比，我们关闭 `optimization.sideEffects`。
-
-```diff title=rspack.config.js
-/**
- * @type {import('@rspack/core').Configuration}
- */
-const config = {
-  mode: 'production',
-  entry: {
-    index: './src/index.js',
-  },
-+ optimization: {
-+   sideEffects: false,
-+   moduleIds: 'named',
-+   minimize: false
-+ }
-};
-
-module.exports = config;
-```
-
-重新构建项目后，`square` 函数将会被删除。
-
-## SideEffects
-
-在一个 100% ESM 模块化的世界里，识别副作用是比较直接的。然而，我们还没有达到那个阶段 (在实际的生产代码中有各种格式的代码混用，cjs、esm 和 umd 等等)，所以在此期间，需要在你的代码中提供“纯度”方面的提示给 Rspack 的编译器。
-该功能通常由 "sideEffects" package.json 属性来完成的。
-
-```json title=package.json
-{
-  "name": "your-project",
-  "sideEffects": false
-}
-```
-
-sideEffects 字段支持以下值：
-
-- **false** 这个包中的所有文件都没有副作用。
-- **string** 匹配包含副作用文件的 glob。
-- **Array\<string\>** 匹配包含副作用文件的 glob 数组。
-- **undefined** 当你不设置 `package.json` 的 `sideEffects` 时的默认值。当 `optimization.sideEffects` 为 true 时，Rspack 将尝试分析代码是否具有副作用，当 `optimization.sideEffects` 为 'flag' 时，Rspack 将默认包中的所有模块均有副作用。
-
-这次，我们使用一个更复杂的示例。
-
-```js title=rspack.config.js
-/**
- * @type {import('@rspack/core').Configuration}
- */
-const config = {
-  mode: 'production',
-  entry: {
-    index: './src/index.js',
-  },
-  optimization: {
-    moduleIds: 'named',
-    minimize: false,
-  },
-};
-module.exports = config;
-```
-
-```js title=index.js
-import { multiply } from 'math';
-
-console.log(multiply(2, 3));
-```
-
-```json title=node_modules/math/package.json
-{
-  "name": "math",
-  "sideEffects": false
-}
-```
-
-```js title=node_modules/math/index.js
-export * from './add.js';
-export * from './multiply.js';
-export * from './subtract.js';
-```
-
-```js title=node_modules/math/subtract.js
-export const subtract = (a, b) => a - b;
-```
-
-```js title=node_modules/math/multiply.js
-export const multiply = (a, b) => a * b;
-```
-
-```js title=node_modules/math/add.js
-const randomDate = Date.now();
-export const addRandomDate = a => a + randomDate;
-export const add = (a, b) => a + b;
-```
-
-变量 `randomDate` 在默认情况下是需要被保留的，因为它在模块初始化时期包含副作用。
-但是，由于 package.json 中包含了 sideEffects 字段，且值为 false，除此之外在 add.js 中没有使用任何导出变量，因此整个模块都可以被跳过，subtract.js 同理。
-
-```js
-//...
-var __webpack_modules__ = {
-  './node_modules/math/index.js': function (
-    module,
-    exports,
-    __webpack_require__,
-  ) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    __webpack_require__.es(
-      __webpack_require__('./node_modules/math/multiply.js'),
-      exports,
-    );
-  },
-  './node_modules/math/multiply.js': function (
-    module,
-    exports,
-    __webpack_require__,
-  ) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    Object.defineProperty(exports, 'multiply', {
-      enumerable: true,
-      get: function () {
-        return multiply;
-      },
-    });
-    const multiply = (a, b) => a * b;
-  },
-  './src/index.js': function (module, exports, __webpack_require__) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    var _indexJs = __webpack_require__('./node_modules/math/index.js');
-    console.log((0, _indexJs.multiply)(2, 3));
-  },
-};
-// ...
-```
-
-### module.rule.sideEffects
-
-你可以使用 `module.rule.sideEffects` 覆盖某些模块的 sideEffects 选项。
-
-为什么我们需要这样的功能呢？我们仍然使用上面的例子，假设 math 包的作者忘记在 package.json 中添加 sideEffects 选项：
-
-```diff title=node_modules/math/package.json
-{
-+ "name": "math"
-- "name": "math",
-- "sideEffects": false
-}
-```
-
-Rspack 将尝试安全地分析代码，并仅在所有顶级语句均没有副作用时标记模块为无副作用。
-
-正如我们所看到的，**math/index.js**、**math/subtract.js** 和 **math/multiply.js** 都没有副作用，而 math/add.js 不是，因为 `const randomDate = Date.now()` 含有副作用。当我们重新构建项目时，你可以看到差异如下：
+Rspack 分析的是 loader 处理后的代码。例如，loader 将 ES modules 转换为 CommonJS 时，导出语句可能会变成这样：
 
 ```diff
-//...
-var __webpack_modules__ = {
-"./node_modules/math/index.js": function (module, exports, __webpack_require__) {
-"use strict";
-Object.defineProperty(exports, "__esModule", {
-    value: true
-});
-__webpack_require__.es(__webpack_require__("./node_modules/math/multiply.js"), exports);
-+__webpack_require__.es(__webpack_require__("./node_modules/math/add.js"), exports);
-},
-"./node_modules/math/multiply.js": function (module, exports, __webpack_require__) {
-"use strict";
-Object.defineProperty(exports, "__esModule", {
-    value: true
-});
-Object.defineProperty(exports, "multiply", {
-    enumerable: true,
-    get: function() {
-        return multiply;
-    }
-});
-const multiply = (a, b)=>a * b;
-},
-+"./node_modules/math/add.js": function (module, exports, __webpack_require__) {
-+ "use strict";
-+ Date.now()
-+},
-"./src/index.js": function (module, exports, __webpack_require__) {
-"use strict";
-Object.defineProperty(exports, "__esModule", {
-    value: true
-});
-var _indexJs = __webpack_require__("./node_modules/math/index.js");
-console.log((0, _indexJs.multiply)(2, 3));
-},
+- export const unused = 1;
++ exports.unused = 1;
+```
 
+这种转换可能影响 tree shaking 的效果。如果构建产物中仍然包含未使用的导出，请检查 loader 或编译器的配置，确保它们保留 ES modules 语法。
+
+## 配置项
+
+当 [mode](/config/mode) 被设置为 `production` 时，Rspack 会默认启用一系列与 tree shaking 相关的优化措施，包括：
+
+- [usedExports](/config/optimization#optimizationusedexports) 检查模块导出是否被使用到，没被使用到的导出可以被移除。
+- [sideEffects](/config/optimization#optimizationsideeffects) 检查模块是否包含副作用，如果不包含副作用可以被重导出优化。
+- [providedExports](/config/optimization#optimizationprovidedexports) 分析模块的所有导出和重导出来源。
+- [innerGraph](/config/optimization#optimizationinnergraph) 追踪变量的传递，更加准确地判断导出是否真的被使用到。
+
+下面有一些例子来说明各个配置项的作用，为了增强文档的可读性，我们会使用伪代码来展示代码的删除效果。
+
+让我们通过一个例子来更好地理解这一机制，假设 `src/main.js` 是项目的入口文件：
+
+```js title='src/main.js'
+import { foo } from './util.js';
+
+console.log(foo);
+// `bar` is not used
+```
+
+```js title='src/util.js'
+export const foo = 1;
+export const bar = 2;
+```
+
+在上述示例中，`util.js` 中的 `bar` 没有被使用。在 `production` 模式下，Rspack 会默认启用 [usedExports](/config/optimization#optimizationusedexports) 优化，这能检测出哪些导出实际被使用了。未使用的导出如 `bar`，将被安全删除。最终的产物将类似：
+
+```js title='dist/main.js'
+const foo = 1;
+
+console.log(foo);
+```
+
+## 副作用分析
+
+在 `production` 模式中，Rspack 也会默认分析模块是否含有副作用。如果一个模块的所有导出都未被使用且没有副作用，那么整个模块都可以被删除。我们对上面的例子做一些修改：
+
+```diff title='src/main.js'
+import { foo } from './util.js';
+
+- console.log(foo);
+// `bar` is not used
+```
+
+此时 `util.js` 文件中的导出都没有被使用，且可以分析出该文件没有副作用，所以 `util.js` 可以被整个删除。
+
+你也可以通过 `package.json` 或 `module.rules` 来手动标记模块是否包含副作用，需要开启配置 [optimization.sideEffects](/config/optimization#optimizationsideeffects)。
+
+在 `package.json` 中，可以用 `true` 或 `false` 标记当前 package 下全部 module 是否包含副作用。
+
+```json title="package.json"
+{
+  "name": "package",
+  "version": "1.0.0",
+  "sideEffects": false
 }
-// ...
 ```
 
-由于`module.rule.sideEffects` 比 package.json 中的 `sideEffects` 优先级更高，我们可以使用 `module.rule.sideEffects` 来覆盖某些模块的 `sideEffects` 标识.
-由于初始化的副作用只在使用 addRandomDate 时才有意义，因此我们可以安全地覆盖它。为此，我们可以对 rspack.config.js 进行以下修改：
+上面 `package.json` 表示该 package 下的所有 module 都没有副作用。
 
-```diff title=rspack.config.js
-/**
- * @type {import('@rspack/core').Configuration}
- */
-const config = {
-  mode: 'production',
-  entry: {
-    index: './src/index.js',
+也可以用写 glob 或字符串匹配部分 module，没有被匹配到的 module 会直接视为没有副作用，因此如果手动标记 side effects，一定要确保没有标记到的 module 都没有副作用。
+
+```json title="package.json"
+{
+  "name": "package",
+  "version": "1.0.0",
+  "sideEffects": ["./src/main.js", "*.css"]
+}
+```
+
+上述写法表示除了 `./src/main.js` 和所有的 `.css` 文件外，其他的 module 都没有副作用。
+
+## 重导出分析
+
+重导出在开发中非常常见，但如果一个模块中包含重导出过多，这个模块会引入太多的其他模块，但一般我们只需要其中的一小部分，Rspack 能够优化这种场景，确保引用方可以直接访问到实际的导出模块。看以下包含重导出的例子：
+
+```js title='src/main.js'
+import { value } from './re-exports.js';
+console.log(value);
+```
+
+```js title='src/re-exports.js'
+export * from './value.js';
+export * from './other.js'; // this can be removed if `other.js` does not have any side effects
+```
+
+```js title='src/value.js'
+export const value = 42;
+export const foo = 42; // not used
+```
+
+Rspack 默认开启 [providedExports](/config/optimization#optimizationprovidedexports)，这可以分析出重导出模块中的所有导出以及他们各自的来源。
+
+如果 `src/re-exports.js` 不包含副作用，Rspack 可以将 `src/main.js` 中对 `src/re-exports.js` 的引入，直接转换成对 `src/value.js` 的引入，效果类似于：
+
+```diff title='src/main.js'
+- import { value } from './re-exports.js';
++ import { value } from './value.js';
+console.log(value);
+```
+
+这样做的好处是可以直接忽略掉整个 `src/re-exports.js` 模块。
+
+由于能够分析出 `src/re-exports.js` 所有的重导出，可以知道 `src/value.js` 中的 `foo` 并未使用到，最终产物中 `foo` 会被删掉。
+
+## 变量传递
+
+有时候，即使导出被访问到，它们也可能并不会被实际使用到。例如：
+
+```js title='src/main.js'
+import { foo } from './value.js';
+
+function log() {
+  console.log(foo);
+} // `log` is not used
+
+const bar = foo; // `foo` is not used
+```
+
+在上例中，即使 `log` 函数和 `bar` 变量依赖了 `foo`，由于他们自身未被使用到，`foo` 仍然可以被视为死代码并删除。
+
+在开启 [innerGraph](/config/optimization#optimizationinnergraph) 优化后（在 `production` 模式下默认开启），针对跨模块的复杂情形，Rspack 依然能够追踪变量的使用情况，从而实现精确的代码优化。
+
+```js title='src/main.js'
+import { value } from './bar.js';
+console.log(value);
+```
+
+```js title='src/bar.js'
+import { foo } from './foo.js';
+const bar = foo;
+export const value = bar;
+```
+
+```js title='src/foo.js'
+export const foo = 42;
+```
+
+在这种情况下，由于 `value` 最终被使用，它所依赖的 `foo` 也得以保留。
+
+## Pure 注解
+
+通过 [`/*#__PURE__*/`](https://github.com/javascript-compiler-hints/compiler-notations-spec/blob/main/pure-notation-spec.md) 注解可以告诉 Rspack 某个函数调用无副作用。它可以被放到函数调用之前，用来标记此函数调用是无副作用的。
+
+如果一个没被使用的变量定义的初始值被认为是无副作用的，它会被标记为死代码，不会被执行且会被压缩工具清除掉。
+
+```js
+/*#__PURE__*/ double(55);
+```
+
+:::tip
+
+- 传入函数的参数无法被这个注释所标记，需要单独对每一个参数进行标记。
+- 当 [optimization.innerGraph](/config/optimization#optimizationinnergraph) 被设置成 `true` 时这个行为将被启用。
+
+:::
+
+## NO_SIDE_EFFECTS 注解
+
+`/*#__NO_SIDE_EFFECTS__*/` 是一项遵循社区[规范](https://github.com/javascript-compiler-hints/compiler-notations-spec/blob/main/no-side-effects-notation-spec.md) 的特性。与 `/*#__PURE__*/` 标记在调用方不同，`/*#__NO_SIDE_EFFECTS__*/` 用于标记**函数的定义**，声明该函数在被调用时不会产生副作用。
+相比 `/*#__PURE__*/`，它的优势在于只需在定义处标记一次，所有调用都会受益。
+
+该功能目前处于实验阶段，由 `experiments.pureFunctions` 控制；该选项在生产模式下默认开启。它还依赖 [optimization.sideEffects](/config/optimization#optimizationsideeffects) 为 `true`（sideEffects 在生产模式下默认值为 `true`）：
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    pureFunctions: true,
   },
-  optimization: {
-    minimize: false,
-    moduleIds: 'named'
-  },
-+  module: {
-+    rules: [
-+      {
-+        test: /math\/add\.js/,
-+        sideEffects: false
-+      }
-+    ]
-+  }
 };
-module.exports = config;
 ```
 
-重新构建项目，我们得到和之前相同的结果，整个 **math/add.js** 模块都被删除了。
+你可以将该注解放在函数声明、函数表达式、箭头函数或导出语句之前，更多请参考社区[规范](https://github.com/javascript-compiler-hints/compiler-notations-spec/blob/main/no-side-effects-notation-spec.md)：
 
-### Reexports optimization
+```js
+/*#__NO_SIDE_EFFECTS__*/
+function foo() {
+  console.log('foo');
+}
 
-开启 SideEffects 优化后，Rspack 还会尝试对重导出模块进行优化。
+/*#__NO_SIDE_EFFECTS__*/
+const bar = () => {
+  console.log('bar');
+};
 
-```js title=sdk.js
-export { a } from './a.js';
-export { b } from './b.js';
-export { c } from './c.js';
-// ...
+/*#__NO_SIDE_EFFECTS__*/
+export default function baz() {}
+
+/*#__NO_SIDE_EFFECTS__*/
+export function baz() {}
 ```
 
-```js title=index.js
-import { a } from './sdk.js';
-console.log(a);
+如果一个函数被标记为无副作用且其返回值未被使用，Rspack 将移除该调用。
+
+## pureFunctions
+
+`pureFunctions` 允许你在命中的模块中，手动将顶层标识符标记为“调用无副作用”，供基于 pure function 的 tree shaking 使用。配置的名字必须能解析到该模块中的顶层绑定 —— 即顶层的 function/class/变量声明、`import` 引入的标识符，或它们的 export 别名。这既适用于无法修改源码的第三方库（例如 `node_modules` 中的包），也适用于在消费侧直接断言某个 import 调用是 pure 的场景。
+
+配置方式请参考 [`experiments.pureFunctions`](/config/experiments#experimentspurefunctions) 和 [`module.parser.javascript.pureFunctions`](/config/module-parser#javascriptpurefunctions)。
+
+:::warning
+该选项目前是实验能力，且只有在启用 `experiments.pureFunctions` 时才会生效；该实验选项在生产模式下默认开启。
+:::
+
+:::note
+对于配置在源模块上的默认导出，请使用 `default` 作为名字。
+:::
+
+对于可以修改源码的业务代码，优先使用 `/*#__NO_SIDE_EFFECTS__*/` 注解。
+
+### 使用方式
+
+该选项配置在 `module.rules` 的 `parser` 中：
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    pureFunctions: true,
+  },
+  module: {
+    rules: [
+      // 将第三方库中的导出标记为 pure
+      {
+        test: /node_modules\/some-library\/index.js/,
+        parser: {
+          pureFunctions: ['isString', 'default'],
+        },
+      },
+      // 也可以在消费侧标记 import
+      {
+        test: /src\/styles\.js$/,
+        parser: {
+          pureFunctions: ['cva'],
+        },
+      },
+    ],
+  },
+};
 ```
 
-当 `sdk.js` 无副作用时，Rspack 会尝试直接从 `a.js` 中引入 `a`，而不引入 `sdk.js` 中重导出的其他模块。
+Rspack 会校验 `pureFunctions` 中配置的每个名字是否能在命中模块中解析到顶层绑定；如果找不到，就会发出警告。
 
-在某些不规范的库中可能存在循环依赖，例如 `a.js` 从 `sdk.js` 中引入 `b.js` 中的成员。
-
-```js title=a.js
-import { b } from './sdk.js';
-export const a = b;
-```
-
-```js title=index.js
-import { a } from './sdk.js';
-console.log(a);
-```
-
-此时 `a.js` 和 `sdk.js` 之间存在循环依赖，很不推荐有意这样利用循环依赖，但仍然可以构建成功，并且成功运行。这是因为 Rspack 会尝试将上述的引用转换成：
-
-```diff title=a.js
-- import { b } from './sdk.js';
-+ import { b } from './b.js';
-export const a = b;
-```
-
-```diff title=index.js
-- import { a } from './sdk.js'
-+ import { a } from './a.js'
-console.log(a);
-```
-
-转换后循环依赖没有了。但是如果你尝试关掉 `optimization.providedExports` 或 `optimization.sideEffects`，构建会成功，但运行时会因为循环依赖而遇到错误。
-
-> 上述循环依赖的例子可以在[这里](https://github.com/rspack-contrib/rspack-examples/tree/main/rspack/rspack/treeshaking-transform-imports)找到。
-
-这张图演示了重导出优化的过程：
-
-![](https://assets.rspack.dev/rspack/assets/rspack-reexports-optimization.png)
+<Attribution url="https://webpack.docschina.org/guides/tree-shaking/" />

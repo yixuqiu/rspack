@@ -1,14 +1,64 @@
+mod alias_value_cacheable;
 mod clever_merge;
 mod value_type;
 
-use std::{borrow::Cow, path::PathBuf};
+use std::borrow::Cow;
 
-use hashlink::LinkedHashMap;
+use rspack_cacheable::{
+  cacheable,
+  with::{AsCacheable, AsMap, AsPreset, AsRefStr, AsTuple2, AsVec},
+};
+use rspack_paths::Utf8PathBuf;
+use rspack_regex::RspackRegex;
+use rspack_util::fx_hash::FxLinkedHashMap;
 
+use self::alias_value_cacheable::AsAliasValue;
 use crate::DependencyCategory;
 
-pub type AliasMap = oxc_resolver::AliasValue;
-pub type Alias = oxc_resolver::Alias;
+pub type AliasMap = rspack_resolver::AliasValue;
+
+// OverwriteToNoAlias is for false, webpack supports object and array for alias
+// the difference is object will merge with the default resolve options alias
+// but array will overwrite the default resolve options alias, unless there is `"..."`
+// and undefined is equal to {}, false is equal to [].
+// I've never seen a requirement that needs to support arrays, so for now I only
+// support false here for simplicity.
+#[cacheable]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum Alias {
+  OverwriteToNoAlias,
+  MergeAlias(
+    #[cacheable(with=AsVec<AsTuple2<AsCacheable, AsVec<AsAliasValue>>>)] rspack_resolver::Alias,
+  ),
+}
+
+impl Default for Alias {
+  fn default() -> Self {
+    Self::MergeAlias(rspack_resolver::Alias::default())
+  }
+}
+
+impl From<rspack_resolver::Alias> for Alias {
+  fn from(value: rspack_resolver::Alias) -> Alias {
+    Alias::MergeAlias(value)
+  }
+}
+
+impl value_type::GetValueType for Alias {
+  fn get_value_type(&self) -> value_type::ValueType {
+    match self {
+      Alias::OverwriteToNoAlias => value_type::ValueType::Atom,
+      Alias::MergeAlias(_) => value_type::ValueType::Other,
+    }
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum Restriction {
+  Path(String),
+  Regex(RspackRegex),
+}
 
 pub(super) type Extensions = Vec<String>;
 pub(super) type PreferRelative = bool;
@@ -16,16 +66,20 @@ pub(super) type PreferAbsolute = bool;
 pub(super) type Symlink = bool;
 pub(super) type MainFiles = Vec<String>;
 pub(super) type MainFields = Vec<String>;
+pub(super) type DescriptionFiles = Vec<String>;
 pub(super) type AliasFields = Vec<Vec<String>>;
 pub(super) type ConditionNames = Vec<String>;
 pub(super) type Fallback = Alias;
 pub(super) type FullySpecified = bool;
-pub(super) type ExportsField = Vec<Vec<String>>;
+pub(super) type EnforceExtension = bool;
+pub(super) type ExportsFields = Vec<Vec<String>>;
+pub(super) type ImportsFields = Vec<Vec<String>>;
 pub(super) type ExtensionAlias = Vec<(String, Vec<String>)>;
 pub(super) type Modules = Vec<String>;
 pub(super) type Roots = Vec<String>;
-pub(super) type Restrictions = Vec<String>;
+pub(super) type Restrictions = Vec<Restriction>;
 
+#[cacheable]
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
 pub struct Resolve {
   /// Tried detect file with this extension.
@@ -64,7 +118,7 @@ pub struct Resolve {
   pub fully_specified: Option<FullySpecified>,
   /// A list of exports fields in descriptions files
   /// Default is `[["exports"]]`.
-  pub exports_field: Option<ExportsField>,
+  pub exports_fields: Option<ExportsFields>,
   /// A list map ext to another.
   /// Default is `[]`
   pub extension_alias: Option<ExtensionAlias>,
@@ -73,35 +127,50 @@ pub struct Resolve {
   /// A list of directories where requests of server-relative URLs (starting with '/') are resolved
   pub roots: Option<Roots>,
   /// A list of resolve restrictions to restrict the paths that a request can be resolved on.
-  pub restrictions: Option<Roots>,
+  pub restrictions: Option<Restrictions>,
+  /// Field names from the description file (usually package.json) which are used to provide internal request of a package (requests starting with # are considered as internal).
+  pub imports_fields: Option<ImportsFields>,
   /// Configure resolve options by the type of module request.
+  #[cacheable(omit_bounds)]
   pub by_dependency: Option<ByDependency>,
+  /// The JSON files to use for descriptions
+  /// Default is [`package.json`]
+  pub description_files: Option<DescriptionFiles>,
+  /// If enforce_extension is set to EnforceExtension::Enabled, resolution will not allow extension-less files. This means require('./foo.js') will resolve, while require('./foo') will not.
+  pub enforce_extension: Option<EnforceExtension>,
+  /// If set, Yarn PnP resolution will be supported.
+  pub pnp: Option<bool>,
+  /// Whether to parse [module.builtinModules](https://nodejs.org/api/module.html#modulebuiltinmodules) or not.
+  pub builtin_modules: bool,
 }
 
 /// Tsconfig Options
 ///
 /// Derived from [tsconfig-paths-webpack-plugin](https://github.com/dividab/tsconfig-paths-webpack-plugin#options)
+#[cacheable]
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Default)]
 pub struct TsconfigOptions {
   /// Allows you to specify where to find the TypeScript configuration file.
   /// You may provide
   /// * a relative path to the configuration file. It will be resolved relative to cwd.
   /// * an absolute path to the configuration file.
-  pub config_file: PathBuf,
+  #[cacheable(with=AsPreset)]
+  pub config_file: Utf8PathBuf,
 
-  /// Support for Typescript Project References.
+  /// Support for TypeScript Project References.
   pub references: TsconfigReferences,
 }
 
-impl From<TsconfigOptions> for oxc_resolver::TsconfigOptions {
+impl From<TsconfigOptions> for rspack_resolver::TsconfigOptions {
   fn from(val: TsconfigOptions) -> Self {
-    oxc_resolver::TsconfigOptions {
-      config_file: val.config_file,
+    rspack_resolver::TsconfigOptions {
+      config_file: val.config_file.into(),
       references: val.references.into(),
     }
   }
 }
 
+#[cacheable]
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Default)]
 pub enum TsconfigReferences {
   #[default]
@@ -109,15 +178,17 @@ pub enum TsconfigReferences {
   /// Use the `references` field from tsconfig read from `config_file`.
   Auto,
   /// Manually provided relative or absolute path.
-  Paths(Vec<PathBuf>),
+  Paths(#[cacheable(with=AsVec<AsPreset>)] Vec<Utf8PathBuf>),
 }
 
-impl From<TsconfigReferences> for oxc_resolver::TsconfigReferences {
+impl From<TsconfigReferences> for rspack_resolver::TsconfigReferences {
   fn from(val: TsconfigReferences) -> Self {
     match val {
-      TsconfigReferences::Disabled => oxc_resolver::TsconfigReferences::Disabled,
-      TsconfigReferences::Auto => oxc_resolver::TsconfigReferences::Auto,
-      TsconfigReferences::Paths(paths) => oxc_resolver::TsconfigReferences::Paths(paths),
+      TsconfigReferences::Disabled => rspack_resolver::TsconfigReferences::Disabled,
+      TsconfigReferences::Auto => rspack_resolver::TsconfigReferences::Auto,
+      TsconfigReferences::Paths(paths) => {
+        rspack_resolver::TsconfigReferences::Paths(paths.into_iter().map(Into::into).collect())
+      }
     }
   }
 }
@@ -161,12 +232,15 @@ impl Resolve {
 
 type DependencyCategoryStr = Cow<'static, str>;
 
+#[cacheable]
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
-pub struct ByDependency(LinkedHashMap<DependencyCategoryStr, Resolve>);
+pub struct ByDependency(
+  #[cacheable(with=AsMap<AsRefStr>)] FxLinkedHashMap<DependencyCategoryStr, Resolve>,
+);
 
 impl FromIterator<(DependencyCategoryStr, Resolve)> for ByDependency {
   fn from_iter<I: IntoIterator<Item = (DependencyCategoryStr, Resolve)>>(i: I) -> Self {
-    Self(LinkedHashMap::from_iter(i))
+    Self(FxLinkedHashMap::from_iter(i))
   }
 }
 

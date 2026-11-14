@@ -1,32 +1,47 @@
 [
   {
-    "type": "dir",
+    "type": "dir-section-header",
     "name": "start",
-    "label": "Getting started"
+    "label": "Start"
   },
   {
-    "type": "dir",
+    "type": "dir-section-header",
     "name": "features",
     "label": "Features"
   },
   {
-    "type": "dir",
-    "name": "tech",
-    "label": "Languages and Frameworks"
+    "type": "dir-section-header",
+    "name": "advanced",
+    "label": "Advanced"
   },
   {
-    "type": "dir",
+    "type": "dir-section-header",
+    "name": "builtin-loaders",
+    "label": "Built-in Loaders"
+  },
+  {
+    "type": "dir-section-header",
+    "name": "languages",
+    "label": "Languages"
+  },
+  {
+    "type": "dir-section-header",
+    "name": "integrations",
+    "label": "Integrations"
+  },
+  {
+    "type": "dir-section-header",
     "name": "optimization",
-    "label": "Optimization"
+    "label": "Bundle Optimization"
   },
   {
-    "type": "dir",
+    "type": "dir-section-header",
+    "name": "diagnostics",
+    "label": "Diagnostics"
+  },
+  {
+    "type": "dir-section-header",
     "name": "migration",
     "label": "Migration"
-  },
-  {
-    "type": "dir",
-    "name": "compatibility",
-    "label": "Compatibility"
   }
 ]

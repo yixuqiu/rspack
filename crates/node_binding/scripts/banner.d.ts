@@ -4,9 +4,62 @@
 /* -- banner.d.ts -- */
 export type JsFilename =
 	| string
-	| ((pathData: JsPathData, assetInfo?: JsAssetInfo) => string);
+	| ((pathData: JsPathData, assetInfo?: AssetInfo) => string);
 
-export type LocalJsFilename = JsFilename;
+export type RawLazyCompilationTest = RegExp | ((module: Module) => boolean);
+
+export type AssetInfo = KnownAssetInfo & Record<string, any>;
+
+export type CustomPluginName = string;
+
+export type ConnectionState = boolean | symbol;
+
+export type BuildInfo = KnownBuildInfo & Record<string, any>;
+
+export interface Module {
+	readonly type: string;
+	readonly context: string | undefined;
+	readonly layer: string | undefined;
+	readonly useSourceMap: boolean;
+	readonly useSimpleSourceMap: boolean;
+	factoryMeta: JsFactoryMeta;
+	buildInfo: BuildInfo;
+	buildMeta: Record<string, any>;
+	readonly blocks: AsyncDependenciesBlock[];
+	readonly dependencies: Dependency[];
+	identifier(): string;
+	readableIdentifier(): string;
+	nameForCondition(): string | undefined;
+	size(type?: string | null): number;
+	libIdent(options: JsLibIdentOptions): string | null;
+}
+
+export interface RspackError extends Error {
+	name: string;
+	message: string;
+	details?: string;
+	module?: null | Module;
+	loc?: DependencyLocation;
+	file?: string;
+	stack?: string;
+	hideStack?: boolean;
+	error?: Error;
+}
+
+export type DependencyLocation = SyntheticDependencyLocation | RealDependencyLocation;
+
+export interface JsSource {
+	source: string | Buffer
+	map?: string
+}
+
+export type JsSourceFromJs =
+	| { kind: "raw"; content: string | Buffer; map?: string }
+	| { kind: "native"; handle: JsNativeSource }
+	| { kind: "concat"; children: JsSourceFromJs[] }
+	| { kind: "replace"; original: JsSourceFromJs; replacements: JsReplaceSourceEdit[]; fallback: () => JsSourceFromJs }
+
+export type CompilerId = void;
 /* -- banner.d.ts end -- */
 
 /* -- napi-rs generated below -- */

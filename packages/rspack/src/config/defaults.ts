@@ -7,1028 +7,1432 @@
  * Copyright (c) JS Foundation and other contributors
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
-
-import assert from "assert";
-import fs from "fs";
-import path from "path";
-import { isNil } from "../util";
-import { cleverMerge } from "../util/cleverMerge";
+import fs from 'node:fs';
+import path from 'node:path';
 import {
-	getDefaultTarget,
-	getTargetProperties,
-	getTargetsProperties
-} from "./target";
+  applyLimits,
+  LightningCssMinimizerRspackPlugin,
+  SwcJsMinimizerRspackPlugin,
+} from '../builtin-plugin';
+import { ASSET_MODULE_TYPE, JSON_MODULE_TYPE } from '../ModuleTypeConstants';
+import { Template } from '../Template';
+import { isNil } from '../util';
+import { assertNotNill } from '../util/assertNotNil';
+import { cleverMerge } from '../util/cleverMerge';
 import type {
-	Context,
-	ExternalsPresets,
-	InfrastructureLogging,
-	JavascriptParserOptions,
-	Library,
-	Mode,
-	ModuleOptions,
-	Node,
-	Optimization,
-	ResolveOptions,
-	RuleSetRules,
-	SnapshotOptions
-} from "./zod";
+  CacheNormalized,
+  EntryDescriptionNormalized,
+  EntryNormalized,
+  ExperimentsNormalized,
+  RspackOptionsNormalized,
+} from './normalization';
 import {
-	EntryDescriptionNormalized,
-	EntryNormalized,
-	ExperimentsNormalized,
-	OutputNormalized,
-	RspackOptionsNormalized
-} from "./normalization";
-import Template = require("../Template");
-import { assertNotNill } from "../util/assertNotNil";
-import { ASSET_MODULE_TYPE } from "../ModuleTypeConstants";
-import { SwcJsMinimizerRspackPlugin } from "../builtin-plugin/SwcJsMinimizerPlugin";
-import { SwcCssMinimizerRspackPlugin } from "../builtin-plugin/SwcCssMinimizerPlugin";
+  getDefaultTarget,
+  getTargetProperties,
+  getTargetsProperties,
+  type TargetProperties,
+} from './target';
+import type {
+  Context,
+  CssAutoOrModuleParserOptions,
+  CssGeneratorOptions,
+  CssModuleGeneratorOptions,
+  CssModuleParserOptions,
+  CssParserOptions,
+  ExternalsPresets,
+  InfrastructureLogging,
+  JavascriptParserOptions,
+  JsonGeneratorOptions,
+  HashFunction,
+  Library,
+  LibraryOptions,
+  Loader,
+  Mode,
+  ModuleOptions,
+  Name,
+  Node,
+  Optimization,
+  Performance,
+  ResolveOptions,
+  RuleSetRules,
+  SnapshotOptions,
+  WasmLoadingType,
+} from './types';
+
+const ERROR_PREFIX = 'Invalid Rspack configuration:';
+const DEFAULT_FILESYSTEM_CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60;
+const DEFAULT_CACHE_NAME = '';
 
 export const applyRspackOptionsDefaults = (
-	options: RspackOptionsNormalized
+  options: RspackOptionsNormalized,
+  compilerIndex?: number,
 ) => {
-	F(options, "context", () => process.cwd());
-	F(options, "target", () => {
-		return getDefaultTarget(options.context!);
-	});
+  F(options, 'context', () => process.cwd());
+  F(options, 'target', () => {
+    return getDefaultTarget(options.context!);
+  });
 
-	const { mode, target } = options;
-	assert(!isNil(target));
+  const { mode, target } = options;
 
-	let targetProperties =
-		target === false
-			? false
-			: typeof target === "string"
-				? getTargetProperties(target, options.context!)
-				: getTargetsProperties(target, options.context!);
+  if (isNil(target)) {
+    throw new Error('target should not be nil after defaults');
+  }
 
-	const development = mode === "development";
-	const production = mode === "production" || !mode;
+  const targetProperties: false | TargetProperties =
+    target === false
+      ? (false as const)
+      : typeof target === 'string'
+        ? getTargetProperties(target, options.context!)
+        : getTargetsProperties(target, options.context!);
 
-	if (typeof options.entry !== "function") {
-		for (const key of Object.keys(options.entry)) {
-			F(options.entry[key], "import", () => ["./src"]);
-		}
-	}
+  const development = mode === 'development';
+  const production = mode === 'production' || !mode;
 
-	F(options, "devtool", () => false as const);
-	D(options, "watch", false);
-	D(options, "profile", false);
-	D(options, "bail", false);
+  if (typeof options.entry !== 'function') {
+    for (const key of Object.keys(options.entry)) {
+      F(options.entry[key], 'import', () => ['./src']);
+    }
+  }
 
-	const futureDefaults = options.experiments.futureDefaults ?? false;
-	F(options, "cache", () => development);
+  F(options, 'devtool', () =>
+    development ? 'cheap-module-source-map' : false,
+  );
+  D(options, 'watch', false);
+  D(options, 'lazyCompilation', false);
+  D(options, 'bail', false);
 
-	applyExperimentsDefaults(options.experiments, {
-		cache: options.cache!
-	});
+  F(options, 'cache', () =>
+    development ? { type: 'memory' as const } : false,
+  );
+  applyCacheDefaults(options.cache!, {
+    context: options.context!,
+    name: options.name || DEFAULT_CACHE_NAME,
+    mode: options.mode || 'production',
+    compilerIndex,
+  });
 
-	applySnapshotDefaults(options.snapshot, { production });
+  applyIncrementalDefaults(options);
 
-	applyModuleDefaults(options.module, {
-		asyncWebAssembly: options.experiments.asyncWebAssembly!,
-		css: options.experiments.css!,
-		targetProperties
-	});
+  applyExperimentsDefaults(options.experiments, { production });
+  applySnapshotDefaults(options.snapshot, {
+    production,
+  });
 
-	applyOutputDefaults(options.output, {
-		context: options.context!,
-		targetProperties,
-		isAffectedByBrowserslist:
-			target === undefined ||
-			(typeof target === "string" && target.startsWith("browserslist")) ||
-			(Array.isArray(target) &&
-				target.some(target => target.startsWith("browserslist"))),
-		outputModule: options.experiments.outputModule,
-		development,
-		entry: options.entry,
-		futureDefaults
-	});
+  applyOptimizationDefaults(options.optimization, {
+    production,
+    development,
+  });
 
-	applyExternalsPresetsDefaults(options.externalsPresets, {
-		targetProperties
-	});
+  applyOutputDefaults(options, {
+    context: options.context!,
+    targetProperties,
+    isAffectedByBrowserslist:
+      target === undefined ||
+      (typeof target === 'string' && target.startsWith('browserslist')) ||
+      (Array.isArray(target) &&
+        target.some((target) => target.startsWith('browserslist'))),
+    entry: options.entry,
+  });
 
-	// @ts-expect-error
-	F(options, "externalsType", () => {
-		return options.output.library
-			? options.output.library.type
-			: options.output.module
-				? "module"
-				: "var";
-	});
+  applyModuleDefaults(options.module, {
+    asyncWebAssembly: options.experiments.asyncWebAssembly!,
+    targetProperties,
+    mode: options.mode,
+    uniqueName: options.output.uniqueName,
+    deferImport: options.experiments.deferImport,
+    sourceImport: options.experiments.sourceImport,
+    outputModule: options.output.module,
+    hashFunction: options.output.hashFunction!,
+    hashSalt: options.output.hashSalt,
+  });
 
-	applyNodeDefaults(options.node, { targetProperties });
+  applyExternalsPresetsDefaults(options.externalsPresets, {
+    targetProperties,
+    buildHttp: Boolean(options.experiments.buildHttp),
+    outputModule: options.output.module!,
+  });
 
-	applyOptimizationDefaults(options.optimization, {
-		production,
-		development,
-		css: options.experiments.css!
-	});
+  F(options, 'externalsType', () => {
+    if (options.output.library?.type) {
+      // Keep modern-module libraries on the existing output.module default for
+      // compatibility. `externalsType: "modern-module"` must be enabled
+      // explicitly for now, and will become the default in the next major.
+      if (options.output.library.type !== 'modern-module') {
+        // loose type 'string', actual type is "commonjs" | "var" | "commonjs2"....
+        return options.output.library.type as any;
+      }
+    }
+    return options.output.module ? 'module-import' : 'var';
+  });
 
-	options.resolve = cleverMerge(
-		getResolveDefaults({
-			context: options.context!,
-			targetProperties,
-			mode: options.mode,
-			css: options.experiments.css!
-		}),
-		options.resolve
-	);
+  applyNodeDefaults(options.node, {
+    targetProperties,
+    outputModule: options.output.module,
+  });
 
-	options.resolveLoader = cleverMerge(
-		getResolveLoaderDefaults(),
-		options.resolveLoader
-	);
+  applyLoaderDefaults(options.loader, {
+    targetProperties,
+    environment: options.output.environment,
+  });
+
+  F(options, 'performance', () =>
+    production &&
+    targetProperties &&
+    (targetProperties.browser || targetProperties.browser === null)
+      ? {}
+      : false,
+  );
+  applyPerformanceDefaults(options.performance!, {
+    production,
+  });
+
+  options.resolve = cleverMerge(
+    getResolveDefaults({
+      targetProperties,
+      mode: options.mode,
+    }),
+    options.resolve,
+  );
+
+  options.resolveLoader = cleverMerge(
+    getResolveLoaderDefaults(),
+    options.resolveLoader,
+  );
+
+  return targetProperties === false
+    ? targetProperties
+    : {
+        platform: {
+          web: targetProperties.web,
+          browser: targetProperties.browser,
+          webworker: targetProperties.webworker,
+          node: targetProperties.node,
+          nwjs: targetProperties.nwjs,
+          electron: targetProperties.electron,
+        },
+        esVersion: targetProperties.esVersion,
+        targets: targetProperties.targets,
+      };
 };
 
-export const applyRspackOptionsBaseDefaults = (
-	options: RspackOptionsNormalized
+const applyCacheDefaults = (
+  cache: CacheNormalized,
+  {
+    context,
+    name,
+    mode,
+    compilerIndex,
+  }: {
+    context: string;
+    name: Name;
+    mode: Mode;
+    compilerIndex?: number;
+  },
 ) => {
-	F(options, "context", () => process.cwd());
-	applyInfrastructureLoggingDefaults(options.infrastructureLogging);
-};
-
-const applyInfrastructureLoggingDefaults = (
-	infrastructureLogging: InfrastructureLogging
-) => {
-	F(infrastructureLogging, "stream", () => process.stderr);
-	const tty =
-		(infrastructureLogging as any).stream.isTTY && process.env.TERM !== "dumb";
-	D(infrastructureLogging, "level", "info");
-	D(infrastructureLogging, "debug", false);
-	D(infrastructureLogging, "colors", tty);
-	D(infrastructureLogging, "appendOnly", !tty);
-};
-
-const applyExperimentsDefaults = (
-	experiments: ExperimentsNormalized,
-	{ cache }: { cache: boolean }
-) => {
-	D(experiments, "lazyCompilation", false);
-	D(experiments, "asyncWebAssembly", false);
-	D(experiments, "newSplitChunks", true);
-	D(experiments, "css", true); // we not align with webpack about the default value for better DX
-	D(experiments, "topLevelAwait", true);
-
-	D(experiments, "rspackFuture", {});
-	if (typeof experiments.rspackFuture === "object") {
-		D(experiments.rspackFuture, "newTreeshaking", true);
-		D(experiments.rspackFuture, "bundlerInfo", {});
-		if (typeof experiments.rspackFuture.bundlerInfo === "object") {
-			D(
-				experiments.rspackFuture.bundlerInfo,
-				"version",
-				require("../../package.json").version
-			);
-			D(experiments.rspackFuture.bundlerInfo, "force", false);
-		}
-	}
+  if (cache === false) return;
+  if (cache.type === 'persistent') {
+    F(cache, 'name', () => {
+      const cacheName = name ? `${name}-${mode}` : mode;
+      return compilerIndex !== undefined && compilerIndex > 0
+        ? `${cacheName}-${compilerIndex}`
+        : cacheName;
+    });
+    D(cache, 'version', '');
+    D(cache, 'maxMemoryGenerations', mode === 'development' ? 5 : Infinity);
+    D(cache, 'readonly', false);
+  }
+  switch (cache.type) {
+    case 'memory':
+      break;
+    case 'persistent':
+      D(cache.storage, 'type', 'filesystem');
+      F(cache.storage, 'directory', () =>
+        path.resolve(context, 'node_modules/.cache/rspack'),
+      );
+      F(cache.storage, 'location', () =>
+        path.resolve(cache.storage.directory!, cache.name!),
+      );
+      D(cache, 'maxAge', DEFAULT_FILESYSTEM_CACHE_MAX_AGE_SECONDS);
+      F(cache, 'buildDependencies', () => []);
+      D(cache, 'portable', false);
+      break;
+  }
 };
 
 const applySnapshotDefaults = (
-	snapshot: SnapshotOptions,
-	{ production }: { production: boolean }
+  snapshot: SnapshotOptions,
+  { production }: { production: boolean },
 ) => {
-	if (typeof snapshot.module === "object") {
-		D(snapshot.module, "timestamp", false);
-		D(snapshot.module, "hash", false);
-	} else {
-		F(snapshot, "module", () =>
-			production
-				? { timestamp: true, hash: true }
-				: { timestamp: true, hash: false }
-		);
-	}
-	if (typeof snapshot.resolve === "object") {
-		D(snapshot.resolve, "timestamp", false);
-		D(snapshot.resolve, "hash", false);
-	} else {
-		F(snapshot, "resolve", () =>
-			production
-				? { timestamp: true, hash: true }
-				: { timestamp: true, hash: false }
-		);
-	}
+  F(snapshot, 'immutablePaths', () => []);
+  F(snapshot, 'unmanagedPaths', () => []);
+  F(snapshot, 'managedPaths', () => [/[\\/]node_modules[\\/][^.]/]);
+  F(snapshot, 'resolveBuildDependencies', () => ({
+    timestamp: true,
+    hash: true,
+  }));
+  F(snapshot, 'buildDependencies', () => ({ timestamp: true, hash: true }));
+  F(snapshot, 'module', () =>
+    production ? { timestamp: true, hash: true } : { timestamp: true },
+  );
+  F(snapshot, 'contextModule', () => ({ timestamp: true }));
+  F(snapshot, 'resolve', () =>
+    production ? { timestamp: true, hash: true } : { timestamp: true },
+  );
+};
+
+export const applyRspackOptionsBaseDefaults = (
+  options: RspackOptionsNormalized,
+) => {
+  F(options, 'context', () => process.cwd());
+  applyInfrastructureLoggingDefaults(options.infrastructureLogging);
+};
+
+const applyInfrastructureLoggingDefaults = (
+  infrastructureLogging: InfrastructureLogging,
+) => {
+  F(infrastructureLogging, 'stream', () => process.stderr);
+  const tty =
+    (infrastructureLogging as any).stream?.isTTY && process.env.TERM !== 'dumb';
+  D(infrastructureLogging, 'level', 'info');
+  D(infrastructureLogging, 'debug', false);
+  D(infrastructureLogging, 'colors', tty);
+  D(infrastructureLogging, 'appendOnly', !tty);
+};
+
+const applyExperimentsDefaults = (
+  experiments: ExperimentsNormalized,
+  { production }: { production: boolean },
+) => {
+  D(experiments, 'futureDefaults', false);
+  D(experiments, 'newCache', false);
+  if (typeof experiments.newCache === 'object') {
+    D(experiments.newCache, 'codeGeneration', true);
+    D(experiments.newCache, 'module', true);
+    D(experiments.newCache, 'devtool', true);
+    D(experiments.newCache, 'loader', true);
+    D(experiments.newCache, 'minimize', true);
+    D(experiments.newCache, 'resolver', false);
+  }
+  D(experiments, 'asyncWebAssembly', true);
+  D(experiments, 'deferImport', false);
+  D(experiments, 'sourceImport', false);
+
+  D(experiments, 'buildHttp', undefined);
+  if (experiments.buildHttp && typeof experiments.buildHttp === 'object') {
+    D(experiments.buildHttp, 'upgrade', false);
+    D(experiments.buildHttp, 'frozen', production);
+  }
+
+  // Enable `useInputFileSystem` will introduce much more fs overheads,  So disable by default.
+  D(experiments, 'useInputFileSystem', false);
+
+  // IGNORE(experiments.pureFunctions): Rspack specific configuration for pure function annotations and hints
+  D(experiments, 'pureFunctions', production);
+  D(experiments, 'runtimeMode', 'webpack');
+};
+
+const applyIncrementalDefaults = (options: RspackOptionsNormalized) => {
+  D(options, 'incremental', {});
+  if (typeof options.incremental === 'object') {
+    D(options.incremental, 'silent', true);
+    D(options.incremental, 'buildModuleGraph', true);
+    D(options.incremental, 'finishModules', true);
+    D(options.incremental, 'optimizeDependencies', true);
+    D(options.incremental, 'buildChunkGraph', true);
+    D(options.incremental, 'optimizeChunkModules', true);
+    D(options.incremental, 'moduleIds', true);
+    D(options.incremental, 'chunkIds', true);
+    D(options.incremental, 'modulesHashes', true);
+    D(options.incremental, 'modulesCodegen', true);
+    D(options.incremental, 'modulesRuntimeRequirements', true);
+    D(options.incremental, 'chunksRuntimeRequirements', true);
+    D(options.incremental, 'chunksHashes', true);
+    D(options.incremental, 'chunkAsset', true);
+    D(options.incremental, 'emitAssets', true);
+  }
 };
 
 const applyJavascriptParserOptionsDefaults = (
-	parserOptions: JavascriptParserOptions,
-	fallback?: JavascriptParserOptions
+  parserOptions: JavascriptParserOptions,
+  {
+    deferImport,
+    sourceImport,
+    outputModule,
+  }: {
+    deferImport?: boolean;
+    sourceImport?: boolean;
+    outputModule: RspackOptionsNormalized['output']['module'];
+  },
 ) => {
-	D(parserOptions, "dynamicImportMode", fallback?.dynamicImportMode ?? "lazy");
-	D(
-		parserOptions,
-		"dynamicImportPrefetch",
-		fallback?.dynamicImportPrefetch ?? false
-	);
-	D(
-		parserOptions,
-		"dynamicImportPreload",
-		fallback?.dynamicImportPreload ?? false
-	);
-	D(parserOptions, "url", fallback?.url ?? true);
-	D(
-		parserOptions,
-		"exprContextCritical",
-		fallback?.exprContextCritical ?? true
-	);
-	D(
-		parserOptions,
-		"wrappedContextCritical",
-		fallback?.wrappedContextCritical ?? false
-	);
+  D(parserOptions, 'dynamicImportMode', 'lazy');
+  D(parserOptions, 'dynamicImportPrefetch', false);
+  D(parserOptions, 'dynamicImportPreload', false);
+  D(parserOptions, 'url', true);
+  D(parserOptions, 'dynamicUrl', true);
+  D(parserOptions, 'exprContextCritical', true);
+  D(parserOptions, 'unknownContextCritical', true);
+  D(parserOptions, 'wrappedContextCritical', false);
+  D(parserOptions, 'strictThisContextOnImports', false);
+  D(parserOptions, 'wrappedContextRegExp', /.*/);
+  D(parserOptions, 'exportsPresence', 'error');
+  D(parserOptions, 'requireAsExpression', true);
+  D(parserOptions, 'requireAlias', false);
+  D(parserOptions, 'requireDynamic', true);
+  D(parserOptions, 'requireResolve', true);
+  D(parserOptions, 'commonjs', true);
+  D(parserOptions, 'importDynamic', true);
+  D(parserOptions, 'worker', ['...']);
+  D(parserOptions, 'importMeta', outputModule ? 'preserve-unknown' : true);
+  D(parserOptions, 'typeReexportsPresence', 'no-tolerant');
+  D(parserOptions, 'jsx', false);
+  D(parserOptions, 'deferImport', deferImport);
+  D(parserOptions, 'sourceImport', sourceImport);
+  D(parserOptions, 'importMetaResolve', false);
+  D(parserOptions, 'createRequire', false);
+};
+
+const applyCssGeneratorOptionsDefaults = (
+  generatorOptions: CssGeneratorOptions,
+  { targetProperties }: { targetProperties: TargetProperties | false },
+) => {
+  D(
+    generatorOptions,
+    'exportsOnly',
+    !targetProperties || targetProperties.document === false,
+  );
+  D(generatorOptions, 'esModule', true);
+};
+
+const applyCssParserOptionsDefaults = (parserOptions: CssParserOptions) => {
+  D(parserOptions, 'namedExports', true);
+  D(parserOptions, 'url', true);
+  D(parserOptions, 'import', true);
+};
+
+const applyCssModuleGeneratorOptionsDefaults = (
+  generatorOptions: CssModuleGeneratorOptions,
+  {
+    hashFunction,
+    hashSalt,
+    localIdentName,
+    targetProperties,
+  }: {
+    hashFunction: HashFunction;
+    hashSalt?: RspackOptionsNormalized['output']['hashSalt'];
+    localIdentName: string;
+    targetProperties: TargetProperties | false;
+  },
+) => {
+  D(
+    generatorOptions,
+    'exportsOnly',
+    !targetProperties || targetProperties.document === false,
+  );
+  D(generatorOptions, 'esModule', true);
+  D(generatorOptions, 'exportsConvention', 'as-is');
+  D(generatorOptions, 'localIdentName', localIdentName);
+  D(generatorOptions, 'localIdentHashSalt', hashSalt);
+  D(generatorOptions, 'localIdentHashFunction', hashFunction);
+  D(generatorOptions, 'localIdentHashDigest', 'base64url');
+  D(generatorOptions, 'localIdentHashDigestLength', 6);
+};
+
+const applyCssModuleParserOptionsDefaults = (
+  parserOptions: CssModuleParserOptions,
+) => {
+  applyCssParserOptionsDefaults(parserOptions);
+  D(parserOptions, 'animation', true);
+  D(parserOptions, 'container', true);
+  D(parserOptions, 'customIdents', true);
+  D(parserOptions, 'dashedIdents', true);
+  D(parserOptions, 'function', true);
+  D(parserOptions, 'grid', true);
+};
+
+const applyCssAutoOrModuleParserOptionsDefaults = (
+  parserOptions: CssAutoOrModuleParserOptions,
+) => {
+  applyCssModuleParserOptionsDefaults(parserOptions);
+  D(parserOptions, 'pure', false);
+};
+
+const applyJsonGeneratorOptionsDefaults = (
+  generatorOptions: JsonGeneratorOptions,
+) => {
+  D(generatorOptions, 'JSONParse', true);
 };
 
 const applyModuleDefaults = (
-	module: ModuleOptions,
-	{
-		asyncWebAssembly,
-		css,
-		targetProperties
-	}: {
-		asyncWebAssembly: boolean;
-		css: boolean;
-		targetProperties: any;
-	}
+  module: ModuleOptions,
+  {
+    asyncWebAssembly,
+    targetProperties,
+    mode,
+    uniqueName,
+    deferImport,
+    sourceImport,
+    outputModule,
+    hashFunction,
+    hashSalt,
+  }: {
+    asyncWebAssembly: boolean;
+    targetProperties: false | TargetProperties;
+    mode?: Mode;
+    uniqueName?: string;
+    deferImport?: boolean;
+    sourceImport?: boolean;
+    outputModule: RspackOptionsNormalized['output']['module'];
+    hashFunction: HashFunction;
+    hashSalt?: RspackOptionsNormalized['output']['hashSalt'];
+  },
 ) => {
-	assertNotNill(module.parser);
-	assertNotNill(module.generator);
+  assertNotNill(module.parser);
+  assertNotNill(module.generator);
 
-	F(module.parser, ASSET_MODULE_TYPE, () => ({}));
-	assertNotNill(module.parser.asset);
-	F(module.parser.asset, "dataUrlCondition", () => ({}));
-	if (typeof module.parser.asset.dataUrlCondition === "object") {
-		D(module.parser.asset.dataUrlCondition, "maxSize", 8096);
-	}
+  F(module.parser, ASSET_MODULE_TYPE, () => ({}));
+  assertNotNill(module.parser.asset);
+  F(module.parser.asset, 'dataUrlCondition', () => ({}));
+  if (typeof module.parser.asset.dataUrlCondition === 'object') {
+    D(module.parser.asset.dataUrlCondition, 'maxSize', 8096);
+  }
 
-	F(module.parser, "javascript", () => ({}));
-	assertNotNill(module.parser.javascript);
-	applyJavascriptParserOptionsDefaults(module.parser.javascript);
+  F(module.parser, 'javascript', () => ({}));
+  assertNotNill(module.parser.javascript);
+  applyJavascriptParserOptionsDefaults(module.parser.javascript, {
+    deferImport,
+    sourceImport,
+    outputModule,
+  });
 
-	F(module.parser, "javascript/auto", () => ({}));
-	assertNotNill(module.parser["javascript/auto"]);
-	applyJavascriptParserOptionsDefaults(
-		module.parser["javascript/auto"],
-		module.parser.javascript
-	);
+  F(module.parser, JSON_MODULE_TYPE, () => ({}));
+  assertNotNill(module.parser[JSON_MODULE_TYPE]);
+  D(
+    module.parser[JSON_MODULE_TYPE],
+    'exportsDepth',
+    mode === 'development' ? 1 : Number.MAX_SAFE_INTEGER,
+  );
 
-	F(module.parser, "javascript/dynamic", () => ({}));
-	assertNotNill(module.parser["javascript/dynamic"]);
-	applyJavascriptParserOptionsDefaults(
-		module.parser["javascript/dynamic"],
-		module.parser.javascript
-	);
+  F(module.generator, 'json', () => ({}));
+  assertNotNill(module.generator.json);
+  applyJsonGeneratorOptionsDefaults(module.generator.json);
+  F(module.parser, 'css', () => ({}));
+  assertNotNill(module.parser.css);
+  applyCssParserOptionsDefaults(module.parser.css);
 
-	F(module.parser, "javascript/esm", () => ({}));
-	assertNotNill(module.parser["javascript/esm"]);
-	applyJavascriptParserOptionsDefaults(
-		module.parser["javascript/esm"],
-		module.parser.javascript
-	);
+  F(module.parser, 'css/auto', () => ({}));
+  assertNotNill(module.parser['css/auto']);
+  applyCssAutoOrModuleParserOptionsDefaults(module.parser['css/auto']);
 
-	if (css) {
-		F(module.parser, "css", () => ({}));
-		assertNotNill(module.parser.css);
-		D(module.parser.css, "namedExports", true);
+  F(module.parser, 'css/global', () => ({}));
+  assertNotNill(module.parser['css/global']);
+  applyCssModuleParserOptionsDefaults(module.parser['css/global']);
 
-		F(module.parser, "css/auto", () => ({}));
-		assertNotNill(module.parser["css/auto"]);
-		D(module.parser["css/auto"], "namedExports", true);
+  F(module.parser, 'css/module', () => ({}));
+  assertNotNill(module.parser['css/module']);
+  applyCssAutoOrModuleParserOptionsDefaults(module.parser['css/module']);
 
-		F(module.parser, "css/module", () => ({}));
-		assertNotNill(module.parser["css/module"]);
-		D(module.parser["css/module"], "namedExports", true);
+  F(module.generator, 'css', () => ({}));
+  assertNotNill(module.generator.css);
+  applyCssGeneratorOptionsDefaults(module.generator.css, {
+    targetProperties,
+  });
 
-		F(module.generator, "css", () => ({}));
-		assertNotNill(module.generator.css);
-		D(
-			module.generator["css"],
-			"exportsOnly",
-			!targetProperties || !targetProperties.document
-		);
-		D(module.generator["css"], "exportsConvention", "as-is");
+  F(module.generator, 'css/auto', () => ({}));
+  assertNotNill(module.generator['css/auto']);
+  const localIdentName =
+    mode === 'development'
+      ? uniqueName && uniqueName.length > 0
+        ? '[uniqueName]-[id]-[local]'
+        : '[id]-[local]'
+      : '[fullhash]';
+  applyCssModuleGeneratorOptionsDefaults(module.generator['css/auto'], {
+    hashFunction,
+    hashSalt,
+    localIdentName,
+    targetProperties,
+  });
 
-		F(module.generator, "css/auto", () => ({}));
-		assertNotNill(module.generator["css/auto"]);
-		D(
-			module.generator["css/auto"],
-			"exportsOnly",
-			!targetProperties || !targetProperties.document
-		);
-		D(module.generator["css/auto"], "exportsConvention", "as-is");
-		D(
-			module.generator["css/auto"],
-			"localIdentName",
-			"[uniqueName]-[id]-[local]"
-		);
+  F(module.generator, 'css/module', () => ({}));
+  assertNotNill(module.generator['css/module']);
+  applyCssModuleGeneratorOptionsDefaults(module.generator['css/module'], {
+    hashFunction,
+    hashSalt,
+    localIdentName,
+    targetProperties,
+  });
 
-		F(module.generator, "css/module", () => ({}));
-		assertNotNill(module.generator["css/module"]);
-		D(
-			module.generator["css/module"],
-			"exportsOnly",
-			!targetProperties || !targetProperties.document
-		);
-		D(module.generator["css/module"], "exportsConvention", "as-is");
-		D(
-			module.generator["css/module"],
-			"localIdentName",
-			"[uniqueName]-[id]-[local]"
-		);
-	}
+  F(module.generator, 'css/global', () => ({}));
+  assertNotNill(module.generator['css/global']);
+  applyCssModuleGeneratorOptionsDefaults(module.generator['css/global'], {
+    hashFunction,
+    hashSalt,
+    localIdentName,
+    targetProperties,
+  });
 
-	A(module, "defaultRules", () => {
-		const esm = {
-			type: "javascript/esm",
-			resolve: {
-				byDependency: {
-					esm: {
-						fullySpecified: true
-					}
-				}
-			}
-		};
-		const commonjs = {
-			type: "javascript/dynamic"
-		};
-		const rules: RuleSetRules = [
-			{
-				mimetype: "application/node",
-				type: "javascript/auto"
-			},
-			{
-				test: /\.json$/i,
-				type: "json"
-			},
-			{
-				mimetype: "application/json",
-				type: "json"
-			},
-			{
-				test: /\.mjs$/i,
-				...esm
-			},
-			{
-				test: /\.js$/i,
-				descriptionData: {
-					type: "module"
-				},
-				...esm
-			},
-			{
-				test: /\.cjs$/i,
-				...commonjs
-			},
-			{
-				test: /\.js$/i,
-				descriptionData: {
-					type: "commonjs"
-				},
-				...commonjs
-			},
-			{
-				mimetype: {
-					or: ["text/javascript", "application/javascript"]
-				},
-				...esm
-			}
-		];
+  // https://github.com/webpack/webpack/blob/main/lib/config/defaults.js#L839
+  A(module, 'defaultRules', () => {
+    const esm = {
+      type: 'javascript/esm',
+      resolve: {
+        byDependency: {
+          esm: {
+            fullySpecified: true,
+          },
+        },
+      },
+    };
+    const commonjs = {
+      type: 'javascript/dynamic',
+    };
+    const rules: RuleSetRules = [
+      {
+        mimetype: 'application/node',
+        type: 'javascript/auto',
+      },
+      {
+        test: /\.json$/,
+        type: 'json',
+      },
+      {
+        mimetype: 'application/json',
+        type: 'json',
+      },
+      {
+        test: /\.mjs$/,
+        ...esm,
+      },
+      {
+        test: /\.js$/,
+        descriptionData: {
+          type: 'module',
+        },
+        ...esm,
+      },
+      {
+        test: /\.cjs$/,
+        ...commonjs,
+      },
+      {
+        test: /\.js$/,
+        descriptionData: {
+          type: 'commonjs',
+        },
+        ...commonjs,
+      },
+      {
+        mimetype: {
+          or: ['text/javascript', 'application/javascript'],
+        },
+        ...esm,
+      },
+    ];
 
-		if (asyncWebAssembly) {
-			const wasm = {
-				type: "webassembly/async",
-				rules: [
-					{
-						descriptionData: {
-							type: "module"
-						},
-						resolve: {
-							fullySpecified: true
-						}
-					}
-				]
-			};
-			rules.push({
-				test: /\.wasm$/i,
-				...wasm
-			});
-			rules.push({
-				mimetype: "application/wasm",
-				...wasm
-			});
-		}
+    if (asyncWebAssembly) {
+      const wasm = {
+        type: 'webassembly/async',
+        rules: [
+          {
+            descriptionData: {
+              type: 'module',
+            },
+            resolve: {
+              fullySpecified: true,
+            },
+          },
+        ],
+      };
+      rules.push({
+        test: /\.wasm$/,
+        ...wasm,
+      });
+      rules.push({
+        mimetype: 'application/wasm',
+        ...wasm,
+      });
+    }
 
-		if (css) {
-			const resolve = {
-				fullySpecified: true,
-				preferRelative: true
-			};
-			rules.push({
-				test: /\.css$/i,
-				type: "css/auto",
-				resolve
-			});
-			rules.push({
-				mimetype: "text/css+module",
-				type: "css/module",
-				resolve
-			});
-			rules.push({
-				mimetype: "text/css",
-				type: "css",
-				resolve
-			});
-		}
+    rules.push(
+      {
+        dependency: 'url',
+        oneOf: [
+          {
+            scheme: /^data$/,
+            type: 'asset/inline',
+          },
+          {
+            type: 'asset/resource',
+          },
+        ],
+      },
+      {
+        with: { type: 'json' },
+        type: 'json',
+      },
+      {
+        with: { type: 'text' },
+        type: 'asset/source',
+      },
+      {
+        with: { type: 'bytes' },
+        type: 'asset/bytes',
+      },
+    );
 
-		rules.push({
-			dependency: "url",
-			oneOf: [
-				{
-					scheme: /^data$/,
-					type: "asset/inline"
-				},
-				{
-					type: "asset/resource"
-				}
-			]
-		});
-
-		return rules;
-	});
+    return rules;
+  });
 };
 
 const applyOutputDefaults = (
-	output: OutputNormalized,
-	{
-		context,
-		outputModule,
-		targetProperties: tp,
-		isAffectedByBrowserslist,
-		development,
-		entry,
-		futureDefaults
-	}: {
-		context: Context;
-		outputModule?: boolean;
-		targetProperties: any;
-		isAffectedByBrowserslist: boolean;
-		development: boolean;
-		entry: EntryNormalized;
-		futureDefaults: boolean;
-	}
+  options: RspackOptionsNormalized,
+  {
+    context,
+    targetProperties: tp,
+    isAffectedByBrowserslist,
+    entry,
+  }: {
+    context: Context;
+    targetProperties: false | TargetProperties;
+    isAffectedByBrowserslist: boolean;
+    entry: EntryNormalized;
+  },
 ) => {
-	const getLibraryName = (library: Library): string => {
-		const libraryName =
-			typeof library === "object" &&
-			library &&
-			!Array.isArray(library) &&
-			"type" in library
-				? library.name
-				: library;
-		if (Array.isArray(libraryName)) {
-			return libraryName.join(".");
-		} else if (typeof libraryName === "object") {
-			return getLibraryName(libraryName.root);
-		} else if (typeof libraryName === "string") {
-			return libraryName;
-		}
-		return "";
-	};
-	F(output, "uniqueName", () => {
-		const libraryName = getLibraryName(output.library).replace(
-			/^\[(\\*[\w:]+\\*)\](\.)|(\.)\[(\\*[\w:]+\\*)\](?=\.|$)|\[(\\*[\w:]+\\*)\]/g,
-			(m, a, d1, d2, b, c) => {
-				const content = a || b || c;
-				return content.startsWith("\\") && content.endsWith("\\")
-					? `${d2 || ""}[${content.slice(1, -1)}]${d1 || ""}`
-					: "";
-			}
-		);
-		if (libraryName) return libraryName;
-		const pkgPath = path.resolve(context, "package.json");
-		try {
-			const packageInfo = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-			return packageInfo.name || "";
-		} catch (err) {
-			const e = err as Error & { code: string };
-			if (e.code !== "ENOENT") {
-				e.message += `\nwhile determining default 'output.uniqueName' from 'name' in ${pkgPath}`;
-				throw e;
-			}
-			return "";
-		}
-	});
-	F(output, "devtoolNamespace", () => output.uniqueName);
-	F(output, "module", () => !!outputModule);
-	D(output, "filename", output.module ? "[name].mjs" : "[name].js");
-	F(output, "iife", () => !output.module);
+  const { output } = options;
+  const getLibraryName = (library: Library): string => {
+    const libraryName =
+      typeof library === 'object' && library && !Array.isArray(library)
+        ? (library as LibraryOptions).name
+        : library;
+    if (Array.isArray(libraryName)) {
+      return libraryName.join('.');
+    }
+    if (typeof libraryName === 'object') {
+      return getLibraryName(libraryName.root);
+    }
+    if (typeof libraryName === 'string') {
+      return libraryName;
+    }
+    return '';
+  };
+  F(output, 'uniqueName', () => {
+    const libraryName = getLibraryName(output.library).replace(
+      /^\[(\\*[\w:]+\\*)\](\.)|(\.)\[(\\*[\w:]+\\*)\](?=\.|$)|\[(\\*[\w:]+\\*)\]/g,
+      (_, a, d1, d2, b, c) => {
+        const content = a || b || c;
+        return content.startsWith('\\') && content.endsWith('\\')
+          ? `${d2 || ''}[${content.slice(1, -1)}]${d1 || ''}`
+          : '';
+      },
+    );
+    if (libraryName) return libraryName;
+    const pkgPath = path.resolve(context, 'package.json');
+    try {
+      const packageInfo = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      return packageInfo.name || '';
+    } catch (err) {
+      const e = err as Error & { code: string };
+      if (e.code !== 'ENOENT') {
+        e.message += `\nwhile determining default 'output.uniqueName' from 'name' in ${pkgPath}`;
+        throw e;
+      }
+      return '';
+    }
+  });
+  F(output, 'devtoolNamespace', () => output.uniqueName);
+  if (output.library) {
+    F(output.library, 'type', () => (output.module ? 'modern-module' : 'var'));
+  }
+  const forEachEntry = (fn: (desc: EntryDescriptionNormalized) => void) => {
+    if (typeof entry === 'function') {
+      return;
+    }
+    for (const name of Object.keys(entry)) {
+      fn(entry[name]);
+    }
+  };
+  A(output, 'enabledLibraryTypes', () => {
+    const enabledLibraryTypes = [];
+    if (output.library) {
+      enabledLibraryTypes.push(output.library.type);
+    }
+    forEachEntry((desc) => {
+      if (desc.library) {
+        enabledLibraryTypes.push(desc.library.type);
+      }
+    });
+    if (enabledLibraryTypes.includes('modern-module')) {
+      applyLimits(options);
+    }
+    return enabledLibraryTypes;
+  });
+  D(
+    output,
+    'module',
+    ['modern-module', 'module'].some((ty) =>
+      output.enabledLibraryTypes!.includes(ty),
+    ),
+  );
 
-	F(output, "chunkFilename", () => {
-		const filename = output.filename!;
-		if (typeof filename !== "function") {
-			const hasName = filename.includes("[name]");
-			const hasId = filename.includes("[id]");
-			const hasChunkHash = filename.includes("[chunkhash]");
-			const hasContentHash = filename.includes("[contenthash]");
-			// Anything changing depending on chunk is fine
-			if (hasChunkHash || hasContentHash || hasName || hasId) return filename;
-			// Otherwise prefix "[id]." in front of the basename to make it changing
-			return filename.replace(/(^|\/)([^/]*(?:\?|$))/, "$1[id].$2");
-		}
-		return "[id].js";
-	});
-	F(output, "cssFilename", () => {
-		const filename = output.filename!;
-		if (typeof filename !== "function") {
-			return filename.replace(/\.[mc]?js(\?|$)/, ".css$1");
-		}
-		return "[id].css";
-	});
-	F(output, "cssChunkFilename", () => {
-		const chunkFilename = output.chunkFilename!;
-		if (typeof chunkFilename !== "function") {
-			return chunkFilename.replace(/\.[mc]?js(\?|$)/, ".css$1");
-		}
-		return "[id].css";
-	});
-	D(
-		output,
-		"hotUpdateChunkFilename",
-		`[id].[fullhash].hot-update.${output.module ? "mjs" : "js"}`
-	);
-	D(output, "hotUpdateMainFilename", "[runtime].[fullhash].hot-update.json");
+  const environment = output.environment!;
 
-	const uniqueNameId = Template.toIdentifier(
-		/** @type {NonNullable<Output["uniqueName"]>} */ output.uniqueName
-	);
-	F(output, "hotUpdateGlobal", () => "webpackHotUpdate" + uniqueNameId);
-	F(output, "chunkLoadingGlobal", () => "webpackChunk" + uniqueNameId);
-	D(output, "assetModuleFilename", "[hash][ext][query]");
-	D(output, "webassemblyModuleFilename", "[hash].module.wasm");
-	F(output, "path", () => path.join(process.cwd(), "dist"));
-	F(output, "pathinfo", () => development);
-	D(
-		output,
-		"publicPath",
-		tp && (tp.document || tp.importScripts) ? "auto" : ""
-	);
+  // For old features we optimistically assume user's target already support it
+  const optimistic = (v?: boolean | null) => v || v === undefined;
+  const conditionallyOptimistic = (v?: boolean | null, c?: boolean) =>
+    (v === undefined && c) || v;
 
-	D(output, "hashFunction", futureDefaults ? "xxhash64" : "md4");
-	D(output, "hashDigest", "hex");
-	D(output, "hashDigestLength", futureDefaults ? 16 : 20);
-	D(output, "strictModuleErrorHandling", false);
-	if (output.library) {
-		F(output.library, "type", () => (output.module ? "module" : "var"));
-	}
-	F(output, "chunkFormat", () => {
-		if (tp) {
-			const helpMessage = isAffectedByBrowserslist
-				? "Make sure that your 'browserslist' includes only platforms that support these features or select an appropriate 'target' to allow selecting a chunk format by default. Alternatively specify the 'output.chunkFormat' directly."
-				: "Select an appropriate 'target' to allow selecting one by default, or specify the 'output.chunkFormat' directly.";
-			if (output.module) {
-				if (tp.dynamicImport) return "module";
-				if (tp.document) return "array-push";
-				throw new Error(
-					"For the selected environment is no default ESM chunk format available:\n" +
-						"ESM exports can be chosen when 'import()' is available.\n" +
-						"JSONP Array push can be chosen when 'document' is available.\n" +
-						helpMessage
-				);
-			} else {
-				if (tp.document) return "array-push";
-				if (tp.require) return "commonjs";
-				if (tp.nodeBuiltins) return "commonjs";
-				if (tp.importScripts) return "array-push";
-				throw new Error(
-					"For the selected environment is no default script chunk format available:\n" +
-						"JSONP Array push can be chosen when 'document' or 'importScripts' is available.\n" +
-						"CommonJs exports can be chosen when 'require' or node builtins are available.\n" +
-						helpMessage
-				);
-			}
-		}
-		throw new Error(
-			"Chunk format can't be selected by default when no target is specified"
-		);
-	});
-	D(output, "asyncChunks", true);
-	F(output, "chunkLoading", () => {
-		if (tp) {
-			switch (output.chunkFormat) {
-				case "array-push":
-					if (tp.document) return "jsonp";
-					if (tp.importScripts) return "import-scripts";
-					break;
-				case "commonjs":
-					if (tp.require) return "require";
-					if (tp.nodeBuiltins) return "async-node";
-					break;
-				case "module":
-					if (tp.dynamicImport) return "import";
-					break;
-			}
-			if (
-				tp.require === null ||
-				tp.nodeBuiltins === null ||
-				tp.document === null ||
-				tp.importScripts === null
-			) {
-				return "universal";
-			}
-		}
-		return false;
-	});
-	F(output, "workerChunkLoading", () => {
-		if (tp) {
-			switch (output.chunkFormat) {
-				case "array-push":
-					if (tp.importScriptsInWorker) return "import-scripts";
-					break;
-				case "commonjs":
-					if (tp.require) return "require";
-					if (tp.nodeBuiltins) return "async-node";
-					break;
-				case "module":
-					if (tp.dynamicImportInWorker) return "import";
-					break;
-			}
-			if (
-				tp.require === null ||
-				tp.nodeBuiltins === null ||
-				tp.importScriptsInWorker === null
-			) {
-				return "universal";
-			}
-		}
-		return false;
-	});
-	F(output, "wasmLoading", () => {
-		if (tp) {
-			if (tp.fetchWasm) return "fetch";
-			if (tp.nodeBuiltins)
-				return output.module ? "async-node-module" : "async-node";
-			if (tp.nodeBuiltins === null || tp.fetchWasm === null) {
-				return "universal";
-			}
-		}
-		return false;
-	});
-	F(output, "workerWasmLoading", () => output.wasmLoading);
-	F(output, "globalObject", () => {
-		if (tp) {
-			if (tp.global) return "global";
-			if (tp.globalThis) return "globalThis";
-		}
-		return "self";
-	});
-	D(output, "importFunctionName", "import");
-	F(output, "clean", () => !!output.clean);
-	D(output, "crossOriginLoading", false);
-	D(output, "workerPublicPath", "");
-	F(output, "sourceMapFilename", () => {
-		return "[file].map";
-	});
-	F(output, "scriptType", () => (output.module ? "module" : false));
+  F(
+    environment,
+    'globalThis',
+    () => tp && (tp.globalThis as boolean | undefined),
+  );
+  F(environment, 'bigIntLiteral', () => tp && optimistic(tp.bigIntLiteral));
+  F(environment, 'const', () => tp && optimistic(tp.const));
+  F(
+    environment,
+    'computedProperty',
+    () => tp && optimistic(tp.computedProperty),
+  );
+  F(environment, 'methodShorthand', () => tp && optimistic(tp.methodShorthand));
+  F(environment, 'arrowFunction', () => tp && optimistic(tp.arrowFunction));
+  F(environment, 'asyncFunction', () => tp && optimistic(tp.asyncFunction));
+  F(environment, 'forOf', () => tp && optimistic(tp.forOf));
+  F(environment, 'destructuring', () => tp && optimistic(tp.destructuring));
+  F(
+    environment,
+    'optionalChaining',
+    () => tp && optimistic(tp.optionalChaining),
+  );
+  F(
+    environment,
+    'logicalAssignment',
+    // No optimistic, because it is new syntax and older runtimes parse-fail on it.
+    () => tp && tp.logicalAssignment === true,
+  );
+  F(
+    environment,
+    'nodePrefixForCoreModules',
+    () => tp && optimistic(tp.nodePrefixForCoreModules),
+  );
+  F(
+    environment,
+    'importMetaDirnameAndFilename',
+    // No optimistic, because it is new
+    () => tp && (tp.importMetaDirnameAndFilename as boolean | undefined),
+  );
+  F(environment, 'templateLiteral', () => tp && optimistic(tp.templateLiteral));
+  F(environment, 'topLevelAwait', () => tp && optimistic(tp.topLevelAwait));
+  F(
+    environment,
+    'dynamicImport',
+    () =>
+      tp &&
+      (conditionallyOptimistic(tp.dynamicImport, output.module) as
+        boolean | undefined),
+  );
+  F(
+    environment,
+    'dynamicImportInWorker',
+    () =>
+      tp &&
+      (conditionallyOptimistic(tp.dynamicImportInWorker, output.module) as
+        boolean | undefined),
+  );
+  F(
+    environment,
+    'module',
+    () =>
+      tp &&
+      (conditionallyOptimistic(tp.module, output.module) as
+        boolean | undefined),
+  );
+  F(environment, 'document', () => tp && optimistic(tp.document));
 
-	const { trustedTypes } = output;
-	if (trustedTypes) {
-		F(
-			trustedTypes,
-			"policyName",
-			() =>
-				output.uniqueName!.replace(/[^a-zA-Z0-9\-#=_/@.%]+/g, "_") || "webpack"
-		);
-	}
+  D(output, 'filename', output.module ? '[name].mjs' : '[name].js');
+  F(output, 'iife', () => !output.module);
 
-	const forEachEntry = (fn: (desc: EntryDescriptionNormalized) => void) => {
-		if (typeof entry === "function") {
-			return;
-		}
-		for (const name of Object.keys(entry)) {
-			fn(entry[name]);
-		}
-	};
-	A(output, "enabledLibraryTypes", () => {
-		const enabledLibraryTypes = [];
-		if (output.library) {
-			enabledLibraryTypes.push(output.library.type);
-		}
-		forEachEntry(desc => {
-			if (desc.library) {
-				enabledLibraryTypes.push(desc.library.type);
-			}
-		});
-		return enabledLibraryTypes;
-	});
-	A(output, "enabledChunkLoadingTypes", () => {
-		const enabledChunkLoadingTypes = new Set<string>();
-		if (output.chunkLoading) {
-			enabledChunkLoadingTypes.add(output.chunkLoading);
-		}
-		if (output.workerChunkLoading) {
-			enabledChunkLoadingTypes.add(output.workerChunkLoading);
-		}
-		forEachEntry(desc => {
-			if (desc.chunkLoading) {
-				enabledChunkLoadingTypes.add(desc.chunkLoading);
-			}
-		});
-		return Array.from(enabledChunkLoadingTypes);
-	});
-	A(output, "enabledWasmLoadingTypes", () => {
-		const enabledWasmLoadingTypes = new Set<string>();
-		if (output.wasmLoading) {
-			enabledWasmLoadingTypes.add(output.wasmLoading);
-		}
-		if (output.workerWasmLoading) {
-			enabledWasmLoadingTypes.add(output.workerWasmLoading);
-		}
-		// forEachEntry(desc => {
-		// 	if (desc.wasmLoading) {
-		// 		enabledWasmLoadingTypes.add(desc.wasmLoading);
-		// 	}
-		// });
-		return Array.from(enabledWasmLoadingTypes);
-	});
+  F(output, 'chunkFilename', () => {
+    const filename = output.filename!;
+    if (typeof filename !== 'function') {
+      const hasName = filename.includes('[name]');
+      const hasId = filename.includes('[id]');
+      const hasChunkHash = filename.includes('[chunkhash]');
+      const hasContentHash = filename.includes('[contenthash]');
+      // Anything changing depending on chunk is fine
+      if (hasChunkHash || hasContentHash || hasName || hasId) return filename;
+      // Otherwise prefix "[id]." in front of the basename to make it changing
+      return filename.replace(/(^|\/)([^/]*(?:\?|$))/, '$1[id].$2');
+    }
+    return '[id].js';
+  });
+  F(output, 'cssFilename', () => {
+    const filename = output.filename!;
+    if (typeof filename !== 'function') {
+      return filename.replace(/\.[mc]?js(\?|$)/, '.css$1');
+    }
+    return '[id].css';
+  });
+  F(output, 'cssChunkFilename', () => {
+    const chunkFilename = output.chunkFilename!;
+    if (typeof chunkFilename !== 'function') {
+      return chunkFilename.replace(/\.[mc]?js(\?|$)/, '.css$1');
+    }
+    return '[id].css';
+  });
+  D(
+    output,
+    'hotUpdateChunkFilename',
+    `[id].[fullhash].hot-update.${output.module ? 'mjs' : 'js'}`,
+  );
+  F(output, 'hotUpdateMainFilename', () => {
+    return `[runtime].[fullhash].hot-update.${output.module ? 'json.mjs' : 'json'}`;
+  });
+
+  const uniqueNameId = Template.toIdentifier(output.uniqueName);
+  F(output, 'hotUpdateGlobal', () => `rspackHotUpdate${uniqueNameId}`);
+  F(output, 'chunkLoadingGlobal', () => `rspackChunk${uniqueNameId}`);
+  D(output, 'assetModuleFilename', '[hash][ext][query]');
+  D(output, 'webassemblyModuleFilename', '[hash].module.wasm');
+  D(output, 'wasmStreamingFallback', true);
+  D(output, 'compareBeforeEmit', true);
+  if (output.path && !path.isAbsolute(output.path)) {
+    if (!context) {
+      throw new Error(
+        `${ERROR_PREFIX} "context" must be a non-empty absolute path when "output.path" is relative, get "${context ?? ''}".`,
+      );
+    }
+    output.path = path.resolve(context, output.path);
+  }
+  F(output, 'path', () => path.join(process.cwd(), 'dist'));
+  F(output, 'pathinfo', () => false);
+  D(
+    output,
+    'publicPath',
+    tp && (tp.document || tp.importScripts) ? 'auto' : '',
+  );
+
+  D(output, 'hashFunction', 'xxhash64');
+  D(output, 'hashDigest', 'hex');
+  D(output, 'hashDigestLength', 16);
+  D(output, 'strictModuleErrorHandling', false);
+
+  F(output, 'chunkFormat', () => {
+    if (tp) {
+      const helpMessage = isAffectedByBrowserslist
+        ? "Make sure that your 'browserslist' includes only platforms that support these features or select an appropriate 'target' to allow selecting a chunk format by default. Alternatively specify the 'output.chunkFormat' directly."
+        : "Select an appropriate 'target' to allow selecting one by default, or specify the 'output.chunkFormat' directly.";
+      if (output.module) {
+        if (environment.dynamicImport) return 'module';
+        if (tp.document) return 'array-push';
+        throw new Error(
+          `For the selected environment is no default ESM chunk format available:\nESM exports can be chosen when 'import()' is available.\nJSONP Array push can be chosen when 'document' is available.\n${helpMessage}`,
+        );
+      }
+      if (tp.document) return 'array-push';
+      if (tp.require) return 'commonjs';
+      if (tp.nodeBuiltins) return 'commonjs';
+      if (tp.importScripts) return 'array-push';
+      throw new Error(
+        `For the selected environment is no default script chunk format available:\nJSONP Array push can be chosen when 'document' or 'importScripts' is available.\nCommonJs exports can be chosen when 'require' or node builtins are available.\n${helpMessage}`,
+      );
+    }
+    throw new Error(
+      "Chunk format can't be selected by default when no target is specified",
+    );
+  });
+  D(output, 'asyncChunks', true);
+  F(output, 'chunkLoading', () => {
+    if (tp) {
+      switch (output.chunkFormat) {
+        case 'array-push':
+          if (tp.document) return 'jsonp';
+          if (tp.importScripts) return 'import-scripts';
+          break;
+        case 'commonjs':
+          if (tp.require) return 'require';
+          if (tp.nodeBuiltins) return 'async-node';
+          break;
+        case 'module':
+          if (environment.dynamicImport) return 'import';
+          break;
+      }
+      if (
+        (tp.require === null ||
+          tp.nodeBuiltins === null ||
+          tp.document === null ||
+          tp.importScripts === null) &&
+        output.module &&
+        environment.dynamicImport
+      ) {
+        return 'universal';
+      }
+    }
+    return false;
+  });
+  F(output, 'workerChunkLoading', () => {
+    if (tp) {
+      switch (output.chunkFormat) {
+        case 'array-push':
+          if (tp.importScriptsInWorker) return 'import-scripts';
+          break;
+        case 'commonjs':
+          if (tp.require) return 'require';
+          if (tp.nodeBuiltins) return 'async-node';
+          break;
+        case 'module':
+          if (environment.dynamicImportInWorker) return 'import';
+          break;
+      }
+      if (
+        (tp.require === null ||
+          tp.nodeBuiltins === null ||
+          tp.importScriptsInWorker === null) &&
+        output.module &&
+        environment.dynamicImport
+      ) {
+        return 'universal';
+      }
+    }
+    return false;
+  });
+  F(output, 'wasmLoading', () => {
+    if (tp) {
+      if (tp.fetchWasm) return 'fetch';
+      if (tp.nodeBuiltins) return 'async-node';
+      if (
+        (tp.nodeBuiltins === null || tp.fetchWasm === null) &&
+        output.module &&
+        environment.dynamicImport
+      ) {
+        return 'universal';
+      }
+    }
+    return false;
+  });
+  F(output, 'workerWasmLoading', () => output.wasmLoading);
+  F(output, 'globalObject', () => {
+    if (tp) {
+      if (tp.global) return 'global';
+      if (tp.globalThis) return 'globalThis';
+    }
+    return 'self';
+  });
+  D(output, 'importFunctionName', 'import');
+  D(output, 'importMetaName', 'import.meta');
+  F(output, 'clean', () => !!output.clean);
+  D(output, 'crossOriginLoading', false);
+  D(output, 'workerPublicPath', '');
+  D(output, 'sourceMapFilename', '[file].map[query]');
+  F(output, 'scriptType', () => (output.module ? 'module' : false));
+  D(output, 'chunkLoadTimeout', 120000);
+
+  const { trustedTypes } = output;
+  if (trustedTypes) {
+    F(
+      trustedTypes,
+      'policyName',
+      () =>
+        output.uniqueName!.replace(/[^a-zA-Z0-9\-#=_/@.%]+/g, '_') || 'rspack',
+    );
+    D(trustedTypes, 'onPolicyCreationFailure', 'stop');
+  }
+
+  A(output, 'enabledChunkLoadingTypes', () => {
+    const enabledChunkLoadingTypes = new Set<string>();
+    if (output.chunkLoading) {
+      enabledChunkLoadingTypes.add(output.chunkLoading);
+    }
+    if (output.workerChunkLoading) {
+      enabledChunkLoadingTypes.add(output.workerChunkLoading);
+    }
+    forEachEntry((desc) => {
+      if (desc.chunkLoading) {
+        enabledChunkLoadingTypes.add(desc.chunkLoading);
+      }
+    });
+    return Array.from(enabledChunkLoadingTypes);
+  });
+  A(output, 'enabledWasmLoadingTypes', () => {
+    const enabledWasmLoadingTypes = new Set<WasmLoadingType>();
+    if (output.wasmLoading) {
+      enabledWasmLoadingTypes.add(output.wasmLoading);
+    }
+    if (output.workerWasmLoading) {
+      enabledWasmLoadingTypes.add(output.workerWasmLoading);
+    }
+    forEachEntry((desc) => {
+      if (desc.wasmLoading) {
+        enabledWasmLoadingTypes.add(desc.wasmLoading);
+      }
+    });
+    return Array.from(enabledWasmLoadingTypes);
+  });
+
+  D(output, 'bundlerInfo', {});
+  if (typeof output.bundlerInfo === 'object') {
+    D(output.bundlerInfo, 'version', RSPACK_VERSION);
+    D(output.bundlerInfo, 'bundler', 'rspack');
+    D(output.bundlerInfo, 'force', false);
+  }
 };
 
 const applyExternalsPresetsDefaults = (
-	externalsPresets: ExternalsPresets,
-	{ targetProperties }: { targetProperties: any }
+  externalsPresets: ExternalsPresets,
+  {
+    targetProperties,
+    buildHttp,
+    outputModule,
+  }: {
+    targetProperties: false | TargetProperties;
+    buildHttp: boolean;
+    outputModule: boolean;
+  },
 ) => {
-	D(externalsPresets, "web", targetProperties && targetProperties.web);
-	D(externalsPresets, "node", targetProperties && targetProperties.node);
-	D(
-		externalsPresets,
-		"electron",
-		targetProperties && targetProperties.electron
-	);
-	D(
-		externalsPresets,
-		"electronMain",
-		targetProperties &&
-			targetProperties.electron &&
-			targetProperties.electronMain
-	);
-	D(
-		externalsPresets,
-		"electronPreload",
-		targetProperties &&
-			targetProperties.electron &&
-			targetProperties.electronPreload
-	);
-	D(
-		externalsPresets,
-		"electronRenderer",
-		targetProperties &&
-			targetProperties.electron &&
-			targetProperties.electronRenderer
-	);
+  const isUniversal = (key: keyof TargetProperties) =>
+    Boolean(outputModule && targetProperties && targetProperties[key] === null);
+
+  D(
+    externalsPresets,
+    'web',
+    !buildHttp &&
+      targetProperties &&
+      (targetProperties.web || isUniversal('node')),
+  );
+  D(
+    externalsPresets,
+    'node',
+    targetProperties && (targetProperties.node || isUniversal('node')),
+  );
+  D(
+    externalsPresets,
+    'electron',
+    (targetProperties && targetProperties.electron) || isUniversal('electron'),
+  );
+  D(
+    externalsPresets,
+    'electronMain',
+    targetProperties &&
+      !!targetProperties.electron &&
+      (targetProperties.electronMain || isUniversal('electronMain')),
+  );
+  D(
+    externalsPresets,
+    'electronPreload',
+    targetProperties &&
+      !!targetProperties.electron &&
+      (targetProperties.electronPreload || isUniversal('electronPreload')),
+  );
+  D(
+    externalsPresets,
+    'electronRenderer',
+    targetProperties &&
+      !!targetProperties.electron &&
+      (targetProperties.electronRenderer || isUniversal('electronRenderer')),
+  );
+  D(
+    externalsPresets,
+    'nwjs',
+    targetProperties && (targetProperties.nwjs || isUniversal('nwjs')),
+  );
+};
+
+const applyLoaderDefaults = (
+  loader: Loader,
+  {
+    targetProperties,
+    environment,
+  }: { targetProperties: false | TargetProperties; environment: any },
+) => {
+  F(loader, 'target', () => {
+    if (targetProperties) {
+      if (targetProperties.electron) {
+        if (targetProperties.electronMain) return 'electron-main';
+        if (targetProperties.electronPreload) return 'electron-preload';
+        if (targetProperties.electronRenderer) return 'electron-renderer';
+        return 'electron';
+      }
+      if (targetProperties.nwjs) return 'nwjs';
+      if (targetProperties.node) return 'node';
+      if (targetProperties.web) return 'web';
+    }
+  });
+  D(loader, 'environment', environment);
 };
 
 const applyNodeDefaults = (
-	node: Node,
-	{ targetProperties }: { targetProperties: any }
+  node: Node,
+  {
+    outputModule,
+    targetProperties,
+  }: { targetProperties: false | TargetProperties; outputModule?: boolean },
 ) => {
-	if (node === false) return;
+  if (node === false) return;
 
-	F(node, "global", () => {
-		if (targetProperties && targetProperties.global) return false;
-		return "warn";
-	});
-	F(node, "__dirname", () => {
-		if (targetProperties && targetProperties.node) return "eval-only";
-		return "warn-mock";
-	});
-	F(node, "__filename", () => {
-		if (targetProperties && targetProperties.node) return "eval-only";
-		return "warn-mock";
-	});
+  F(node, 'global', () => {
+    if (targetProperties && targetProperties.global) return false;
+    return 'warn';
+  });
+  const handlerForNames = () => {
+    if (targetProperties) {
+      if (targetProperties.node) {
+        return outputModule ? 'node-module' : 'eval-only';
+      }
+      if (
+        outputModule &&
+        targetProperties.node === null &&
+        targetProperties.web === null
+      ) {
+        return 'eval-only';
+      }
+    }
+    return 'warn-mock';
+  };
+  F(node, '__dirname', handlerForNames);
+  F(node, '__filename', handlerForNames);
+};
+
+const applyPerformanceDefaults = (
+  performance: Performance,
+  { production }: { production: boolean },
+) => {
+  if (performance === false) return;
+  D(performance, 'maxAssetSize', 300 * 1024);
+  D(performance, 'maxEntrypointSize', 500 * 1024);
+  F(performance, 'hints', () => (production ? 'warning' : false));
 };
 
 const applyOptimizationDefaults = (
-	optimization: Optimization,
-	{
-		production,
-		development,
-		css
-	}: { production: boolean; development: boolean; css: boolean }
+  optimization: Optimization,
+  {
+    production,
+    development,
+  }: {
+    production: boolean;
+    development: boolean;
+  },
 ) => {
-	D(optimization, "removeAvailableModules", true);
-	D(optimization, "removeEmptyChunks", true);
-	D(optimization, "mergeDuplicateChunks", true);
-	F(optimization, "moduleIds", (): "named" | "deterministic" => {
-		if (production) return "deterministic";
-		return "named";
-	});
-	F(optimization, "chunkIds", (): "named" | "deterministic" => {
-		if (production) return "deterministic";
-		if (development) return "named";
-		return "named"; // we have not implemented 'natural' so use 'named' now
-	});
-	F(optimization, "sideEffects", () => (production ? true : "flag"));
-	D(optimization, "mangleExports", production);
-	D(optimization, "providedExports", true);
-	D(optimization, "usedExports", production);
-	D(optimization, "innerGraph", production);
-	D(optimization, "runtimeChunk", false);
-	D(optimization, "realContentHash", production);
-	D(optimization, "minimize", production);
-	D(optimization, "concatenateModules", false);
-	A(optimization, "minimizer", () => [
-		new SwcJsMinimizerRspackPlugin(),
-		new SwcCssMinimizerRspackPlugin()
-	]);
-	F(optimization, "nodeEnv", () => {
-		if (production) return "production";
-		if (development) return "development";
-		return false;
-	});
-	const { splitChunks } = optimization;
-	if (splitChunks) {
-		A(splitChunks, "defaultSizeTypes", () =>
-			css ? ["javascript", "css", "unknown"] : ["javascript", "unknown"]
-		);
-		D(splitChunks, "hidePathInfo", production);
-		D(splitChunks, "chunks", "async");
-		// D(splitChunks, "usedExports", optimization.usedExports === true);
-		D(splitChunks, "minChunks", 1);
-		F(splitChunks, "minSize", () => (production ? 20000 : 10000));
-		// F(splitChunks, "minRemainingSize", () => (development ? 0 : undefined));
-		// F(splitChunks, "enforceSizeThreshold", () => (production ? 50000 : 30000));
-		F(splitChunks, "maxAsyncRequests", () => (production ? 30 : Infinity));
-		F(splitChunks, "maxInitialRequests", () => (production ? 30 : Infinity));
-		D(splitChunks, "automaticNameDelimiter", "-");
-		const { cacheGroups } = splitChunks;
-		if (cacheGroups) {
-			F(cacheGroups, "default", () => ({
-				idHint: "",
-				reuseExistingChunk: true,
-				minChunks: 2,
-				priority: -20
-			}));
-			F(cacheGroups, "defaultVendors", () => ({
-				idHint: "vendors",
-				reuseExistingChunk: true,
-				test: /[\\/]node_modules[\\/]/i,
-				priority: -10
-			}));
-		}
-	}
+  D(optimization, 'removeEmptyChunks', true);
+  D(optimization, 'mergeDuplicateChunks', true);
+  F(optimization, 'moduleIds', (): 'natural' | 'named' | 'deterministic' => {
+    if (production) return 'deterministic';
+    if (development) return 'named';
+    return 'natural';
+  });
+  F(optimization, 'chunkIds', (): 'natural' | 'named' | 'deterministic' => {
+    if (production) return 'deterministic';
+    if (development) return 'named';
+    return 'natural';
+  });
+  F(optimization, 'sideEffects', () => (production ? true : 'flag'));
+  D(optimization, 'mangleExports', production);
+  D(optimization, 'inlineExports', production);
+  D(optimization, 'providedExports', true);
+  D(optimization, 'usedExports', production);
+  D(optimization, 'innerGraph', production);
+  D(optimization, 'emitOnErrors', !production);
+  D(optimization, 'runtimeChunk', false);
+  D(optimization, 'realContentHash', production);
+  D(optimization, 'avoidEntryIife', false);
+  D(optimization, 'minimize', production);
+  D(optimization, 'concatenateModules', production);
+  A(optimization, 'minimizer', () => [
+    new SwcJsMinimizerRspackPlugin(),
+    new LightningCssMinimizerRspackPlugin(),
+  ]);
+  F(optimization, 'nodeEnv', () => {
+    if (production) return 'production';
+    if (development) return 'development';
+    return false;
+  });
+  const { splitChunks } = optimization;
+  if (splitChunks) {
+    D(splitChunks, 'dedupDepth', production ? 1 : 0);
+    A(splitChunks, 'defaultSizeTypes', () => ['javascript', 'css', 'unknown']);
+    D(splitChunks, 'hidePathInfo', production);
+    D(splitChunks, 'chunks', 'async');
+    D(splitChunks, 'usedExports', optimization.usedExports === true);
+    D(splitChunks, 'minChunks', 1);
+    F(splitChunks, 'minSize', () => (production ? 20000 : 10000));
+    F(splitChunks, 'minRemainingSize', () => (development ? 0 : undefined));
+    F(splitChunks, 'enforceSizeThreshold', () => (production ? 50000 : 30000));
+    F(splitChunks, 'maxAsyncRequests', () =>
+      production ? 30 : Number.POSITIVE_INFINITY,
+    );
+    F(splitChunks, 'maxInitialRequests', () =>
+      production ? 30 : Number.POSITIVE_INFINITY,
+    );
+    D(splitChunks, 'automaticNameDelimiter', '-');
+    const { cacheGroups } = splitChunks;
+    if (cacheGroups) {
+      F(cacheGroups, 'default', () => ({
+        idHint: '',
+        reuseExistingChunk: true,
+        minChunks: 2,
+        priority: -20,
+      }));
+      F(cacheGroups, 'defaultVendors', () => ({
+        idHint: 'vendors',
+        reuseExistingChunk: true,
+        test: /[\\/]node_modules[\\/]/,
+        priority: -10,
+      }));
+    }
+  }
 };
 
 const getResolveLoaderDefaults = () => {
-	const resolveOptions: ResolveOptions = {
-		conditionNames: ["loader", "require", "node"],
-		exportsFields: ["exports"],
-		mainFields: ["loader", "main"],
-		extensions: [".js"],
-		mainFiles: ["index"]
-	};
+  const resolveOptions: ResolveOptions = {
+    conditionNames: ['loader', 'require', 'node'],
+    exportsFields: ['exports'],
+    mainFields: ['loader', 'main'],
+    extensions: ['.js'],
+    mainFiles: ['index'],
+  };
 
-	return resolveOptions;
+  return resolveOptions;
 };
 
 // The values are aligned with webpack
 // https://github.com/webpack/webpack/blob/b9fb99c63ca433b24233e0bbc9ce336b47872c08/lib/config/defaults.js#L1431
 const getResolveDefaults = ({
-	context,
-	targetProperties,
-	mode,
-	css
+  targetProperties,
+  mode,
 }: {
-	context: string;
-	targetProperties: any;
-	mode?: Mode;
-	css: boolean;
+  targetProperties: false | TargetProperties;
+  mode?: Mode;
 }) => {
-	const conditions = ["webpack"];
+  const conditions = ['webpack'];
 
-	conditions.push(mode === "development" ? "development" : "production");
+  conditions.push(mode === 'development' ? 'development' : 'production');
 
-	if (targetProperties) {
-		if (targetProperties.webworker) conditions.push("worker");
-		if (targetProperties.node) conditions.push("node");
-		if (targetProperties.web) conditions.push("browser");
-		if (targetProperties.electron) conditions.push("electron");
-		if (targetProperties.nwjs) conditions.push("nwjs");
-	}
-	const jsExtensions = [".js", ".json", ".wasm"];
+  if (targetProperties) {
+    if (targetProperties.webworker) conditions.push('worker');
+    if (targetProperties.node) conditions.push('node');
+    if (targetProperties.web) conditions.push('browser');
+    if (targetProperties.electron) conditions.push('electron');
+    if (targetProperties.nwjs) conditions.push('nwjs');
+  }
+  const jsExtensions = ['.js', '.json'];
 
-	const tp = targetProperties;
+  const tp = targetProperties;
 
-	const browserField =
-		tp && tp.web && (!tp.node || (tp.electron && tp.electronRenderer));
-	const aliasFields = browserField ? ["browser"] : [];
-	const mainFields = browserField
-		? ["browser", "module", "..."]
-		: ["module", "..."];
+  const browserField =
+    tp && tp.web && (!tp.node || (tp.electron && tp.electronRenderer));
+  const aliasFields = browserField ? ['browser'] : [];
+  const mainFields = browserField
+    ? ['browser', 'module', '...']
+    : ['module', '...'];
 
-	const cjsDeps = () => ({
-		aliasFields,
-		mainFields,
-		conditionNames: ["require", "module", "..."],
-		extensions: [...jsExtensions]
-	});
+  const cjsDeps = () => ({
+    aliasFields,
+    mainFields,
+    conditionNames: ['require', 'module', '...'],
+    extensions: [...jsExtensions],
+  });
 
-	const esmDeps = () => ({
-		aliasFields,
-		mainFields,
-		conditionNames: ["import", "module", "..."],
-		extensions: [...jsExtensions]
-	});
+  const esmDeps = () => ({
+    aliasFields,
+    mainFields,
+    conditionNames: ['import', 'module', '...'],
+    extensions: [...jsExtensions],
+  });
 
-	const resolveOptions: ResolveOptions = {
-		modules: ["node_modules"],
-		conditionNames: conditions,
-		mainFiles: ["index"],
-		extensions: [],
-		aliasFields: [],
-		exportsFields: ["exports"],
-		roots: [context],
-		mainFields: ["main"],
-		byDependency: {
-			wasm: esmDeps(),
-			esm: esmDeps(),
-			url: {
-				preferRelative: true
-			},
-			worker: {
-				...esmDeps(),
-				preferRelative: true
-			},
-			commonjs: cjsDeps(),
-			// amd: cjsDeps(),
-			// for backward-compat: loadModule
-			// loader: cjsDeps(),
-			// for backward-compat: Custom Dependency and getResolve without dependencyType
-			unknown: cjsDeps()
-		}
-	};
+  const resolveOptions: ResolveOptions = {
+    // enable pnp only in pnp environment, see https://yarnpkg.com/advanced/pnpapi#processversionspnp
+    pnp: getPnpDefault(),
+    modules: ['node_modules'],
+    conditionNames: conditions,
+    mainFiles: ['index'],
+    extensions: [],
+    aliasFields: [],
+    exportsFields: ['exports'],
+    roots: [],
+    mainFields: ['main'],
+    importsFields: ['imports'],
+    byDependency: {
+      wasm: esmDeps(),
+      esm: esmDeps(),
+      loaderImport: esmDeps(),
+      url: {
+        preferRelative: true,
+      },
+      worker: {
+        ...esmDeps(),
+        preferRelative: true,
+      },
+      commonjs: cjsDeps(),
+      amd: cjsDeps(),
+      // for backward-compat: loadModule
+      loader: cjsDeps(),
+      // for backward-compat: Custom Dependency and getResolve without dependencyType
+      unknown: cjsDeps(),
+    },
+  };
 
-	if (css) {
-		const styleConditions = [];
+  const styleConditions = [];
 
-		styleConditions.push("webpack");
-		styleConditions.push(mode === "development" ? "development" : "production");
-		styleConditions.push("style");
+  styleConditions.push(mode === 'development' ? 'development' : 'production');
+  styleConditions.push('style');
 
-		resolveOptions.byDependency!["css-import"] = {
-			// We avoid using any main files because we have to be consistent with CSS `@import`
-			// and CSS `@import` does not handle `main` files in directories,
-			// you should always specify the full URL for styles
-			mainFiles: [],
-			mainFields: ["style", "..."],
-			conditionNames: styleConditions,
-			extensions: [".css"],
-			preferRelative: true
-		};
-	}
+  const cssResolveOptions = {
+    // We avoid using any main files because we have to be consistent with CSS `@import`
+    // and CSS `@import` does not handle `main` files in directories,
+    // you should always specify the full URL for styles
+    mainFiles: [],
+    mainFields: ['style', '...'],
+    conditionNames: styleConditions,
+    extensions: ['.css'],
+    preferRelative: true,
+  };
 
-	return resolveOptions;
+  resolveOptions.byDependency!['css-import'] = cssResolveOptions;
+  resolveOptions.byDependency!['css-import-local-module'] = cssResolveOptions;
+  resolveOptions.byDependency!['css-import-global-module'] = cssResolveOptions;
+
+  return resolveOptions;
 };
 
 const D = <T, P extends keyof T>(obj: T, prop: P, value: T[P]) => {
-	if (obj[prop] === undefined) {
-		obj[prop] = value;
-	}
+  if (obj[prop] === undefined) {
+    obj[prop] = value;
+  }
 };
 
 const F = <T, P extends keyof T>(obj: T, prop: P, factory: () => T[P]) => {
-	if (obj[prop] === undefined) {
-		obj[prop] = factory();
-	}
+  if (obj[prop] === undefined) {
+    obj[prop] = factory();
+  }
 };
 
 const A = <T, P extends keyof T>(
-	obj: T,
-	prop: P,
-	factory: () => T[P]
+  obj: T,
+  prop: P,
+  factory: () => T[P],
 ): void => {
-	const value = obj[prop];
-	if (value === undefined) {
-		obj[prop] = factory();
-	} else if (Array.isArray(value)) {
-		let newArray = undefined;
-		for (let i = 0; i < value.length; i++) {
-			const item = value[i];
-			if (item === "...") {
-				if (newArray === undefined) {
-					newArray = value.slice(0, i);
-					// @ts-expect-error
-					obj[prop] = newArray;
-				}
-				const items = factory();
-				if (items !== undefined) {
-					for (const item of items as any) {
-						newArray.push(item);
-					}
-				}
-			} else if (newArray !== undefined) {
-				newArray.push(item);
-			}
-		}
-	}
+  const value = obj[prop];
+  if (value === undefined) {
+    obj[prop] = factory();
+  } else if (Array.isArray(value)) {
+    let newArray: any;
+    for (let i = 0; i < value.length; i++) {
+      const item = value[i];
+      if (item === '...') {
+        if (newArray === undefined) {
+          newArray = value.slice(0, i);
+          obj[prop] = newArray;
+        }
+        const items = factory();
+        if (items !== undefined) {
+          for (const item of items as any) {
+            newArray.push(item);
+          }
+        }
+      } else if (newArray !== undefined) {
+        newArray.push(item);
+      }
+    }
+  }
+};
+
+export const getPnpDefault = () => {
+  return !!process.versions.pnp;
 };

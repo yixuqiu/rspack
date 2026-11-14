@@ -1,58 +1,66 @@
-use std::borrow::Cow;
-use std::hash::Hash;
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_collections::{Identifiable, Identifier};
 use rspack_core::{
-  impl_module_meta_info, impl_source_map_config,
-  rspack_sources::{RawSource, Source, SourceExt},
-  AsyncDependenciesBlockIdentifier, BoxDependency, BuildContext, BuildInfo, BuildMeta, BuildResult,
-  ChunkUkey, CodeGenerationResult, Compilation, ConcatenationScope, Context, DependenciesBlock,
-  DependencyId, FactoryMeta, LibIdentOptions, Module, ModuleIdentifier, ModuleType, RuntimeGlobals,
-  RuntimeSpec, SourceType,
+  BoxDependency, BoxModule, BuildContext, BuildInfo, BuildMeta, ChunkGraph, ChunkUkey,
+  CodeGenerationResultBuilder, Compilation, Context, DependenciesBlock, DependenciesBlockData,
+  FactoryMetaStore, FreezeLock, LibIdentOptions, Module, ModuleArgument,
+  ModuleCodeGenerationContext, ModuleGraph, ModuleIdentifier, ModuleType, NeedBuildContext,
+  RuntimeGlobals, RuntimeSpec, SourceType, impl_module_meta_info, impl_source_map_config,
+  module_update_hash,
+  rspack_sources::{BoxSource, RawStringSource, SourceExt},
+  runtime_mode::RuntimeMode,
 };
-use rspack_error::{impl_empty_diagnosable_trait, Diagnostic, Result};
-use rspack_hash::RspackHash;
-use rspack_identifier::{Identifiable, Identifier};
-use rspack_util::source_map::SourceMapKind;
+use rspack_error::{Result, impl_empty_diagnosable_trait};
+use rspack_hash::{RspackHashDigest, RspackHasher};
+use rspack_util::{itoa, source_map::SourceMapKind};
 
 use super::fallback_item_dependency::FallbackItemDependency;
-use crate::utils::json_stringify;
+use crate::utils::{json_stringify, module_identifier_namespace};
 
 #[impl_source_map_config]
+#[cacheable]
 #[derive(Debug)]
 pub struct FallbackModule {
-  blocks: Vec<AsyncDependenciesBlockIdentifier>,
-  dependencies: Vec<DependencyId>,
+  dependencies_block: DependenciesBlockData,
   identifier: ModuleIdentifier,
   readable_identifier: String,
   lib_ident: String,
   requests: Vec<String>,
-  factory_meta: Option<FactoryMeta>,
-  build_info: Option<BuildInfo>,
-  build_meta: Option<BuildMeta>,
+  factory_meta: FactoryMetaStore,
+  build_info: FreezeLock<BuildInfo>,
+  build_meta: FreezeLock<BuildMeta>,
 }
 
 impl FallbackModule {
-  pub fn new(requests: Vec<String>) -> Self {
+  pub fn new(requests: Vec<String>, runtime_mode: RuntimeMode) -> Self {
     let identifier = format!("fallback {}", requests.join(" "));
+    let mut requests_len_buffer = itoa::Buffer::new();
+    let requests_len_minus_one = requests_len_buffer.format(requests.len() - 1);
+    let namespace = module_identifier_namespace(runtime_mode);
     let lib_ident = format!(
-      "webpack/container/fallback/{}/and {} more",
+      "{namespace}/container/fallback/{}/and {} more",
       requests
         .first()
         .expect("should have at one more requests in FallbackModule"),
-      requests.len() - 1
+      requests_len_minus_one
     );
     Self {
-      blocks: Default::default(),
-      dependencies: Default::default(),
+      dependencies_block: Default::default(),
       identifier: ModuleIdentifier::from(identifier.as_str()),
       readable_identifier: identifier,
       lib_ident,
       requests,
-      factory_meta: None,
-      build_info: None,
-      build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      factory_meta: Default::default(),
+      build_info: BuildInfo {
+        strict: true,
+        ..Default::default()
+      }
+      .into(),
+      build_meta: Default::default(),
+      source_map_kind: SourceMapKind::empty(),
     }
   }
 }
@@ -64,28 +72,21 @@ impl Identifiable for FallbackModule {
 }
 
 impl DependenciesBlock for FallbackModule {
-  fn add_block_id(&mut self, block: AsyncDependenciesBlockIdentifier) {
-    self.blocks.push(block)
+  fn dependencies_block(&self) -> &DependenciesBlockData {
+    &self.dependencies_block
   }
 
-  fn get_blocks(&self) -> &[AsyncDependenciesBlockIdentifier] {
-    &self.blocks
-  }
-
-  fn add_dependency_id(&mut self, dependency: DependencyId) {
-    self.dependencies.push(dependency)
-  }
-
-  fn get_dependencies(&self) -> &[DependencyId] {
-    &self.dependencies
+  fn dependencies_block_mut(&mut self) -> &mut DependenciesBlockData {
+    &mut self.dependencies_block
   }
 }
 
+#[cacheable_dyn]
 #[async_trait]
 impl Module for FallbackModule {
   impl_module_meta_info!();
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>) -> f64 {
     self.requests.len() as f64 * 5.0 + 42.0
   }
 
@@ -93,79 +94,71 @@ impl Module for FallbackModule {
     &ModuleType::Fallback
   }
 
-  fn get_diagnostics(&self) -> Vec<Diagnostic> {
-    vec![]
-  }
-
-  fn source_types(&self) -> &[SourceType] {
+  fn source_types(&self, _module_graph: &ModuleGraph) -> &[SourceType] {
     &[SourceType::JavaScript]
   }
 
-  fn original_source(&self) -> Option<&dyn Source> {
+  fn source(&self) -> Option<&BoxSource> {
     None
   }
 
-  fn readable_identifier(&self, _context: &Context) -> Cow<str> {
+  fn readable_identifier(&self, _context: &Context) -> Cow<'_, str> {
     self.readable_identifier.as_str().into()
   }
 
-  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<str>> {
+  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<'_, str>> {
     Some(self.lib_ident.as_str().into())
   }
 
   fn chunk_condition(&self, chunk: &ChunkUkey, compilation: &Compilation) -> Option<bool> {
-    Some(compilation.chunk_graph.get_number_of_entry_modules(chunk) > 0)
+    Some(
+      compilation
+        .build_chunk_graph_artifact
+        .chunk_graph
+        .get_number_of_entry_modules(chunk)
+        > 0,
+    )
+  }
+
+  async fn need_build(&self, _context: &NeedBuildContext<'_>) -> Result<bool> {
+    Ok(self.build_info.frozen().is_none())
   }
 
   async fn build(
-    &mut self,
-    build_context: BuildContext<'_>,
+    mut self: Box<Self>,
+    _build_context: Arc<BuildContext>,
     _: Option<&Compilation>,
-  ) -> Result<BuildResult> {
-    let mut hasher = RspackHash::from(&build_context.compiler_options.output);
-    self.update_hash(&mut hasher);
-
-    let build_info = BuildInfo {
-      strict: true,
-      hash: Some(hasher.digest(&build_context.compiler_options.output.hash_digest)),
-      ..Default::default()
-    };
-
+  ) -> Result<BoxModule> {
     let mut dependencies: Vec<BoxDependency> = Vec::new();
     for request in &self.requests {
-      dependencies.push(Box::new(FallbackItemDependency::new(request.clone())))
+      dependencies.push(BoxDependency::new(FallbackItemDependency::new(
+        request.clone(),
+      )))
     }
 
-    Ok(BuildResult {
-      build_info,
-      build_meta: Default::default(),
-      dependencies,
-      blocks: Vec::new(),
-      analyze_result: Default::default(),
-      optimization_bailouts: vec![],
-    })
+    Ok(
+      BoxModule::new(self)
+        .with_dependencies(dependencies.into_iter().map(Into::into).collect(), vec![]),
+    )
   }
 
-  #[allow(clippy::unwrap_in_result)]
-  fn code_generation(
+  // #[tracing::instrument("FallbackModule::code_generation", skip_all, fields(identifier = ?self.identifier()))]
+  async fn code_generation(
     &self,
-    compilation: &Compilation,
-    _runtime: Option<&RuntimeSpec>,
-    _: Option<ConcatenationScope>,
-  ) -> Result<CodeGenerationResult> {
-    let mut codegen = CodeGenerationResult::default();
+    code_generation_context: &mut ModuleCodeGenerationContext,
+  ) -> Result<CodeGenerationResultBuilder> {
+    let ModuleCodeGenerationContext {
+      compilation,
+      runtime_template,
+      ..
+    } = code_generation_context;
+    let mut codegen = CodeGenerationResultBuilder::default();
     let module_graph = compilation.get_module_graph();
-    codegen.runtime_requirements.insert(RuntimeGlobals::MODULE);
-    codegen.runtime_requirements.insert(RuntimeGlobals::REQUIRE);
     let ids: Vec<_> = self
-      .get_dependencies()
-      .iter()
+      .get_dependency_ids()
       .filter_map(|dep| module_graph.get_module_by_dependency_id(dep))
       .filter_map(|module| {
-        compilation
-          .chunk_graph
-          .get_module_id(module.identifier())
-          .as_deref()
+        ChunkGraph::get_module_id(&compilation.module_ids_artifact, module.identifier())
       })
       .collect();
     let code = format!(
@@ -187,29 +180,25 @@ var handleError = function(e) {{
   error = e;
   return loop();
 }};
-module.exports = loop();
+{module}.exports = loop();
 "#,
+      module = runtime_template.render_module_argument(ModuleArgument::Module),
       ids = json_stringify(&ids),
-      require = RuntimeGlobals::REQUIRE,
+      require = runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE),
     );
-    codegen = codegen.with_javascript(RawSource::from(code).boxed());
+    codegen.add(SourceType::JavaScript, RawStringSource::from(code).boxed());
     Ok(codegen)
+  }
+
+  async fn get_runtime_hash(
+    &self,
+    compilation: &Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    let mut hasher = RspackHasher::from(&compilation.options.output);
+    module_update_hash(self, &mut hasher, compilation, runtime);
+    Ok(hasher.digest(&compilation.options.output.hash_digest))
   }
 }
 
 impl_empty_diagnosable_trait!(FallbackModule);
-
-impl Hash for FallbackModule {
-  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    "__rspack_internal__FallbackModule".hash(state);
-    self.identifier().hash(state);
-  }
-}
-
-impl PartialEq for FallbackModule {
-  fn eq(&self, other: &Self) -> bool {
-    self.identifier() == other.identifier()
-  }
-}
-
-impl Eq for FallbackModule {}

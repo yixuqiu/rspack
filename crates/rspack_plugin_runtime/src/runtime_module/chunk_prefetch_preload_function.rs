@@ -1,51 +1,69 @@
 use rspack_core::{
+  Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext, RuntimeTemplate,
   impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Compilation, RuntimeGlobals, RuntimeModule,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
+#[derive(Debug)]
 pub struct ChunkPrefetchPreloadFunctionRuntimeModule {
-  id: Identifier,
   runtime_function: RuntimeGlobals,
   runtime_handlers: RuntimeGlobals,
 }
 
 impl ChunkPrefetchPreloadFunctionRuntimeModule {
   pub fn new(
+    runtime_template: &RuntimeTemplate,
     child_type: &str,
     runtime_function: RuntimeGlobals,
     runtime_handlers: RuntimeGlobals,
   ) -> Self {
-    Self {
-      id: Identifier::from(format!(
-        "webpack/runtime/chunk_prefetch_function/{}",
-        child_type
-      )),
+    Self::with_name(
+      runtime_template,
+      child_type,
       runtime_function,
       runtime_handlers,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
-    }
+    )
   }
 }
 
+#[async_trait::async_trait]
 impl RuntimeModule for ChunkPrefetchPreloadFunctionRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
   }
 
-  fn generate(&self, _: &Compilation) -> rspack_error::Result<BoxSource> {
-    Ok(
-      RawSource::from(
-        include_str!("runtime/chunk_prefetch_preload_function.js")
-          .replace("$RUNTIME_FUNCTION$", &self.runtime_function.to_string())
-          .replace("$RUNTIME_HANDLERS$", &self.runtime_handlers.to_string()),
-      )
-      .boxed(),
-    )
+  fn template(&self) -> Vec<(String, String)> {
+    vec![(
+      self.id().to_string(),
+      include_str!("runtime/chunk_prefetch_preload_function.ejs").to_string(),
+    )]
+  }
+
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let runtime_template = context.runtime_template;
+    let source = runtime_template.render(
+      self.id(),
+      Some(serde_json::json!({
+        "_runtime_handlers":  runtime_template.render_runtime_globals(&self.runtime_handlers),
+        "_runtime_handlers_define":  runtime_template.render_runtime_global_definition(&self.runtime_handlers),
+        "_runtime_function_define": runtime_template.render_runtime_global_definition(&self.runtime_function),
+      })),
+    )?;
+
+    Ok(source)
+  }
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      dependencies: { self.runtime_handlers },
+      define: { self.runtime_function | self.runtime_handlers },
+      force_context: self.runtime_function,
+      ..Default::default()
+    }
   }
 }

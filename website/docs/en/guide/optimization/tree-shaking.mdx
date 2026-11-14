@@ -1,398 +1,280 @@
-import WebpackLicense from '@components/webpack-license';
-
-<WebpackLicense from="https://webpack.js.org/guides/tree-shaking" />
+---
+description: 'Rspack supports tree shaking, a term commonly used in the JavaScript ecosystem for removing unused code, also known as "dead code"'
+---
 
 # Tree shaking
 
-Rspack supports tree shaking, which is a term commonly used within a JavaScript context to describe the removal of dead code.
+Rspack supports [tree shaking](https://developer.mozilla.org/en-US/docs/Glossary/Tree_shaking), a term commonly used in the JavaScript ecosystem for removing unused code, also known as "dead code". Dead code occurs when module exports are unused and have no side effects, allowing them to be safely removed to reduce bundle size.
 
-It relies on the import and export statements to detect if code modules are exported and imported for use between JavaScript files.
+## What is tree shaking
 
-Tree shaking will be enable when you set `mode` into `production`.
+Think of your application as a tree. The source code and libraries you actually use are the green, living leaves. Dead code is like the brown, dead leaves consumed by autumn. To remove the dead leaves, you shake the tree and they fall off.
 
-## Basic tree shaking
+Rspack doesn't directly remove dead code—it marks unused exports as potential "dead code". Minification tools then recognize and process these markers. If [minimize](/config/optimization#optimizationminimize) is disabled, you won't see any actual code removal.
 
-```js title=rspack.config.js
-/**
- * @type {import('@rspack/core').Configuration}
- */
-const config = {
-  mode: 'development',
-  entry: {
-    index: './src/index.js',
-  },
-  output: {},
-};
+:::tip What is dead code
+[Dead code](https://en.wikipedia.org/wiki/Dead_code) is code that's no longer executed, typically due to refactoring, optimization, or logical errors. It may be a remnant from previous versions or code that never executes under any condition.
+:::
 
-module.exports = config;
-```
+## Prerequisites
 
-```js title=./src/index.js
-import { cube } from './math.js';
+To effectively leverage tree shaking, you need to:
 
-function component() {
-  const element = document.createElement('pre');
+- Set Rspack's [mode](/config/mode) to `production` to enable tree shaking optimizations.
+  - In production builds, `mode` defaults to `production`.
+- Use ES module syntax (`import` and `export`).
+  - When using compilers such as SWC or Babel, configure them to preserve ES module syntax. For example, set `modules` to `false` in [@babel/preset-env](https://babeljs.io/docs/en/babel-preset-env).
 
-  element.innerHTML = ['Hello webpack!', '5 cubed is equal to ' + cube(5)].join(
-    '\n\n',
-  );
-
-  return element;
-}
-
-document.body.appendChild(component());
-```
-
-```js title=./src/math.js
-export function square(x) {
-  return x * x;
-}
-
-export function cube(x) {
-  return x * x * x;
-}
-```
-
-Note that we did not import the `square` method from the **src/math.js** module. That function is what's known as "dead code",
-meaning an unused export that should be dropped. Now let's build the project.
-This will yield the following result:
-
-```js
-// ...skipping some trivial code
-var __webpack_modules__ = {
-  './src/index.js': function (module, exports, __webpack_require__) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    var _mathJs = __webpack_require__('./src/math.js');
-    function component() {
-      const element = document.createElement('pre');
-      element.innerHTML = [
-        'Hello webpack!',
-        '5 cubed is equal to ' + (0, _mathJs.cube)(5),
-      ].join('\n\n');
-      return element;
-    }
-    document.body.appendChild(component());
-  },
-  './src/math.js': function (module, exports, __webpack_require__) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    function _export(target, all) {
-      for (var name in all)
-        Object.defineProperty(target, name, {
-          enumerable: true,
-          get: all[name],
-        });
-    }
-    _export(exports, {
-      square: function () {
-        return square;
-      },
-      cube: function () {
-        return cube;
-      },
-    });
-    function square(x) {
-      return x * x;
-    }
-    function cube(x) {
-      return x * x * x;
-    }
-  },
-};
-// ...
-```
-
-As you can see, if we don't enable the treeShaking, all the code is kept as is, except wrapping with
-some runtime code.
-
-Now, we switch to production mode and rebuild the project. In order to make the output more readable, we also turn off the `minimize` option and switch the `moduleIds` to `named`. To compare with the later chapters, we turn off `optimization.sideEffects`.
-
-```diff title=rspack.config.js
-/**
- * @type {import('@rspack/core').Configuration}
- */
-const config = {
-  mode: 'production',
-  entry: {
-    index: './src/index.js',
-  },
-+ optimization: {
-+   sideEffects: false,
-+   moduleIds: 'named',
-+   minimize: false
-+ }
-};
-
-module.exports = config;
-```
-
-Rebuilding the project, the `square` function got dropped.
-
-## SideEffects
-
-In a 100% ESM module world, identifying side effects is straightforward. However, we aren't there quite yet (In real project we using different kinds of format of package cjs, esm, umd and so on.), so in the mean time, it's necessary to provide hints to rspack's compiler on the "pureness" of your code.
-The way this is accomplished is the "sideEffects" package.json property.
-
-```json title=package.json
-{
-  "name": "your-project",
-  "sideEffects": false
-}
-```
-
-The sideEffects field supports the following values:
-
-- `false` All files in this package have no side effects.
-- `string` A glob matching files that includes side effects.
-- `Array<string>` An array of globs matching files that include side effects.
-- `undefined` This is the default value of `sideEffects` when you don't provide any value to `sideEffects` field of `package.json`, When the `undefined` is set, Rspack will try to analyse if the code has sideEffects when `optimization.sideEffects` is `true`
-  (which is the default value when `mode` is `production`), or Rspack will treat all the modules in package has `sideEffect`
-
-This time, we use a more complicated demo.
-
-```js title=rspack.config.js
-/**
- * @type {import('@rspack/core').Configuration}
- */
-const config = {
-  mode: 'production',
-  entry: {
-    index: './src/index.js',
-  },
-  optimization: {
-    moduleIds: 'named',
-    minimize: false,
-  },
-};
-module.exports = config;
-```
-
-```js title=index.js
-import { multiply } from 'math';
-
-console.log(multiply(2, 3));
-```
-
-```json title=node_modules/math/package.json
-{
-  "name": "math",
-  "sideEffects": false
-}
-```
-
-```js title=node_modules/math/index.js
-export * from './add.js';
-export * from './multiply.js';
-export * from './subtract.js';
-```
-
-```js title=node_modules/math/subtract.js
-export const subtract = (a, b) => a - b;
-```
-
-```js title=node_modules/math/multiply.js
-export const multiply = (a, b) => a * b;
-```
-
-```js title=node_modules/math/add.js
-const randomDate = Date.now();
-export const addRandomDate = a => a + randomDate;
-export const add = (a, b) => a + b;
-```
-
-The variable `randomDate` would still be needed because it includes a side effect that runs during the module's initialization.
-However, because the package.json includes the `sideEffects` field and the value is `false`, and there are no export variable used in
-**add.js**, so the whole module could be skipped, same for **subtract.js**
-
-```js
-//...
-var __webpack_modules__ = {
-  './node_modules/math/index.js': function (
-    module,
-    exports,
-    __webpack_require__,
-  ) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    __webpack_require__.es(
-      __webpack_require__('./node_modules/math/multiply.js'),
-      exports,
-    );
-  },
-  './node_modules/math/multiply.js': function (
-    module,
-    exports,
-    __webpack_require__,
-  ) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    Object.defineProperty(exports, 'multiply', {
-      enumerable: true,
-      get: function () {
-        return multiply;
-      },
-    });
-    const multiply = (a, b) => a * b;
-  },
-  './src/index.js': function (module, exports, __webpack_require__) {
-    'use strict';
-    Object.defineProperty(exports, '__esModule', {
-      value: true,
-    });
-    var _indexJs = __webpack_require__('./node_modules/math/index.js');
-    console.log((0, _indexJs.multiply)(2, 3));
-  },
-};
-// ...
-```
-
-### module.rule.sideEffects
-
-You could override some modules sideEffects by using `module.rule.sideEffects`.
-Why do we need such feature?
-Considering if the author of package `math` forgot to add `sideEffects` field in package.json:
-
-```diff title=node_modules/math/package.json
-{
-+ "name": "math"
-- "name": "math",
-- "sideEffects": false
-}
-```
-
-Then Rspack will try to analyze the code safely and only mark the module is sideEffectFree when
-all toplevel statements are sideEffectFree. As you can see, `math/index.js`, `math/subtract.js` and `math/multiply.js` is sideEffectFree
-while `math/add.js` is not, because of `const randomDate = Date.now()`. When rebuilding the project,
-you could see the diff:
+Rspack analyzes your code after loaders have processed it. A loader that converts ES modules to CommonJS might change an export like this:
 
 ```diff
-//...
-var __webpack_modules__ = {
-"./node_modules/math/index.js": function (module, exports, __webpack_require__) {
-"use strict";
-Object.defineProperty(exports, "__esModule", {
-    value: true
-});
-__webpack_require__.es(__webpack_require__("./node_modules/math/multiply.js"), exports);
-+__webpack_require__.es(__webpack_require__("./node_modules/math/add.js"), exports);
-},
-"./node_modules/math/multiply.js": function (module, exports, __webpack_require__) {
-"use strict";
-Object.defineProperty(exports, "__esModule", {
-    value: true
-});
-Object.defineProperty(exports, "multiply", {
-    enumerable: true,
-    get: function() {
-        return multiply;
-    }
-});
-const multiply = (a, b)=>a * b;
-},
-+"./node_modules/math/add.js": function (module, exports, __webpack_require__) {
-+ "use strict";
-+ Date.now()
-+},
-"./src/index.js": function (module, exports, __webpack_require__) {
-"use strict";
-Object.defineProperty(exports, "__esModule", {
-    value: true
-});
-var _indexJs = __webpack_require__("./node_modules/math/index.js");
-console.log((0, _indexJs.multiply)(2, 3));
-},
+- export const unused = 1;
++ exports.unused = 1;
+```
 
+This conversion can limit tree shaking. If your bundle still includes unused exports, check your loader or compiler settings to make sure they preserve ES module syntax.
+
+## Configurations
+
+When [mode](/config/mode) is set to `production`, Rspack enables several tree shaking optimizations:
+
+- [usedExports](/config/optimization#optimizationusedexports): Detects which module exports are used, enabling removal of unused exports.
+- [sideEffects](/config/optimization#optimizationsideeffects): Analyzes modules for side effects. Modules without side effects can be further optimized through re-exports.
+- [providedExports](/config/optimization#optimizationprovidedexports): Analyzes all exports and tracks their re-export sources.
+- [innerGraph](/config/optimization#optimizationinnergraph): Tracks variable usage to more accurately determine if exports are actually used.
+
+The following examples illustrate how these options work. For clarity, we'll use simplified code to demonstrate code removal.
+
+Let's look at an example with `src/main.js` as the entry point:
+
+```js title='src/main.js'
+import { foo } from './util.js';
+
+console.log(foo);
+// `bar` is not used
+```
+
+```js title='src/util.js'
+export const foo = 1;
+export const bar = 2;
+```
+
+In this example, `bar` from `util.js` is unused. In `production` mode, Rspack enables [usedExports](/config/optimization#optimizationusedexports) by default, which detects which exports are used. Unused exports like `bar` are removed. The final output looks like this:
+
+```js title='dist/main.js'
+const foo = 1;
+
+console.log(foo);
+```
+
+## Side effects analysis
+
+In `production` mode, Rspack also analyzes modules for side effects. If all exports from a module are unused and the module has no side effects, the entire module can be removed. Let's modify the previous example:
+
+```diff title='src/main.js'
+import { foo } from './util.js';
+
+- console.log(foo);
+// `bar` is not used
+```
+
+In this case, none of the exports from `util.js` are used, and it’s analyzed as having no side effects, permitting the entire deletion of `util.js`.
+
+You can manually indicate whether a module has side effects via `package.json` or `module.rules`. To do this, enable [optimization.sideEffects](/config/optimization#optimizationsideeffects).
+
+In `package.json`, you can use `true` or `false` to indicate whether all modules in the package have side effects.
+
+```json title="package.json"
+{
+  "name": "package",
+  "version": "1.0.0",
+  "sideEffects": false
 }
-// ...
 ```
 
-That's not what we expect, then we could use `module.rule.sideEffects`, because it has higher priority than `sideEffects` in package.json.
-Since the initialization side effect is only meaningful when addRandomDate is utilized, we can safely override it. To do so, we can make the following modification to our rspack.config.js:
+This `package.json` indicates that all modules in this package are side-effect-free.
 
-```diff title=rspack.config.js
-/**
- * @type {import('@rspack/core').Configuration}
- */
-const config = {
-  mode: 'production',
-  entry: {
-    index: './src/index.js',
+You can also use glob patterns to specify which modules have side effects. Unmatched modules are automatically treated as side-effect-free. If you manually mark side effects, ensure all unmarked modules truly have no side effects.
+
+```json title="package.json"
+{
+  "name": "package",
+  "version": "1.0.0",
+  "sideEffects": ["./src/main.js", "*.css"]
+}
+```
+
+This `package.json` indicates that only `./src/main.js` and all `.css` files have side effects, while all other modules are side-effect-free.
+
+## Re-export analysis
+
+Re-exports are common in development. However, a module might import many other modules while only needing a few exports. Rspack optimizes this by allowing consumers to access the actual exported modules directly. Consider this re-export example:
+
+```js title='src/main.js'
+import { value } from './re-exports.js';
+console.log(value);
+```
+
+```js title='src/re-exports.js'
+export * from './value.js';
+export * from './other.js'; // this can be removed if `other.js` does not have any side effects
+```
+
+```js title='src/value.js'
+export const value = 42;
+export const foo = 42; // not used
+```
+
+Rspack enables [providedExports](/config/optimization#optimizationprovidedexports) by default, which analyzes all exports from a re-exporting module and identifies their origins.
+
+If `src/re-exports.js` has no side effects, Rspack can convert the import in `src/main.js` to import directly from `src/value.js`:
+
+```diff title='src/main.js'
+- import { value } from './re-exports.js';
++ import { value } from './value.js';
+console.log(value);
+```
+
+This allows Rspack to completely skip the `src/re-exports.js` module.
+
+By analyzing all re-exports in `src/re-exports.js`, Rspack determines that `foo` from `src/value.js` is unused and removes it from the final output.
+
+## Variable transmission
+
+Sometimes exports are imported but not actually used. For example:
+
+```js title='src/main.js'
+import { foo } from './value.js';
+
+function log() {
+  console.log(foo);
+} // `log` is not used
+
+const bar = foo; // `foo` is not used
+```
+
+In this scenario, even though the `log` function and the `bar` variable depend on `foo`, neither is used, so `foo` is considered dead code and removed.
+
+When [innerGraph](/config/optimization#optimizationinnergraph) is enabled (the default in `production` mode), Rspack can track variable usage across modules to achieve precise code optimization.
+
+```js title='src/main.js'
+import { value } from './bar.js';
+console.log(value);
+```
+
+```js title='src/bar.js'
+import { foo } from './foo.js';
+const bar = foo;
+export const value = bar;
+```
+
+```js title='src/foo.js'
+export const foo = 42;
+```
+
+Since `value` is used, the `foo` it depends on is retained.
+
+## Pure annotation
+
+Use the [`/*#__PURE__*/`](https://github.com/javascript-compiler-hints/compiler-notations-spec/blob/main/pure-notation-spec.md) annotation to tell Rspack that a function call is side-effect-free (pure). Place it before function calls to mark them as having no side effects.
+
+When an unused variable's initial value is marked as side-effect-free (pure), it's treated as dead code and removed by the minimizer.
+
+```js
+/*#__PURE__*/ double(55);
+```
+
+:::tip
+
+- Function arguments aren't marked by the annotation and may need to be marked individually.
+- This behavior is enabled when [optimization.innerGraph](/config/optimization#optimizationinnergraph) is set to true.
+
+:::
+
+## NO_SIDE_EFFECTS annotation
+
+`/*#__NO_SIDE_EFFECTS__*/` is a feature that follows the community [JavaScript Compiler Hints Spec](https://github.com/javascript-compiler-hints/compiler-notations-spec/blob/main/no-side-effects-notation-spec.md). Unlike `/*#__PURE__*/` which marks call sites, `/*#__NO_SIDE_EFFECTS__*/` is used to mark **function definitions**, declaring that the function has no side effects when called with arguments.
+
+### Configuration
+
+This feature is currently experimental and controlled by `experiments.pureFunctions`, which is enabled by default in production mode. It also depends on [optimization.sideEffects](/config/optimization#optimizationsideeffects) being `true` (`sideEffects` is `true` by default in production mode):
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    pureFunctions: true,
   },
-  optimization: {
-    minimize: false,
-    moduleIds: 'named'
-  },
-+  module: {
-+    rules: [
-+      {
-+        test: /math\/add\.js/,
-+        sideEffects: false
-+      }
-+    ]
-+  }
 };
-module.exports = config;
 ```
 
-Rebuilding the project, we could got the same result as before, the whole **math/add.js** module got dropped.
+### Usage
 
-### Reexports optimization
+You can place this annotation before function declarations, function expressions, arrow functions, or export statements, check [spec](https://github.com/javascript-compiler-hints/compiler-notations-spec/blob/main/no-side-effects-notation-spec.md) for details:
 
-After enabling SideEffects optimization, Rspack tries to optimize re-exports modules.
+```js
+/*#__NO_SIDE_EFFECTS__*/
+function foo() {
+  console.log('foo');
+}
 
-```js title=sdk.js
-export { a } from './a.js';
-export { b } from './b.js';
-export { c } from './c.js';
-// ...
+/*#__NO_SIDE_EFFECTS__*/
+const bar = () => {
+  console.log('bar');
+};
+
+/*#__NO_SIDE_EFFECTS__*/
+export default function baz() {}
+
+/*#__NO_SIDE_EFFECTS__*/
+export function baz() {}
 ```
 
-```js title=index.js
-import { a } from './sdk.js';
-console.log(a);
+If a function is marked as side-effect-free and its return value is unused, Rspack can safely remove the call. Compared to `/*#__PURE__*/`, the advantage is that you only need to mark it once at the definition, and all call sites will benefit.
+
+## pureFunctions
+
+`pureFunctions` lets you manually mark top-level identifiers in matched modules as side-effect-free for pure-function-based tree shaking. Each name must resolve to a top-level binding in the module — a function/class/variable declaration, an `import` specifier, or an export alias of one. This is useful for third-party libraries where source code cannot be modified, such as packages in `node_modules`, and for asserting that a particular import is pure on the consumer side.
+
+For configuration details, see [`experiments.pureFunctions`](/config/experiments#experimentspurefunctions) and [`module.parser.javascript.pureFunctions`](/config/module-parser#javascriptpurefunctions).
+
+:::warning
+This option is experimental and only takes effect when `experiments.pureFunctions` is enabled, which is the default in production mode.
+:::
+
+:::note
+For default exports configured on the source module, use `default` as the name.
+:::
+
+For business source code where modification is possible, it is recommended to use the `/*#__NO_SIDE_EFFECTS__*/` annotation.
+
+### Usage
+
+This option is configured in `module.rules[i].parser`:
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    pureFunctions: true,
+  },
+  module: {
+    rules: [
+      // Mark exports of a third-party library as pure.
+      {
+        test: /node_modules\/some-library\/index.js/,
+        parser: {
+          pureFunctions: ['isString', 'default'],
+        },
+      },
+      // Or mark the import on the consumer side.
+      {
+        test: /src\/styles\.js$/,
+        parser: {
+          pureFunctions: ['cva'],
+        },
+      },
+    ],
+  },
+};
 ```
 
-If Rspack knows that module `sdk.js` has no side effects, Rspack will try to import `a` directly from `a.js` rather than imports the whole `sdk.js`.
-
-In some non-standard libraries, there may be circular dependencies, for example, `a.js` imports members from `b.js` via `sdk.js`.
-
-```js title=a.js
-import { b } from './sdk.js';
-export const a = b;
-```
-
-```js title=index.js
-import { a } from './sdk.js';
-console.log(a);
-```
-
-At this time, there is a circular dependency between `a.js` and `sdk.js`, which is not recommended to intentionally use circular dependencies like this. However, it can still be built successfully and run successfully. This is because Rspack will attempt to transform the above imports into:
-
-```diff title=a.js
-- import { b } from './sdk.js';
-+ import { b } from './b.js';
-export const a = b;
-```
-
-```diff title=index.js
-- import { a } from './sdk.js'
-+ import { a } from './a.js'
-console.log(a);
-```
-
-After the transformation, the circular dependency is gone. However, if you try to turn off `optimization.providedExports` or `optimization.sideEffects`, the build will be successful, but errors due to circular dependencies will occur at runtime.
-
-> You can find above example [here](https://github.com/rspack-contrib/rspack-examples/tree/main/rspack/rspack/treeshaking-transform-imports).
-
-This diagram demonstrates the process of re-exports optimization:
-
-![](https://assets.rspack.dev/rspack/assets/rspack-reexports-optimization.png)
+Rspack validates each configured name against the matched module. If a configured name does not appear as a top-level binding in the module, Rspack emits a warning.

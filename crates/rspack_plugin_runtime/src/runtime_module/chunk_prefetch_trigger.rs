@@ -1,49 +1,69 @@
-use std::hash::BuildHasherDefault;
+use std::sync::LazyLock;
 
-use indexmap::IndexMap;
+use rspack_cacheable::with::AsMap;
 use rspack_core::{
-  impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Compilation, RuntimeModule, RuntimeModuleStage,
+  Compilation, IndexChunkIdMap, RuntimeModule, RuntimeModuleGenerateContext,
+  RuntimeModuleRuntimeRequirements, RuntimeModuleStage, RuntimeTemplate,
+  chunk_graph_chunk::ChunkId, impl_runtime_module,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
-use rustc_hash::FxHasher;
+
+use crate::{extract_runtime_globals_from_ejs, extract_runtime_module_variables_from_ejs};
+
+static CHUNK_PREFETCH_TRIGGER_TEMPLATE: &str = include_str!("runtime/chunk_prefetch_trigger.ejs");
+static RUNTIME_MODULE_VARIABLES: LazyLock<Vec<&'static str>> =
+  LazyLock::new(|| extract_runtime_module_variables_from_ejs(&[CHUNK_PREFETCH_TRIGGER_TEMPLATE]));
+static CHUNK_PREFETCH_TRIGGER_RUNTIME_REQUIREMENTS: LazyLock<RuntimeModuleRuntimeRequirements> =
+  LazyLock::new(|| extract_runtime_globals_from_ejs(CHUNK_PREFETCH_TRIGGER_TEMPLATE));
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
+#[derive(Debug)]
 pub struct ChunkPrefetchTriggerRuntimeModule {
-  id: Identifier,
-  chunk_map: IndexMap<String, Vec<String>, BuildHasherDefault<FxHasher>>,
+  #[cacheable(with=AsMap)]
+  chunk_map: IndexChunkIdMap<Vec<ChunkId>>,
 }
 
 impl ChunkPrefetchTriggerRuntimeModule {
-  pub fn new(chunk_map: IndexMap<String, Vec<String>, BuildHasherDefault<FxHasher>>) -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/chunk_prefetch_trigger"),
-      chunk_map,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
-    }
+  pub fn new(runtime_template: &RuntimeTemplate, chunk_map: IndexChunkIdMap<Vec<ChunkId>>) -> Self {
+    Self::with_default(runtime_template, chunk_map)
   }
 }
 
+#[async_trait::async_trait]
 impl RuntimeModule for ChunkPrefetchTriggerRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn runtime_module_variables() -> &'static [&'static str] {
+    RUNTIME_MODULE_VARIABLES.as_slice()
   }
 
-  fn generate(&self, _: &Compilation) -> rspack_error::Result<BoxSource> {
-    Ok(
-      RawSource::from(include_str!("runtime/chunk_prefetch_trigger.js").replace(
-        "$CHUNK_MAP$",
-        &serde_json::to_string(&self.chunk_map).expect("invalid json tostring"),
-      ))
-      .boxed(),
-    )
+  fn template(&self) -> Vec<(String, String)> {
+    vec![(
+      self.id().to_string(),
+      CHUNK_PREFETCH_TRIGGER_TEMPLATE.to_string(),
+    )]
+  }
+
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let source = context.runtime_template.render(
+      self.id(),
+      Some(serde_json::json!({
+        "_chunk_map": &self.chunk_map,
+      })),
+    )?;
+    Ok(source)
   }
 
   fn stage(&self) -> RuntimeModuleStage {
     RuntimeModuleStage::Trigger
+  }
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      dependencies: CHUNK_PREFETCH_TRIGGER_RUNTIME_REQUIREMENTS.dependencies,
+      ..Default::default()
+    }
   }
 }

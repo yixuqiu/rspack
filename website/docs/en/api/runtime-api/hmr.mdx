@@ -1,0 +1,409 @@
+---
+description: 'Rspack provides the same interface as webpack for implementing HMR'
+---
+
+import Attribution from '@components/Attribution';
+
+# Hot module replacement
+
+Rspack provides the same interface as webpack for implementing HMR.
+
+If you've enabled Hot Module Replacement via the [HotModuleReplacementPlugin](/plugins/hot-module-replacement-plugin), its interface is exposed on the `module.hot` and `import.meta.webpackHot` objects.
+
+In ESM, use `import.meta.webpackHot` instead of `module.hot`.
+
+## Example
+
+To accept updates to a module you have already loaded, first check whether the HMR interface is available:
+
+```js
+if (module.hot) {
+  module.hot.accept('./library.js', function () {
+    // Do something with the updated library module...
+  });
+}
+
+// or
+if (import.meta.webpackHot) {
+  import.meta.webpackHot.accept('./library.js', function () {
+    // Do something with the updated library module…
+  });
+}
+```
+
+## Update propagation
+
+When a module changes, Rspack checks whether the update can be handled without reloading the page. A module can accept its own update with `accept()`, or an importing module can accept updates to that dependency with `accept(dependency, callback)`. Otherwise, the update continues to the modules that import it.
+
+For example, consider this chain of imports:
+
+```text
+app.js
+└── view.js
+    └── button.js
+```
+
+When `button.js` changes:
+
+- If `view.js` accepts updates to `button.js`, Rspack replaces `button.js` and calls the callback in `view.js`. It does not replace `view.js` or `app.js`.
+- If only `app.js` accepts updates to `view.js`, Rspack replaces both `button.js` and `view.js`, then calls the callback in `app.js`.
+
+If there are multiple importers, every affected path must accept the update. By default, an update is aborted if a module declines it or it reaches an entry module without being accepted. The dev server can then fall back to a full page reload.
+
+## Module API
+
+The following methods are supported by `module.hot` and `import.meta.webpackHot`.
+
+### accept
+
+Accepts updates for the given `dependencies` and fires a `callback` to handle those updates. You can also attach an optional error handler:
+
+```js
+module.hot.accept(
+  dependencies, // Either a string or an array of strings
+  callback, // Function to fire when the dependencies are updated
+  errorHandler, // (err, {moduleId, dependencyId}) => {}
+);
+
+// or
+import.meta.webpackHot.accept(
+  dependencies, // Either a string or an array of strings
+  callback, // Function to fire when the dependencies are updated
+  errorHandler, // (err, {moduleId, dependencyId}) => {}
+);
+```
+
+When using ESM `import`, all imported symbols from `dependencies` are automatically updated. Note: The dependency string must exactly match the `from` string in the `import`. In some cases, `callback` can be omitted. Using `require()` in the `callback` isn't useful here.
+
+When using CommonJS, update dependencies manually using `require()` in the `callback`. Omitting the `callback` isn't useful here.
+
+#### errorHandler for accept
+
+`(err, {moduleId, dependencyId}) => {}`
+
+- `err`: The error thrown by the callback in the second argument or during dependency execution when using ESM dependencies.
+- `moduleId`: The current module ID.
+- `dependencyId`: The module ID of the (first) changed dependency.
+
+### accept (self)
+
+Accepts updates for itself.
+
+```js
+module.hot.accept(
+  errorHandler, // Function to handle errors when evaluating the new version
+);
+
+// or
+import.meta.webpackHot.accept(
+  errorHandler, // Function to handle errors when evaluating the new version
+);
+```
+
+When this module or its dependencies are updated, it can be disposed and re-evaluated without notifying parents. This makes sense if the module has no exports (or exports are updated in another way).
+
+The `errorHandler` fires when evaluating this module (or its dependencies) throws an exception.
+
+#### errorHandler for self accept
+
+`(err, {moduleId, module}) => {}`
+
+- `err`: The error when evaluating the new version.
+- `moduleId`: The current module ID.
+- `module`: The current module instance.
+  - `module.hot`: Allows using the HMR API of the errored module instance. A common scenario is to self-accept it again. It also makes sense to add a dispose handler to pass data along. Note that the errored module might already be partially executed, so avoid getting into an inconsistent state. Use `module.hot.data` to store partial state.
+  - `module.exports`: Can be overridden, but be careful since property names might be mangled in production mode.
+
+### decline
+
+Rejects updates for the given `dependencies`, forcing the update to fail with a `'decline'` code.
+
+```js
+module.hot.decline(
+  dependencies, // Either a string or an array of strings
+);
+
+// or
+import.meta.webpackHot.decline(
+  dependencies, // Either a string or an array of strings
+);
+```
+
+Flags a dependency as not updatable. This makes sense when changes to this dependency's exports can't be handled or handling isn't implemented yet. Depending on your HMR management code, updates to these dependencies (or their unaccepted dependencies) usually cause a full page reload.
+
+### decline (self)
+
+Rejects updates for itself.
+
+```js
+module.hot.decline();
+
+// or
+import.meta.webpackHot.decline();
+```
+
+Flag this module as not-update-able. This makes sense when this module has irreversible side-effects, or HMR handling is not implemented for this module yet. Depending on your HMR management code, an update to this module (or unaccepted dependencies) usually causes a full-reload of the page.
+
+### dispose (or addDisposeHandler)
+
+Register a handler to clean up resources, such as timers or event listeners, before the module is replaced. Store any state you want to preserve on the `data` argument; the updated module can read it from `import.meta.webpackHot.data` (or `module.hot.data` for CommonJS).
+
+```js
+module.hot.dispose((data) => {
+  // Clean up and pass data to the updated module...
+});
+
+// or
+import.meta.webpackHot.dispose((data) => {
+  // Clean up and pass data to the updated module...
+});
+```
+
+This example clears the old timer and resumes counting from the saved value after an update:
+
+```js
+let count = import.meta.webpackHot?.data?.count ?? 0;
+const timer = setInterval(() => {
+  console.log(++count);
+}, 1000);
+
+if (import.meta.webpackHot) {
+  import.meta.webpackHot.accept();
+  import.meta.webpackHot.dispose((data) => {
+    clearInterval(timer);
+    data.count = count;
+  });
+}
+```
+
+### invalidate
+
+Call `invalidate()` when the current module cannot handle a hot update and needs the modules that import it to handle the update instead. The update propagates to those modules even if the current module previously called `accept()` to accept its own updates. See [Update propagation](#update-propagation).
+
+When applying an accepted update, Rspack first calls the current module's [`dispose`](#dispose-or-adddisposehandler) handlers to clean up its resources.
+
+To reject updates to the current module, use [`decline()`](#decline-self).
+
+When called during the `idle` state, a new HMR update will be created containing this module. HMR will enter the `ready` state.
+
+When called during the `ready` or `prepare` state, this module will be added to the current HMR update.
+
+When called during the `check` state, this module will be added to the update when an update is available. If no update is available it will create a new update. HMR will enter the `ready` state.
+
+When called during the `dispose` or `apply` state, HMR will pick it up after getting out of those states.
+
+#### Use cases
+
+**When a dependency update cannot be handled**
+
+Inside an `accept()` callback, call `invalidate()` if the current module cannot handle the dependency's update. This lets modules that import the current module handle the update:
+
+```js
+import { x, y } from './dep.js';
+import { processX, processY } from 'anotherDep';
+
+const oldY = y;
+
+processX(x);
+export default processY(y);
+
+import.meta.webpackHot.accept('./dep.js', () => {
+  if (y !== oldY) {
+    // This can't be handled, bubble to parent
+    import.meta.webpackHot.invalidate();
+    return;
+  }
+  // This can be handled
+  processX(x);
+});
+```
+
+**When a module cannot handle its own update**
+
+The following module accepts its own updates and compares the new exported string with the previous one. If the string changes, it calls `invalidate()` so that modules importing it can also update:
+
+```js
+const message = 'Hello';
+
+export default message;
+
+const previousMessage = import.meta.webpackHot.data?.message;
+
+if (previousMessage !== undefined && previousMessage !== message) {
+  import.meta.webpackHot.invalidate();
+} else {
+  import.meta.webpackHot.dispose((data) => {
+    data.message = message;
+  });
+  import.meta.webpackHot.accept();
+}
+```
+
+:::tip
+
+- In a [`dispose`](#dispose-or-adddisposehandler) callback, write any data you want to keep to the `data` object. The updated module can read it from `import.meta.webpackHot.data` (`module.hot.data` in CommonJS).
+- On first execution, no previous state is available, so this value is `undefined`. After an update, it is an empty object if the previous version did not save any data.
+- Do not call `invalidate()` every time the module runs. Doing so can make each hot update trigger another, creating an update loop.
+
+:::
+
+### removeDisposeHandler
+
+Remove the handler added via `dispose` or `addDisposeHandler`.
+
+```js
+module.hot.removeDisposeHandler(callback);
+
+// or
+import.meta.webpackHot.removeDisposeHandler(callback);
+```
+
+## Management API
+
+### status
+
+Retrieve the current status of the hot module replacement process.
+
+```js
+module.hot.status(); // Will return one of the following strings...
+
+// or
+import.meta.webpackHot.status();
+```
+
+| Status  | Description                                                                         |
+| ------- | ----------------------------------------------------------------------------------- |
+| idle    | The process is waiting for a call to [`check`](#check)                              |
+| check   | The process is checking for updates                                                 |
+| prepare | The process is getting ready for the update (e.g. downloading the updated module)   |
+| ready   | The update is prepared and available                                                |
+| dispose | The process is calling the `dispose` handlers on the modules that will be replaced  |
+| apply   | The process is calling the `accept` handlers and re-executing self-accepted modules |
+| abort   | An update was aborted, but the system is still in its previous state                |
+| fail    | An update has thrown an exception and the system's state has been compromised       |
+
+### check
+
+Check for hot updates and download any that are available. HMR must be in the `idle` state when you call this method.
+
+```js
+module.hot
+  .check(autoApply)
+  .then((outdatedModules) => {
+    // outdated modules...
+  })
+  .catch((error) => {
+    // catch errors
+  });
+
+// or
+import.meta.webpackHot
+  .check(autoApply)
+  .then((outdatedModules) => {
+    // outdated modules...
+  })
+  .catch((error) => {
+    // catch errors
+  });
+```
+
+Use `autoApply` to choose whether to apply the update as soon as it finishes downloading:
+
+- Omitted or `false`: download the update and enter the `ready` state. Call [`apply()`](#apply) when you are ready to apply it.
+- `true`: apply the update immediately after downloading it.
+- An options object: apply the update immediately, using the object as the [`apply()` options](#apply).
+
+The `.then()` callback receives an array of module IDs involved in the update, or `null` if no update is available. Errors while downloading or applying the update can be handled in `.catch()`.
+
+### apply
+
+Continue the update process (as long as `module.hot.status() === 'ready'`).
+
+```js
+module.hot
+  .apply(options)
+  .then((outdatedModules) => {
+    // outdated modules...
+  })
+  .catch((error) => {
+    // catch errors
+  });
+
+// or
+import.meta.webpackHot
+  .apply(options)
+  .then((outdatedModules) => {
+    // outdated modules...
+  })
+  .catch((error) => {
+    // catch errors
+  });
+```
+
+The optional `options` object can include the following properties:
+
+- `ignoreUnaccepted` (boolean): Ignore changes made to unaccepted modules.
+- `ignoreDeclined` (boolean): Ignore changes made to declined modules.
+- `ignoreErrored` (boolean): Ignore errors thrown in accept handlers, error handlers and while reevaluating module.
+- `onDeclined` (function(info)): Notifier for declined modules
+- `onUnaccepted` (function(info)): Notifier for unaccepted modules
+- `onAccepted` (function(info)): Notifier for accepted modules
+- `onDisposed` (function(info)): Notifier for disposed modules
+- `onErrored` (function(info)): Notifier for errors
+
+The `info` parameter will be an object containing some of the following values:
+
+```ts
+{
+  type: 'self-declined' | 'declined' |
+        'unaccepted' | 'accepted' |
+        'disposed' | 'accept-errored' |
+        'accept-error-handler-errored' |
+        'self-accept-errored' | 'self-accept-error-handler-errored',
+  moduleId: 4, // The ID of the module involved; see the example below.
+  dependencyId: 3, // For errors in an accept callback: the ID of the updated dependency.
+  chain: [1, 2, 3, 4], // For declined/accepted/unaccepted: the chain from where the update was propagated.
+  parentId: 5, // For declined: the module id of the declining parent
+  outdatedModules: [1, 2, 3, 4], // For accepted: the modules that are outdated and will be disposed
+  outdatedDependencies: { // For accepted: The location of accept handlers that will handle the update
+    5: [4]
+  },
+  error: new Error(...), // For errors: the thrown error
+  originalError: new Error(...) // For accept-error-handler-errored or self-accept-error-handler-errored:
+                                // the first error, which the error handler received before throwing a new error.
+}
+```
+
+For example, if `app.js` calls `module.hot.accept('./button.js', callback)` and `callback` throws when `button.js` is updated, `moduleId` is the ID of `app.js`, and `dependencyId` is the ID of `button.js`.
+
+If the error handler then throws another error, `type` is `'accept-error-handler-errored'`, `error` is the new error, and `originalError` is the error thrown by `callback`.
+
+### addStatusHandler
+
+Register a function to listen for changes in `status`.
+
+```js
+module.hot.addStatusHandler((status) => {
+  // React to the current status...
+});
+
+// or
+import.meta.webpackHot.addStatusHandler((status) => {
+  // React to the current status...
+});
+```
+
+Bear in mind that when the status handler returns a `Promise`, the HMR system will wait for the `Promise` to resolve before continuing.
+
+### removeStatusHandler
+
+Remove a registered status handler.
+
+```js
+module.hot.removeStatusHandler(callback);
+
+// or
+import.meta.webpackHot.removeStatusHandler(callback);
+```
+
+<Attribution url="https://webpack.js.org/api/hot-module-replacement/" />

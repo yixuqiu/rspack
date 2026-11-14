@@ -1,57 +1,112 @@
-use std::collections::hash_map::IntoValues;
-use std::ops::{Deref, DerefMut};
-use std::{cmp::Ordering, fmt::Debug, sync::Arc};
+use std::{cmp::Ordering, collections::hash_map, fmt::Debug, ops::Deref};
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rspack_cacheable::{
+  cacheable,
+  with::{AsPreset, AsRefStr, AsVec},
+};
+use rspack_hash::RspackHasher;
+#[cfg(allocative)]
+use rspack_util::rspack_allocative;
+use rustc_hash::FxHashMap;
+use smol_str::{SmolStr, SmolStrBuilder};
+use ustr::{Ustr, UstrSet};
 
 use crate::{EntryOptions, EntryRuntime};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct RuntimeSpec(HashSet<Arc<str>>);
+#[cacheable]
+#[derive(Debug, Default, Clone, rspack_hash::RspackHash)]
+#[cfg_attr(allocative, derive(rspack_allocative::Allocative))]
+pub struct RuntimeSpec {
+  #[cacheable(with=AsVec<AsRefStr>)]
+  #[rspack_hash(skip)]
+  inner: UstrSet,
+  #[cacheable(with=AsPreset)]
+  #[cfg_attr(allocative, allocative(skip))]
+  key: RuntimeKey,
+}
+
+impl std::fmt::Display for RuntimeSpec {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let mut iter = self.iter();
+    if let Some(first) = iter.next() {
+      write!(f, "{first}")?;
+    }
+    for r in iter {
+      write!(f, ",")?;
+      write!(f, "{r}")?;
+    }
+    Ok(())
+  }
+}
+
+impl std::hash::Hash for RuntimeSpec {
+  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    self.key.hash(state);
+  }
+}
+
+impl std::cmp::PartialEq for RuntimeSpec {
+  fn eq(&self, other: &Self) -> bool {
+    self.key == other.key
+  }
+}
+
+impl std::cmp::Eq for RuntimeSpec {}
 
 impl Deref for RuntimeSpec {
-  type Target = HashSet<Arc<str>>;
+  type Target = UstrSet;
 
   fn deref(&self) -> &Self::Target {
-    &self.0
+    &self.inner
   }
 }
 
-impl DerefMut for RuntimeSpec {
-  fn deref_mut(&mut self) -> &mut Self::Target {
-    &mut self.0
-  }
-}
-
-impl From<HashSet<Arc<str>>> for RuntimeSpec {
-  fn from(value: HashSet<Arc<str>>) -> Self {
+impl From<UstrSet> for RuntimeSpec {
+  fn from(value: UstrSet) -> Self {
     Self::new(value)
   }
 }
 
-impl FromIterator<Arc<str>> for RuntimeSpec {
-  fn from_iter<T: IntoIterator<Item = Arc<str>>>(iter: T) -> Self {
-    Self(HashSet::from_iter(iter))
+impl FromIterator<Ustr> for RuntimeSpec {
+  fn from_iter<T: IntoIterator<Item = Ustr>>(iter: T) -> Self {
+    Self::new(UstrSet::from_iter(iter))
   }
 }
 
 impl IntoIterator for RuntimeSpec {
-  type Item = Arc<str>;
-  type IntoIter = std::collections::hash_set::IntoIter<Self::Item>;
+  type Item = Ustr;
+  type IntoIter = <UstrSet as IntoIterator>::IntoIter;
 
   fn into_iter(self) -> Self::IntoIter {
-    self.0.into_iter()
+    self.inner.into_iter()
   }
 }
 
 impl RuntimeSpec {
-  pub fn new(inner: HashSet<Arc<str>>) -> Self {
-    Self(inner)
+  pub fn new(mut inner: UstrSet) -> Self {
+    // A set collected from an iterator reserves room for every item, duplicates
+    // included, and each clone copies that room. Runtime specs are cloned into
+    // per-module tables, so trim the set once here.
+    inner.shrink_to_fit();
+    let mut this = Self {
+      inner,
+      key: RuntimeKey::default(),
+    };
+    this.update_key();
+    this
+  }
+
+  pub fn from_runtimes<'a>(runtimes: impl IntoIterator<Item = &'a RuntimeSpec>) -> Self {
+    let mut inner = UstrSet::default();
+    for runtime in runtimes {
+      inner.extend(runtime.inner.iter().copied());
+    }
+    Self::new(inner)
   }
 
   pub fn from_entry(entry: &str, runtime: Option<&EntryRuntime>) -> Self {
     let r = match runtime {
-      Some(EntryRuntime::String(s)) => s,
+      Some(EntryRuntime::String(s)) if !s.is_empty() => s,
       _ => entry,
     }
     .to_string();
@@ -60,21 +115,68 @@ impl RuntimeSpec {
 
   pub fn from_entry_options(options: &EntryOptions) -> Option<Self> {
     let r = match &options.runtime {
-      Some(EntryRuntime::String(s)) => Some(s.to_owned()),
+      Some(EntryRuntime::String(s)) if !s.is_empty() => Some(s.to_owned()),
       _ => options.name.clone(),
     };
     r.map(|r| Self::from_iter([r.into()]))
   }
 
   pub fn subtract(&self, b: &RuntimeSpec) -> Self {
-    let res = &self.0 - &b.0;
-    Self(res)
+    let res = self.inner.difference(&b.inner).copied().collect();
+    Self::new(res)
+  }
+
+  pub fn extend(&mut self, other: &Self) {
+    let prev = self.inner.len();
+    self.inner.extend(other.inner.iter().copied());
+    if prev != self.inner.len() {
+      self.update_key();
+    }
+  }
+
+  fn update_key(&mut self) {
+    match self.inner.len() {
+      0 => {
+        self.key = RuntimeKey::default();
+      }
+      1 => {
+        self.key = SmolStr::new(
+          self
+            .inner
+            .iter()
+            .next()
+            .expect("should have one runtime")
+            .as_str(),
+        );
+      }
+      _ => {
+        let mut ordered = self.inner.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+        ordered.sort_unstable();
+
+        let mut key = SmolStrBuilder::new();
+        let mut iter = ordered.into_iter();
+        if let Some(first) = iter.next() {
+          key.push_str(first);
+        }
+        for runtime in iter {
+          key.push('_');
+          key.push_str(runtime);
+        }
+        self.key = key.finish();
+      }
+    }
+  }
+
+  pub fn as_str(&self) -> &str {
+    &self.key
   }
 }
 
-pub type RuntimeKey = String;
+pub type RuntimeKey = SmolStr;
 
-#[derive(Default, Clone, Copy, Debug)]
+pub type RuntimeKeyMap<T> = FxHashMap<RuntimeKey, T>;
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeMode {
   #[default]
   Empty = 0,
@@ -83,34 +185,21 @@ pub enum RuntimeMode {
 }
 
 pub fn is_runtime_equal(a: &RuntimeSpec, b: &RuntimeSpec) -> bool {
-  if a.len() != b.len() {
-    return false;
-  }
-
-  let mut a: Vec<Arc<str>> = Vec::from_iter(a.iter().cloned());
-  let mut b: Vec<Arc<str>> = Vec::from_iter(b.iter().cloned());
-
-  a.sort_unstable();
-  b.sort_unstable();
-
-  a.into_iter().zip(b).all(|(a, b)| a == b)
+  a.key == b.key
 }
 
+#[cacheable]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeCondition {
   Boolean(bool),
   Spec(RuntimeSpec),
 }
 
-impl std::hash::Hash for RuntimeCondition {
-  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl rspack_hash::RspackHash for RuntimeCondition {
+  fn hash(&self, state: &mut RspackHasher) {
     match self {
-      Self::Boolean(v) => v.hash(state),
-      Self::Spec(s) => {
-        for i in s.iter() {
-          i.hash(state);
-        }
-      }
+      RuntimeCondition::Boolean(value) => value.hash(state),
+      RuntimeCondition::Spec(spec) => spec.hash(state),
     }
   }
 }
@@ -123,23 +212,20 @@ impl RuntimeCondition {
       None
     }
   }
+
+  pub fn as_spec_mut(&mut self) -> Option<&mut RuntimeSpec> {
+    if let Self::Spec(v) = self {
+      Some(v)
+    } else {
+      None
+    }
+  }
 }
 
 pub fn merge_runtime(a: &RuntimeSpec, b: &RuntimeSpec) -> RuntimeSpec {
-  let mut set: RuntimeSpec = Default::default();
-  for r in a.iter() {
-    set.insert(r.clone());
-  }
-  for r in b.iter() {
-    set.insert(r.clone());
-  }
-  set
-}
-
-pub fn runtime_to_string(runtime: &RuntimeSpec) -> String {
-  let mut arr = runtime.iter().map(|item| item.as_ref()).collect::<Vec<_>>();
-  arr.sort();
-  arr.join(",")
+  let mut set = a.inner.clone();
+  set.extend(b.inner.iter().copied());
+  RuntimeSpec::new(set)
 }
 
 pub fn filter_runtime(
@@ -148,17 +234,18 @@ pub fn filter_runtime(
 ) -> RuntimeCondition {
   match runtime {
     None => RuntimeCondition::Boolean(filter(None)),
+    Some(runtime) if runtime.len() == 1 => RuntimeCondition::Boolean(filter(Some(runtime))),
     Some(runtime) => {
       let mut some = false;
       let mut every = true;
-      let mut result = RuntimeSpec::default();
+      let mut result = UstrSet::default();
 
-      for r in runtime.iter() {
-        let cur = RuntimeSpec::from_iter([r.clone()]);
+      for &r in runtime.iter() {
+        let cur = RuntimeSpec::from_iter([r]);
         let v = filter(Some(&cur));
         if v {
           some = true;
-          result = merge_runtime(&result, &cur);
+          result.insert(r);
         } else {
           every = false;
         }
@@ -169,7 +256,7 @@ pub fn filter_runtime(
       } else if every {
         RuntimeCondition::Boolean(true)
       } else {
-        RuntimeCondition::Spec(result)
+        RuntimeCondition::Spec(RuntimeSpec::new(result))
       }
     }
   }
@@ -186,7 +273,7 @@ pub fn merge_runtime_condition_non_false(
     (RuntimeCondition::Boolean(false), _) => unreachable!(),
     (_, RuntimeCondition::Boolean(false)) => unreachable!(),
     (RuntimeCondition::Spec(_), RuntimeCondition::Boolean(true)) => {
-      return RuntimeCondition::Boolean(true)
+      return RuntimeCondition::Boolean(true);
     }
     (RuntimeCondition::Spec(a), RuntimeCondition::Spec(b)) => merge_runtime(a, b),
   };
@@ -205,7 +292,7 @@ pub fn merge_runtime_condition(
     (RuntimeCondition::Boolean(false), _) => return b.clone(),
     (_, RuntimeCondition::Boolean(false)) => return a.clone(),
     (_, RuntimeCondition::Boolean(true)) | (RuntimeCondition::Boolean(true), _) => {
-      return RuntimeCondition::Boolean(true)
+      return RuntimeCondition::Boolean(true);
     }
     (RuntimeCondition::Spec(a), RuntimeCondition::Spec(b)) => merge_runtime(a, b),
   };
@@ -224,24 +311,13 @@ pub fn subtract_runtime_condition(
     (_, RuntimeCondition::Boolean(true)) => return RuntimeCondition::Boolean(false),
     (_, RuntimeCondition::Boolean(false)) => return a.clone(),
     (RuntimeCondition::Boolean(false), _) => return RuntimeCondition::Boolean(false),
-    (RuntimeCondition::Spec(a), RuntimeCondition::Spec(b)) => {
-      let mut set = HashSet::default();
-      for item in a.iter() {
-        if !b.contains(item) {
-          set.insert(item.clone());
-        }
-      }
-      set
-    }
+    (RuntimeCondition::Spec(a), RuntimeCondition::Spec(b)) => a.difference(b).copied().collect(),
     (RuntimeCondition::Boolean(true), RuntimeCondition::Spec(b)) => {
-      let a = runtime.cloned().unwrap_or_default();
-      let mut set = HashSet::default();
-      for item in a.iter() {
-        if !b.contains(item) {
-          set.insert(item.clone());
-        }
+      if let Some(a) = runtime {
+        a.difference(b).copied().collect()
+      } else {
+        UstrSet::default()
       }
-      set
     }
   };
   if merged.is_empty() {
@@ -250,45 +326,37 @@ pub fn subtract_runtime_condition(
   RuntimeCondition::Spec(merged.into())
 }
 
-pub fn get_runtime_key(runtime: RuntimeSpec) -> String {
-  let mut runtime: Vec<Arc<str>> = Vec::from_iter(runtime);
-  runtime.sort_unstable();
-  runtime.join("\n")
+pub fn get_runtime_key(runtime: &RuntimeSpec) -> &RuntimeKey {
+  &runtime.key
 }
 
 pub fn compare_runtime(a: &RuntimeSpec, b: &RuntimeSpec) -> Ordering {
-  if a == b {
-    return Ordering::Equal;
-  }
-  let a_key = get_runtime_key(a.clone());
-  let b_key = get_runtime_key(b.clone());
-  if a_key < b_key {
-    return Ordering::Less;
-  }
-  if a_key > b_key {
-    return Ordering::Greater;
-  }
-  Ordering::Equal
+  a.key.cmp(&b.key)
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeSpecMap<T> {
   pub mode: RuntimeMode,
-  pub map: HashMap<RuntimeKey, T>,
+  pub map: RuntimeKeyMap<T>,
 
   pub single_runtime: Option<RuntimeSpec>,
   pub single_value: Option<T>,
 }
 
 impl<T> RuntimeSpecMap<T> {
+  pub fn new() -> Self {
+    Self {
+      mode: RuntimeMode::Empty,
+      map: Default::default(),
+      single_runtime: None,
+      single_value: None,
+    }
+  }
+
   pub fn size(&self) -> usize {
     let mode = self.mode as usize;
 
-    if mode <= 1 {
-      mode
-    } else {
-      self.map.len()
-    }
+    if mode <= 1 { mode } else { self.map.len() }
   }
 
   pub fn get(&self, runtime: &RuntimeSpec) -> Option<&T> {
@@ -303,7 +371,7 @@ impl<T> RuntimeSpecMap<T> {
           None
         }
       }
-      RuntimeMode::Map => self.map.get(&get_runtime_key(runtime.clone())),
+      RuntimeMode::Map => self.map.get(get_runtime_key(runtime)),
     }
   }
 
@@ -319,7 +387,7 @@ impl<T> RuntimeSpecMap<T> {
           None
         }
       }
-      RuntimeMode::Map => self.map.get_mut(&get_runtime_key(runtime.clone())),
+      RuntimeMode::Map => self.map.get_mut(get_runtime_key(runtime)),
     }
   }
 
@@ -349,48 +417,67 @@ impl<T> RuntimeSpecMap<T> {
 
           self
             .map
-            .insert(get_runtime_key(single_runtime), single_value);
-          self.map.insert(get_runtime_key(runtime), value);
+            .insert(get_runtime_key(&single_runtime).clone(), single_value);
+          self.map.insert(get_runtime_key(&runtime).clone(), value);
         }
       }
       RuntimeMode::Map => {
-        self.map.insert(get_runtime_key(runtime), value);
+        self.map.insert(get_runtime_key(&runtime).clone(), value);
       }
     }
   }
 
-  pub fn get_values(&self) -> Vec<&T> {
+  pub fn values(&self) -> RuntimeSpecMapValues<'_, T> {
     match self.mode {
-      RuntimeMode::Empty => vec![],
-      RuntimeMode::SingleEntry => vec![self
-        .single_value
-        .as_ref()
-        .expect("Expected single value exists")],
-      RuntimeMode::Map => self.map.values().collect(),
+      RuntimeMode::Empty => RuntimeSpecMapValues::Empty,
+      RuntimeMode::SingleEntry => RuntimeSpecMapValues::SingleEntry(self.single_value.iter()),
+      RuntimeMode::Map => RuntimeSpecMapValues::Map(self.map.values()),
+    }
+  }
+}
+
+pub enum RuntimeSpecMapValues<'a, T> {
+  Empty,
+  SingleEntry(std::option::Iter<'a, T>),
+  Map(hash_map::Values<'a, RuntimeKey, T>),
+}
+
+impl<'a, T> Iterator for RuntimeSpecMapValues<'a, T> {
+  type Item = &'a T;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    match self {
+      RuntimeSpecMapValues::Empty => None,
+      RuntimeSpecMapValues::SingleEntry(i) => i.next(),
+      RuntimeSpecMapValues::Map(i) => i.next(),
+    }
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    match self {
+      RuntimeSpecMapValues::Empty => (0, Some(0)),
+      RuntimeSpecMapValues::SingleEntry(i) => i.size_hint(),
+      RuntimeSpecMapValues::Map(i) => i.size_hint(),
     }
   }
 }
 
 #[derive(Default, Debug)]
 pub struct RuntimeSpecSet {
-  map: HashMap<RuntimeKey, RuntimeSpec>,
+  map: RuntimeKeyMap<RuntimeSpec>,
 }
 
 impl RuntimeSpecSet {
-  pub fn get(&self, runtime: &RuntimeSpec) -> Option<&RuntimeSpec> {
-    self.map.get(&get_runtime_key(runtime.clone()))
-  }
-
   pub fn set(&mut self, runtime: RuntimeSpec) {
-    self.map.insert(get_runtime_key(runtime.clone()), runtime);
+    self.map.insert(get_runtime_key(&runtime).clone(), runtime);
   }
 
-  pub fn values(&self) -> Vec<&RuntimeSpec> {
-    self.map.values().collect()
+  pub fn contains(&self, runtime: &RuntimeSpec) -> bool {
+    self.map.contains_key(get_runtime_key(runtime))
   }
 
-  pub fn into_values(self) -> IntoValues<String, RuntimeSpec> {
-    self.map.into_values()
+  pub fn values(&self) -> hash_map::Values<'_, RuntimeKey, RuntimeSpec> {
+    self.map.values()
   }
 
   pub fn len(&self) -> usize {

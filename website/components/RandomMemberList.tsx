@@ -1,4 +1,5 @@
-import { NoSSR } from 'rspress/runtime';
+import { NoSSR } from '@rspress/core/runtime';
+import { Link } from '@rspress/core/theme';
 import style from './RandomMemberList.module.scss';
 
 interface Member {
@@ -8,6 +9,7 @@ interface Member {
   name?: string;
   desc?: string;
   x?: string;
+  bluesky?: string;
 }
 
 const TwitterSVG = (
@@ -36,151 +38,216 @@ const GitHubSVG = (
   </svg>
 );
 
+const BlueskySVG = (
+  <svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 24 24">
+    <title>Bluesky</title>
+    <path d="M12 10.8c-1.087-2.114-4.046-6.053-6.798-7.995C2.566.944 1.561 1.266.902 1.565C.139 1.908 0 3.08 0 3.768c0 .69.378 5.65.624 6.479c.815 2.736 3.713 3.66 6.383 3.364q.204-.03.415-.056q-.207.033-.415.056c-3.912.58-7.387 2.005-2.83 7.078c5.013 5.19 6.87-1.113 7.823-4.308c.953 3.195 2.05 9.271 7.733 4.308c4.267-4.308 1.172-6.498-2.74-7.078a9 9 0 0 1-.415-.056q.21.026.415.056c2.67.297 5.568-.628 6.383-3.364c.246-.828.624-5.79.624-6.478c0-.69-.139-1.861-.902-2.206c-.659-.298-1.664-.62-4.3 1.24C16.046 4.748 13.087 8.687 12 10.8" />
+  </svg>
+);
+
 const coreTeam: Member[] = [
   {
     id: 'zoolsher',
-    avatar: 'https://avatars.githubusercontent.com/u/9161085?s=120&v=4',
-    x: 'https://twitter.com/zoolsher',
-    desc: 'Rspack contributor',
+    avatar: 'https://github.com/zoolsher.png',
+    x: 'https://x.com/zoolsher',
+    desc: 'Rspack core team',
   },
   {
     id: 'hardfist',
-    avatar: 'https://avatars.githubusercontent.com/u/8898718?s=120&v=4',
-    x: 'https://twitter.com/hardfist_1',
-    desc: 'Rspack contributor',
+    avatar: 'https://github.com/hardfist.png',
+    x: 'https://x.com/hardfist_1',
+    bluesky: 'https://bsky.app/profile/hardfist1.bsky.social',
+    desc: 'Rspack core team',
   },
   {
     id: 'jkzing',
-    desc: 'Rspack contributor',
-    avatar: 'https://avatars.githubusercontent.com/u/2851517?v=4',
+    desc: 'Rspack core team, Vue contributor',
+    x: 'https://x.com/zjkdddd',
+    avatar: 'https://github.com/jkzing.png',
   },
   {
     id: 'ahabhgk',
-    avatar: 'https://avatars.githubusercontent.com/u/42857895?s=120&v=4',
-    x: 'https://twitter.com/ahabhgk',
-    desc: 'Rspack / Webpack contributor',
-  },
-  {
-    id: 'bvanjoi',
-    avatar: 'https://avatars.githubusercontent.com/u/30187863?s=120&v=4',
-    desc: 'Rspack / Rust contributor',
-  },
-  {
-    id: 'Boshen',
-    avatar: 'https://avatars.githubusercontent.com/u/1430279?s=120&v=4',
-    x: 'https://twitter.com/boshen_c',
-    desc: 'Rspack / Oxc contributor',
-  },
-  {
-    id: 'h-a-n-a',
-    name: 'Hana',
-    avatar: 'https://avatars.githubusercontent.com/u/10465670?s=120&v=4',
-    x: 'https://twitter.com/_h_ana___',
-    desc: 'Rspack / NAPI contributor',
-  },
-  {
-    id: 'IWANABETHATGUY',
-    avatar: 'https://avatars.githubusercontent.com/u/17974631?s=120&v=4',
-    desc: 'Rspack contributor',
+    avatar: 'https://github.com/ahabhgk.png',
+    x: 'https://x.com/ahabhgk',
+    bluesky: 'https://bsky.app/profile/ahabhgk.bsky.social',
+    desc: 'Rspack core team, webpack contributor',
   },
   {
     id: 'jerrykingxyz',
-    avatar: 'https://avatars.githubusercontent.com/u/9291503?s=120&v=4',
-    desc: 'Rspack contributor',
+    avatar: 'https://github.com/jerrykingxyz.png',
+    desc: 'Rspack core team',
   },
   {
     id: 'chenjiahan',
-    avatar: 'https://avatars.githubusercontent.com/u/7237365?s=120&v=4',
-    x: 'https://twitter.com/jait_chen',
-    desc: 'Rspack / Rsbuild / Rspress contributor',
+    name: 'Jiahan Chen',
+    avatar: 'https://github.com/chenjiahan.png',
+    x: 'https://x.com/jiahan_c',
+    bluesky: 'https://bsky.app/profile/chenjiahan.bsky.social',
+    desc: 'Rspack core team, project lead of Vant',
   },
   {
     id: 'JSerFeng',
-    avatar: 'https://avatars.githubusercontent.com/u/57202839?s=120&v=4',
-    x: 'https://twitter.com/JSerFeng',
-    desc: 'Rspack contributor',
+    avatar: 'https://github.com/JSerFeng.png',
+    x: 'https://x.com/JSerFeng',
+    bluesky: 'https://bsky.app/profile/jserfeng.bsky.social',
+    desc: 'Rspack core team',
   },
   {
     id: '9aoy',
-    avatar: 'https://avatars.githubusercontent.com/u/22373761?s=120&v=4',
-    desc: 'Rspack / Rsbuild contributor',
-  },
-  {
-    id: 'sanyuan0704',
-    avatar: 'https://avatars.githubusercontent.com/u/39261479?s=120&v=4',
-    x: 'https://twitter.com/sanyuan0704',
-    desc: 'Rspack / Rspress contributor',
-  },
-  {
-    id: 'suxin2017',
-    avatar: 'https://avatars.githubusercontent.com/u/28481035?v=4',
-    x: 'https://twitter.com/suxin2017',
-    desc: 'Rspack contributor',
+    avatar: 'https://github.com/9aoy.png',
+    desc: 'Rspack core team',
   },
   {
     id: 'zackarychapple',
-    avatar: 'https://avatars.githubusercontent.com/u/2133184?v=4',
-    desc: 'Rspack contributor, CEO at ZephyrCloudIO',
+    avatar: 'https://github.com/zackarychapple.png',
+    desc: 'Rspack core team, CEO at ZephyrCloudIO',
+    x: 'https://x.com/Zackary_Chapple',
   },
   {
     id: 'valorkin',
-    avatar: 'https://avatars.githubusercontent.com/u/1107171?v=4',
-    desc: 'Rspack contributor, CTO at ZephyrCloudIO',
-    x: 'https://twitter.com/valorkin',
+    avatar: 'https://github.com/valorkin.png',
+    desc: 'Rspack core team, CTO at ZephyrCloudIO',
+    x: 'https://x.com/valorkin',
   },
   {
     id: 'lingyucoder',
-    avatar: 'https://avatars.githubusercontent.com/u/2663351?v=4',
-    x: 'https://twitter.com/lingyucoder',
-    desc: 'Rspack contributor',
+    avatar: 'https://github.com/lingyucoder.png',
+    x: 'https://x.com/lingyucoder',
+    desc: 'Rspack core team',
   },
   {
     id: 'ScriptedAlchemy',
-    avatar: 'https://avatars.githubusercontent.com/u/25274700?v=4',
-    desc: 'Inventor of Module Federation, Rspack / Webpack contributor',
-    x: 'https://twitter.com/ScriptedAlchemy',
+    avatar: 'https://github.com/ScriptedAlchemy.png',
+    desc: 'Inventor of Module Federation, Rspack & webpack core team',
+    bluesky: 'https://bsky.app/profile/scriptedalchemy.bsky.social',
+    x: 'https://x.com/ScriptedAlchemy',
   },
   {
     id: 'SyMind',
-    avatar: 'https://avatars.githubusercontent.com/u/19852293?v=4',
-    desc: 'Rspack contributor',
+    avatar: 'https://github.com/SyMind.png',
+    desc: 'Rspack core team',
   },
   {
     id: 'xc2',
-    avatar: 'https://avatars.githubusercontent.com/u/18117084?v=4',
-    x: 'https://twitter.com/kfll',
-    desc: 'Rspack / Rsbuild / Rspress contributor',
+    avatar: 'https://github.com/xc2.png',
+    x: 'https://x.com/kfll',
+    desc: 'Rspack core team',
+  },
+  {
+    id: 'fi3ework',
+    avatar: 'https://github.com/fi3ework.png',
+    x: 'https://x.com/fi3ework27',
+    desc: 'Rspack core team, creator of vite-plugin-checker, webpack contributor',
+  },
+  {
+    id: 'yifancong',
+    avatar: 'https://github.com/yifancong.png',
+    x: 'https://x.com/yifan56737904',
+    desc: 'Rspack core team',
+  },
+  {
+    id: 'Timeless0911',
+    avatar: 'https://github.com/Timeless0911.png',
+    x: 'https://x.com/Timeless911',
+    desc: 'Rspack core team',
+  },
+  {
+    id: 'SoonIter',
+    avatar: 'https://github.com/SoonIter.png',
+    x: 'https://x.com/Soon_Iter',
+    bluesky: 'https://bsky.app/profile/sooniter.bsky.social',
+    desc: 'Rspack core team',
+  },
+  {
+    id: 'inottn',
+    avatar: 'https://github.com/inottn.png',
+    x: 'https://x.com/inorr_r',
+    desc: 'Rspack & Vant core team',
+  },
+  {
+    id: 'GiveMe-A-Name',
+    avatar: 'https://github.com/GiveMe-A-Name.png',
+    x: 'https://x.com/qixuan_xie',
+    desc: 'Rspack core team, Modern.js contributor',
+  },
+  {
+    id: 'nyqykk',
+    avatar: 'https://github.com/nyqykk.png',
+    desc: 'Rspack core team, Module Federation contributor',
+  },
+  {
+    id: 'stormslowly',
+    avatar: 'https://github.com/stormslowly.png',
+    desc: 'Rspack core team',
+  },
+  {
+    id: 'CPunisher',
+    avatar: 'https://github.com/CPunisher.png',
+    x: 'https://x.com/c_punisher',
+    desc: 'Rspack & SWC core team',
+  },
+  {
+    id: 'quininer',
+    avatar: 'https://github.com/quininer.png',
+    desc: 'Rspack core team, creator of io-uring',
+    x: 'https://x.com/quininers',
+  },
+  {
+    id: 'fansenze',
+    avatar: 'https://github.com/fansenze.png',
+    desc: 'Rspack core team',
+  },
+  {
+    id: 'intellild',
+    avatar: 'https://github.com/intellild.png',
+    desc: 'Rspack core team',
+  },
+  {
+    id: 'elecmonkey',
+    avatar: 'https://github.com/elecmonkey.png',
+    x: 'https://x.com/elecmonkeyjs',
+    desc: 'Rspack core team',
+  },
+  {
+    id: 'swwind',
+    avatar: 'https://github.com/swwind.png',
+    x: 'https://x.com/swwind233',
+    desc: 'Rspack core team',
+  },
+  {
+    id: 'hai-x',
+    avatar: 'https://github.com/hai-x.png',
+    x: 'https://x.com/__haijie',
+    desc: 'Rspack & webpack core team',
   },
 ];
 
-export const RandomMemberList = ({ list = coreTeam }: { list: Member[] }) => {
+export const RandomMemberList = ({ list = coreTeam }: { list?: Member[] }) => {
   const randomList = list.sort(() => Math.random() - 0.5);
   return (
     <NoSSR>
-      <div className={style.wrapper}>
-        {randomList.map(item => (
+      <div className={`${style.wrapper} rp-not-doc`}>
+        {randomList.map((item) => (
           <div className={style.card} key={item.id}>
             <img className={style.avatar} src={item.avatar} alt="avatar" />
             <div className={style.name}>{item.name || item.id}</div>
             <div className={style.desc}>{item.desc}</div>
             <div className={style.icons}>
-              <a
+              <Link
                 className={style.icon}
                 href={`https://github.com/${item.id}`}
-                target="_blank"
-                rel="noreferrer"
               >
                 {GitHubSVG}
-              </a>
+              </Link>
               {item.x ? (
-                <a
-                  className={style.icon}
-                  href={item.x}
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <Link className={style.icon} href={item.x}>
                   {TwitterSVG}
-                </a>
+                </Link>
+              ) : null}
+              {item.bluesky ? (
+                <Link className={style.icon} href={item.bluesky}>
+                  {BlueskySVG}
+                </Link>
               ) : null}
             </div>
           </div>
@@ -193,18 +260,58 @@ export const RandomMemberList = ({ list = coreTeam }: { list: Member[] }) => {
 export const RandomContributorsList = () => {
   const list: Member[] = [
     {
-      id: 'hyf0',
-      avatar: 'https://avatars.githubusercontent.com/u/49502170?s=120&v=4',
-      x: 'https://twitter.com/_hyf0',
-      desc: 'Rspack / Rolldown contributor',
+      id: 'hyfdev',
+      avatar: 'https://github.com/hyfdev.png',
+      x: 'https://x.com/hyfdev',
+      desc: 'Rspack & Rolldown core team',
     },
     {
       id: 'underfin',
-      avatar: 'https://avatars.githubusercontent.com/u/14008915?s=120&v=4',
-      desc: 'Rspack / Rolldown / Vite contributor',
+      avatar: 'https://github.com/underfin.png',
+      desc: 'Rspack & Rolldown core team, Vite contributor',
+    },
+    {
+      id: 'Boshen',
+      avatar: 'https://github.com/Boshen.png',
+      x: 'https://x.com/boshen_c',
+      desc: 'Rspack & Rolldown core team, creator of Oxc',
+    },
+    {
+      id: 'IWANABETHATGUY',
+      avatar: 'https://github.com/IWANABETHATGUY.png',
+      desc: 'Rspack & Rolldown core team',
+    },
+    {
+      id: 'xin2017338',
+      avatar: 'https://github.com/xin2017338.png',
+      x: 'https://x.com/suxin2017',
+      desc: 'Rspack core team, Biome contributor',
+    },
+    {
+      id: 'sanyuan0704',
+      avatar: 'https://github.com/sanyuan0704.png',
+      x: 'https://x.com/sanyuan0704',
+      desc: 'Rspack core team, creator of Rspress',
+    },
+    {
+      id: 'shulaoda',
+      avatar: 'https://github.com/shulaoda.png',
+      x: 'https://x.com/dalaoshv',
+      desc: 'Rspack & Rolldown core team',
+    },
+    {
+      id: 'bvanjoi',
+      avatar: 'https://github.com/bvanjoi.png',
+      desc: 'Rspack & SWC core team, Rust language contributor',
+    },
+    {
+      id: 'h-a-n-a',
+      name: 'Hana',
+      avatar: 'https://github.com/h-a-n-a.png',
+      x: 'https://x.com/_h_ana___',
+      desc: 'Rspack & Rolldown core team',
     },
   ];
 
-  const randomList = list.sort(() => Math.random() - 0.5);
-  return <RandomMemberList list={randomList} />;
+  return <RandomMemberList list={list} />;
 };

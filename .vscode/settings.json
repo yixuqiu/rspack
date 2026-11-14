@@ -6,24 +6,39 @@
     "**/CVS": true,
     "**/.DS_Store": true,
     "**/*.bk": true,
-    "/target": true,
-    "**/.yarn": true
-  },
-  "[typescript]": {
-    "editor.formatOnSave": true
+    "/target": true
   },
   "editor.formatOnSave": true,
+  "editor.defaultFormatter": "rstack.rstack",
+  "[javascript]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[javascriptreact]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[json]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[json5]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[jsonc]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[markdown]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[mdx]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[toml]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[typescript]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[typescriptreact]": { "editor.defaultFormatter": "rstack.rstack" },
+  "[yaml]": { "editor.defaultFormatter": "rstack.rstack" },
   "git.ignoreLimitWarning": true,
-  "eslint.enable": false,
   "cSpell.allowCompoundWords": true,
   "cSpell.caseSensitive": true,
+  "json.schemas": [
+    {
+      "fileMatch": ["**/_meta.json"],
+      "url": "./website/node_modules/@rspress/core/meta-json-schema.json"
+    },
+    {
+      "fileMatch": ["**/_nav.json"],
+      "url": "./website/node_modules/@rspress/core/nav-json-schema.json"
+    }
+  ],
   "rust-analyzer.procMacro.enable": true,
   "rust-analyzer.procMacro.attributes.enable": true,
-  "rust-analyzer.linkedProjects": [
-    "Cargo.toml",
-    "crates/node_binding/Cargo.toml",
-    "./crates/rspack_plugin_ensure_chunk_conditions/Cargo.toml"
-  ],
+  "rust-analyzer.linkedProjects": ["Cargo.toml"],
+  "rust-analyzer.cargo.targetDir": true, // Don't let RA blocking cargo build
+  "rust-analyzer.check.features": "all",
   "files.associations": {
     "*.snap": "markdown",
     "*.snap.txt": "markdown",
@@ -32,15 +47,26 @@
   "cSpell.words": [
     "contextify",
     "Ctxt",
+    "dedupe",
     "Deque",
     "ecma",
     "napi",
     "postcss",
     "pxtorem",
+    "rslib",
+    "Rslib",
+    "rslint",
     "rspack",
+    "rstack",
+    "rstackjs",
+    "rstest",
+    "taplo",
     "threejs",
     "tokio",
     "ukey",
     "Ukey"
-  ]
+  ],
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  }
 }

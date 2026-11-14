@@ -1,8 +1,9 @@
+use rspack_collections::Identifiable;
 use rspack_core::{
-  to_identifier, ChunkUkey, Compilation, ExternalModule, ExternalRequest, LibraryOptions,
+  ChunkGraph, ChunkUkey, Compilation, ExternalModule, ExternalRequest, LibraryOptions,
+  to_identifier,
 };
-use rspack_error::{error, Result};
-use rspack_identifier::Identifiable;
+use rspack_error::{Result, ToStringResultToRspackResultExt};
 
 pub fn externals_dep_array(modules: &[&ExternalModule]) -> Result<String> {
   let value = modules
@@ -13,8 +14,11 @@ pub fn externals_dep_array(modules: &[&ExternalModule]) -> Result<String> {
         ExternalRequest::Map(map) => map.get("amd").map(|r| r.primary()),
       })
     })
-    .collect::<Result<Vec<_>>>()?;
-  serde_json::to_string(&value).map_err(|e| error!(e.to_string()))
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+  simd_json::to_string(&value).to_rspack_result()
 }
 
 fn inner_external_arguments(modules: &[&ExternalModule], compilation: &Compilation) -> Vec<String> {
@@ -22,13 +26,11 @@ fn inner_external_arguments(modules: &[&ExternalModule], compilation: &Compilati
     .iter()
     .map(|m| {
       format!(
-        "__WEBPACK_EXTERNAL_MODULE_{}__",
+        "__rspack_external_{}",
         to_identifier(
-          compilation
-            .get_module_graph()
-            .module_graph_module_by_identifier(&m.identifier())
-            .expect("Module not found")
-            .id(&compilation.chunk_graph)
+          ChunkGraph::get_module_id(&compilation.module_ids_artifact, m.identifier())
+            .map(|s| s.as_str())
+            .expect("should have module id")
         )
       )
     })
@@ -48,18 +50,22 @@ pub fn external_module_names(
 
 pub fn get_options_for_chunk<'a>(
   compilation: &'a Compilation,
-  chunk_ukey: &'a ChunkUkey,
+  chunk_ukey: &ChunkUkey,
 ) -> Option<&'a LibraryOptions> {
   if compilation
+    .build_chunk_graph_artifact
     .chunk_graph
     .get_number_of_entry_modules(chunk_ukey)
     == 0
   {
     return None;
   }
-  let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+  let chunk = compilation
+    .build_chunk_graph_artifact
+    .chunk_by_ukey
+    .expect_get(chunk_ukey);
   chunk
-    .get_entry_options(&compilation.chunk_group_by_ukey)
+    .get_entry_options(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
     .and_then(|options| options.library.as_ref())
     .or(compilation.options.output.library.as_ref())
 }

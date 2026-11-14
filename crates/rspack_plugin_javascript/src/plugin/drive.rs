@@ -1,197 +1,57 @@
-use std::{fmt, ops::Deref, sync::Arc};
+#![allow(clippy::too_many_arguments)]
 
-use async_trait::async_trait;
 use rspack_core::{
-  rspack_sources::BoxSource, BoxModule, Chunk, ChunkInitFragments, ChunkUkey, Compilation,
-  ModuleIdentifier,
+  AssetInfo, Chunk, ChunkInitFragments, ChunkUkey, Compilation, Module, ModuleIdentifier,
+  ModuleRef, RuntimeCodeTemplate, RuntimeGlobals, rspack_sources::BoxSource,
 };
-use rspack_error::Result;
-use rspack_hash::RspackHash;
+use rspack_hash::RspackHasher;
+use rspack_hook::define_hook;
+#[cfg(allocative)]
+use rspack_util::rspack_allocative;
 
-#[async_trait]
-pub trait JavascriptModulesPluginPlugin {
-  async fn render_chunk(&self, _args: &RenderJsChunkArgs) -> PluginRenderJsChunkHookOutput {
-    Ok(None)
-  }
+define_hook!(JavascriptModulesRenderChunk: Series(compilation: &Compilation, chunk_ukey: &ChunkUkey, source: &mut RenderSource, runtime_template: &RuntimeCodeTemplate));
+define_hook!(JavascriptModulesRenderChunkContent: SeriesBail(compilation: &Compilation, chunk_ukey: &ChunkUkey, asset_info: &mut AssetInfo, runtime_template: &RuntimeCodeTemplate) -> RenderSource);
+define_hook!(JavascriptModulesRender: Series(compilation: &Compilation, chunk_ukey: &ChunkUkey, source: &mut RenderSource, runtime_template: &RuntimeCodeTemplate));
+define_hook!(JavascriptModulesRenderStartup: Series(compilation: &Compilation, chunk_ukey: &ChunkUkey, module: &ModuleIdentifier, source: &mut RenderSource, runtime_template: &RuntimeCodeTemplate));
+define_hook!(JavascriptModulesRenderModuleContent: Series(compilation: &Compilation, chunk_ukey: &ChunkUkey,module: &dyn Module, source: &mut RenderSource, runtime_requirements: &mut RuntimeGlobals, init_fragments: &mut ChunkInitFragments, runtime_template: &RuntimeCodeTemplate),tracing=false);
+define_hook!(JavascriptModulesRenderModuleContainer: Series(compilation: &Compilation, chunk_ukey: &ChunkUkey,module: &dyn Module, source: &mut RenderSource, init_fragments: &mut ChunkInitFragments, runtime_template: &RuntimeCodeTemplate),tracing=false);
+define_hook!(JavascriptModulesRenderModulePackage: Series(compilation: &Compilation, chunk_ukey: &ChunkUkey, module: &dyn Module, source: &mut RenderSource, init_fragments: &mut ChunkInitFragments, runtime_template: &RuntimeCodeTemplate),tracing=false);
+define_hook!(JavascriptModulesChunkHash: Series(compilation: &Compilation, chunk_ukey: &ChunkUkey, hasher: &mut RspackHasher));
+define_hook!(JavascriptModulesInlineInRuntimeBailout: SeriesBail(compilation: &Compilation) -> String);
+define_hook!(JavascriptModulesEmbedInRuntimeBailout: SeriesBail(compilation: &Compilation, module: &ModuleRef, chunk: &Chunk) -> String);
+define_hook!(JavascriptModulesStrictRuntimeBailout: SeriesBail(compilation: &Compilation, chunk_ukey: &ChunkUkey) -> String);
+define_hook!(JavascriptModulesUseSourceMap: SeriesBail(compilation: &Compilation, chunk_ukey: &ChunkUkey) -> bool);
 
-  fn render(&self, _args: &RenderJsArgs) -> PluginRenderJsStartupHookOutput {
-    Ok(None)
-  }
-
-  fn render_startup(&self, _args: &RenderJsStartupArgs) -> PluginRenderJsStartupHookOutput {
-    Ok(None)
-  }
-
-  fn render_module_content<'a>(
-    &'a self,
-    args: RenderJsModuleContentArgs<'a>,
-  ) -> PluginRenderJsModuleContentOutput<'a> {
-    Ok(args)
-  }
-
-  fn js_chunk_hash(&self, _args: &mut JsChunkHashArgs) -> PluginJsChunkHashHookOutput {
-    Ok(())
-  }
+#[derive(Debug, Default)]
+#[cfg_attr(allocative, derive(rspack_allocative::Allocative))]
+pub struct JavascriptModulesPluginHooks {
+  #[cfg_attr(allocative, allocative(skip))]
+  pub render_chunk: JavascriptModulesRenderChunkHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub render_chunk_content: JavascriptModulesRenderChunkContentHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub render: JavascriptModulesRenderHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub render_startup: JavascriptModulesRenderStartupHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub render_module_content: JavascriptModulesRenderModuleContentHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub render_module_container: JavascriptModulesRenderModuleContainerHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub render_module_package: JavascriptModulesRenderModulePackageHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub chunk_hash: JavascriptModulesChunkHashHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub inline_in_runtime_bailout: JavascriptModulesInlineInRuntimeBailoutHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub embed_in_runtime_bailout: JavascriptModulesEmbedInRuntimeBailoutHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub strict_runtime_bailout: JavascriptModulesStrictRuntimeBailoutHook,
+  #[cfg_attr(allocative, allocative(skip))]
+  pub use_source_map: JavascriptModulesUseSourceMapHook,
 }
 
 #[derive(Debug)]
-pub struct RenderJsChunkArgs<'a> {
-  pub compilation: &'a Compilation,
-  pub chunk_ukey: &'a ChunkUkey,
-  pub module_source: BoxSource,
-}
-
-impl<'me> RenderJsChunkArgs<'me> {
-  pub fn chunk(&self) -> &Chunk {
-    self.compilation.chunk_by_ukey.expect_get(self.chunk_ukey)
-  }
-}
-
-#[derive(Debug)]
-pub struct RenderJsModuleContentArgs<'a> {
-  pub module_source: BoxSource,
-  pub chunk_init_fragments: ChunkInitFragments,
-  pub compilation: &'a Compilation,
-  pub module: &'a BoxModule,
-}
-
-#[derive(Debug)]
-pub struct RenderJsStartupArgs<'a> {
-  // pub module_source: &'a BoxSource,
-  pub compilation: &'a Compilation,
-  pub chunk: &'a ChunkUkey,
-  pub module: ModuleIdentifier,
+pub struct RenderSource {
   pub source: BoxSource,
-}
-
-impl<'me> RenderJsStartupArgs<'me> {
-  pub fn chunk(&self) -> &Chunk {
-    self.compilation.chunk_by_ukey.expect_get(self.chunk)
-  }
-}
-
-#[derive(Debug)]
-pub struct RenderJsArgs<'a> {
-  pub source: &'a BoxSource,
-  pub chunk: &'a ChunkUkey,
-  pub compilation: &'a Compilation,
-}
-
-impl<'me> RenderJsArgs<'me> {
-  pub fn chunk(&self) -> &Chunk {
-    self.compilation.chunk_by_ukey.expect_get(self.chunk)
-  }
-}
-
-pub struct JsChunkHashArgs<'a> {
-  pub chunk_ukey: &'a ChunkUkey,
-  pub compilation: &'a Compilation,
-  pub hasher: &'a mut RspackHash,
-}
-
-impl<'me> JsChunkHashArgs<'me> {
-  pub fn chunk(&self) -> &Chunk {
-    self.compilation.chunk_by_ukey.expect_get(self.chunk_ukey)
-  }
-}
-
-pub type PluginRenderJsChunkHookOutput = Result<Option<BoxSource>>;
-pub type PluginRenderJsModuleContentOutput<'a> = Result<RenderJsModuleContentArgs<'a>>;
-pub type PluginRenderJsStartupHookOutput = Result<Option<BoxSource>>;
-pub type PluginRenderJsHookOutput = Result<Option<BoxSource>>;
-pub type PluginJsChunkHashHookOutput = Result<()>;
-
-pub type BoxJavascriptModulePluginPlugin = Box<dyn JavascriptModulesPluginPlugin + Send + Sync>;
-
-#[async_trait]
-impl<T: JavascriptModulesPluginPlugin + Send + Sync> JavascriptModulesPluginPlugin for Arc<T> {
-  async fn render_chunk(&self, args: &RenderJsChunkArgs) -> PluginRenderJsChunkHookOutput {
-    self.deref().render_chunk(args).await
-  }
-
-  fn render(&self, args: &RenderJsArgs) -> PluginRenderJsStartupHookOutput {
-    self.deref().render(args)
-  }
-
-  fn render_startup(&self, args: &RenderJsStartupArgs) -> PluginRenderJsStartupHookOutput {
-    self.deref().render_startup(args)
-  }
-
-  fn render_module_content<'a>(
-    &'a self,
-    args: RenderJsModuleContentArgs<'a>,
-  ) -> PluginRenderJsModuleContentOutput<'a> {
-    self.deref().render_module_content(args)
-  }
-
-  fn js_chunk_hash(&self, args: &mut JsChunkHashArgs) -> PluginJsChunkHashHookOutput {
-    self.deref().js_chunk_hash(args)
-  }
-}
-
-#[derive(Default)]
-pub struct JavascriptModulesPluginPluginDrive {
-  plugins: Vec<BoxJavascriptModulePluginPlugin>,
-}
-
-impl fmt::Debug for JavascriptModulesPluginPluginDrive {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("JavascriptModulesPluginPluginDrive")
-      .field("plugins", &"..")
-      .finish()
-  }
-}
-
-impl JavascriptModulesPluginPluginDrive {
-  pub fn add_plugin(&mut self, plugin: impl JavascriptModulesPluginPlugin + Send + Sync + 'static) {
-    self.plugins.push(Box::new(plugin));
-  }
-
-  pub async fn render_chunk(&self, args: RenderJsChunkArgs<'_>) -> PluginRenderJsChunkHookOutput {
-    for plugin in &self.plugins {
-      if let Some(source) = plugin.render_chunk(&args).await? {
-        return Ok(Some(source));
-      }
-    }
-    Ok(None)
-  }
-
-  pub fn render(&self, args: RenderJsArgs) -> PluginRenderJsHookOutput {
-    for plugin in &self.plugins {
-      if let Some(source) = plugin.render(&args)? {
-        return Ok(Some(source));
-      }
-    }
-    Ok(None)
-  }
-
-  pub fn render_startup(&self, args: RenderJsStartupArgs) -> PluginRenderJsStartupHookOutput {
-    let mut source = args.source;
-    for plugin in &self.plugins {
-      if let Some(s) = plugin.render_startup(&RenderJsStartupArgs {
-        source: source.clone(),
-        ..args
-      })? {
-        source = s;
-      }
-    }
-    Ok(Some(source))
-  }
-
-  pub fn js_chunk_hash(&self, mut args: JsChunkHashArgs) -> PluginJsChunkHashHookOutput {
-    for plugin in &self.plugins {
-      plugin.js_chunk_hash(&mut args)?
-    }
-    Ok(())
-  }
-
-  pub fn render_module_content<'a>(
-    &'a self,
-    mut args: RenderJsModuleContentArgs<'a>,
-  ) -> PluginRenderJsModuleContentOutput<'a> {
-    for plugin in &self.plugins {
-      args = plugin.render_module_content(args)?;
-    }
-    Ok(args)
-  }
 }

@@ -1,104 +1,163 @@
+use std::sync::LazyLock;
+
 use rspack_core::{
-  impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Compilation, CrossOriginLoading, RuntimeGlobals, RuntimeModule,
+  ChunkUkey, Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext,
+  RuntimeModuleRuntimeRequirements, RuntimeTemplate, impl_runtime_module,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
+
+use crate::{
+  CreateScriptData, RuntimeModuleChunkWrapper, RuntimePlugin, extract_runtime_globals_from_ejs,
+  extract_runtime_module_variables_from_ejs, get_chunk_runtime_requirements,
+};
+
+static LOAD_SCRIPT_TEMPLATE: &str = include_str!("runtime/load_script.ejs");
+static LOAD_SCRIPT_CREATE_SCRIPT_TEMPLATE: &str =
+  include_str!("runtime/load_script_create_script.ejs");
+static RUNTIME_MODULE_VARIABLES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+  let mut variables = extract_runtime_module_variables_from_ejs(&[
+    LOAD_SCRIPT_TEMPLATE,
+    LOAD_SCRIPT_CREATE_SCRIPT_TEMPLATE,
+  ]);
+  variables.push("uniqueName");
+  variables
+});
+static LOAD_SCRIPT_RUNTIME_REQUIREMENTS: LazyLock<RuntimeModuleRuntimeRequirements> =
+  LazyLock::new(|| extract_runtime_globals_from_ejs(LOAD_SCRIPT_TEMPLATE));
+static LOAD_SCRIPT_CREATE_SCRIPT_RUNTIME_REQUIREMENTS: LazyLock<RuntimeModuleRuntimeRequirements> =
+  LazyLock::new(|| extract_runtime_globals_from_ejs(LOAD_SCRIPT_CREATE_SCRIPT_TEMPLATE));
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
+#[derive(Debug)]
 pub struct LoadScriptRuntimeModule {
-  id: Identifier,
   unique_name: String,
   with_create_script_url: bool,
+  chunk_ukey: ChunkUkey,
 }
 
 impl LoadScriptRuntimeModule {
-  pub fn new(unique_name: String, with_create_script_url: bool) -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/load_script"),
+  pub fn new(
+    runtime_template: &RuntimeTemplate,
+    unique_name: String,
+    with_create_script_url: bool,
+    chunk_ukey: ChunkUkey,
+  ) -> Self {
+    Self::with_default(
+      runtime_template,
       unique_name,
       with_create_script_url,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
-    }
+      chunk_ukey,
+    )
   }
 }
 
+enum TemplateId {
+  Raw,
+  CreateScript,
+}
+
+#[async_trait::async_trait]
 impl RuntimeModule for LoadScriptRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn runtime_module_variables() -> &'static [&'static str] {
+    RUNTIME_MODULE_VARIABLES.as_slice()
   }
 
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    let url = if self.with_create_script_url {
-      format!("{}(url)", RuntimeGlobals::CREATE_SCRIPT_URL)
-    } else {
-      "url".to_string()
-    };
-    let cross_origin_loading = match &compilation.options.output.cross_origin_loading {
-      CrossOriginLoading::Disable => "".to_string(),
-      CrossOriginLoading::Enable(cross_origin) => {
-        if cross_origin == "use-credentials" {
-          "script.crossOrigin = \"use-credentials\";".to_string()
-        } else {
-          format!(
-            r#"
-            if (script.src.indexOf(window.location.origin + '/') !== 0) {{
-              script.crossOrigin = "{cross_origin}";
-            }}
-            "#
-          )
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      dependencies: {
+        let mut requirements = LOAD_SCRIPT_RUNTIME_REQUIREMENTS.dependencies
+          | LOAD_SCRIPT_CREATE_SCRIPT_RUNTIME_REQUIREMENTS.dependencies;
+        if self.with_create_script_url {
+          requirements.insert(RuntimeGlobals::CREATE_SCRIPT_URL);
         }
-      }
-    };
+        requirements
+      },
+      weak: LOAD_SCRIPT_CREATE_SCRIPT_RUNTIME_REQUIREMENTS.weak,
+      define: LOAD_SCRIPT_RUNTIME_REQUIREMENTS.define,
+      ..Default::default()
+    }
+  }
 
-    let script_type = if compilation.options.output.script_type.eq("false") {
-      String::new()
-    } else {
-      format!(
-        "script.type = '{}';",
-        compilation.options.output.script_type
-      )
-    };
+  fn template(&self) -> Vec<(String, String)> {
+    vec![
+      (
+        self.template_id(TemplateId::Raw),
+        LOAD_SCRIPT_TEMPLATE.to_string(),
+      ),
+      (
+        self.template_id(TemplateId::CreateScript),
+        LOAD_SCRIPT_CREATE_SCRIPT_TEMPLATE.to_string(),
+      ),
+    ]
+  }
+
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
+    let runtime_template = context.runtime_template;
+    let runtime_requirements = get_chunk_runtime_requirements(compilation, &self.chunk_ukey);
+    let with_fetch_priority = runtime_requirements.contains(RuntimeGlobals::HAS_FETCH_PRIORITY);
 
     let unique_prefix = if self.unique_name.is_empty() {
       None
     } else {
       Some(format!(
-        r#"var dataWebpackPrefix = "{}:";"#,
-        self.unique_name
+        r#"var uniqueName = {};"#,
+        rspack_util::json_stringify_str(&format!("{}:", self.unique_name))
       ))
     };
 
-    Ok(RawSource::from(
-      include_str!("runtime/load_script.js")
-        .replace(
-          "__CROSS_ORIGIN_LOADING_PLACEHOLDER__",
-          &cross_origin_loading,
-        )
-        .replace("$URL$", &url)
-        .replace("$SCRIPT_TYPE$", &script_type)
-        .replace(
-          "$UNIQUE_GET_ATTRIBUTE$",
-          match unique_prefix {
-            Some(_) => r#"s.getAttribute("src") == url || s.getAttribute("data-webpack") == dataWebpackPrefix + key"#,
-            None => r#"s.getAttribute("src") == url"#,
-          },
-        )
-        .replace(
-          "$UNIQUE_SET_ATTRIBUTE$",
-          match unique_prefix {
-            Some(_) => r#"script.setAttribute("data-webpack", dataWebpackPrefix + key);"#,
-            None => "",
-          },
-        )
-        .replace(
-          "$UNIQUE_PREFIX$",
-          unique_prefix.unwrap_or_default().as_str(),
-        ),
-    )
-    .boxed())
+    let create_script_code = runtime_template.render(
+      &self.template_id(TemplateId::CreateScript),
+      Some(serde_json::json!({
+        "_script_type": &compilation.options.output.script_type,
+        "_unique_prefix": unique_prefix.is_some(),
+        "_with_fetch_priority": with_fetch_priority,
+        "_with_create_script_url": self.with_create_script_url,
+        "_cross_origin": compilation.options.output.cross_origin_loading.to_string(),
+        "_chunk_load_timeout": compilation.options.output.chunk_load_timeout.saturating_div(1000).to_string(),
+      })),
+    )?;
+
+    let hooks = RuntimePlugin::get_compilation_hooks(compilation.id());
+    let chunk_ukey = self.chunk_ukey;
+    let res = hooks
+      .borrow()
+      .create_script
+      .call(CreateScriptData {
+        code: create_script_code,
+        chunk: RuntimeModuleChunkWrapper {
+          chunk_ukey,
+          compilation_id: compilation.id(),
+        },
+      })
+      .await?;
+
+    let render_source = runtime_template.render(
+      &self.template_id(TemplateId::Raw),
+      Some(serde_json::json!({
+        "_unique_prefix": unique_prefix.unwrap_or_default(),
+        "_create_script": res.code,
+        "_chunk_load_timeout": compilation.options.output.chunk_load_timeout.to_string(),
+        "_fetch_priority": if with_fetch_priority { ", fetchPriority" } else { "" },
+      })),
+    )?;
+
+    Ok(render_source)
+  }
+}
+
+impl LoadScriptRuntimeModule {
+  fn template_id(&self, id: TemplateId) -> String {
+    let base_id = self.id().to_string();
+
+    match id {
+      TemplateId::Raw => base_id,
+      TemplateId::CreateScript => format!("{base_id}_create_script"),
+    }
   }
 }

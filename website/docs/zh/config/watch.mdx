@@ -1,10 +1,12 @@
-import WebpackLicense from '@components/webpack-license';
+---
+description: '开启监听模式，使 Rspack 在第一次构建完后不会退出，而是继续监听文件变更，并在变更时触发重新编译。'
+---
 
-<WebpackLicense from="https://webpack.js.org/configuration/watch" />
+import Attribution from '@components/Attribution';
 
 # Watch
 
-监听：该选项用于监听文件变更并在变更时触发重新编译。
+监听：该选项用于监听文件变更，并在变更时触发重新编译。
 
 ## watch
 
@@ -13,15 +15,14 @@ import WebpackLicense from '@components/webpack-license';
 
 开启监听模式，使 Rspack 在第一次构建完后不会退出，而是继续监听文件变更，并在变更时触发重新编译。
 
-```js title=rspack.config.js
-module.exports = {
-  // ...
+```js title="rspack.config.mjs"
+export default {
   watch: true,
 };
 ```
 
-:::info Tip
-在使用 `@rspack/dev-server` 时，watch 默认为 true。
+:::tip
+在使用 `@rspack/dev-server` 时，`watch` 默认为 true。
 :::
 
 ## watchOptions
@@ -30,9 +31,8 @@ module.exports = {
 
 监听模式相关的配置项。
 
-```js title=rspack.config.js
-module.exports = {
-  // ...
+```js title="rspack.config.mjs"
+export default {
   watchOptions: {
     ignored: /node_modules/,
     poll: true,
@@ -40,15 +40,154 @@ module.exports = {
 };
 ```
 
+### watchOptions.aggregateTimeout
+
+- **类型：** `number`
+- **默认值：** `5`
+
+当第一个文件更改后，在触发 rebuild 前存在一个延迟时间，Rspack 会将这段时间内进行的任何其他更改都聚合到一次 rebuild 里。你可以通过这个选项来设置这个时间，以毫秒为单位：
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    aggregateTimeout: 600,
+  },
+};
+```
+
 ### watchOptions.ignored
 
-- **类型：** `RegExp`, `string`, `string[]`
+- **类型：** `RegExp | string | (string | RegExp)[] | ((entry: string) => boolean)`
+- **默认值：** `/[\\/](?:\.git|node_modules)[\\/]/`
 
-监听时排除匹配到的路径。
+使用 `watchOptions.ignored` 可以从监听范围中排除匹配的文件和目录。忽略不需要监听的目录有助于降低 CPU 和内存占用。
+
+默认情况下，`.git` 和 `node_modules` 目录会被忽略，其中的文件发生变化时不会触发重新构建。
+
+如果需要监听 `node_modules` 中的文件，可以覆盖默认值，仅忽略 `.git` 目录：
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    ignored: /[\\/]\.git[\\/]/,
+  },
+};
+```
+
+也可以使用 glob 模式：
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    ignored: '**/.git',
+  },
+};
+```
+
+如需忽略多个 glob 模式，请传入一个数组：
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    ignored: ['**/files/**/*.js', '**/.git', '**/node_modules'],
+  },
+};
+```
+
+数组中可以混合使用 glob 匹配和正则表达式：
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    ignored: [/\.git/, '**/node_modules', '**/.cache'],
+  },
+};
+```
+
+还可以指定一个或多个绝对路径。由于字符串会按 glob 模式解析，请将路径分隔符统一为正斜杠，以确保在各平台上的行为一致：
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+const ignoredDir = path
+  .resolve(import.meta.dirname, 'ignored-dir')
+  .replaceAll(path.sep, '/');
+
+export default {
+  watchOptions: {
+    ignored: [ignoredDir],
+  },
+};
+```
+
+`watchOptions.ignored` 的 glob 语法基于 [glob-to-regexp](https://github.com/fitzgen/glob-to-regexp)。有关支持的模式语法，请参阅其文档。
+
+最后，`ignored` 也可以是一个函数，它会被每个条目调用，返回 `true` 表示排除该条目：
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    ignored: (entry) => entry.includes('.git'),
+  },
+};
+```
+
+与其他形式不同，函数拿到的路径保留了当前平台的分隔符，并且需要自行排除被排除目录下的条目。
 
 ### watchOptions.poll
 
-- **类型：** `boolean`, `number`
+- **类型：** `number | boolean`
 - **默认值：** `false`
 
-是否通过轮询进行监听，`true` 时默认的轮询间隔为 5007 毫秒。
+是否通过轮询进行监听。
+
+当设置为 `true` 时，默认的轮询间隔为 5007 毫秒，这与 Node.js `fs.watchFile()` 的默认轮询间隔一致。
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    poll: true,
+  },
+};
+```
+
+还可以设置一个自定义的轮询间隔。注意，轮询间隔过短会显著增加 CPU 占用和文件系统 I/O 开销：
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    poll: 1000, // 每秒检查一次
+  },
+};
+```
+
+### watchOptions.followSymlinks
+
+- **类型：** `boolean`
+- **默认值：** `false`
+
+是否根据软链接查找文件。这通常是不需要的，因为 Rspack 已经使用 [resolve.symlinks](/config/resolve#resolvesymlinks) 解析了软链接。
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    followSymlinks: true,
+  },
+};
+```
+
+### watchOptions.stdin
+
+- **类型：** `boolean`
+
+当 stdin 流结束时停止监听。
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    stdin: true,
+  },
+};
+```
+
+<Attribution url="https://webpack.docschina.org/configuration/watch/" />

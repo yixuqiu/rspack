@@ -1,43 +1,91 @@
-use rspack_core::{
-  module_namespace_promise, AsContextDependency, Dependency, DependencyCategory, DependencyId,
-  DependencyTemplate, DependencyType, ErrorSpan, ExtendedReferencedExport, ImportDependencyTrait,
-  ModuleDependency, ModuleGraph, ReferencedExport, RuntimeSpec, TemplateContext,
-  TemplateReplaceSource,
-};
-use swc_core::ecma::atoms::Atom;
+use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsCacheable, AsOption, AsPreset, AsVec},
+};
+use rspack_core::{
+  AsContextDependency, Dependency, DependencyCategory, DependencyCodeGeneration,
+  DependencyCondition, DependencyId, DependencyRange, DependencyTemplate, DependencyTemplateType,
+  DependencyType, ExportsInfoArtifact, ImportAttributes, ImportPhase, ModuleDependency,
+  ModuleGraphCacheArtifact, ReferencedSpecifier, ResourceIdentifier, TemplateContext,
+  TemplateReplaceSource, UsedByExports, create_exports_object_referenced,
+  create_referenced_exports_by_referenced_specifiers,
+};
+
+use super::{
+  create_resource_identifier_for_esm_dependency,
+  import_dependency::get_import_dependency_inner_graph_condition,
+};
+use crate::Atom;
+
+#[cacheable]
+#[derive(Debug)]
 pub struct ImportEagerDependency {
-  start: u32,
-  end: u32,
   id: DependencyId,
+  #[cacheable(with=AsPreset)]
   request: Atom,
-  span: Option<ErrorSpan>,
-  referenced_exports: Option<Vec<Atom>>,
+  range: DependencyRange,
+  #[cacheable(with=AsOption<AsVec<AsCacheable>>)]
+  referenced_specifiers: Option<Vec<ReferencedSpecifier>>,
+  attributes: Option<ImportAttributes>,
+  phase: ImportPhase,
+  resource_identifier: ResourceIdentifier,
+  used_by_exports: Option<Arc<UsedByExports>>,
 }
 
 impl ImportEagerDependency {
   pub fn new(
-    start: u32,
-    end: u32,
     request: Atom,
-    span: Option<ErrorSpan>,
-    referenced_exports: Option<Vec<Atom>>,
+    range: DependencyRange,
+    attributes: Option<ImportAttributes>,
+    phase: ImportPhase,
   ) -> Self {
+    let resource_identifier =
+      create_resource_identifier_for_esm_dependency(request.as_str(), phase, attributes.as_ref());
     Self {
-      start,
-      end,
       request,
-      span,
+      range,
       id: DependencyId::new(),
-      referenced_exports,
+      referenced_specifiers: None,
+      attributes,
+      phase,
+      resource_identifier,
+      used_by_exports: None,
     }
+  }
+
+  pub fn set_referenced_specifiers(
+    &mut self,
+    referenced_specifiers: Vec<ReferencedSpecifier>,
+    from_magic_comment: bool,
+  ) {
+    if !from_magic_comment && referenced_specifiers.is_empty() {
+      // If the referenced specifiers are empty, keep it as default (None), since this dependency can't eliminate by side effects optimization,
+      // so if we set it to Some(vec![]), and the dependency still executes, it will cause runtime error because the exports are all tree shaken.
+      // see test case `tests/rspack-test/configCases/tree-shaking/side-effects-free-dynamic-import`
+      return;
+    }
+    self.referenced_specifiers = Some(referenced_specifiers);
+  }
+
+  pub fn set_used_by_exports(&mut self, used_by_exports: Option<Arc<UsedByExports>>) {
+    self.used_by_exports = used_by_exports;
+  }
+
+  pub(super) fn used_by_exports(&self) -> Option<&UsedByExports> {
+    self.used_by_exports.as_deref()
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for ImportEagerDependency {
   fn id(&self) -> &DependencyId {
     &self.id
+  }
+
+  fn resource_identifier(&self) -> Option<&str> {
+    Some(&self.resource_identifier)
   }
 
   fn category(&self) -> &DependencyCategory {
@@ -48,15 +96,59 @@ impl Dependency for ImportEagerDependency {
     &DependencyType::DynamicImportEager
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    self.span
+  fn get_attributes(&self) -> Option<&ImportAttributes> {
+    self.attributes.as_ref()
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "ImportEagerDependency"
+  fn get_phase(&self) -> ImportPhase {
+    self.phase
+  }
+
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
+  }
+
+  fn get_referenced_exports(
+    &self,
+    module_graph: &rspack_core::ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+    _runtime: Option<&rspack_core::RuntimeSpec>,
+  ) -> Vec<rspack_core::ReferencedExport> {
+    if let Some(referenced_specifiers) = &self.referenced_specifiers {
+      let module = module_graph
+        .get_module_by_dependency_id(&self.id)
+        .expect("should have module");
+      let parent_module = module_graph
+        .get_parent_module(&self.id)
+        .expect("should have parent module");
+      let strict = module_graph
+        .module_by_identifier(parent_module)
+        .expect("should have parent module")
+        .get_strict_esm_module();
+      let exports_type = module.get_exports_type(
+        module_graph,
+        module_graph_cache,
+        exports_info_artifact,
+        strict,
+      );
+      create_referenced_exports_by_referenced_specifiers(
+        referenced_specifiers,
+        exports_type,
+        exports_info_artifact,
+        exports_info_artifact.get_exports_info_data(&module.identifier()),
+      )
+    } else {
+      create_exports_object_referenced()
+    }
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
   }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for ImportEagerDependency {
   fn request(&self) -> &str {
     &self.request
@@ -66,56 +158,60 @@ impl ModuleDependency for ImportEagerDependency {
     &self.request
   }
 
-  fn set_request(&mut self, request: String) {
-    self.request = request.into();
-  }
-
-  fn get_referenced_exports(
-    &self,
-    _module_graph: &ModuleGraph,
-    _runtime: Option<&RuntimeSpec>,
-  ) -> Vec<ExtendedReferencedExport> {
-    if let Some(referenced_exports) = &self.referenced_exports {
-      vec![ReferencedExport::new(referenced_exports.clone(), false).into()]
-    } else {
-      vec![ExtendedReferencedExport::Array(vec![])]
-    }
+  fn get_condition(&self) -> Option<DependencyCondition> {
+    get_import_dependency_inner_graph_condition(self.used_by_exports.as_deref())
   }
 }
 
-impl ImportDependencyTrait for ImportEagerDependency {
-  fn referenced_exports(&self) -> Option<&Vec<Atom>> {
-    self.referenced_exports.as_ref()
-  }
-}
-
-impl DependencyTemplate for ImportEagerDependency {
-  fn apply(
-    &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
-  ) {
-    let module_graph = code_generatable_context.compilation.get_module_graph();
-    let block = module_graph.get_parent_block(&self.id);
-    source.replace(
-      self.start,
-      self.end,
-      module_namespace_promise(
-        code_generatable_context,
-        &self.id,
-        block,
-        &self.request,
-        self.dependency_type().as_str().as_ref(),
-        false,
-      )
-      .as_str(),
-      None,
-    );
-  }
-
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+#[cacheable_dyn]
+impl DependencyCodeGeneration for ImportEagerDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(ImportEagerDependencyTemplate::template_type())
   }
 }
 
 impl AsContextDependency for ImportEagerDependency {}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct ImportEagerDependencyTemplate;
+
+impl ImportEagerDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Custom("ImportEagerDependency")
+  }
+}
+
+impl DependencyTemplate for ImportEagerDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<ImportEagerDependency>()
+      .expect("ImportEagerDependencyTemplate should only be used for ImportEagerDependency");
+
+    let module_graph = code_generatable_context.compilation.get_module_graph();
+    let block = module_graph.get_parent_block(&dep.id);
+    source.replace(
+      dep.range.start,
+      dep.range.end,
+      code_generatable_context
+        .runtime_template
+        .module_namespace_promise(
+          code_generatable_context.compilation,
+          code_generatable_context.module.identifier(),
+          &dep.id,
+          block,
+          &dep.request,
+          dep.dependency_type().as_str(),
+          false,
+          dep.get_phase(),
+        ),
+      None,
+    );
+  }
+}

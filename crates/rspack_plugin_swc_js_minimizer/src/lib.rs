@@ -1,50 +1,66 @@
-#![feature(let_chains)]
+use std::{
+  fmt::{Display, Formatter},
+  hash::Hasher,
+  path::Path,
+  sync::{LazyLock, Mutex, mpsc},
+};
 
-mod minify;
-
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::path::Path;
-use std::sync::{mpsc, Arc, Mutex};
-
-use once_cell::sync::{Lazy, OnceCell};
+use cow_utils::CowUtils;
+use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use regex::Regex;
-use rspack_core::rspack_sources::{ConcatSource, MapOptions, RawSource, SourceExt, SourceMap};
-use rspack_core::rspack_sources::{Source, SourceMapSource, SourceMapSourceOptions};
 use rspack_core::{
-  AssetInfo, Compilation, CompilationAsset, CompilationParams, CompilationProcessAssets,
-  CompilerCompilation, Plugin, PluginContext,
+  AssetInfo, CacheValue, ChunkUkey, Compilation, CompilationAsset, CompilationParams,
+  CompilationProcessAssets, CompilerCompilation, Etag, Logger, Plugin,
+  cache::{CachedExtractedComments, CachedMinimizeEntry},
+  diagnostics::MinifyError,
+  legacy_cache::persistent::occasion::minimize::MinimizeCacheKey,
+  rspack_sources::{
+    BoxSource, ConcatSource, MapOptions, RawStringSource, SourceExt, SourceMapSource,
+    SourceMapSourceOptions,
+  },
 };
-use rspack_error::miette::IntoDiagnostic;
 use rspack_error::{Diagnostic, Result};
+use rspack_hash::RspackHasher;
 use rspack_hook::{plugin, plugin_hook};
-use rspack_plugin_javascript::{
-  JavascriptModulesPluginPlugin, JsChunkHashArgs, JsPlugin, PluginJsChunkHashHookOutput,
-};
+use rspack_javascript_compiler::JavaScriptCompiler;
+use rspack_plugin_javascript::{ExtractedCommentsInfo, JavascriptModulesChunkHash, JsPlugin};
 use rspack_regex::RspackRegex;
-use rspack_util::try_any_sync;
-use swc_config::config_types::BoolOrDataConfig;
-use swc_core::base::config::JsMinifyFormatOptions;
-pub use swc_ecma_minifier::option::terser::{TerserCompressorOptions, TerserEcmaVersion};
-pub use swc_ecma_minifier::option::MangleOptions;
-
-use self::minify::{match_object, minify};
+use rspack_util::{
+  asset_condition::AssetConditions,
+  fx_hash::{FxHashMap, FxHashSet, FxHasher},
+};
+use swc_config::types::BoolOrDataConfig;
+use swc_core::{
+  base::config::JsMinifyFormatOptions,
+  common::comments::{CommentKind, SingleThreadedComments},
+};
+pub use swc_ecma_minifier::option::{
+  MangleOptions,
+  terser::{TerserCompressorOptions, TerserEcmaVersion},
+};
 
 const PLUGIN_NAME: &str = "rspack.SwcJsMinimizerRspackPlugin";
 
-static JAVASCRIPT_ASSET_REGEXP: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"\.[cm]?js(\?.*)?$").expect("Invalid RegExp"));
+static JAVASCRIPT_ASSET_REGEXP: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"\.[cm]?js(\?.*)?$").expect("Invalid RegExp"));
+
+#[derive(Debug, Hash, rspack_hash::RspackHash)]
+pub struct PluginOptions {
+  pub test: Option<AssetConditions>,
+  pub include: Option<AssetConditions>,
+  pub exclude: Option<AssetConditions>,
+  pub extract_comments: Option<ExtractComments>,
+  pub minimizer_options: MinimizerOptions,
+}
 
 #[derive(Debug, Default)]
-pub struct SwcJsMinimizerRspackPluginOptions {
-  pub extract_comments: Option<ExtractComments>,
+pub struct MinimizerOptions {
+  pub ecma: TerserEcmaVersion,
+  pub minify: Option<bool>,
   pub compress: BoolOrDataConfig<TerserCompressorOptions>,
   pub mangle: BoolOrDataConfig<MangleOptions>,
   pub format: JsMinifyFormatOptions,
-  pub test: Option<SwcJsMinimizerRules>,
-  pub include: Option<SwcJsMinimizerRules>,
-  pub exclude: Option<SwcJsMinimizerRules>,
   pub module: Option<bool>,
 
   /// Internal fields for hashing only.
@@ -55,12 +71,40 @@ pub struct SwcJsMinimizerRspackPluginOptions {
   pub __format_cache: OnceCell<String>,
 }
 
-impl std::hash::Hash for SwcJsMinimizerRspackPluginOptions {
+impl rspack_hash::RspackHash for MinimizerOptions {
+  fn hash(&self, state: &mut RspackHasher) {
+    rspack_hash::RspackHash::hash(
+      self
+        .__format_cache
+        .get_or_init(|| simd_json::to_string(&self.format).expect("Should be able to serialize")),
+      state,
+    );
+    rspack_hash::RspackHash::hash(
+      self.__compress_cache.get_or_init(|| {
+        self
+          .compress
+          .as_ref()
+          .map(|v| simd_json::to_string(v).expect("Should be able to serialize"))
+      }),
+      state,
+    );
+    rspack_hash::RspackHash::hash(
+      self.__mangle_cache.get_or_init(|| {
+        self
+          .mangle
+          .as_ref()
+          .map(|v| simd_json::to_string(v).expect("Should be able to serialize"))
+      }),
+      state,
+    );
+  }
+}
+
+impl std::hash::Hash for MinimizerOptions {
   fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    self.extract_comments.hash(state);
     self
       .__format_cache
-      .get_or_init(|| serde_json::to_string(&self.format).expect("Should be able to serialize"))
+      .get_or_init(|| simd_json::to_string(&self.format).expect("Should be able to serialize"))
       .hash(state);
     self
       .__compress_cache
@@ -68,7 +112,7 @@ impl std::hash::Hash for SwcJsMinimizerRspackPluginOptions {
         self
           .compress
           .as_ref()
-          .map(|v| serde_json::to_string(v).expect("Should be able to serialize"))
+          .map(|v| simd_json::to_string(v).expect("Should be able to serialize"))
       })
       .hash(state);
     self
@@ -77,101 +121,78 @@ impl std::hash::Hash for SwcJsMinimizerRspackPluginOptions {
         self
           .mangle
           .as_ref()
-          .map(|v| serde_json::to_string(v).expect("Should be able to serialize"))
+          .map(|v| simd_json::to_string(v).expect("Should be able to serialize"))
       })
       .hash(state);
-    self.test.hash(state);
-    self.include.hash(state);
-    self.exclude.hash(state);
-  }
-}
-
-#[derive(Debug, Clone, Hash)]
-pub enum SwcJsMinimizerRule {
-  String(String),
-  Regexp(RspackRegex),
-}
-
-impl SwcJsMinimizerRule {
-  pub fn try_match(&self, data: &str) -> rspack_error::Result<bool> {
-    match self {
-      Self::String(s) => Ok(data.starts_with(s)),
-      Self::Regexp(r) => Ok(r.test(data)),
-    }
-  }
-}
-
-#[derive(Debug, Clone, Hash)]
-pub enum SwcJsMinimizerRules {
-  String(String),
-  Regexp(rspack_regex::RspackRegex),
-  Array(Vec<SwcJsMinimizerRule>),
-}
-
-impl SwcJsMinimizerRules {
-  pub fn try_match(&self, data: &str) -> rspack_error::Result<bool> {
-    match self {
-      Self::String(s) => Ok(data.starts_with(s)),
-      Self::Regexp(r) => Ok(r.test(data)),
-      Self::Array(l) => try_any_sync(l, |i| i.try_match(data)),
-    }
   }
 }
 
 #[derive(Debug, Hash)]
-pub enum OptionWrapper<T: std::fmt::Debug + Hash> {
+pub enum OptionWrapper<T: std::fmt::Debug + std::hash::Hash> {
   Default,
   Disabled,
   Custom(T),
 }
 
-#[derive(Debug)]
+impl<T: std::fmt::Debug + std::hash::Hash> Display for OptionWrapper<T> {
+  fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    f.write_str(match self {
+      OptionWrapper::Default => "default",
+      OptionWrapper::Disabled => "disabled",
+      OptionWrapper::Custom(_) => "custom",
+    })
+  }
+}
+
+impl<T: std::fmt::Debug + std::hash::Hash + rspack_hash::RspackHash> rspack_hash::RspackHash
+  for OptionWrapper<T>
+{
+  fn hash(&self, state: &mut RspackHasher) {
+    rspack_hash::RspackHash::hash(&self.to_string(), state);
+    if let OptionWrapper::Custom(value) = self {
+      rspack_hash::RspackHash::hash(value, state);
+    }
+  }
+}
+
+#[derive(Debug, rspack_hash::RspackHash)]
 pub struct ExtractComments {
   pub condition: String,
+  pub condition_flags: String,
   pub banner: OptionWrapper<String>,
 }
 
-impl Hash for ExtractComments {
+impl std::hash::Hash for ExtractComments {
   fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
     self.condition.as_str().hash(state);
+    self.condition_flags.as_str().hash(state);
     self.banner.hash(state);
   }
 }
 
 #[derive(Debug)]
-struct NormalizedExtractComments<'a> {
+struct NormalizedExtractComments {
   filename: String,
-  condition: &'a Regex,
+  condition: RspackRegex,
   banner: Option<String>,
-}
-
-#[derive(Debug)]
-struct SwcJsMinimizerJavascriptModulesPluginPlugin {
-  options: Arc<SwcJsMinimizerRspackPluginOptions>,
-}
-
-impl JavascriptModulesPluginPlugin for SwcJsMinimizerJavascriptModulesPluginPlugin {
-  fn js_chunk_hash(&self, args: &mut JsChunkHashArgs) -> PluginJsChunkHashHookOutput {
-    PLUGIN_NAME.hash(&mut args.hasher);
-    self.options.hash(&mut args.hasher);
-    Ok(())
-  }
 }
 
 #[plugin]
 #[derive(Debug)]
 pub struct SwcJsMinimizerRspackPlugin {
-  options: Arc<SwcJsMinimizerRspackPluginOptions>,
-  js_plugin: Arc<SwcJsMinimizerJavascriptModulesPluginPlugin>,
+  options: PluginOptions,
+  options_hash: u64,
 }
 
 impl SwcJsMinimizerRspackPlugin {
-  pub fn new(options: SwcJsMinimizerRspackPluginOptions) -> Self {
-    let options = Arc::new(options);
-    Self::new_inner(
-      options.clone(),
-      Arc::new(SwcJsMinimizerJavascriptModulesPluginPlugin { options }),
-    )
+  pub fn new(options: PluginOptions) -> Self {
+    use std::hash::Hash;
+
+    let mut hasher = FxHasher::default();
+    PLUGIN_NAME.hash(&mut hasher);
+    options.hash(&mut hasher);
+    let options_hash = hasher.finish();
+    Self::new_inner(options, options_hash)
   }
 }
 
@@ -181,132 +202,355 @@ async fn compilation(
   compilation: &mut Compilation,
   _params: &mut CompilationParams,
 ) -> Result<()> {
-  let mut drive = JsPlugin::get_compilation_drives_mut(compilation);
-  drive.add_plugin(self.js_plugin.clone());
+  let hooks = JsPlugin::get_compilation_hooks_mut(compilation.id());
+  let mut hooks = hooks.write().await;
+  hooks.chunk_hash.tap(js_chunk_hash::new(self));
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesChunkHash for SwcJsMinimizerRspackPlugin)]
+async fn js_chunk_hash(
+  &self,
+  _compilation: &Compilation,
+  _chunk_ukey: &ChunkUkey,
+  hasher: &mut RspackHasher,
+) -> Result<()> {
+  rspack_hash::RspackHash::hash(&self.options, hasher);
   Ok(())
 }
 
 #[plugin_hook(CompilationProcessAssets for SwcJsMinimizerRspackPlugin, stage = Compilation::PROCESS_ASSETS_STAGE_OPTIMIZE_SIZE)]
 async fn process_assets(&self, compilation: &mut Compilation) -> Result<()> {
-  let minify_options = &self.options;
+  let options = &self.options;
+  let minimizer_options = &self.options.minimizer_options;
+
+  let new_cache = compilation
+    .options
+    .experiments
+    .new_cache
+    .minimize
+    .then(|| compilation.get_cache(PLUGIN_NAME));
+  let minimize_persistent_cache = compilation.minimize_persistent_cache.take();
+  let legacy_cache_entries: Mutex<Vec<(MinimizeCacheKey, CachedMinimizeEntry)>> =
+    Mutex::new(Vec::new());
+  let logger = compilation.get_logger(PLUGIN_NAME);
+  let minimize_cache_counter = (new_cache.is_none() && minimize_persistent_cache.is_some())
+    .then(|| logger.cache("minimize persistent cache"));
 
   let (tx, rx) = mpsc::channel::<Vec<Diagnostic>>();
   // collect all extracted comments info
-  let all_extracted_comments = Mutex::new(HashMap::new());
-  let extract_comments_condition = minify_options
-    .extract_comments
-    .as_ref()
-    .map(|extract_comment| extract_comment.condition.as_ref())
-    .map(|condition| {
-      Regex::new(condition)
-        .unwrap_or_else(|_| panic!("`{condition}` is invalid extractComments condition"))
-    });
+  let all_extracted_comments = Mutex::new(FxHashMap::default());
+  let extract_comments_condition = options.extract_comments.as_ref().map(|extract_comment| {
+    RspackRegex::with_flags(
+      extract_comment.condition.as_ref(),
+      extract_comment.condition_flags.as_ref(),
+    )
+    .unwrap_or_else(|_| {
+      panic!(
+        "`/{}/{}` is invalid extractComments condition",
+        extract_comment.condition, extract_comment.condition_flags
+      )
+    })
+  });
+  let enter_span = tracing::Span::current();
 
   compilation
     .assets_mut()
     .par_iter_mut()
     .filter(|(filename, original)| {
-      if !JAVASCRIPT_ASSET_REGEXP.is_match(filename) {
-        return false
-      }
+      // propagate span in rayon to keep parent relation
+      let is_matched = match_object(options, filename);
 
-      let is_matched = match_object(minify_options, filename)
-        .unwrap_or(false);
-
-      if !is_matched || original.get_info().minimized {
+      if !is_matched || original.get_info().minimized.unwrap_or(false) {
         return false
       }
 
       true
     })
-    .try_for_each_with(tx,|tx, (filename, original)| -> Result<()>  {
-      let filename = filename.split('?').next().expect("Should have filename");
+    .try_for_each_with(tx,|tx, (asset_filename, original)| -> Result<()>  {
+      let _guard = enter_span.enter();
+      let filename = asset_filename.split('?').next().expect("Should have filename");
       if let Some(original_source) = original.get_source() {
-        let input = original_source.source().to_string();
-        let input_source_map = original_source.map(&MapOptions::default());
+        let is_module = get_is_module(minimizer_options, original, filename);
 
-        let is_module = if let Some(module) = self.options.module {
-          module
-        } else if let Some(module) = original.info.javascript_module {
-          module
+        let new_cache_entry = if let Some(cache) = &new_cache {
+          let etag = Etag::from(format!(
+            "{:016x}",
+            minimize_cache_hash(original_source, self.options_hash, filename, is_module)
+          ));
+          let value = cache.get::<CachedMinimizeEntry>(asset_filename, Some(etag.clone()));
+          Some((cache, etag, value))
         } else {
-          filename.ends_with(".mjs")
+          None
         };
 
-        let js_minify_options = JsMinifyOptions {
-          compress: minify_options.compress.clone(),
-          mangle: minify_options.mangle.clone(),
-          format: minify_options.format.clone(),
+        let mut cache_key = None;
+        let cached = if let Some((_, _, cached)) = &new_cache_entry {
+          cached.as_deref()
+        } else if let Some(cache) = &minimize_persistent_cache {
+          let key = MinimizeCacheKey::new(minimize_cache_hash(
+            original_source,
+            self.options_hash,
+            filename,
+            is_module,
+          ));
+          cache_key = Some(key);
+          cache.get(key)
+        } else {
+          None
+        };
+        if let Some(cached) = cached {
+          if let Some(cache) = &new_cache {
+            cache.record_reuse();
+          } else if let Some(counter) = &minimize_cache_counter {
+            counter.hit();
+          }
+          original.set_source(Some(cached.source.clone()));
+          original.get_info_mut().minimized.replace(true);
+          if let Some(ec) = &cached.extracted_comments {
+            all_extracted_comments
+              .lock()
+              .expect("all_extract_comments lock failed")
+              .insert(
+                filename.to_string(),
+                ExtractedCommentsInfo {
+                  source: ec.source.clone(),
+                  comments_file_name: ec.comments_file_name.clone(),
+                },
+              );
+          }
+          return Ok(());
+        }
+        if cache_key.is_some() && let Some(counter) = &minimize_cache_counter {
+          counter.miss();
+        }
+        let input = original_source.source().into_string_lossy().into_owned();
+        let input_source_map = original_source.map(&MapOptions::default());
+
+        let js_minify_options = rspack_javascript_compiler::minify::JsMinifyOptions {
+          minify: minimizer_options.minify.unwrap_or(true),
+          compress: minimizer_options.compress.clone(),
+          mangle: minimizer_options.mangle.clone(),
+          format: minimizer_options.format.clone(),
+          ecma: minimizer_options.ecma.clone(),
           source_map: BoolOrDataConfig::from_bool(input_source_map.is_some()),
           inline_sources_content: true, /* Using true so original_source can be None in SourceMapSource */
           module: is_module,
           ..Default::default()
-          };
-        let extract_comments_option = minify_options.extract_comments.as_ref().map(|extract_comments| {
-          let comments_filename = format!("{}.LICENSE.txt", filename);
+        };
+        let extract_comments_option = options.extract_comments.as_ref().map(|extract_comments| {
+          let comments_filename = format!("{filename}.LICENSE.txt");
           let banner = match &extract_comments.banner {
             OptionWrapper::Default => {
               let dir = Path::new(filename).parent().expect("should has parent");
-              let relative = Path::new(&comments_filename).strip_prefix(dir).expect("should has common prefix").to_string_lossy().to_string().replace('\\', "/");
-              Some(format!("/*! For license information please see {relative} */"))
+              let raw = Path::new(&comments_filename).strip_prefix(dir).expect("should has common prefix").to_string_lossy();
+              let relative = raw.cow_replace('\\', "/");
+              Some(format!("/*! LICENSE: {relative} */"))
             },
             OptionWrapper::Disabled => None,
             OptionWrapper::Custom(value) => Some(format!("/*! {value} */"))
           };
           NormalizedExtractComments {
             filename: comments_filename,
-            condition: extract_comments_condition.as_ref().expect("must exists"),
+            condition: extract_comments_condition.as_ref().expect("must exist").clone(),
             banner
           }
         });
-        let output = match minify(
-          &js_minify_options,
-          input,
-          filename,
-          &all_extracted_comments,
-          &extract_comments_option,
-        ) {
-          Ok(r) => r,
-          Err(e) => {
-            tx.send(e.into()).into_diagnostic()?;
-            return Ok(())
+
+        let javascript_compiler = JavaScriptCompiler::new();
+        let comments_op = |comments: &SingleThreadedComments| {
+          if let Some(ref extract_comments) = extract_comments_option {
+            let mut extracted_comments = FxHashSet::default();
+            // add all matched comments to source
+
+            let (leading_trivial, trailing_trivial) = comments.borrow_all();
+
+            leading_trivial.iter().for_each(|(_, comments)| {
+              comments.iter().for_each(|c| {
+                if extract_comments.condition.test(&c.text) {
+                  let comment = match c.kind {
+                    CommentKind::Line => {
+                      format!("//{}", c.text)
+                    }
+                    CommentKind::Block => {
+                      format!("/*{}*/", c.text)
+                    }
+                  };
+                  extracted_comments.insert(comment);
+                }
+              });
+            });
+            trailing_trivial.iter().for_each(|(_, comments)| {
+              comments.iter().for_each(|c| {
+                if extract_comments.condition.test(&c.text) {
+                  let comment = match c.kind {
+                    CommentKind::Line => {
+                      format!("//{}", c.text)
+                    }
+                    CommentKind::Block => {
+                      format!("/*{}*/", c.text)
+                    }
+                  };
+                  extracted_comments.insert(comment);
+                }
+              });
+            });
+
+            // if not matched comments, we don't need to emit .License.txt file
+            if !extracted_comments.is_empty() {
+              let mut extracted_comments = extracted_comments.into_iter().collect::<Vec<_>>();
+              extracted_comments.sort();
+              all_extracted_comments
+                .lock()
+                .expect("all_extract_comments lock failed")
+                .insert(
+                  filename.to_string(),
+                  ExtractedCommentsInfo {
+                    source: RawStringSource::from(extracted_comments.join("\n\n")).boxed(),
+                    comments_file_name: extract_comments.filename.clone(),
+                  },
+                );
+            }
           }
         };
-        let source = if let Some(map) = &output.map {
-          SourceMapSource::new(SourceMapSourceOptions {
-            value: output.code,
-            name: filename,
-            source_map: SourceMap::from_json(map).expect("should be able to generate source-map"),
-            original_source: None,
-            inner_source_map: input_source_map,
-            remove_original_source: true,
-          })
-          .boxed()
-        } else {
-          RawSource::from(output.code).boxed()
+
+        let mut output = match javascript_compiler.minify(
+          swc_core::common::FileName::Custom(filename.to_string()),
+          input,
+          js_minify_options,
+          Some(comments_op),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+              let errors = e.into_inner().into_iter().map(|err| {
+                let mut d = Diagnostic::from(MinifyError(err));
+                d.file = Some(filename.into());
+                d
+              }).collect::<Vec<_>>();
+              tx.send(errors)?;
+              return Ok(())
+            },
         };
-        let source = if let Some(Some(banner)) = extract_comments_option.map(|option| option.banner)
-          && all_extracted_comments
+
+        let banner = if all_extracted_comments
           .lock()
           .expect("all_extract_comments lock failed")
-          .contains_key(filename)
-        {
-          ConcatSource::new([
-            RawSource::Source(banner).boxed(),
-            RawSource::from("\n").boxed(),
-            source
-          ]).boxed()
-        } else {
-          source
+          .contains_key(filename) {
+            extract_comments_option.and_then(|option| option.banner)
+          } else {
+            None
+          };
+
+        let source = match banner {
+            Some(banner) => {
+              // There are two cases with banner:
+              // 1. There's no shebang, we just prepend the banner to the code.
+              // 2. There's a shebang, we prepend the shebang, then the banner, then the code.
+
+              let mut shebang = None;
+              if output.code.starts_with("#!") {
+                if let Some(line_pos) = output.code.find('\n') {
+                  shebang = Some(output.code[0..line_pos + 1].to_string());
+                  output.code = output.code[line_pos + 1..].to_string();
+                } else {
+                  // Handle shebang without newline - treat entire content as shebang
+                  shebang = Some(output.code.clone());
+                  output.code = String::new();
+                }
+              }
+
+              let source = if let Some(source_map) = output.map {
+                SourceMapSource::new(SourceMapSourceOptions {
+                  value: output.code,
+                  name: filename,
+                  source_map,
+                  original_source: None,
+                  inner_source_map: input_source_map,
+                  remove_original_source: true,
+                })
+                .boxed()
+              } else {
+                RawStringSource::from(output.code).boxed()
+              };
+
+              if let Some(shebang) = shebang {
+                ConcatSource::new([
+                  RawStringSource::from(shebang).boxed(),
+                  RawStringSource::from(banner).boxed(),
+                  RawStringSource::from_static("\n").boxed(),
+                  source
+                ]).boxed()
+              } else {
+                ConcatSource::new([
+                  RawStringSource::from(banner).boxed(),
+                  RawStringSource::from_static("\n").boxed(),
+                  source
+                ]).boxed()
+              }
+            },
+            None => {
+              // If there's no banner, we don't need to handle `output.code` at all.
+              if let Some(source_map) = output.map {
+                SourceMapSource::new(SourceMapSourceOptions {
+                  value: output.code,
+                  name: filename,
+                  source_map,
+                  original_source: None,
+                  inner_source_map: input_source_map,
+                  remove_original_source: true,
+                })
+                .boxed()
+              } else {
+                RawStringSource::from(output.code).boxed()
+              }
+            },
         };
+
+        if new_cache_entry.is_some() || cache_key.is_some() {
+          let extracted_comments_for_cache = all_extracted_comments
+            .lock()
+            .expect("all_extract_comments lock failed")
+            .get(filename)
+            .map(|ec| CachedExtractedComments {
+              source: ec.source.clone(),
+              comments_file_name: ec.comments_file_name.clone(),
+            });
+          let entry = CachedMinimizeEntry {
+            source: source.clone(),
+            extracted_comments: extracted_comments_for_cache,
+          };
+          if let Some((cache, etag, _)) = &new_cache_entry {
+            cache.store(asset_filename, Some(etag.clone()), CacheValue::new(entry));
+          } else if let Some(cache_key) = cache_key {
+            legacy_cache_entries
+              .lock()
+              .expect("legacy_cache_entries lock failed")
+              .push((cache_key, entry));
+          }
+        }
+
         original.set_source(Some(source));
-        original.get_info_mut().minimized = true;
+        original.get_info_mut().minimized.replace(true);
       }
 
       Ok(())
   })?;
 
-  compilation.push_batch_diagnostic(rx.into_iter().flatten().collect::<Vec<_>>());
+  if let Some(mut cache) = minimize_persistent_cache {
+    for (key, entry) in legacy_cache_entries
+      .into_inner()
+      .expect("legacy_cache_entries lock failed")
+    {
+      cache.insert(key, entry);
+    }
+    compilation.minimize_persistent_cache = Some(cache);
+  }
+
+  if let Some(counter) = minimize_cache_counter {
+    logger.cache_end(counter);
+  }
+
+  compilation.extend_diagnostics(rx.into_iter().flatten().collect::<Vec<_>>());
 
   // write all extracted comments to assets
   all_extracted_comments
@@ -317,17 +561,71 @@ async fn process_assets(&self, compilation: &mut Compilation) -> Result<()> {
     .for_each(|(_, comments)| {
       compilation.emit_asset(
         comments.comments_file_name,
-        CompilationAsset {
-          source: Some(comments.source),
-          info: AssetInfo {
-            minimized: true,
+        CompilationAsset::new(
+          Some(comments.source),
+          AssetInfo {
+            minimized: Some(true),
             ..Default::default()
           },
-        },
+        ),
       )
     });
 
   Ok(())
+}
+
+fn minimize_cache_hash(
+  source: &BoxSource,
+  options_hash: u64,
+  filename: &str,
+  is_module: Option<bool>,
+) -> u64 {
+  use std::hash::Hash;
+
+  let mut hasher = FxHasher::default();
+  source.buffer().hash(&mut hasher);
+  options_hash.hash(&mut hasher);
+  filename.hash(&mut hasher);
+  is_module.hash(&mut hasher);
+  hasher.finish()
+}
+
+fn get_is_module(
+  minimizer_options: &MinimizerOptions,
+  asset: &CompilationAsset,
+  filename: &str,
+) -> Option<bool> {
+  minimizer_options
+    .module
+    .or(asset.info.javascript_module)
+    .or_else(|| {
+      filename
+        .ends_with(".mjs")
+        .then_some(true)
+        .or_else(|| filename.ends_with(".cjs").then_some(false))
+    })
+}
+
+pub fn match_object(obj: &PluginOptions, str: &str) -> bool {
+  if let Some(condition) = &obj.test {
+    if !condition.try_match(str) {
+      return false;
+    }
+  } else if !JAVASCRIPT_ASSET_REGEXP.is_match(str) {
+    return false;
+  }
+  if let Some(condition) = &obj.include
+    && !condition.try_match(str)
+  {
+    return false;
+  }
+  if let Some(condition) = &obj.exclude
+    && condition.try_match(str)
+  {
+    return false;
+  }
+
+  true
 }
 
 impl Plugin for SwcJsMinimizerRspackPlugin {
@@ -335,45 +633,12 @@ impl Plugin for SwcJsMinimizerRspackPlugin {
     PLUGIN_NAME
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut rspack_core::ApplyContext>,
-    _options: &mut rspack_core::CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
     ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
-    ctx
-      .context
       .compilation_hooks
       .process_assets
       .tap(process_assets::new(self));
     Ok(())
   }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct JsMinifyOptions {
-  pub compress: BoolOrDataConfig<TerserCompressorOptions>,
-  pub mangle: BoolOrDataConfig<MangleOptions>,
-  pub format: JsMinifyFormatOptions,
-  pub ecma: TerserEcmaVersion,
-  pub keep_class_names: bool,
-  pub keep_fn_names: bool,
-  pub module: bool,
-  pub safari10: bool,
-  pub toplevel: bool,
-  pub source_map: BoolOrDataConfig<TerserSourceMapKind>,
-  pub output_path: Option<String>,
-  pub inline_sources_content: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TerserSourceMapKind {
-  pub filename: Option<String>,
-  pub url: Option<String>,
-  pub root: Option<String>,
-  pub content: Option<String>,
 }

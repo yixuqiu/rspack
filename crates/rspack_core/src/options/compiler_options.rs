@@ -1,45 +1,27 @@
 use crate::{
-  Builtins, CacheOptions, Context, DevServerOptions, Experiments, IncrementalRebuildMakeState,
-  Mode, ModuleOptions, NodeOption, Optimization, OutputOptions, Resolve, SnapshotOptions,
-  StatsOptions, Target,
+  CacheOptions, Context, Experiments, Mode, ModuleOptions, NodeOption, Optimization, OutputOptions,
+  Resolve, SnapshotOptions, StatsOptions, incremental::IncrementalOptions,
 };
 
 #[derive(Debug)]
 pub struct CompilerOptions {
+  pub name: Option<String>,
   pub context: Context,
-  pub dev_server: DevServerOptions,
   pub output: OutputOptions,
-  // TODO(swc-loader): target should not exist on compiler options
-  pub target: Target,
   pub mode: Mode,
   pub resolve: Resolve,
   pub resolve_loader: Resolve,
   pub module: ModuleOptions,
   pub stats: StatsOptions,
-  pub snapshot: SnapshotOptions,
   pub cache: CacheOptions,
+  pub snapshot: SnapshotOptions,
   pub experiments: Experiments,
+  pub incremental: IncrementalOptions,
   pub node: Option<NodeOption>,
   pub optimization: Optimization,
-  pub profile: bool,
+  pub amd: Option<String>,
   pub bail: bool,
-  pub builtins: Builtins,
+  pub __references: References,
 }
 
-impl CompilerOptions {
-  pub fn is_incremental_rebuild_make_enabled(&self) -> bool {
-    self.experiments.incremental_rebuild.make.is_some()
-  }
-
-  pub fn get_incremental_rebuild_make_state(&self) -> Option<&IncrementalRebuildMakeState> {
-    self.experiments.incremental_rebuild.make.as_ref()
-  }
-
-  pub fn is_incremental_rebuild_emit_asset_enabled(&self) -> bool {
-    self.experiments.incremental_rebuild.emit_asset
-  }
-
-  pub fn is_new_tree_shaking(&self) -> bool {
-    self.experiments.rspack_future.new_treeshaking
-  }
-}
+pub type References = serde_json::Map<String, serde_json::Value>;

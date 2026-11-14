@@ -1,11 +1,11 @@
 // Port of https://github.com/webpack/webpack/blob/main/lib/util/findGraphRoots.js
 
-use std::hash::Hash;
+use std::{fmt::Debug, hash::Hash};
 
-use rspack_database::{Database, DatabaseItem, Ukey};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 #[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy)]
 enum Marker {
   NoMarker,
   InProgressMarker,
@@ -14,45 +14,34 @@ enum Marker {
   DoneAndRootMarker,
 }
 
-struct Cycle<T: Hash + PartialEq + Eq> {
-  pub ukey: Ukey<Cycle<T>>,
-  pub nodes: FxHashSet<T>,
+type NodeId = usize;
+type CycleId = usize;
+
+struct Cycle {
+  pub nodes: FxHashSet<NodeId>,
+  pub is_root: bool,
 }
 
-impl<T: 'static + Hash + PartialEq + Eq> Default for Cycle<T> {
-  fn default() -> Self {
+impl Cycle {
+  fn with_capacity(capacity: usize) -> Self {
     Self {
-      ukey: Ukey::<Cycle<T>>::new(),
-      nodes: Default::default(),
+      nodes: FxHashSet::with_capacity_and_hasher(capacity, Default::default()),
+      is_root: false,
     }
   }
 }
 
-impl<T: Hash + PartialEq + Eq> DatabaseItem for Cycle<T> {
-  fn ukey(&self) -> Ukey<Self> {
-    self.ukey
-  }
-}
-
-struct Node<T> {
-  pub ukey: Ukey<Node<T>>,
+struct Node<T: Hash + Eq + Copy> {
   pub item: T,
-  pub dependencies: Vec<Ukey<Node<T>>>,
+  pub dependencies: Vec<NodeId>,
   pub marker: Marker,
-  pub cycle: Option<Ukey<Cycle<Ukey<Node<T>>>>>,
+  pub cycle: Option<CycleId>,
   pub incoming: usize,
 }
 
-impl<T> DatabaseItem for Node<T> {
-  fn ukey(&self) -> Ukey<Self> {
-    self.ukey
-  }
-}
-
-impl<T: 'static> Node<T> {
+impl<T: Hash + Eq + Copy> Node<T> {
   fn new(item: T) -> Self {
     Self {
-      ukey: Ukey::<Node<T>>::new(),
       item,
       dependencies: Default::default(),
       marker: Marker::NoMarker,
@@ -64,14 +53,14 @@ impl<T: 'static> Node<T> {
 
 struct StackEntry<T> {
   node: T,
-  open_edges: Vec<T>,
+  next_edge: usize,
 }
 
 pub fn find_graph_roots<
-  Item: Clone + std::fmt::Debug + PartialEq + Eq + Hash + Send + Sync + Ord + 'static,
+  Item: Clone + Copy + Debug + PartialEq + Eq + Hash + Send + Sync + Ord + 'static,
 >(
   items: Vec<Item>,
-  get_dependencies: impl Sync + Fn(Item) -> Vec<Item>,
+  get_dependencies: impl Sync + Fn(Item, &mut dyn FnMut(Item)),
 ) -> Vec<Item> {
   use rayon::prelude::*;
   // early exit when there is only a single item
@@ -79,59 +68,51 @@ pub fn find_graph_roots<
     return items;
   }
 
-  let mut db = Database::<Node<Item>>::new();
-  let mut cycle_db = Database::<Cycle<Ukey<Node<Item>>>>::new();
-
-  items
+  let mut nodes = items
     .into_iter()
     .map(|item| Node::new(item))
-    .for_each(|node| {
-      db.add(node);
-    });
+    .collect::<Vec<_>>();
 
-  let item_to_node_ukey = db
-    .values()
-    .map(|node| (node.item.clone(), node.ukey))
-    .collect::<FxHashMap<_, _>>();
+  let mut cycle_db = Vec::<Cycle>::new();
+  let mut item_to_node_id = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
+  for (node_id, node) in nodes.iter().enumerate() {
+    item_to_node_id.insert(node.item, node_id);
+  }
+  let items_by_node = nodes.iter().map(|node| node.item).collect::<Vec<_>>();
 
   // grab all the dependencies
-  db.par_values_mut().for_each(|node| {
-    node.dependencies = get_dependencies(node.item.clone())
-      .into_iter()
-      .filter_map(|item| item_to_node_ukey.get(&item))
-      .cloned()
-      .collect::<Vec<_>>();
+  nodes.par_iter_mut().for_each(|node| {
+    get_dependencies(node.item, &mut |item| {
+      if let Some(node_id) = item_to_node_id.get(&item) {
+        node.dependencies.push(*node_id);
+      }
+    });
+    node
+      .dependencies
+      .sort_unstable_by_key(|node_id| items_by_node[*node_id]);
+    node.dependencies.dedup();
   });
 
   // Set of current root modules
   // items will be removed if a new reference to it has been found
-  let mut roots: FxHashSet<Ukey<Node<Item>>> = FxHashSet::default();
+  let mut roots = FxHashSet::with_capacity_and_hasher(nodes.len(), Default::default());
 
-  // Set of current cycles without references to it
-  // cycles will be removed if a new reference to it has been found
-  // that is not part of the cycle
-  let mut root_cycles: FxHashSet<Ukey<Cycle<Ukey<Node<Item>>>>> = FxHashSet::default();
-
-  let mut keys = db.keys().cloned().collect::<Vec<_>>();
-  keys.sort_by(|a, b| a.as_ref(&db).item.cmp(&b.as_ref(&db).item));
+  let mut keys = (0..nodes.len()).collect::<Vec<_>>();
+  keys.sort_unstable_by_key(|node_id| nodes[*node_id].item);
 
   // For all non-marked nodes
   for select_node in keys {
-    if matches!(select_node.as_ref(&db).marker, Marker::NoMarker) {
+    if matches!(nodes[select_node].marker, Marker::NoMarker) {
       // deep-walk all referenced modules
       // in a non-recursive way
 
       // start by entering the selected node
-      select_node.as_mut(&mut db).marker = Marker::InProgressMarker;
+      nodes[select_node].marker = Marker::InProgressMarker;
 
       // keep a stack to avoid recursive walk
       let mut stack = vec![StackEntry {
         node: select_node,
-        open_edges: {
-          let mut v: Vec<_> = select_node.as_ref(&db).dependencies.to_vec();
-          v.sort_by(|a, b| a.as_ref(&db).item.cmp(&b.as_ref(&db).item));
-          v
-        },
+        next_edge: nodes[select_node].dependencies.len(),
       }];
 
       // process the top item until stack is empty
@@ -139,61 +120,51 @@ pub fn find_graph_roots<
         let top_of_stack_idx = stack.len() - 1;
 
         // Are there still edges unprocessed in the current node?
-        if !stack[top_of_stack_idx].open_edges.is_empty() {
-          let mut edges = stack[top_of_stack_idx]
-            .open_edges
-            .iter()
-            .map(|edge| edge.as_ref(&db))
-            .collect::<Vec<_>>();
-
-          edges.sort_by(|a, b| a.item.cmp(&b.item));
-
+        if stack[top_of_stack_idx].next_edge > 0 {
           // Process one dependency
-          let dependency = stack[top_of_stack_idx]
-            .open_edges
-            .pop()
-            .expect("Should exist");
-          match dependency.as_ref(&db).marker {
+          let dependency = {
+            let top_of_stack = &mut stack[top_of_stack_idx];
+            top_of_stack.next_edge -= 1;
+            nodes[top_of_stack.node].dependencies[top_of_stack.next_edge]
+          };
+          match nodes[dependency].marker {
             Marker::NoMarker => {
               // dependency has not be visited yet
               // mark it as in-progress and recurse
               stack.push(StackEntry {
                 node: dependency,
-                open_edges: {
-                  let mut v: Vec<_> = dependency.as_ref(&db).dependencies.to_vec();
-                  v.sort_unstable();
-                  v
-                },
+                next_edge: nodes[dependency].dependencies.len(),
               });
-              dependency.as_mut(&mut db).marker = Marker::InProgressMarker;
+              nodes[dependency].marker = Marker::InProgressMarker;
             }
             Marker::InProgressMarker => {
               // It's a in-progress cycle
-              let cycle = &dependency.as_ref(&db).cycle;
-              if cycle.is_none() {
-                let cycle = cycle_db.create_default_item();
-                cycle.nodes.insert(dependency);
-                dependency.as_mut(&mut db).cycle = Some(cycle.ukey);
+              if nodes[dependency].cycle.is_none() {
+                let cycle_id = cycle_db.len();
+                cycle_db.push(Cycle::with_capacity(stack.len()));
+                cycle_db[cycle_id].nodes.insert(dependency);
+                nodes[dependency].cycle = Some(cycle_id);
               }
-              let cycle = dependency.as_ref(&db).cycle.expect("Should exist");
+              let cycle = nodes[dependency].cycle.expect("Should exist");
 
               // set cycle property for each node in the cycle
               // if nodes are already part of a cycle
               // we merge the cycles to a shared cycle
               {
                 let mut i = stack.len() - 1;
-                while stack[i].node.as_ref(&db).item != dependency.as_ref(&db).item {
+                while stack[i].node != dependency {
                   let node = stack[i].node;
-                  if let Some(node_cycle) = node.as_ref(&db).cycle {
+                  if let Some(node_cycle) = nodes[node].cycle {
                     if node_cycle != cycle {
-                      for cycle_node in node_cycle.as_ref(&cycle_db).nodes.clone() {
-                        cycle_node.as_mut(&mut db).cycle = Some(cycle);
-                        cycle.as_mut(&mut cycle_db).nodes.insert(cycle_node);
+                      let old_cycle_nodes = std::mem::take(&mut cycle_db[node_cycle].nodes);
+                      for cycle_node in old_cycle_nodes {
+                        nodes[cycle_node].cycle = Some(cycle);
+                        cycle_db[cycle].nodes.insert(cycle_node);
                       }
                     }
                   } else {
-                    node.as_mut(&mut db).cycle = Some(cycle);
-                    cycle.as_mut(&mut cycle_db).nodes.insert(node);
+                    nodes[node].cycle = Some(cycle);
+                    cycle_db[cycle].nodes.insert(node);
                   }
 
                   if i == 0 {
@@ -207,29 +178,29 @@ pub fn find_graph_roots<
               // these are already on the stack
             }
             Marker::DoneAndRootMarker => {
-              dependency.as_mut(&mut db).marker = Marker::DoneMarker;
+              nodes[dependency].marker = Marker::DoneMarker;
               roots.remove(&dependency);
             }
             Marker::DoneMaybeRootCycleMarker => {
-              if let Some(cycle) = dependency.as_ref(&db).cycle {
-                root_cycles.remove(&cycle);
+              if let Some(cycle) = nodes[dependency].cycle {
+                cycle_db[cycle].is_root = false;
               };
-              dependency.as_mut(&mut db).marker = Marker::DoneMarker;
+              nodes[dependency].marker = Marker::DoneMarker;
             }
             _ => {}
           }
         } else if let Some(top_of_stack) = stack.pop() {
-          top_of_stack.node.as_mut(&mut db).marker = Marker::DoneMarker;
+          nodes[top_of_stack.node].marker = Marker::DoneMarker;
         }
       }
-      let cycle = select_node.as_ref(&db).cycle;
+      let cycle = nodes[select_node].cycle;
       if let Some(cycle) = cycle {
-        for node in cycle.as_mut(&mut cycle_db).nodes.iter() {
-          node.as_mut(&mut db).marker = Marker::DoneMaybeRootCycleMarker;
+        for &node in &cycle_db[cycle].nodes {
+          nodes[node].marker = Marker::DoneMaybeRootCycleMarker;
         }
-        root_cycles.insert(cycle);
+        cycle_db[cycle].is_root = true;
       } else {
-        select_node.as_mut(&mut db).marker = Marker::DoneAndRootMarker;
+        nodes[select_node].marker = Marker::DoneAndRootMarker;
         roots.insert(select_node);
       }
     }
@@ -239,23 +210,28 @@ pub fn find_graph_roots<
   // We take the nodes with most incoming edges
   // inside of the cycle
 
-  for cycle in root_cycles {
+  for cycle in &cycle_db {
+    if !cycle.is_root {
+      continue;
+    }
     let mut max = 0;
 
-    let mut cycle_roots: FxHashSet<Ukey<Node<Item>>> = Default::default();
-    let nodes = &cycle.as_ref(&cycle_db).nodes;
-    for node in nodes.iter() {
-      for dep in node.as_ref(&db).dependencies.clone().into_iter() {
-        if nodes.contains(&dep) {
-          dep.as_mut(&mut db).incoming += 1;
-          if dep.as_ref(&db).incoming < max {
+    let mut cycle_roots = Vec::new();
+    for &node in &cycle.nodes {
+      let dependency_len = nodes[node].dependencies.len();
+      for dependency_idx in 0..dependency_len {
+        let dep = nodes[node].dependencies[dependency_idx];
+        if cycle.nodes.contains(&dep) {
+          nodes[dep].incoming += 1;
+          let incoming = nodes[dep].incoming;
+          if incoming < max {
             continue;
           }
-          if dep.as_ref(&db).incoming > max {
+          if incoming > max {
             cycle_roots.clear();
-            max = dep.as_ref(&db).incoming;
+            max = incoming;
           }
-          cycle_roots.insert(dep);
+          cycle_roots.push(dep);
         }
       }
     }
@@ -268,9 +244,56 @@ pub fn find_graph_roots<
     panic!("Implementation of findGraphRoots is broken")
   }
 
-  roots
-    .into_iter()
-    .map(|root| db.remove(&root).expect("should exist"))
-    .map(|node| node.item)
-    .collect()
+  roots.into_iter().map(|root| nodes[root].item).collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::find_graph_roots;
+
+  fn collect_roots(
+    items: Vec<u32>,
+    dependencies: impl Sync + Fn(u32) -> &'static [u32],
+  ) -> Vec<u32> {
+    let mut roots = find_graph_roots(items, |item, add_dependency| {
+      for dependency in dependencies(item) {
+        add_dependency(*dependency);
+      }
+    });
+    roots.sort_unstable();
+    roots
+  }
+
+  #[test]
+  fn finds_roots_for_linear_graph() {
+    let roots = collect_roots(vec![1, 2, 3], |item| match item {
+      1 => &[2],
+      2 => &[3],
+      _ => &[],
+    });
+
+    assert_eq!(roots, vec![1]);
+  }
+
+  #[test]
+  fn finds_roots_for_disconnected_graph() {
+    let roots = collect_roots(vec![1, 2, 3], |item| match item {
+      1 => &[2],
+      _ => &[],
+    });
+
+    assert_eq!(roots, vec![1, 3]);
+  }
+
+  #[test]
+  fn extracts_roots_from_root_cycle() {
+    let roots = collect_roots(vec![1, 2, 3], |item| match item {
+      1 => &[2],
+      2 => &[1],
+      3 => &[1],
+      _ => &[],
+    });
+
+    assert_eq!(roots, vec![3]);
+  }
 }

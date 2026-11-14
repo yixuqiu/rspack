@@ -1,5 +1,12 @@
 // @ts-nocheck
-module.exports = function urlToRelativePath(url) {
-	if (url.startsWith("https://test.cases/path/")) url = url.slice(24);
-	return `./${url}`;
-};
+import { URL } from 'node:url';
+
+function urlToRelativePath(url) {
+  if (url.startsWith('https://') || url.startsWith('file://')) {
+    const urlObj = new URL(url);
+    return `./${urlObj.pathname.split('/').pop()}`;
+  }
+  return `./${url}`;
+}
+
+export { urlToRelativePath };

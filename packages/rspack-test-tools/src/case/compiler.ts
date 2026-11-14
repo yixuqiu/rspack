@@ -1,31 +1,301 @@
-import { ECompilerType } from "../type";
-import { ISimpleProcessorOptions, SimpleTaskProcessor } from "../processor";
-import { getSimpleProcessorRunner } from "../test/simple";
+import path from 'node:path';
+import type {
+  Compilation,
+  Compiler,
+  OutputFileSystem,
+  RspackOptions,
+  Stats,
+  StatsCompilation,
+} from '@rspack/core';
+import { readTestFile } from '../helper/read-test-file';
+import { BasicCaseCreator } from '../test/creator';
+import type {
+  ITestContext,
+  ITestEnv,
+  ITestProcessor,
+  MaybePromise,
+} from '../type';
 
-export type TCompilerCaseConfig = Omit<
-	ISimpleProcessorOptions,
-	"name" | "compilerType"
-> & {
-	description: string;
-};
+function createCompilerProcessor(
+  name: string,
+  caseConfig: TManagedCompilerCaseConfig,
+) {
+  const logs = {
+    mkdir: [] as string[],
+    writeFile: [] as (string | number | Buffer<ArrayBufferLike>)[],
+  };
+  const files = {} as Record<string, string>;
+  return {
+    config: (context: ITestContext) => {
+      const compiler = context.getCompiler();
+      const options = caseConfig.options?.(context) || {};
+      options.mode ??= 'production';
+      options.context ??= context.getSource();
+      options.entry ??= './a.js';
+      options.output ??= {};
+      options.output.path ??= '/';
+      options.output.pathinfo ??= true;
+      options.optimization ??= {};
+      options.optimization.minimize ??= false;
+      compiler.setOptions(options);
+    },
+    compiler: async (context: ITestContext) => {
+      const compiler = context.getCompiler();
+      if (caseConfig.compilerCallback) {
+        compiler.createCompilerWithCallback(caseConfig.compilerCallback);
+      } else {
+        compiler.createCompiler();
+      }
+      const c = compiler.getCompiler()!;
+      c.outputFileSystem = {
+        // CHANGE: Added support for the `options` parameter to enable recursive directory creation,
+        // accommodating Rspack's requirement that differs from webpack's usage
+        mkdir(
+          path: string,
+          callback: (
+            err?: Error & {
+              code?: string;
+            },
+          ) => void,
+        ) {
+          const recursive = false;
+          // if (typeof options === "function") {
+          // 	callback = options;
+          // } else if (options) {
+          // 	if (options.recursive !== undefined) recursive = options.recursive;
+          // }
+          logs.mkdir.push(path);
+          if (recursive) {
+            callback();
+          } else {
+            const err = new Error() as Error & {
+              code?: string;
+            };
+            err.code = 'EEXIST';
+            callback(err);
+          }
+        },
+        writeFile(name, content, callback) {
+          logs.writeFile.push(name, content);
+          files[name] = content.toString('utf-8');
+          callback();
+        },
+        stat(path, callback) {
+          callback(new Error('ENOENT'));
+        },
+      } as OutputFileSystem;
+      c.hooks.compilation.tap(
+        'CompilerTest',
+        (compilation) => ((compilation as any).bail = true),
+      );
+      await caseConfig.compiler?.(context, c);
+    },
+    build: async (context: ITestContext) => {
+      const compiler = context.getCompiler();
+      if (typeof caseConfig.build === 'function') {
+        await caseConfig.build?.(context, compiler.getCompiler()!);
+      } else {
+        await compiler.build();
+      }
+    },
+    run: async (env: ITestEnv, context: ITestContext) => {},
+    check: async (env: ITestEnv, context: ITestContext) => {
+      const compiler = context.getCompiler();
+      const c = compiler.getCompiler()!;
+      const stats = compiler.getStats() as Stats;
+      if (caseConfig.error) {
+        const statsJson = stats?.toJson({
+          modules: true,
+          reasons: true,
+        });
+        const compilation = stats?.compilation;
+        await caseConfig.check?.({
+          context,
+          compiler: c,
+          stats: statsJson,
+          compilation,
+          files,
+        });
+      } else if (stats) {
+        expect(typeof stats).toBe('object');
+        const compilation = stats.compilation;
+        const statsJson = stats.toJson({
+          assets: true,
+          chunks: true,
+          chunkModules: true,
+          modules: true,
+          entrypoints: true,
+          chunkGroups: true,
+          reasons: true,
+        });
+        expect(typeof statsJson).toBe('object');
+        expect(statsJson).toHaveProperty('errors');
+        expect(Array.isArray(statsJson.errors)).toBe(true);
+        if (statsJson.errors!.length > 0) {
+          expect(statsJson.errors![0]).toBeInstanceOf(Object);
+          throw statsJson.errors![0];
+        }
+        statsJson.logs = logs;
+        await caseConfig.check?.({
+          context,
+          stats: statsJson,
+          files,
+          compiler: c,
+          compilation,
+        });
+      } else {
+        await caseConfig.check?.({
+          context,
+          files,
+          compiler: c,
+        });
+      }
+    },
+    after: async (context: ITestContext) => {
+      await context.closeCompiler();
+    },
+  } as ITestProcessor;
+}
+
+const creator = new BasicCaseCreator({
+  clean: true,
+  describe: false,
+  steps: ({ name, caseConfig }) => {
+    const config = caseConfig as TCompilerCaseConfig;
+    if (typeof config.run === 'function') {
+      // Lifecycle cases own their compilers: a manager retaining compiler/stats
+      // would prevent GC assertions, and process-only cases need no compiler here.
+      // Execute in the build phase so failures use the existing case error handling.
+      return [
+        {
+          config() {},
+          compiler() {},
+          run() {},
+          check() {},
+          build: async () => {
+            await config.run();
+          },
+        },
+      ];
+    }
+    return [createCompilerProcessor(name, config)];
+  },
+  concurrent: false,
+});
 
 export function createCompilerCase(
-	name: string,
-	src: string,
-	dist: string,
-	testConfig: string
+  name: string,
+  src: string,
+  dist: string,
+  testConfig: string,
 ) {
-	const caseConfig: TCompilerCaseConfig = require(testConfig);
-	const runner = getSimpleProcessorRunner(src, dist);
-
-	it(caseConfig.description, async () => {
-		await runner(
-			name,
-			new SimpleTaskProcessor({
-				name: name,
-				compilerType: ECompilerType.Rspack,
-				...caseConfig
-			})
-		);
-	});
+  let caseConfigList: TCompilerCaseConfig | TCompilerCaseConfig[] =
+    readTestFile(testConfig);
+  if (!Array.isArray(caseConfigList)) {
+    caseConfigList = [caseConfigList];
+  }
+  // Names become both filter identifiers and output path segments. Validate the
+  // whole group before registration to avoid collisions or partially registered cases.
+  const names = new Set<string>();
+  for (const config of caseConfigList) {
+    if (config.name !== undefined) {
+      if (
+        !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(config.name) ||
+        names.has(config.name)
+      ) {
+        throw new Error(
+          `Invalid or duplicate compiler case name: ${config.name}`,
+        );
+      }
+      names.add(config.name);
+    }
+    // JS configs bypass the type union; reject mixed ownership instead of
+    // silently ignoring hooks that only apply to a framework-managed compiler.
+    if ('run' in config) {
+      const managed = [
+        'options',
+        'compiler',
+        'build',
+        'check',
+        'compilerCallback',
+        'error',
+      ];
+      if (
+        typeof config.run !== 'function' ||
+        managed.some((key) => key in config)
+      ) {
+        throw new Error(
+          `Compiler case "${config.description}" must not mix run with managed compiler fields`,
+        );
+      }
+    }
+  }
+  for (let i = 0; i < caseConfigList.length; i++) {
+    const caseConfig = caseConfigList[i];
+    // Stable names allow selecting one scenario without depending on array order.
+    // Preserve the existing identifiers and output paths for unnamed cases.
+    const caseName = caseConfig.name
+      ? `${name}/${caseConfig.name}`
+      : `${name}[${i}]`;
+    if (caseConfig.skip) {
+      it.skip(caseName, () => {});
+      continue;
+    }
+    creator.create(
+      caseName,
+      src,
+      caseConfig.name ? path.join(dist, caseConfig.name) : dist,
+      undefined,
+      {
+        caseConfig,
+        // Rstest filters display names; BasicCaseCreator filters caseName.
+        // Include the same path in both so a single filter selects the scenario.
+        description: () =>
+          caseConfig.name
+            ? `${caseName}: ${caseConfig.description}`
+            : caseConfig.description,
+      },
+    );
+  }
 }
+
+type TCompilerCaseBase = {
+  description: string;
+  name?: string;
+  skip?: boolean;
+};
+
+type TManagedCompilerCaseConfig = TCompilerCaseBase & {
+  run?: never;
+  error?: boolean;
+  options?: (context: ITestContext) => RspackOptions;
+  compiler?: (context: ITestContext, compiler: Compiler) => MaybePromise<void>;
+  build?: (context: ITestContext, compiler: Compiler) => MaybePromise<void>;
+  check?: ({
+    context,
+    stats,
+    files,
+    compiler,
+    compilation,
+  }: {
+    context: ITestContext;
+    stats?: StatsCompilation;
+    files?: Record<string, string>;
+    compiler: Compiler;
+    compilation?: Compilation;
+  }) => MaybePromise<void>;
+  compilerCallback?: (error: Error | null, stats?: Stats) => void;
+};
+
+export type TCompilerCaseConfig =
+  | TManagedCompilerCaseConfig
+  | (TCompilerCaseBase & {
+      /** Owns compiler creation and cleanup; close owned compilers in finally. */
+      run: () => MaybePromise<void>;
+      options?: never;
+      compiler?: never;
+      build?: never;
+      check?: never;
+      compilerCallback?: never;
+      error?: never;
+    });

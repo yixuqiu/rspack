@@ -1,0 +1,318 @@
+#![allow(clippy::too_many_arguments)]
+
+use std::borrow::Cow;
+
+use cow_utils::CowUtils;
+use derive_more::Debug;
+use rspack_core::{
+  ChunkInitFragments, ChunkUkey, Compilation, CompilationAdditionalModuleRuntimeRequirements,
+  CompilationParams, CompilerCompilation, Filename, Module, ModuleIdentifier, PathData, Plugin,
+  RuntimeCodeTemplate, RuntimeGlobals,
+  rspack_sources::{BoxSource, RawStringSource, Source, SourceExt},
+};
+use rspack_error::Result;
+use rspack_hash::{RspackHash, RspackHasher};
+use rspack_hook::{plugin, plugin_hook};
+use rspack_plugin_javascript::{
+  JavascriptModulesChunkHash, JavascriptModulesInlineInRuntimeBailout,
+  JavascriptModulesRenderModuleContent, JsPlugin, RenderSource,
+};
+use rspack_util::{fx_hash::FxDashMap, json_stringify_str};
+
+use crate::{
+  ModuleFilenameTemplate, SourceReference, default_eval_module_filename_template,
+  module_filename_helpers::ModuleFilenameHelpers,
+};
+
+#[derive(Clone, Debug)]
+pub struct EvalDevToolModulePluginOptions {
+  pub namespace: Option<String>,
+  #[debug(skip)]
+  pub module_filename_template: Option<ModuleFilenameTemplate>,
+  pub source_url_comment: Option<String>,
+}
+
+const EVAL_DEV_TOOL_MODULE_PLUGIN_NAME: &str = "rspack.EvalDevToolModulePlugin";
+
+#[plugin]
+#[derive(Debug)]
+pub struct EvalDevToolModulePlugin {
+  namespace: String,
+  source_url_comment: String,
+  #[debug(skip)]
+  module_filename_template: Option<ModuleFilenameTemplate>,
+  cache: FxDashMap<(ModuleIdentifier, BoxSource), BoxSource>,
+}
+
+impl EvalDevToolModulePlugin {
+  pub fn new(options: EvalDevToolModulePluginOptions) -> Self {
+    let namespace = options.namespace.unwrap_or_default();
+
+    let source_url_comment = options
+      .source_url_comment
+      .unwrap_or("\n//# sourceURL=[url]".to_string());
+
+    Self::new_inner(
+      namespace,
+      source_url_comment,
+      options.module_filename_template,
+      Default::default(),
+    )
+  }
+}
+
+#[plugin_hook(CompilerCompilation for EvalDevToolModulePlugin)]
+async fn compilation(
+  &self,
+  compilation: &mut Compilation,
+  _params: &mut CompilationParams,
+) -> Result<()> {
+  let hooks = JsPlugin::get_compilation_hooks_mut(compilation.id());
+  let mut hooks = hooks.write().await;
+  hooks
+    .render_module_content
+    .tap(render_module_content::new(self));
+  hooks.chunk_hash.tap(js_chunk_hash::new(self));
+  hooks
+    .inline_in_runtime_bailout
+    .tap(inline_in_runtime_bailout::new(self));
+
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesRenderModuleContent for EvalDevToolModulePlugin,tracing=false)]
+async fn render_module_content(
+  &self,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  module: &dyn Module,
+  render_source: &mut RenderSource,
+  runtime_requirements: &mut RuntimeGlobals,
+  _init_fragments: &mut ChunkInitFragments,
+  runtime_template: &RuntimeCodeTemplate,
+) -> Result<()> {
+  if compilation.options.output.trusted_types.is_some() {
+    runtime_requirements.insert(RuntimeGlobals::CREATE_SCRIPT);
+  }
+  let origin_source = render_source.source.clone();
+  let cache_key = (module.identifier(), origin_source.clone());
+  if let Some(cached_source) = self.cache.get(&cache_key) {
+    render_source.source = cached_source.value().clone();
+    return Ok(());
+  } else if module.as_external_module().is_some() {
+    return Ok(());
+  }
+
+  let Some(chunk) = compilation
+    .build_chunk_graph_artifact
+    .chunk_by_ukey
+    .get(chunk_ukey)
+  else {
+    return Ok(());
+  };
+  let path_data = PathData::default()
+    .chunk(chunk.ukey(), compilation)
+    .chunk_id_optional(chunk.id().map(|id| id.as_str()))
+    .chunk_name_optional(chunk.name())
+    .chunk_hash_optional(chunk.rendered_hash(
+      &compilation.chunk_hashes_artifact,
+      compilation.options.output.hash_digest_length,
+    ));
+
+  let filename = Filename::from(self.namespace.as_str());
+  let namespace = compilation.get_path(&filename, path_data).await?;
+
+  let output_options = &compilation.options.output;
+  let default_module_filename_template =
+    default_eval_module_filename_template(compilation.options.experiments.runtime_mode);
+  let module_filename_template = self
+    .module_filename_template
+    .as_ref()
+    .unwrap_or(default_module_filename_template);
+  let str = match module_filename_template {
+    ModuleFilenameTemplate::String(s) => ModuleFilenameHelpers::create_filename_of_string_template(
+      &SourceReference::Module(module.identifier()),
+      compilation,
+      s,
+      output_options,
+      &namespace,
+      None,
+    ),
+    ModuleFilenameTemplate::Fn(f) => {
+      ModuleFilenameHelpers::create_filename_of_fn_template(
+        &SourceReference::Module(module.identifier()),
+        compilation,
+        f,
+        output_options,
+        &namespace,
+        None,
+      )
+      .await?
+    }
+  };
+  let source = {
+    let source = &origin_source.source().into_string_lossy();
+    let footer = format!(
+      "\n{}",
+      &self.source_url_comment.cow_replace(
+        "[url]",
+        encode_uri(&str)
+          .cow_replace("%2F", "/")
+          .cow_replace("%20", "_")
+          .cow_replace("%5E", "^")
+          .cow_replace("%5C", "\\")
+          .trim_start_matches('/')
+      )
+    );
+
+    let module_content = json_stringify_str(&format!("{{{source}{footer}\n}}"));
+    RawStringSource::from(format!(
+      "eval({});",
+      if compilation.options.output.trusted_types.is_some() {
+        format!(
+          "{}({})",
+          runtime_template.render_runtime_globals(&RuntimeGlobals::CREATE_SCRIPT),
+          module_content
+        )
+      } else {
+        module_content
+      }
+    ))
+    .boxed()
+  };
+
+  self.cache.insert(cache_key, source.clone());
+  render_source.source = source;
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesChunkHash for EvalDevToolModulePlugin)]
+async fn js_chunk_hash(
+  &self,
+  _compilation: &Compilation,
+  _chunk_ukey: &ChunkUkey,
+  hasher: &mut RspackHasher,
+) -> Result<()> {
+  EVAL_DEV_TOOL_MODULE_PLUGIN_NAME.hash(hasher);
+  Ok(())
+}
+
+#[plugin_hook(JavascriptModulesInlineInRuntimeBailout for EvalDevToolModulePlugin)]
+async fn inline_in_runtime_bailout(&self, _compilation: &Compilation) -> Result<Option<String>> {
+  Ok(Some("the eval devtool is used.".to_string()))
+}
+
+impl Plugin for EvalDevToolModulePlugin {
+  fn name(&self) -> &'static str {
+    EVAL_DEV_TOOL_MODULE_PLUGIN_NAME
+  }
+
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
+    ctx
+      .compilation_hooks
+      .additional_module_runtime_requirements
+      .tap(additional_module_runtime_requirements::new(self));
+    Ok(())
+  }
+}
+
+#[plugin_hook(CompilationAdditionalModuleRuntimeRequirements for EvalDevToolModulePlugin,tracing=false)]
+async fn additional_module_runtime_requirements(
+  &self,
+  compilation: &Compilation,
+  _module: &ModuleIdentifier,
+  runtime_requirements: &mut RuntimeGlobals,
+) -> Result<()> {
+  if compilation.options.output.trusted_types.is_some() {
+    runtime_requirements.insert(RuntimeGlobals::CREATE_SCRIPT);
+  }
+
+  Ok(())
+}
+
+// https://tc39.es/ecma262/#sec-encode
+// UNESCAPED is combined by ALWAYS_UNESCAPED and ";/?:@&=+$,#"
+const fn is_unescape(c: u8) -> bool {
+  const TABLE: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!*'();/?:@&=+$,#";
+
+  const TABLE_BIT: u128 = {
+    let mut table: u128 = 0;
+
+    let mut i = 0;
+    while i < TABLE.len() {
+      let c = TABLE[i];
+      table |= 1 << c;
+      i += 1;
+    }
+
+    if i > u128::BITS as usize {
+      panic!("bitset overflow");
+    }
+
+    table
+  };
+
+  (TABLE_BIT & (1 << c)) != 0
+}
+
+// https://tc39.es/ecma262/#sec-encode
+fn encode_uri(string: &str) -> Cow<'_, str> {
+  use std::fmt::Write;
+
+  // Let R be the empty String.
+  let mut r = Cow::Borrowed(string);
+  // Let alwaysUnescaped be the string-concatenation of the ASCII word characters and "-.!~*'()".
+  for (byte_idx, c) in string.char_indices() {
+    let is_unescape = c
+      .try_into()
+      .ok()
+      .filter(|&ascii| is_unescape(ascii))
+      .is_some();
+    if is_unescape {
+      match r {
+        Cow::Borrowed(_) => {}
+        Cow::Owned(mut inner) => {
+          inner.push(c);
+          r = Cow::Owned(inner);
+        }
+      }
+    } else {
+      if let Cow::Borrowed(_) = r {
+        r = Cow::Owned(string[0..byte_idx].to_owned());
+      }
+
+      if let Cow::Owned(mut inner) = r {
+        let mut b = [0u8; 4];
+        for &octet in c.encode_utf8(&mut b).as_bytes() {
+          write!(&mut inner, "%{octet:02X}").expect("write failed");
+        }
+        r = Cow::Owned(inner);
+      }
+    }
+  }
+  r
+}
+
+#[cfg(test)]
+mod test {
+  use super::*;
+
+  // https://github.com/tc39/test262/blob/c47b716e8d6bea0c4510d449fd22b7ed5f8b0151/test/built-ins/encodeURI/S15.1.3.3_A4_T2.js#L6
+  #[test]
+  fn check_russian_alphabet() {
+    assert_eq!(
+      encode_uri("http://ru.wikipedia.org/wiki/Юникод"),
+      "http://ru.wikipedia.org/wiki/%D0%AE%D0%BD%D0%B8%D0%BA%D0%BE%D0%B4"
+    );
+    assert_eq!(
+      encode_uri("http://ru.wikipedia.org/wiki/Юникод#Ссылки"),
+      "http://ru.wikipedia.org/wiki/%D0%AE%D0%BD%D0%B8%D0%BA%D0%BE%D0%B4#%D0%A1%D1%81%D1%8B%D0%BB%D0%BA%D0%B8"
+    );
+    assert_eq!(
+      encode_uri("http://ru.wikipedia.org/wiki/Юникод#Версии Юникода"),
+      "http://ru.wikipedia.org/wiki/%D0%AE%D0%BD%D0%B8%D0%BA%D0%BE%D0%B4#%D0%92%D0%B5%D1%80%D1%81%D0%B8%D0%B8%20%D0%AE%D0%BD%D0%B8%D0%BA%D0%BE%D0%B4%D0%B0"
+    );
+  }
+}

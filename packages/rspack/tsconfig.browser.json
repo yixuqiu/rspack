@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "../rspack-browser/dist",
+    "rootDir": "src",
+    "lib": ["es2022", "dom"],
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "emitDeclarationOnly": true,
+    "sourceMap": false,
+    "declarationMap": false
+  },
+  "include": ["src", "src/**/*.json"],
+  "exclude": ["src/container/default.runtime.js"]
+}

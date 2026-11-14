@@ -1,18 +1,29 @@
-use std::borrow::Cow;
+/**
+ * The following code is modified based on
+ * https://github.com/webpack/webpack/blob/3919c844eca394d73ca930e4fc5506fb86e2b094/lib/util/deterministicGrouping.js
+ *
+ * MIT Licensed
+ * Author Tobias Koppers @sokra
+ * Copyright (c) JS Foundation and other contributors
+ * https://github.com/webpack/webpack/blob/main/LICENSE
+ */
+use std::{borrow::Cow, sync::LazyLock};
 
-use once_cell::sync::Lazy;
-use rayon::prelude::*;
 use regex::Regex;
 use rspack_core::{
-  ChunkUkey, Compilation, CompilerOptions, Module, ModuleIdentifier, DEFAULT_DELIMITER,
+  ChunkUkey, Compilation, CompilerOptions, Module, ModuleIdentifier, ModuleRef, SourceType,
+  incremental::Mutation, module_chunk_condition,
 };
-use rspack_error::Result;
-use rspack_hash::{RspackHash, RspackHashDigest};
-use rspack_util::{ext::DynHash, identifier::make_paths_relative};
-use rustc_hash::FxHashMap;
+use rspack_error::{Result, ToStringResultToRspackResultExt};
+use rspack_hash::{RspackHashDigest, RspackHasher};
+use rspack_util::identifier::make_paths_relative;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::MaxSizeSetting;
 use crate::{SplitChunkSizes, SplitChunksPlugin};
+
+static MAX_SIZE_KEY_REGEX: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"^.*!|\?[^?!]*$").expect("should build regex"));
 
 #[derive(Debug)]
 struct GroupItem {
@@ -26,92 +37,253 @@ struct Group {
   nodes: Vec<GroupItem>,
   pub size: SplitChunkSizes,
   pub key: Option<String>,
+  pub similarities: Vec<usize>,
 }
 
 impl Group {
-  fn new(items: Vec<GroupItem>, key: Option<String>) -> Self {
+  fn new(items: Vec<GroupItem>, key: Option<String>, similarities: Vec<usize>) -> Self {
     let mut summed_size = SplitChunkSizes::empty();
-    items.iter().for_each(|item| summed_size.add_by(&item.size));
+    sum_size(&mut summed_size, &items);
 
     Self {
       nodes: items,
       size: summed_size,
       key,
+      similarities,
     }
+  }
+
+  fn pop_nodes(&mut self, filter: impl Fn(&GroupItem) -> bool) -> Option<Vec<GroupItem>> {
+    let mut filtered = vec![false; self.nodes.len()];
+    let mut all_success = true;
+    for (idx, node) in self.nodes.iter().enumerate() {
+      filtered[idx] = filter(node);
+
+      if !filtered[idx] {
+        all_success = false;
+      }
+    }
+
+    if all_success {
+      return None;
+    }
+
+    let mut new_nodes = vec![];
+    let mut new_similarities = vec![];
+    let mut result_nodes = vec![];
+    let mut last_node: Option<&GroupItem> = None;
+    let mut last_node_idx = 0;
+    let nodes = std::mem::take(&mut self.nodes);
+
+    for (idx, node) in nodes.into_iter().enumerate() {
+      if filtered[idx] {
+        result_nodes.push(node);
+      } else {
+        if !new_nodes.is_empty() {
+          let last_node = last_node.expect("last node exist");
+          let similarity = if last_node_idx == idx - 1 {
+            self.similarities[last_node_idx]
+          } else {
+            similarity(&last_node.key, &node.key)
+          };
+          new_similarities.push(similarity);
+        }
+
+        new_nodes.push(node);
+        last_node_idx = idx;
+        last_node = new_nodes.last();
+      }
+    }
+
+    self.nodes = new_nodes;
+    self.similarities = new_similarities;
+    self.size = SplitChunkSizes::empty();
+    sum_size(&mut self.size, &self.nodes);
+
+    Some(result_nodes)
   }
 }
 
-fn get_size(module: &dyn Module) -> SplitChunkSizes {
+fn sum_size(size: &mut SplitChunkSizes, items: &[GroupItem]) {
+  items.iter().for_each(|item| size.add_by(&item.size));
+}
+
+fn get_size(module: &dyn Module, compilation: &Compilation) -> SplitChunkSizes {
+  let module_graph = compilation.get_module_graph();
   SplitChunkSizes(
     module
-      .source_types()
+      .source_types(module_graph)
       .iter()
-      .map(|ty| (*ty, module.size(ty)))
+      .map(|ty| (*ty, module.size(Some(ty))))
       .collect(),
   )
 }
 
 fn hash_filename(filename: &str, options: &CompilerOptions) -> String {
-  let mut filename_hash = RspackHash::from(&options.output);
-  filename.dyn_hash(&mut filename_hash);
+  let mut filename_hash = RspackHasher::new(&options.output.hash_function);
+  filename_hash.write(filename.as_bytes());
   let hash_digest: RspackHashDigest = filename_hash.digest(&options.output.hash_digest);
   hash_digest.rendered(8).to_string()
 }
 
-static REPLACE_MODULE_IDENTIFIER_REG: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^.*!|\?[^?!]*$").expect("regexp init failed"));
-static REPLACE_RELATIVE_PREFIX_REG: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^(\.\.?\/)+").expect("regexp init failed"));
-static REPLACE_ILLEGEL_LETTER_REG: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"(^[.-]|[^a-zA-Z0-9_-])+").expect("regexp init failed"));
+use rspack_util::identifier::request_to_id;
 
-fn request_to_id(req: &str) -> String {
-  let mut res = REPLACE_RELATIVE_PREFIX_REG.replace_all(req, "").to_string();
-  res = REPLACE_ILLEGEL_LETTER_REG
-    .replace_all(&res, "_")
-    .to_string();
-  res
+fn get_too_small_types(
+  size: &SplitChunkSizes,
+  min_size: &SplitChunkSizes,
+) -> FxHashSet<SourceType> {
+  let mut types = FxHashSet::default();
+  size.iter().for_each(|(ty, ty_size)| {
+    if *ty_size == 0.0f64 {
+      return;
+    }
+
+    if let Some(min_ty_size) = min_size.get(ty)
+      && ty_size < min_ty_size
+    {
+      types.insert(*ty);
+    }
+  });
+  types
+}
+
+fn remove_problematic_nodes(
+  group: &mut Group,
+  considered_size: &SplitChunkSizes,
+  min_size: &SplitChunkSizes,
+  result: &mut Vec<Group>,
+) -> bool {
+  let problem_types = get_too_small_types(considered_size, min_size);
+
+  if !problem_types.is_empty() {
+    // We hit an edge case where the working set is already smaller than minSize
+    // We merge problematic nodes with the smallest result node to keep minSize intact
+    let problem_nodes = group.pop_nodes(|item| {
+      item
+        .size
+        .iter()
+        .any(|(ty, size)| *size != 0.0f64 && problem_types.contains(ty))
+    });
+
+    let Some(problem_nodes) = problem_nodes else {
+      return false;
+    };
+
+    let possible_result_groups = result
+      .iter_mut()
+      .filter(|group| {
+        group
+          .size
+          .iter()
+          .any(|(ty, size)| *size != 0.0f64 && problem_types.contains(ty))
+      })
+      .collect::<Vec<_>>();
+
+    if possible_result_groups.is_empty() {
+      result.push(Group::new(problem_nodes, None, vec![]));
+    } else {
+      let best_group = possible_result_groups.into_iter().reduce(|min, group| {
+        let min_matched = min
+          .size
+          .iter()
+          .filter(|(ty, _)| problem_types.contains(ty))
+          .count();
+
+        let group_matched = group
+          .size
+          .iter()
+          .filter(|(ty, _)| problem_types.contains(ty))
+          .count();
+
+        match min_matched.cmp(&group_matched) {
+          std::cmp::Ordering::Less => group,
+          std::cmp::Ordering::Greater => min,
+          std::cmp::Ordering::Equal => {
+            if sum_for_types(&min.size, &problem_types) > sum_for_types(&group.size, &problem_types)
+            {
+              group
+            } else {
+              min
+            }
+          }
+        }
+      });
+
+      let best_group: &mut Group =
+        best_group.expect("best_group exist as possible_result_groups is not empty");
+      best_group.nodes.extend(problem_nodes);
+      best_group.nodes.sort_by(|a, b| a.key.cmp(&b.key));
+    }
+
+    return true;
+  }
+
+  false
+}
+
+fn sum_for_types(size: &SplitChunkSizes, ty: &FxHashSet<SourceType>) -> f64 {
+  size
+    .iter()
+    .filter(|(t, _)| ty.contains(t))
+    .map(|(_, s)| s)
+    .sum()
+}
+
+fn get_key(module: &dyn Module, delimiter: &str, compilation: &Compilation) -> String {
+  let ident = make_paths_relative(
+    compilation.options.context.as_str(),
+    module.identifier().as_str(),
+  );
+  let name = if let Some(name_for_condition) = module.name_for_condition() {
+    Cow::Owned(make_paths_relative(
+      compilation.options.context.as_str(),
+      &name_for_condition,
+    ))
+  } else {
+    MAX_SIZE_KEY_REGEX.replace_all(&ident, "")
+  };
+
+  let full_key = format!(
+    "{}{}{}",
+    name,
+    delimiter,
+    hash_filename(&ident, &compilation.options)
+  );
+
+  request_to_id(&full_key)
 }
 
 fn deterministic_grouping_for_modules(
   compilation: &Compilation,
-  chunk: &ChunkUkey,
+  items: &[&ModuleRef],
   allow_max_size: &SplitChunkSizes,
   min_size: &SplitChunkSizes,
   delimiter: &str,
 ) -> Vec<Group> {
-  let mut results: Vec<Group> = Default::default();
-  let module_graph = compilation.get_module_graph();
-  let items = compilation
-    .chunk_graph
-    .get_chunk_modules(chunk, &module_graph);
-
-  let context = compilation.options.context.as_ref();
-
-  let nodes: Vec<GroupItem> = items
-    .into_iter()
+  let nodes = items
+    .iter()
     .map(|module| {
-      let module: &dyn Module = &**module;
-      let name: String = if module.name_for_condition().is_some() {
-        make_paths_relative(context, module.identifier().as_str())
-      } else {
-        REPLACE_MODULE_IDENTIFIER_REG
-          .replace_all(&module.identifier(), "")
-          .to_string()
-      };
-      let key = format!(
-        "{}{}{}",
-        name,
-        delimiter,
-        hash_filename(&name, &compilation.options)
-      );
+      let module: &dyn Module = module.as_ref();
+
       GroupItem {
         module: module.identifier(),
-        size: get_size(module),
-        key: request_to_id(&key),
+        size: get_size(module, compilation),
+        key: get_key(module, delimiter, compilation),
       }
     })
     .collect::<Vec<_>>();
+
+  deterministic_grouping(nodes, allow_max_size, min_size)
+}
+
+fn deterministic_grouping(
+  mut nodes: Vec<GroupItem>,
+  allow_max_size: &SplitChunkSizes,
+  min_size: &SplitChunkSizes,
+) -> Vec<Group> {
+  let mut results: Vec<Group> = Default::default();
+
+  nodes.sort_by(|a, b| a.key.cmp(&b.key));
 
   let initial_nodes = nodes
     .into_iter()
@@ -126,7 +298,7 @@ fn deterministic_grouping_for_modules(
           allow_max_size
         );
         let key = node.key.clone();
-        results.push(Group::new(vec![node], Some(key)));
+        results.push(Group::new(vec![node], Some(key), vec![]));
         None
       } else {
         Some(node)
@@ -135,7 +307,8 @@ fn deterministic_grouping_for_modules(
     .collect::<Vec<_>>();
 
   if !initial_nodes.is_empty() {
-    let initial_group = Group::new(initial_nodes, None);
+    let similarities = get_similarities(&initial_nodes);
+    let initial_group = Group::new(initial_nodes, None, similarities);
 
     let mut queue = vec![initial_group];
 
@@ -146,47 +319,109 @@ fn deterministic_grouping_for_modules(
         continue;
       }
 
+      let size = group.size.clone();
+      if remove_problematic_nodes(&mut group, &size, min_size, &mut results) {
+        queue.push(group);
+        continue;
+      }
+
       // find unsplittable area from left and right
       // going minSize from left and right
       // at least one node need to be included otherwise we get stuck
-      let mut left = 1;
+      let mut left: i32 = 1;
       let mut left_size = SplitChunkSizes::empty();
       left_size.add_by(&group.nodes[0].size);
-      while left < group.nodes.len() && left_size.smaller_than(min_size) {
-        left_size.add_by(&group.nodes[left].size);
+
+      while left < group.nodes.len() as i32 && left_size.smaller_than(min_size) {
+        left_size.add_by(&group.nodes[left as usize].size);
 
         left += 1;
       }
 
-      let mut right = group.nodes.len() - 2;
+      let mut right: i32 = group.nodes.len() as i32 - 2;
       let mut right_size = SplitChunkSizes::empty();
-      right_size.add_by(&group.nodes[right + 1].size);
-      while right != 0 && right_size.smaller_than(min_size) {
-        right_size.add_by(&group.nodes[right].size);
+      right_size.add_by(&group.nodes[right as usize + 1].size);
 
-        right = right.saturating_sub(1);
+      while right >= 0 && right_size.smaller_than(min_size) {
+        right_size.add_by(&group.nodes[right as usize].size);
+        right -= 1;
       }
 
       if left - 1 > right {
         // There are overlaps
 
-        // TODO(hyf0): There are some algorithms we could do better in this
-        // situation.
+        let prev_size = if left + right < group.nodes.len() as i32 {
+          // [0 0 0 0 0 0 0]
+          //    ^ ^
+          subtract_size_from(&mut right_size, &group.nodes[(right + 1) as usize].size);
 
-        // can't split group while holding minSize
-        // because minSize is preferred of maxSize we return
-        // the problematic nodes as result here even while it's too big
-        // To avoid this make sure maxSize > minSize * 3
+          right_size
+        } else {
+          // [0 0 0 0 0 0 0]
+          //          ^ ^
+          subtract_size_from(&mut left_size, &group.nodes[left as usize - 1].size);
+
+          left_size
+        };
+
+        if remove_problematic_nodes(&mut group, &prev_size, min_size, &mut results) {
+          queue.push(group);
+          continue;
+        }
+
         group.key = group.nodes.first().map(|n| n.key.clone());
         results.push(group);
-        continue;
-      }
+      } else {
+        let mut pos = left;
+        let mut best = -1;
+        let mut best_similarity = usize::MAX;
+        right_size = group
+          .nodes
+          .iter()
+          .rev()
+          .take(group.nodes.len() - pos as usize)
+          .fold(SplitChunkSizes::empty(), |mut acc, node| {
+            acc.add_by(&node.size);
+            acc
+          });
 
-      if left <= right {
-        let right_nodes = group.nodes.split_off(left);
+        while pos <= right + 1 {
+          let similarity = group.similarities[pos as usize - 1];
+          if similarity < best_similarity
+            && !left_size.smaller_than(min_size)
+            && !right_size.smaller_than(min_size)
+          {
+            best_similarity = similarity;
+            best = pos;
+          }
+          let size = &group.nodes[pos as usize].size;
+          left_size.add_by(size);
+          right_size.subtract_by(size);
+          pos += 1;
+        }
+
+        if best == -1 {
+          results.push(group);
+          continue;
+        }
+
+        left = best;
+        right = best - 1;
+
+        let mut right_similarities = vec![];
+        for i in right as usize + 2..group.nodes.len() {
+          right_similarities.push((group.similarities)[i - 1]);
+        }
+
+        let mut left_similarities = vec![];
+        for i in 1..left {
+          left_similarities.push((group.similarities)[i as usize - 1]);
+        }
+        let right_nodes = group.nodes.split_off(left as usize);
         let left_nodes = group.nodes;
-        queue.push(Group::new(right_nodes, None));
-        queue.push(Group::new(left_nodes, None));
+
+        queue.push(Group::new(right_nodes, None, right_similarities));
+        queue.push(Group::new(left_nodes, None, left_similarities));
       }
     }
   }
@@ -197,99 +432,180 @@ fn deterministic_grouping_for_modules(
   results
 }
 
-struct ChunkWithSizeInfo<'a> {
+fn subtract_size_from(total: &mut SplitChunkSizes, size: &SplitChunkSizes) {
+  size.iter().for_each(|(ty, ty_size)| {
+    let total_ty_size = total.get(ty).copied().unwrap_or(0.0);
+    total.insert(*ty, total_ty_size - ty_size);
+  });
+}
+
+struct ChunkWithSizeInfo {
   pub chunk: ChunkUkey,
-  pub allow_max_size: Cow<'a, SplitChunkSizes>,
-  pub min_size: &'a SplitChunkSizes,
-  pub automatic_name_delimiter: &'a String,
+  pub allow_max_size: SplitChunkSizes,
+  pub min_size: SplitChunkSizes,
+  pub automatic_name_delimiter: String,
+}
+
+fn get_similarities(nodes: &[GroupItem]) -> Vec<usize> {
+  let mut similarities = Vec::with_capacity(nodes.len());
+  let mut nodes = nodes.iter();
+  let Some(mut last) = nodes.next() else {
+    return similarities;
+  };
+
+  for node in nodes {
+    similarities.push(similarity(&last.key, &node.key));
+    last = node;
+  }
+
+  similarities
+}
+
+fn similarity(a: &str, b: &str) -> usize {
+  let mut a = a.chars();
+  let mut b = b.chars();
+  let mut dist = 0;
+  while let (Some(ca), Some(cb)) = (a.next(), b.next()) {
+    dist += std::cmp::max(0, 10 - (ca as i32 - cb as i32).abs());
+  }
+  dist as usize
 }
 
 impl SplitChunksPlugin {
   /// Affected by `splitChunks.minSize`/`splitChunks.cacheGroups.{cacheGroup}.minSize`
-  #[tracing::instrument(skip_all)]
-  pub(super) fn ensure_max_size_fit(
+  // #[tracing::instrument(skip_all)]
+  pub(super) async fn ensure_max_size_fit(
     &self,
     compilation: &mut Compilation,
-    max_size_setting_map: FxHashMap<ChunkUkey, MaxSizeSetting>,
+    max_size_setting_map: &FxHashMap<ChunkUkey, MaxSizeSetting>,
   ) -> Result<()> {
     let fallback_cache_group = &self.fallback_cache_group;
-    let chunk_group_db = &compilation.chunk_group_by_ukey;
+    // With no maximum sizes, every chunk task would return `None`. Native
+    // filters are pure; function filters must still run for their observable
+    // callback behavior, including errors, even when no chunk needs splitting.
+    if !fallback_cache_group.chunks_filter.is_func()
+      && fallback_cache_group.max_async_size.is_empty()
+      && fallback_cache_group.max_initial_size.is_empty()
+      && max_size_setting_map
+        .values()
+        .all(|s| s.max_async_size.is_empty() && s.max_initial_size.is_empty())
+    {
+      return Ok(());
+    }
+
+    let chunk_group_db = &compilation.build_chunk_graph_artifact.chunk_group_by_ukey;
     let compilation_ref = &*compilation;
 
-    let chunks_with_size_info = compilation_ref
-    .chunk_by_ukey
-    .values()
-    .par_bridge()
-    .map(|chunk| {
-      let max_size_setting = max_size_setting_map.get(&chunk.ukey);
-      tracing::trace!("max_size_setting : {max_size_setting:#?} for {:?}", chunk.ukey);
-
-      if max_size_setting.is_none()
-        && !(fallback_cache_group.chunks_filter)(chunk, chunk_group_db)?
-      {
-        tracing::debug!("Chunk({}) skips `maxSize` checking. Reason: max_size_setting.is_none() and chunks_filter is false", chunk.chunk_reasons.join("~"));
-        return Ok(None);
-      }
-
-      let min_size = max_size_setting
-        .map(|s| &s.min_size)
-        .unwrap_or(&fallback_cache_group.min_size);
-      let max_async_size = max_size_setting
-        .map(|s| &s.max_async_size)
-        .unwrap_or(&fallback_cache_group.max_async_size);
-      let max_initial_size: &SplitChunkSizes = max_size_setting
-        .map(|s| &s.max_initial_size)
-        .unwrap_or(&fallback_cache_group.max_initial_size);
-      let automatic_name_delimiter = max_size_setting.map(|s| &s.automatic_name_delimiter).unwrap_or(&fallback_cache_group.automatic_name_delimiter);
-
-      let mut allow_max_size = if chunk.is_only_initial(chunk_group_db) {
-        Cow::Borrowed(max_initial_size)
-      } else if chunk.can_be_initial(chunk_group_db) {
-        let mut sizes = SplitChunkSizes::empty();
-        sizes.combine_with(max_async_size, &f64::min);
-        sizes.combine_with(max_initial_size, &f64::min);
-        Cow::Owned(sizes)
-      } else {
-        Cow::Borrowed(max_async_size)
-      };
-
-      // Fast path
-      if allow_max_size.is_empty() {
-        tracing::debug!(
-          "Chunk({}) skips the `maxSize` checking. Reason: allow_max_size is empty",
-          chunk.chunk_reasons.join("~")
-        );
-        return Ok(None);
-      }
-
-      let mut is_invalid = false;
-      allow_max_size.iter().for_each(|(ty, ty_max_size)| {
-        if let Some(ty_min_size) = min_size.get(ty) {
-          if ty_min_size > ty_max_size {
-            is_invalid = true;
-            tracing::warn!(
-              "minSize({}) should not be bigger than maxSize({})",
-              ty_min_size,
-              ty_max_size
+    let chunks_with_size_info_results = rspack_parallel::scope::<_, Result<_>>(|token| {
+      compilation_ref
+        .build_chunk_graph_artifact
+        .chunk_by_ukey
+        .values()
+        .for_each(|chunk| {
+        let s = unsafe {
+          token.used((
+            &*compilation,
+            chunk,
+            fallback_cache_group,
+            chunk_group_db,
+            &max_size_setting_map,
+          ))
+        };
+        s.spawn(
+          move |(
+            compilation,
+            chunk,
+            fallback_cache_group,
+            chunk_group_db,
+            max_size_setting_map,
+          )| async move {
+            let max_size_setting = max_size_setting_map.get(&chunk.ukey());
+            tracing::trace!(
+              "max_size_setting : {max_size_setting:#?} for {:?}",
+              chunk.ukey()
             );
-          }
-        }
-      });
-      if is_invalid {
-        allow_max_size.to_mut().combine_with(min_size, &f64::max);
-      }
 
-      Ok(Some(ChunkWithSizeInfo {
-        allow_max_size,
-        min_size,
-        chunk: chunk.ukey,
-        automatic_name_delimiter,
-      }))
-    }).collect::<Result<Vec<_>>>()?
+            if max_size_setting.is_none()
+              && !(if fallback_cache_group.chunks_filter.is_func() {
+              fallback_cache_group.chunks_filter.test_func(&chunk.ukey(), compilation).await?
+            } else {
+              fallback_cache_group.chunks_filter.test_internal(&chunk.ukey(), compilation)
+            })
+            {
+              tracing::debug!("Chunk({:?}) skips `maxSize` checking. Reason: max_size_setting.is_none() and chunks_filter is false", chunk.chunk_reason());
+              return Ok(None);
+            }
+
+            let min_size = max_size_setting
+              .map_or(&fallback_cache_group.min_size, |s| &s.min_size);
+            let max_async_size = max_size_setting
+              .map_or(&fallback_cache_group.max_async_size, |s| &s.max_async_size);
+            let max_initial_size: &SplitChunkSizes = max_size_setting
+              .map_or(&fallback_cache_group.max_initial_size, |s| &s.max_initial_size);
+            let automatic_name_delimiter = max_size_setting
+              .map_or(&fallback_cache_group.automatic_name_delimiter, |s| &s.automatic_name_delimiter);
+
+            let mut allow_max_size = if chunk.is_only_initial(chunk_group_db) {
+              Cow::Borrowed(max_initial_size)
+            } else if chunk.can_be_initial(chunk_group_db) {
+              let mut sizes = SplitChunkSizes::empty();
+              sizes.combine_with(max_async_size, &f64::min);
+              sizes.combine_with(max_initial_size, &f64::min);
+              Cow::Owned(sizes)
+            } else {
+              Cow::Borrowed(max_async_size)
+            };
+
+            // Fast path
+            if allow_max_size.is_empty() {
+              tracing::debug!(
+                "Chunk({:?}) skips the `maxSize` checking. Reason: allow_max_size is empty",
+                chunk.chunk_reason()
+              );
+              return Ok(None);
+            }
+
+            let mut is_invalid = false;
+            allow_max_size.iter().for_each(|(ty, ty_max_size)| {
+              if let Some(ty_min_size) = min_size.get(ty)
+                && ty_min_size > ty_max_size {
+                  is_invalid = true;
+                  tracing::warn!(
+                    "minSize({}) should not be bigger than maxSize({})",
+                    ty_min_size,
+                    ty_max_size
+                  );
+                }
+            });
+            if is_invalid {
+              allow_max_size.to_mut().combine_with(min_size, &f64::max);
+            }
+
+            Ok(Some(ChunkWithSizeInfo {
+              allow_max_size: allow_max_size.into_owned(),
+              min_size: min_size.clone(),
+              chunk: chunk.ukey(),
+              automatic_name_delimiter: automatic_name_delimiter.clone(),
+            }))
+          },
+        );
+      });
+    })
+    .await
     .into_iter()
-    .flatten();
+    .map(|r| r.to_rspack_result())
+    .collect::<Result<Vec<_>>>()?;
+
+    let mut chunks_with_size_info = vec![];
+
+    for result in chunks_with_size_info_results {
+      if let Some(info) = result? {
+        chunks_with_size_info.push(info);
+      }
+    }
 
     let infos_with_results = chunks_with_size_info
+      .into_iter()
       .filter_map(|info| {
         let ChunkWithSizeInfo {
           chunk,
@@ -297,9 +613,15 @@ impl SplitChunksPlugin {
           min_size,
           automatic_name_delimiter,
         } = &info;
+        let module_graph = compilation_ref.get_module_graph();
+
+        let items = compilation_ref
+          .build_chunk_graph_artifact
+          .chunk_graph
+          .get_chunk_modules(chunk, module_graph);
         let results = deterministic_grouping_for_modules(
           compilation_ref,
-          chunk,
+          &items,
           allow_max_size,
           min_size,
           automatic_name_delimiter,
@@ -317,9 +639,9 @@ impl SplitChunksPlugin {
       })
       .collect::<Vec<_>>();
 
-    infos_with_results.into_iter().for_each(|(info, results)| {
+    for (info, results) in infos_with_results {
       let last_index = results.len() - 1;
-      results.into_iter().enumerate().for_each(|(index, group)| {
+      for (index, group) in results.into_iter().enumerate() {
         let group_key = if let Some(key) = group.key {
           if self.hide_path_info {
             hash_filename(&key, &compilation.options)
@@ -329,60 +651,252 @@ impl SplitChunksPlugin {
         } else {
           index.to_string()
         };
-        let chunk = info.chunk.as_mut(&mut compilation.chunk_by_ukey);
-        let delimiter = max_size_setting_map
-          .get(&chunk.ukey)
-          .map(|s| s.automatic_name_delimiter.as_str())
-          .unwrap_or(DEFAULT_DELIMITER);
+        let chunk = compilation
+          .build_chunk_graph_artifact
+          .chunk_by_ukey
+          .expect_get_mut(&info.chunk);
+        let delimiter = info.automatic_name_delimiter.as_str();
         let mut name = chunk
-          .name
-          .as_ref()
+          .name()
           .map(|name| format!("{name}{delimiter}{group_key}"));
 
-        if let Some(n) = name.clone() {
-          if n.len() > 100 {
-            let s = &n[0..100];
-            let k = hash_filename(&n, &compilation.options);
-            name = Some(format!("{s}{delimiter}{k}"));
-          }
+        if let Some(n) = name.clone()
+          && n.len() > 100
+        {
+          let s = &n[0..100];
+          let k = hash_filename(&n, &compilation.options);
+          name = Some(format!("{s}{delimiter}{k}"));
         }
 
         if index != last_index {
-          let old_chunk = chunk.ukey;
+          let old_chunk = chunk.ukey();
           let new_chunk_ukey = if let Some(name) = name {
-            Compilation::add_named_chunk(
+            let (new_chunk_ukey, created) = Compilation::add_named_chunk(
               name,
-              &mut compilation.chunk_by_ukey,
-              &mut compilation.named_chunks,
-            )
+              &mut compilation.build_chunk_graph_artifact.chunk_by_ukey,
+              &mut compilation.build_chunk_graph_artifact.named_chunks,
+            );
+            if created && let Some(mut mutations) = compilation.incremental.mutations_write() {
+              mutations.add(Mutation::ChunkAdd {
+                chunk: new_chunk_ukey,
+              });
+            }
+            new_chunk_ukey
           } else {
-            Compilation::add_chunk(&mut compilation.chunk_by_ukey)
+            let new_chunk_ukey =
+              Compilation::add_chunk(&mut compilation.build_chunk_graph_artifact.chunk_by_ukey);
+            if let Some(mut mutations) = compilation.incremental.mutations_write() {
+              mutations.add(Mutation::ChunkAdd {
+                chunk: new_chunk_ukey,
+              });
+            }
+            new_chunk_ukey
           };
 
-          let [new_part, chunk] = compilation
+          let [Some(new_part), Some(chunk)] = compilation
+            .build_chunk_graph_artifact
             .chunk_by_ukey
-            ._todo_should_remove_this_method_inner_mut()
             .get_many_mut([&new_chunk_ukey, &old_chunk])
-            .expect("split_from_original_chunks failed");
-          chunk.split(new_part, &mut compilation.chunk_group_by_ukey);
+          else {
+            panic!("split_from_original_chunks failed")
+          };
+          let new_part_ukey = new_part.ukey();
+          chunk.split(
+            new_part,
+            &mut compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
+          );
+          *new_part.chunk_reason_mut() = chunk.chunk_reason().map(ToString::to_string);
+          if chunk.filename_template().is_some() {
+            new_part.set_filename_template(chunk.filename_template().cloned());
+          }
+          if let Some(mut mutations) = compilation.incremental.mutations_write() {
+            mutations.add(Mutation::ChunkSplit {
+              from: old_chunk,
+              to: new_chunk_ukey,
+            });
+          }
 
-          group.nodes.iter().for_each(|module| {
-            compilation.chunk_graph.add_chunk(new_part.ukey);
+          for group_node in &group.nodes {
+            compilation
+              .build_chunk_graph_artifact
+              .chunk_graph
+              .add_chunk(new_part_ukey);
+
+            if let Some(module) = compilation.module_by_identifier(&group_node.module)
+              && module_chunk_condition(module.as_ref(), &new_part_ukey, compilation)
+                .await?
+                .is_some_and(|condition| !condition)
+            {
+              continue;
+            }
 
             // Add module to new chunk
             compilation
+              .build_chunk_graph_artifact
               .chunk_graph
-              .connect_chunk_and_module(new_part.ukey, module.module);
+              .connect_chunk_and_module(new_part_ukey, group_node.module);
             // Remove module from used chunks
             compilation
+              .build_chunk_graph_artifact
               .chunk_graph
-              .disconnect_chunk_and_module(&old_chunk, module.module)
-          })
+              .disconnect_chunk_and_module(&old_chunk, group_node.module)
+          }
         } else {
-          chunk.name = name;
+          chunk.set_name(name);
         }
-      })
-    });
+      }
+    }
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::BTreeMap;
+
+  use super::*;
+
+  type NormalizedSize = Vec<(String, i32)>;
+  type GroupResult = Vec<(Vec<usize>, NormalizedSize)>;
+
+  fn sizes(values: &[(&str, i32)]) -> SplitChunkSizes {
+    SplitChunkSizes(
+      values
+        .iter()
+        .map(|(ty, size)| (SourceType::from(*ty), f64::from(*size)))
+        .collect(),
+    )
+  }
+
+  fn item(index: usize, size: &[(&str, i32)]) -> GroupItem {
+    GroupItem {
+      module: ModuleIdentifier::from(index.to_string()),
+      size: sizes(size),
+      key: (100_000 + index).to_string(),
+    }
+  }
+
+  fn normalize_size(size: &SplitChunkSizes) -> NormalizedSize {
+    size
+      .iter()
+      .map(|(ty, size)| (ty.to_string(), *size as i32))
+      .collect::<BTreeMap<_, _>>()
+      .into_iter()
+      .collect()
+  }
+
+  fn expected_size(values: &[(&str, i32)]) -> NormalizedSize {
+    values
+      .iter()
+      .map(|(ty, size)| ((*ty).to_string(), *size))
+      .collect()
+  }
+
+  fn group(
+    items: Vec<&[(&str, i32)]>,
+    min_size: &[(&str, i32)],
+    max_size: &[(&str, i32)],
+  ) -> GroupResult {
+    deterministic_grouping(
+      items
+        .into_iter()
+        .enumerate()
+        .map(|(index, size)| item(index, size))
+        .collect(),
+      &sizes(max_size),
+      &sizes(min_size),
+    )
+    .into_iter()
+    .map(|group| {
+      (
+        group
+          .nodes
+          .iter()
+          .map(|node| node.module.as_str().parse().expect("module index"))
+          .collect(),
+        normalize_size(&group.size),
+      )
+    })
+    .collect()
+  }
+
+  #[test]
+  fn should_split_large_chunks_with_different_size_types() {
+    assert_eq!(
+      group(
+        vec![&[("a", 3), ("b", 3)], &[("b", 1)], &[("a", 3)]],
+        &[("a", 3), ("b", 3)],
+        &[("a", 5), ("b", 5)],
+      ),
+      vec![
+        (vec![0, 1], expected_size(&[("a", 3), ("b", 4)])),
+        (vec![2], expected_size(&[("a", 3)])),
+      ]
+    );
+  }
+
+  #[test]
+  fn should_separate_items_with_different_size_types_when_unsplittable() {
+    assert_eq!(
+      group(
+        vec![
+          &[("a", 1)],
+          &[("b", 1)],
+          &[("a", 1)],
+          &[("a", 1)],
+          &[("b", 1)],
+          &[("a", 1)],
+          &[("a", 1)],
+          &[("b", 1)],
+          &[("a", 1)],
+          &[("a", 1)],
+        ],
+        &[("a", 3), ("b", 3)],
+        &[("a", 5), ("b", 5)],
+      ),
+      vec![
+        (vec![0, 2, 3], expected_size(&[("a", 3)])),
+        (vec![1, 4, 7], expected_size(&[("b", 3)])),
+        (vec![5, 6, 8, 9], expected_size(&[("a", 4)])),
+      ]
+    );
+  }
+
+  #[test]
+  fn should_handle_entangled_size_types_case_1() {
+    assert_eq!(
+      group(
+        vec![
+          &[("c", 2), ("b", 2)],
+          &[("a", 2), ("c", 2)],
+          &[("a", 2), ("b", 2)]
+        ],
+        &[("a", 3), ("b", 3), ("c", 3)],
+        &[("a", 3), ("b", 3), ("c", 3)],
+      ),
+      vec![(
+        vec![0, 1, 2],
+        expected_size(&[("a", 4), ("b", 4), ("c", 4)])
+      )]
+    );
+  }
+
+  #[test]
+  fn should_handle_entangled_size_types_case_2() {
+    assert_eq!(
+      group(
+        vec![
+          &[("c", 2), ("b", 2)],
+          &[("a", 2), ("c", 2)],
+          &[("a", 2), ("b", 2)]
+        ],
+        &[("a", 3), ("b", 3)],
+        &[("c", 3)],
+      ),
+      vec![
+        (vec![0, 2], expected_size(&[("a", 2), ("b", 4), ("c", 2)])),
+        (vec![1], expected_size(&[("a", 2), ("c", 2)])),
+      ]
+    );
   }
 }

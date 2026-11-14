@@ -1,11 +1,14 @@
-use std::ffi::CStr;
-use std::marker::PhantomData;
-use std::os::raw::c_void;
-use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::Arc;
+use std::{
+  marker::PhantomData,
+  os::raw::c_void,
+  ptr,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicPtr, Ordering},
+  },
+};
 
-use napi::{check_status, sys, Env, Result};
+use napi::{Env, Result, check_status, sys};
 
 struct DeferredData<Resolver: FnOnce(Env)> {
   resolver: Resolver,
@@ -40,13 +43,14 @@ pub struct JsCallback<Resolver: FnOnce(Env)> {
 }
 
 unsafe impl<Resolver: FnOnce(Env)> Send for JsCallback<Resolver> {}
+unsafe impl<Resolver: FnOnce(Env)> Sync for JsCallback<Resolver> {}
 
 impl<Resolver: FnOnce(Env)> JsCallback<Resolver> {
   /// # Safety
   /// The provided `env` must be a valid `napi_env`.
   pub unsafe fn new(env: sys::napi_env) -> Result<Self> {
     let mut async_resource_name = ptr::null_mut();
-    let s = unsafe { CStr::from_bytes_with_nul_unchecked(b"napi_js_callback\0") };
+    let s = c"napi_js_callback";
     check_status!(
       unsafe { sys::napi_create_string_utf8(env, s.as_ptr(), 16, &mut async_resource_name) },
       "Create async resource name in JsCallback failed"
@@ -140,5 +144,5 @@ extern "C" fn napi_js_callback<Resolver: FnOnce(Env)>(
     return;
   }
   let deferred_data = unsafe { Box::<DeferredData<Resolver>>::from_raw(data.cast()) };
-  (deferred_data.resolver)(unsafe { Env::from_raw(env) });
+  (deferred_data.resolver)(Env::from_raw(env));
 }

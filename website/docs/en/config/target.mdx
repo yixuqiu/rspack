@@ -1,51 +1,234 @@
+---
+description: 'Configure the runtime environment and ECMAScript compatibility of Rspack output.'
+---
+
+import Attribution from '@components/Attribution';
+
 # Target
 
-Used to configure the target environment of Rspack output and the ECMAScript version of Rspack runtime code.
+The `target` option describes the environment in which the output code will run. Rspack uses it to determine which platform APIs and ECMAScript syntax the target environment supports, then sets compatible defaults for module resolution conditions, externals presets, and chunk loading. The generated Rspack runtime code also uses syntax supported by the target environment.
 
-- **Type:** `string | string[]`
+When their own target options are omitted, Rspack's built-in loaders and minimizers can also inherit defaults from `target`. However, `target` does not add polyfills for missing APIs.
 
-## string
+- **Type:**
 
-The following options are now supported:
-
-| options                      | description                                                                                                                                                                                                                                   |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `'node[[X].Y]'`              | Compile as available for Node.js environments                                                                                                                                                                                                 |
-| `'async-node[[X].Y]'`        | Compile for usage in a Node.js-like environment (uses fs and vm to load chunks asynchronously)                                                                                                                                                |
-| `'web'`                      | Compile as available in the browser environment (default)                                                                                                                                                                                     |
-| `'esX'`                      | Compile Rspack runtime to the corresponding ECMAScript version. Currently supports `es3`, `es5`, `es2015`, `es2016`, `es2017`, `es2018`, `es2019`, `es2020`, `es2021`, `es2022` (es5 is used by default)                                      |
-| `'browserslist'`             | Infer the ECMAScript version based on the configured browserslist                                                                                                                                                                             |
-| `'electron[[X].Y]-main'`     | Compile for Electron for main process.                                                                                                                                                                                                        |
-| `'electron[[X].Y]-renderer'` | Compile for Electron for renderer process, providing a target using `array-push` as chunkFormat and `jsonp` as chunkLoading for browser environments and `NodeTargetPlugin` and `ExternalsPlugin` for CommonJS and Electron built-in modules. |
-| `'electron[[X].Y]-preload'`  | Compile for Electron for preload script of renderer process                                                                                                                                                                                   |
-
-{/* | `'webworker'`   | Compile as WebWorker                                                                                                                                                                                     | */}
-
-:::warning Specifies the ECMAScript version of the user code
-
-The `esX` in the `target` configuration can only specify the ECMAScript version syntax of the code in the Rspack runtime. If you want to specify the ECMAScript version of the user code, you should use [builtin:swc-loader](/guide/features/builtin-swc-loader.html), or [babel-loader](https://www.npmjs.com/package/babel-loader), or [swc-loader](https://www.npmjs.com/package/swc-loader) to degrade the user code.
-
-:::
-
-## Example
-
-Specify that the Compiler needs to compile to the Node.js environment:
-
-```ts title="rspack.config.js"
-module.exports = {
-  target: 'node',
-};
+```ts
+type Target = false | string | string[];
 ```
 
-When specifying that the Compiler needs to be compiled for multiple platforms, an error is reported:
+- **Default:** `browserslist` when the project includes a standard Browserslist configuration; otherwise `web`
 
-```ts title="rspack.config.js"
-module.exports = {
-  target: ['web', 'node'],
-};
-```
+## Default behavior \{#default-behavior}
 
+When `target` is not set, Rspack looks for a [Browserslist configuration](#browserslist) starting from [`context`](/config/context):
+
+- If found, `target` defaults to `browserslist` and uses that configuration.
+- Otherwise, it defaults to `web`, which selects a browser environment without specifying browser versions or an ECMAScript version.
+
+Explicitly setting `target: 'browserslist'` requires a Browserslist configuration or the `BROWSERSLIST` environment variable; otherwise, Rspack reports an error.
+
+## Recommended configurations
+
+### Browsers
+
+For browser applications, define the supported browsers in a shared [Browserslist](https://github.com/browserslist/browserslist#config-file) configuration (see [Browserslist](#browserslist) for details):
+
+```json title="package.json"
 {
-// TODO: add link to MultiCompiler
-// In this case, you can use MultiCompiler to package it in multiple configurations.
+  "browserslist": ["fully supports es6"]
 }
+```
+
+Use the following configuration:
+
+```js title="rspack.config.mjs"
+export default {
+  target: 'browserslist',
+};
+```
+
+When the project includes a standard Browserslist configuration, `target` defaults to `browserslist`, so the explicit option can be omitted. Keeping it explicit makes the intended runtime policy clearer.
+
+#### Syntax version
+
+If you do not use Browserslist and want browser output whose Rspack runtime uses at most ES2020 syntax, combine the platform and syntax targets (see [Target arrays](#target-arrays) for details):
+
+```js title="rspack.config.mjs"
+export default {
+  target: ['web', 'es2020'],
+};
+```
+
+`web` selects the platform. `es2020` limits the syntax used by the Rspack runtime; built-in transforms that inherit `target` also use it as their default output target.
+
+### Node.js
+
+For a Node.js application, specify the oldest Node.js version used in deployment:
+
+```js title="rspack.config.mjs"
+export default {
+  target: 'node22',
+};
+```
+
+Replace `22` with the version your application supports. A versioned target lets Rspack use runtime features known to be available in that release. An unversioned `node` target uses more conservative compatibility assumptions.
+
+### Web workers
+
+For code that runs in a Web Worker, Shared Worker, or Service Worker, use:
+
+```js title="rspack.config.mjs"
+export default {
+  target: 'webworker',
+};
+```
+
+This selects worker globals and chunk-loading behavior instead of browser APIs that depend on `document`.
+
+## Common values
+
+In the patterns below, `X` and `Y` are version numbers, and brackets indicate optional parts. For example, `node22`, `node22.12`, and `electron34-renderer` are valid values; the brackets are not typed literally.
+
+| Value                      | Use                                                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `async-node[X[.Y]]`        | A Node.js environment that loads chunks asynchronously with `fs` and `vm`                                 |
+| `browserslist[:...]`       | Infer the platform and supported features from a Browserslist configuration, environment, or inline query |
+| `electron[X[.Y]]-main`     | Electron main process                                                                                     |
+| `electron[X[.Y]]-preload`  | Electron preload script                                                                                   |
+| `electron[X[.Y]]-renderer` | Electron renderer process                                                                                 |
+| `esX`                      | Limit ECMAScript features used by the Rspack runtime; normally combined with a platform target            |
+| `false`                    | Disable target inference and target-derived defaults                                                      |
+| `node[X[.Y]]`              | Node.js environment; chunks are loaded with `require()`                                                   |
+| `node-webkit[X[.Y]]`       | Alias for the corresponding NW.js target                                                                  |
+| `nwjs[X[.Y]]`              | NW.js environment                                                                                         |
+| `web`                      | Browser-like environment                                                                                  |
+| `webworker`                | Web Worker, Shared Worker, or Service Worker environment                                                  |
+
+- Supported ECMAScript targets are `es3`, `es5`, and `es2015` through `es2026`.
+- An `esX` target describes syntax capabilities, not a runtime platform. It should usually be combined with a platform target such as `web` or `node`.
+- Versions can be specified for Node.js, Electron, and NW.js targets.
+
+## Effects
+
+### Output defaults
+
+Rspack derives several defaults from the selected target, including:
+
+- [module resolution conditions](/config/resolve#resolveconditionnames) such as `browser`, `node`, and `electron`
+- [`output.environment`](/config/output#outputenvironment), chunk format, chunk loading, worker loading, and WebAssembly loading
+- [externals presets](/config/externals#externalspresets), such as keeping Node.js or Electron built-in modules external
+- platform globals and capabilities, such as `document`, `require`, `global`, and `importScripts`
+
+These are defaults. You can override the corresponding options when the target preset does not match a specific output requirement.
+
+### Source transforms \{#target-inheritance}
+
+`target` directly controls the syntax used in the generated Rspack runtime. It does not, by itself, lower the syntax of every application module.
+
+When used without an explicit transform target, the following built-in tools inherit a compatible default from `target`:
+
+- [`builtin:swc-loader`](/guide/builtin-loaders/swc-loader) derives `env.targets` or `jsc.target`
+- [`builtin:lightningcss-loader`](/guide/builtin-loaders/lightningcss-loader) derives browser targets when available
+- [`SwcJsMinimizerRspackPlugin`](/plugins/swc-js-minimizer-rspack-plugin) derives its ECMAScript target
+- [`LightningCssMinimizerRspackPlugin`](/plugins/lightning-css-minimizer-rspack-plugin) derives browser targets when available
+
+Only code processed by these tools receives their transformations. Code processed by Babel follows Babel's own configuration. Built-in tools may also limit inherited targets to the versions they support.
+
+## Target arrays \{#target-arrays}
+
+A target array applies the common subset of features supported by every item to a single compilation. A typical combination adds an ECMAScript constraint to a platform target:
+
+```js title="rspack.config.mjs"
+export default {
+  target: ['web', 'es2018'],
+};
+```
+
+A target array does not create a separate compilation for each environment. Combining conflicting platform targets such as `['web', 'node']` can leave defaults such as the chunk format indeterminate.
+
+When you need separate browser and Node.js artifacts, export multiple configurations instead:
+
+```js title="rspack.config.mjs"
+export default [
+  {
+    name: 'client',
+    entry: './src/client.js',
+    target: 'web',
+    output: {
+      filename: 'client.js',
+    },
+  },
+  {
+    name: 'server',
+    entry: './src/server.js',
+    target: 'node22',
+    output: {
+      filename: 'server.js',
+    },
+  },
+];
+```
+
+Rspack runs these configurations through [MultiCompiler](/api/javascript-api/compiler#multicompiler) and creates a separate compilation for each one.
+
+## Browserslist
+
+The `browserslist` target uses a Browserslist query to infer both the platform and supported ECMAScript features. Browser queries select a web target, while Node.js queries select a Node.js target with matching runtime capabilities.
+
+Rspack recognizes the following forms:
+
+| Value                                 | Resolution                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| `browserslist`                        | Use the nearest configuration and its active environment         |
+| `browserslist:modern`                 | Use the `modern` environment from the nearest configuration      |
+| `browserslist:last 2 versions`        | Use an inline query and ignore the project configuration         |
+| `browserslist:/path/to/config`        | Use an explicit configuration file                               |
+| `browserslist:/path/to/config:modern` | Use the `modern` environment from an explicit configuration file |
+
+The nearest configuration can come from a `browserslist` or `.browserslistrc` file, or from the `browserslist` field in `package.json`. An explicitly selected `browserslist` target can also use the `BROWSERSLIST` environment variable. Rspack supports browser and Node.js queries; Electron queries are not supported.
+
+### Baseline \{#baseline-queries}
+
+Rspack 2.1.9 and later support [Baseline](https://web.dev/baseline) queries. For example, the following target includes browsers that support every feature in Baseline Widely Available:
+
+```js title="rspack.config.mjs"
+export default {
+  target: 'browserslist:baseline widely available',
+};
+```
+
+You can also use a year query such as `baseline 2024`, or a fixed-date query such as `baseline widely available on 2025-05-01`. See [Use Baseline with Browserslist](https://web.dev/articles/use-baseline-with-browserslist) for details.
+
+### Limitations
+
+Rspack uses [browserslist-rs](https://github.com/browserslist/browserslist-rs), which does not yet implement every Browserslist feature. The following queries are currently unsupported:
+
+- custom usage queries, such as `> 0.5% in my stats`
+- coverage queries, such as `cover 99.5% in my stats`
+
+## Disable target
+
+Set `target` to `false` only when you need to replace target inference with custom settings. This disables all target-derived defaults.
+
+The following is a minimal configuration that uses the CommonJS chunk format:
+
+```js title="rspack.config.mjs"
+export default {
+  target: false,
+  output: {
+    chunkFormat: 'commonjs',
+  },
+};
+```
+
+A configuration containing only `target: false` will fail because Rspack cannot infer [`output.chunkFormat`](/config/output#outputchunkformat). Set `output.chunkFormat` explicitly, then configure other environment-dependent options, such as `output.environment`, chunk loading, resolution conditions, and externals presets, as needed.
+
+## Related options
+
+- [`output.environment`](/config/output#outputenvironment) overrides target-derived Rspack runtime syntax capabilities.
+- [`output.chunkFormat`](/config/output#outputchunkformat) and [`output.chunkLoading`](/config/output#outputchunkloading) override how chunks are emitted and loaded.
+- [`externalsPresets`](/config/externals#externalspresets) controls which platform built-ins are treated as external.
+- [`resolve.conditionNames`](/config/resolve#resolveconditionnames) controls which conditions in the `exports` field of `package.json` are used during resolution.
+- Plugin authors can read the resolved target from [`compiler.target`](/api/javascript-api/compiler#target).
+
+<Attribution url="https://webpack.js.org/configuration/target/" />

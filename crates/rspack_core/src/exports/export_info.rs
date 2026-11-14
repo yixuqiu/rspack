@@ -1,0 +1,321 @@
+use rspack_intern::Atom;
+use rustc_hash::FxHashMap as HashMap;
+
+use super::{ExportInfoTargetValue, ExportProvided, ExportsInfo, ExportsInfoData, UsageState};
+use crate::{
+  CanInlineUse, DependencyId, EvaluatedInlinableValue, ExportsInfoArtifact, UsedNameItem,
+};
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+enum ExportName {
+  Other,
+  SideEffects,
+  Named(Atom),
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct ExportInfo {
+  exports_info: ExportsInfo,
+  export_name: ExportName,
+}
+
+impl ExportInfo {
+  pub fn as_data<'a>(&self, exports_info_artifact: &'a ExportsInfoArtifact) -> &'a ExportInfoData {
+    self
+      .exports_info
+      .as_data(exports_info_artifact)
+      .get_export_info_data(self)
+  }
+
+  pub fn as_data_mut<'a>(
+    &self,
+    exports_info_artifact: &'a mut ExportsInfoArtifact,
+  ) -> &'a mut ExportInfoData {
+    self
+      .exports_info
+      .as_data_mut(exports_info_artifact)
+      .get_export_info_data_mut(self)
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportInfoData {
+  belongs_to: ExportsInfo,
+  // the name could be `null` you could refer https://github.com/webpack/webpack/blob/ac7e531436b0d47cd88451f497cdfd0dad4153d/lib/ExportsInfo.js#L78
+  name: Option<Atom>,
+  /// this is mangled name, https://github.com/webpack/webpack/blob/1f99ad6367f2b8a6ef17cce0e058f7a67fb7db18/lib/ExportsInfo.js#L1181-L1188
+  used_name: Option<UsedNameItem>,
+  // Boxed and created on demand: an inline hash map costs ~40 bytes in every
+  // export info (two live in every exports info, plus one per named export),
+  // while most exports never record a target.
+  target: Option<Box<HashMap<Option<DependencyId>, ExportInfoTargetValue>>>,
+  /// This is rspack only variable, it is used to flag if the target has been initialized
+  target_is_set: bool,
+  provided: Option<ExportProvided>,
+  can_mangle_provide: Option<bool>,
+  can_mangle_use: Option<bool>,
+  can_inline_provide: Option<Box<EvaluatedInlinableValue>>,
+  can_inline_use: Option<CanInlineUse>,
+  terminal_binding: bool,
+  exports_info: Option<ExportsInfo>,
+  exports_info_owned: bool,
+  has_use_in_runtime_info: bool,
+  global_used: Option<UsageState>,
+  // Boxed for the same reason as the target map: the inline map costs ~40
+  // bytes and is only populated for exports that were used at runtime.
+  used_in_runtime: Option<Box<ustr::UstrMap<UsageState>>>,
+  ns_access: bool,
+}
+
+impl ExportInfoData {
+  pub fn new(
+    belongs_to: ExportsInfo,
+    name: Option<Atom>,
+    init_from: Option<&ExportInfoData>,
+  ) -> Self {
+    let used_name = init_from.and_then(|init_from| init_from.used_name.clone());
+    let global_used = init_from.and_then(|init_from| init_from.global_used);
+    let used_in_runtime = init_from.and_then(|init_from| init_from.used_in_runtime.clone());
+    let has_use_in_runtime_info =
+      init_from.is_some_and(|init_from| init_from.has_use_in_runtime_info);
+    let ns_access = init_from.is_some_and(|init_from| init_from.ns_access);
+
+    let provided = init_from.and_then(|init_from| init_from.provided);
+    let terminal_binding = init_from.is_some_and(|init_from| init_from.terminal_binding);
+    let can_mangle_provide = init_from.and_then(|init_from| init_from.can_mangle_provide);
+    let can_mangle_use = init_from.and_then(|init_from| init_from.can_mangle_use);
+
+    let target = init_from.and_then(|item| {
+      if item.target_is_set {
+        let mut target = HashMap::default();
+        if let Some(current) = &item.target {
+          for (k, v) in current.iter() {
+            target.insert(
+              *k,
+              ExportInfoTargetValue {
+                dependency: v.dependency,
+                export: match v.export.clone() {
+                  Some(vec) => Some(vec),
+                  None => Some(vec![
+                    name
+                      .clone()
+                      .expect("name should not be empty if target is set"),
+                  ]),
+                },
+                priority: v.priority,
+              },
+            );
+          }
+        }
+        Some(Box::new(target))
+      } else {
+        None
+      }
+    });
+    Self {
+      belongs_to,
+      name,
+      used_name,
+      used_in_runtime,
+      target,
+      provided,
+      can_mangle_provide,
+      terminal_binding,
+      target_is_set: init_from.map(|init| init.target_is_set).unwrap_or_default(),
+      exports_info: None,
+      exports_info_owned: false,
+      has_use_in_runtime_info,
+      can_mangle_use,
+      global_used,
+      // only specific export info can be inlined, so other_export_info.can_inline_provide is always None
+      can_inline_provide: None,
+      // only specific export info can be inlined, so other_export_info.can_inline_use is always None
+      can_inline_use: None,
+      ns_access,
+    }
+  }
+
+  pub fn name(&self) -> Option<&Atom> {
+    self.name.as_ref()
+  }
+
+  pub fn used_name(&self) -> Option<&UsedNameItem> {
+    self.used_name.as_ref()
+  }
+
+  pub fn target(&self) -> &HashMap<Option<DependencyId>, ExportInfoTargetValue> {
+    static EMPTY: std::sync::LazyLock<HashMap<Option<DependencyId>, ExportInfoTargetValue>> =
+      std::sync::LazyLock::new(HashMap::default);
+    self.target.as_deref().unwrap_or(&EMPTY)
+  }
+
+  pub fn target_is_set(&self) -> bool {
+    self.target_is_set
+  }
+
+  pub fn target_mut(&mut self) -> &mut HashMap<Option<DependencyId>, ExportInfoTargetValue> {
+    self
+      .target
+      .get_or_insert_with(|| Box::new(HashMap::default()))
+  }
+
+  /// Drop the recorded targets and return the boxed map's memory.
+  ///
+  /// [`Self::reset_provide_info`] runs for every export info of every module, so
+  /// it must neither create a map for the exports that never recorded a target
+  /// nor keep the allocation of one that did. [`Self::target`] keeps reporting
+  /// an empty map and [`Self::target_is_set`] is false, so this is
+  /// indistinguishable from clearing in place.
+  pub fn reset_target(&mut self) {
+    self.target = None;
+  }
+
+  pub fn provided(&self) -> Option<ExportProvided> {
+    self.provided
+  }
+
+  pub fn can_mangle_provide(&self) -> Option<bool> {
+    self.can_mangle_provide
+  }
+
+  pub fn can_mangle_use(&self) -> Option<bool> {
+    self.can_mangle_use
+  }
+
+  pub fn can_inline_provide(&self) -> Option<&EvaluatedInlinableValue> {
+    self.can_inline_provide.as_deref()
+  }
+
+  pub fn can_inline_use(&self) -> Option<CanInlineUse> {
+    self.can_inline_use
+  }
+
+  pub fn terminal_binding(&self) -> bool {
+    self.terminal_binding
+  }
+
+  pub fn id(&self) -> ExportInfo {
+    ExportInfo {
+      exports_info: self.belongs_to,
+      export_name: if let Some(name) = &self.name {
+        if name == "*side effects only*" {
+          ExportName::SideEffects
+        } else {
+          ExportName::Named(name.clone())
+        }
+      } else {
+        ExportName::Other
+      },
+    }
+  }
+
+  pub fn exports_info(&self) -> Option<ExportsInfo> {
+    self.exports_info
+  }
+
+  pub fn exports_info_owned(&self) -> bool {
+    self.exports_info_owned
+  }
+
+  pub fn has_use_in_runtime_info(&self) -> bool {
+    self.has_use_in_runtime_info
+  }
+
+  pub fn global_used(&self) -> Option<UsageState> {
+    self.global_used
+  }
+
+  pub fn used_in_runtime(&self) -> Option<&ustr::UstrMap<UsageState>> {
+    self.used_in_runtime.as_deref()
+  }
+
+  pub fn used_in_runtime_mut(&mut self) -> &mut ustr::UstrMap<UsageState> {
+    self
+      .used_in_runtime
+      .get_or_insert_with(|| Box::new(ustr::UstrMap::default()))
+  }
+
+  pub fn ns_access(&self) -> bool {
+    self.ns_access
+  }
+
+  pub fn set_provided(&mut self, value: Option<ExportProvided>) {
+    self.provided = value;
+  }
+
+  pub fn set_can_mangle_provide(&mut self, value: Option<bool>) {
+    self.can_mangle_provide = value;
+  }
+
+  pub fn set_can_mangle_use(&mut self, value: Option<bool>) {
+    self.can_mangle_use = value;
+  }
+
+  pub fn set_can_inline_provide(&mut self, value: Option<EvaluatedInlinableValue>) {
+    self.can_inline_provide = value.map(Box::new);
+  }
+
+  pub fn set_can_inline_use(&mut self, value: Option<CanInlineUse>) {
+    self.can_inline_use = value;
+  }
+
+  pub fn set_terminal_binding(&mut self, value: bool) {
+    self.terminal_binding = value;
+  }
+
+  pub fn set_exports_info(&mut self, value: Option<ExportsInfo>) {
+    self.exports_info = value;
+  }
+
+  pub fn set_exports_info_owned(&mut self, value: bool) {
+    self.exports_info_owned = value;
+  }
+
+  pub fn set_used_name(&mut self, name: UsedNameItem) {
+    self.used_name = Some(name);
+  }
+
+  pub fn set_target_is_set(&mut self, value: bool) {
+    self.target_is_set = value;
+  }
+
+  pub fn set_global_used(&mut self, value: Option<UsageState>) {
+    self.global_used = value;
+  }
+
+  pub fn set_used_in_runtime(&mut self, value: Option<ustr::UstrMap<UsageState>>) {
+    self.used_in_runtime = value.map(Box::new);
+  }
+
+  pub fn set_has_use_in_runtime_info(&mut self, value: bool) {
+    self.has_use_in_runtime_info = value;
+  }
+
+  pub fn set_ns_access(&mut self, value: bool) {
+    self.ns_access = value;
+  }
+}
+
+impl ExportsInfoData {
+  pub fn get_export_info_data(&self, export_info: &ExportInfo) -> &ExportInfoData {
+    debug_assert_eq!(export_info.exports_info, self.id());
+
+    match &export_info.export_name {
+      ExportName::Other => self.other_exports_info(),
+      ExportName::SideEffects => self.side_effects_only_info(),
+      ExportName::Named(name) => self.named_exports(name).expect("should have named export"),
+    }
+  }
+
+  pub fn get_export_info_data_mut(&mut self, export_info: &ExportInfo) -> &mut ExportInfoData {
+    debug_assert_eq!(export_info.exports_info, self.id());
+
+    match &export_info.export_name {
+      ExportName::Other => self.other_exports_info_mut(),
+      ExportName::SideEffects => self.side_effects_only_info_mut(),
+      ExportName::Named(name) => self
+        .named_exports_mut(name)
+        .expect("should have named export"),
+    }
+  }
+}

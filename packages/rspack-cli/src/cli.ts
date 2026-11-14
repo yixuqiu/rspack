@@ -1,0 +1,428 @@
+import path from 'node:path';
+import util from 'node:util';
+import type {
+  Compiler,
+  MultiCompiler,
+  MultiRspackOptions,
+  MultiStats,
+  RspackOptions,
+  RspackPluginFunction,
+  RspackPluginInstance,
+  Stats,
+} from '@rspack/core';
+import { rspack } from '@rspack/core';
+import cac, { type CAC } from 'cac';
+import { BuildCommand } from './commands/build';
+import { PreviewCommand } from './commands/preview';
+import { ServeCommand } from './commands/serve';
+import type { RspackCLIColors, RspackCLILogger } from './types';
+import { loadExtendedConfig, loadRspackConfig } from './utils/loadConfig';
+import type {
+  CommonOptions,
+  CommonOptionsForBuildAndServe,
+} from './utils/options';
+
+type Command = 'serve' | 'build';
+
+declare global {
+  const RSPACK_CLI_VERSION: string;
+}
+
+function isEnvColorSupported(): boolean {
+  if (typeof process === 'undefined') return false;
+  const p = process;
+  const argv = p.argv ?? [];
+  const env = p.env ?? {};
+  return (
+    !('NO_COLOR' in env || argv.includes('--no-color')) &&
+    ('FORCE_COLOR' in env ||
+      argv.includes('--color') ||
+      p.platform === 'win32' ||
+      ((p.stdout as typeof process.stdout | undefined)?.isTTY &&
+        env.TERM !== 'dumb') ||
+      (Boolean(env.CI) && env.CI !== 'false'))
+  );
+}
+
+function createAnsiFormatter(
+  open: string,
+  close: string,
+  replace: string = open,
+) {
+  const closeLength = close.length;
+  return (input: string): string => {
+    const string = String(input);
+    let index = string.indexOf(close, open.length);
+    if (index === -1) {
+      return open + string + close;
+    }
+    let result = '';
+    let cursor = 0;
+    do {
+      result += string.substring(cursor, index) + replace;
+      cursor = index + closeLength;
+      index = string.indexOf(close, cursor);
+    } while (index !== -1);
+    return open + result + string.substring(cursor) + close;
+  };
+}
+
+export class RspackCLI {
+  colors: RspackCLIColors;
+  program: CAC;
+  _actionPromise: Promise<void> | undefined;
+
+  constructor() {
+    const program = cac('rspack');
+    this.colors = this.createColors();
+    this.program = program;
+    program.help();
+    program.version(RSPACK_CLI_VERSION);
+  }
+
+  /**
+   * Wraps an async action handler so its promise is captured and can be
+   * awaited in `run()`. CAC's `parse()` does not await async actions,
+   * so without this wrapper, rejections become unhandled.
+   */
+  wrapAction<T extends (...args: any[]) => Promise<void>>(fn: T): T {
+    return ((...args: any[]) => {
+      this._actionPromise = fn(...args);
+      return this._actionPromise;
+    }) as unknown as T;
+  }
+
+  async buildCompilerConfig(
+    options: CommonOptionsForBuildAndServe,
+    rspackCommand: Command,
+  ) {
+    const { config: rawConfig, pathMap } = await this.loadConfig(options);
+    if (process.env.RSPACK_PROFILE) {
+      const { applyProfile } = await import('./utils/profile.js');
+      await applyProfile(
+        process.env.RSPACK_PROFILE,
+        process.env.RSPACK_TRACE_LAYER,
+        process.env.RSPACK_TRACE_OUTPUT,
+      );
+    }
+    return this.buildConfig(rawConfig, pathMap, options, rspackCommand);
+  }
+
+  createCompiler(
+    config: RspackOptions | MultiRspackOptions,
+    callback?: (e: Error | null, res?: Stats | MultiStats) => void,
+  ) {
+    const isWatch = Array.isArray(config)
+      ? (config as MultiRspackOptions).some((i) => i.watch)
+      : (config as RspackOptions).watch;
+
+    let compiler: MultiCompiler | Compiler | null;
+    try {
+      compiler = rspack(config, isWatch ? callback : undefined);
+      if (!isWatch && compiler) {
+        // unsafeFastDrop is an internal option api and not shown in types
+        compiler.unsafeFastDrop = true;
+      }
+    } catch (e) {
+      // Aligned with webpack-cli
+      // See: https://github.com/webpack/webpack-cli/blob/eea6adf7d34dfbfd3b5b784ece4a4664834f5a6a/packages/webpack-cli/src/webpack-cli.ts#L2394
+      if (e instanceof rspack.ValidationError) {
+        this.getLogger().error(e.message);
+        process.exit(2);
+      } else if (e instanceof Error) {
+        if (typeof callback === 'function') {
+          callback(e);
+        } else {
+          this.getLogger().error(e);
+        }
+        return null;
+      }
+      throw e;
+    }
+    return compiler;
+  }
+
+  private createColors(useColor?: boolean): RspackCLIColors {
+    const envSupported = isEnvColorSupported();
+    const enabled = useColor ?? envSupported;
+
+    if (!enabled) {
+      const passthrough = (text: string) => String(text);
+      return {
+        isColorSupported: false,
+        red: passthrough,
+        yellow: passthrough,
+        cyan: passthrough,
+        green: passthrough,
+      };
+    }
+
+    return {
+      isColorSupported: true,
+      red: createAnsiFormatter('\x1b[31m', '\x1b[39m'),
+      green: createAnsiFormatter('\x1b[32m', '\x1b[39m'),
+      yellow: createAnsiFormatter('\x1b[33m', '\x1b[39m'),
+      cyan: createAnsiFormatter('\x1b[36m', '\x1b[39m'),
+    };
+  }
+
+  getLogger(): RspackCLILogger {
+    return {
+      error: (val) =>
+        console.error(`[rspack-cli] ${this.colors.red(util.format(val))}`),
+      warn: (val) => console.warn(`[rspack-cli] ${this.colors.yellow(val)}`),
+      info: (val) => console.info(`[rspack-cli] ${this.colors.cyan(val)}`),
+      success: (val) => console.log(`[rspack-cli] ${this.colors.green(val)}`),
+      log: (val) => console.log(`[rspack-cli] ${val}`),
+      raw: (val) => console.log(val),
+    };
+  }
+
+  async run(argv: string[]) {
+    await this.registerCommands();
+    this.program.parse(argv);
+
+    // CAC's parse() fires async action handlers but does not await them,
+    // so errors would become unhandled rejections. Await the captured
+    // promise to propagate errors through the CLI's own async chain.
+    if (this._actionPromise) {
+      await this._actionPromise;
+    }
+  }
+
+  private async registerCommands() {
+    const builtinCommands = [
+      new BuildCommand(),
+      new ServeCommand(),
+      new PreviewCommand(),
+    ];
+    for (const command of builtinCommands) {
+      await command.apply(this);
+    }
+  }
+  private buildConfig(
+    item: RspackOptions | MultiRspackOptions,
+    pathMap: WeakMap<RspackOptions, string[]>,
+    options: CommonOptionsForBuildAndServe,
+    command: Command,
+  ): RspackOptions | MultiRspackOptions {
+    const isBuild = command === 'build';
+    const isServe = command === 'serve';
+
+    const internalBuildConfig = (item: RspackOptions) => {
+      if (options.entry) {
+        item.entry = {
+          main: options.entry.map((x) => path.resolve(process.cwd(), x))[0], // Fix me when entry supports array
+        };
+      }
+      // to set output.path
+      item.output = item.output || {};
+      if (options.outputPath) {
+        item.output.path = path.resolve(process.cwd(), options.outputPath);
+      }
+      // cli --watch overrides the watch config
+      if (options.watch) {
+        item.watch = options.watch;
+      }
+      // auto set default mode if user config don't set it
+      if (!item.mode) {
+        item.mode = isBuild ? 'production' : 'development';
+      }
+      // user parameters always has highest priority than default mode and config mode
+      if (options.mode) {
+        item.mode = options.mode as RspackOptions['mode'];
+      }
+
+      // false is also a valid value for sourcemap, so don't override it
+      if (typeof item.devtool === 'undefined') {
+        item.devtool = isBuild ? false : 'cheap-module-source-map';
+      }
+      // The CLI flag has a higher priority than the default devtool and devtool from the config.
+      if (typeof options.devtool !== 'undefined') {
+        item.devtool = options.devtool as RspackOptions['devtool'];
+      }
+
+      if (isServe) {
+        const installed = (item.plugins ||= []).find(
+          (item) => item instanceof rspack.ProgressPlugin,
+        );
+        if (!installed) {
+          (item.plugins ??= []).push(new rspack.ProgressPlugin());
+        }
+      }
+
+      // Track loaded config files as persistent cache build dependencies.
+      const cacheOptions = item.cache;
+      if (
+        typeof cacheOptions === 'object' &&
+        cacheOptions.type === 'persistent'
+      ) {
+        const configPaths = pathMap.get(item);
+        if (configPaths) {
+          cacheOptions.buildDependencies = [
+            ...configPaths,
+            ...(cacheOptions.buildDependencies || []),
+          ];
+        }
+      }
+
+      if (typeof item.stats === 'undefined') {
+        item.stats = {
+          preset: 'errors-warnings',
+          timings: true,
+          logging: false,
+        };
+      } else if (typeof item.stats === 'boolean') {
+        item.stats = item.stats ? { preset: 'normal' } : { preset: 'none' };
+      } else if (typeof item.stats === 'string') {
+        item.stats = {
+          preset: item.stats as
+            'normal' | 'none' | 'verbose' | 'errors-only' | 'errors-warnings',
+        };
+      } else if (
+        typeof item.stats.preset === 'undefined' &&
+        item.stats.all !== true
+      ) {
+        item.stats.logging ??= false;
+      }
+
+      return item;
+    };
+
+    if (Array.isArray(item)) {
+      return item.map(internalBuildConfig);
+    }
+    return internalBuildConfig(item as RspackOptions);
+  }
+
+  async loadConfig(options: CommonOptions): Promise<{
+    config: RspackOptions | MultiRspackOptions;
+    pathMap: WeakMap<RspackOptions, string[]>;
+  }> {
+    const config = await loadRspackConfig(options);
+    // can not found any config
+    if (!config) {
+      return {
+        config: this.filterConfig(options, {}),
+        pathMap: new WeakMap(),
+      };
+    }
+
+    const { loadedConfig, configPath } = config;
+
+    const { config: extendedConfig, pathMap } = await loadExtendedConfig(
+      loadedConfig,
+      configPath,
+      process.cwd(),
+      options,
+    );
+
+    return {
+      config: this.filterConfig(options, extendedConfig),
+      pathMap,
+    };
+  }
+
+  private filterConfig(
+    options: CommonOptions,
+    config: RspackOptions | MultiRspackOptions,
+  ): RspackOptions | MultiRspackOptions {
+    if (options.configName) {
+      const notFoundConfigNames: string[] = [];
+
+      config = options.configName.map((configName: string) => {
+        let found: RspackOptions | undefined;
+
+        if (Array.isArray(config)) {
+          found = config.find((options) => options.name === configName);
+        } else {
+          found =
+            (config as RspackOptions).name === configName
+              ? (config as RspackOptions)
+              : undefined;
+        }
+
+        if (!found) {
+          notFoundConfigNames.push(configName);
+        }
+
+        // WARNING: if config is not found, the program will exit
+        // so assert here is okay to avoid runtime filtering
+        return found!;
+      });
+
+      if (notFoundConfigNames.length > 0) {
+        this.getLogger().error(
+          notFoundConfigNames
+            .map(
+              (configName) =>
+                `Configuration with the name "${configName}" was not found.`,
+            )
+            .join(' '),
+        );
+        process.exit(2);
+      }
+    }
+    return config;
+  }
+
+  isMultipleCompiler(
+    compiler: Compiler | MultiCompiler,
+  ): compiler is MultiCompiler {
+    return Boolean((compiler as MultiCompiler).compilers);
+  }
+  isWatch(compiler: Compiler | MultiCompiler): boolean {
+    return Boolean(
+      this.isMultipleCompiler(compiler)
+        ? compiler.compilers.some((compiler) => compiler.options.watch)
+        : compiler.options.watch,
+    );
+  }
+}
+
+export type RspackConfigFn = (
+  env: Record<string, any>,
+  argv: Record<string, any>,
+) => RspackOptions | MultiRspackOptions;
+
+export type RspackConfigAsyncFn = (
+  env: Record<string, any>,
+  argv: Record<string, any>,
+) => Promise<RspackOptions | MultiRspackOptions>;
+
+export type RspackConfigExport =
+  RspackOptions | MultiRspackOptions | RspackConfigFn | RspackConfigAsyncFn;
+
+/**
+ * This function helps you to autocomplete configuration types.
+ * It accepts a Rspack config object, or a function that returns a config.
+ */
+export function defineConfig<
+  const Config extends RspackOptions | MultiRspackOptions,
+  const Definition extends
+    | Config
+    | ((...args: Parameters<RspackConfigFn>) => Config)
+    | ((...args: Parameters<RspackConfigFn>) => Promise<Config>),
+>(
+  config: Definition,
+): Definition extends (...args: Parameters<RspackConfigFn>) => Promise<unknown>
+  ? RspackConfigAsyncFn
+  : Definition extends (...args: Parameters<RspackConfigFn>) => unknown
+    ? RspackConfigFn
+    : Definition extends readonly unknown[]
+      ? MultiRspackOptions
+      : RspackOptions;
+export function defineConfig(config: RspackConfigExport) {
+  return config;
+}
+
+// Note: use union type will make apply function's `compiler` type to be `any`
+export function definePlugin(
+  plugin: RspackPluginFunction,
+): RspackPluginFunction;
+export function definePlugin(
+  plugin: RspackPluginInstance,
+): RspackPluginInstance;
+export function definePlugin(plugin: any): any {
+  return plugin;
+}

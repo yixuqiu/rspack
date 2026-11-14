@@ -1,8 +1,9 @@
-import { BuiltinPluginName } from "@rspack/binding";
-import { create } from "./base";
+import { BuiltinPluginName } from '@rspack/binding';
+
+import { create } from './base';
 
 export const FlagDependencyExportsPlugin = create(
-	BuiltinPluginName.FlagDependencyExportsPlugin,
-	() => {},
-	"compilation"
+  BuiltinPluginName.FlagDependencyExportsPlugin,
+  () => {},
+  'compilation',
 );

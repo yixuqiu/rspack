@@ -1,153 +1,392 @@
+use std::sync::Arc;
+
 use rspack_core::{
-  ConstDependency, ContextDependency, DependencyLocation, RuntimeGlobals, SpanExt,
+  ConstDependency, ContextDependency, DependencyCodeGenerationRef, DependencyRange, ExportsArgument,
 };
-use swc_core::{common::Spanned, ecma::ast::CallExpr};
+use rspack_util::{SpanExt, itoa, swc::AstSubRangeExt};
+use swc_next_ecma_ast::{
+  ArgumentData, BindingPatternData, CallExpression, GetSpan, NodeKindData, Program, Span, Stmt,
+  UnaryExpression, VariableDeclaration, VariableDeclarator,
+};
 
 use super::JavascriptParserPlugin;
 use crate::{
+  Atom,
   dependency::CommonJsRequireContextDependency,
-  visitors::{expr_name, JavascriptParser, TagInfoData},
+  visitors::{JavascriptParser, PatRef, PatternIdentifier, TagInfoData, expr_name},
 };
 
-const NESTED_WEBPACK_IDENTIFIER_TAG: &str = "_identifier__nested_webpack_identifier__";
+pub const NESTED_IDENTIFIER_TAG: &str = "_identifier__nested_rspack_identifier__";
 
-#[derive(serde::Deserialize, serde::Serialize, Clone)]
-struct NestedRequireData {
-  name: String,
+#[derive(Debug, Clone)]
+pub struct NestedRequireData {
+  pub name: String,
   update: bool,
-  loc: DependencyLocation,
-}
-
-impl TagInfoData for NestedRequireData {
-  fn serialize(data: &Self) -> serde_json::Value {
-    serde_json::to_value(data).expect("serialize failed for `NestedRequireData`")
-  }
-
-  fn deserialize(value: serde_json::Value) -> Self {
-    serde_json::from_value(value).expect("deserialize failed for `NestedRequireData`")
-  }
+  loc: DependencyRange,
+  in_short_hand: bool,
 }
 
 pub struct CompatibilityPlugin;
 
 impl CompatibilityPlugin {
+  fn nested_require_name<'a>(&self, parser: &'a JavascriptParser) -> &'a str {
+    parser
+      .parser_runtime_requirements
+      .compatibility_runtime_scope
+      .as_ref()
+  }
+
+  /// Rewrite a reference to a tagged nested binding to its deconflicted name,
+  /// materializing the declaration replacement on the first rewrite.
+  fn rewrite_nested_identifier<'p>(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    ident_span: Span,
+    in_short_hand: bool,
+  ) -> Option<bool> {
+    let ident_name = parser
+      .ast
+      .ast
+      .get_utf8(
+        parser
+          .ast
+          .ast
+          .source_slice(ident_span.start, ident_span.end),
+      )
+      .to_string();
+    let tag_info = parser
+      .definitions_db
+      .expect_get_mut_tag_info(parser.current_tag_info?)
+      .data
+      .as_deref_mut()?;
+
+    let nested_require_data = NestedRequireData::downcast_mut(tag_info);
+    let mut deps: Vec<DependencyCodeGenerationRef> = Vec::with_capacity(2);
+    let name = nested_require_data.name.clone();
+    if !nested_require_data.update {
+      let shorthand = nested_require_data.in_short_hand;
+      deps.push(Arc::new(ConstDependency::new(
+        nested_require_data.loc,
+        if shorthand {
+          format!("{ident_name}: {name}").into()
+        } else {
+          name.clone().into()
+        },
+      )));
+      nested_require_data.update = true;
+    }
+
+    deps.push(Arc::new(ConstDependency::new(
+      ident_span.into(),
+      if in_short_hand {
+        format!("{ident_name}: {name}").into()
+      } else {
+        name.into()
+      },
+    )));
+    parser.add_presentational_dependencies(deps);
+    Some(true)
+  }
+
   pub fn browserify_require_handler(
     &self,
     parser: &mut JavascriptParser,
-    expr: &CallExpr,
+    expr: CallExpression,
   ) -> Option<bool> {
-    if expr.args.len() != 2 {
+    let ast = parser.ast.ast;
+    let arguments = expr.arguments(ast);
+    if arguments.len() != 2 {
       return None;
     }
-    let second = parser.evaluate_expression(&expr.args[1].expr);
+    let ArgumentData::Expr(second) = ast.argument_data(ast.second(arguments)?) else {
+      return None;
+    };
+    let second = parser.evaluate_expression(second);
     if !second.is_bool() || !matches!(second.as_bool(), Some(true)) {
       return None;
     }
-    let dep = ConstDependency::new(
-      expr.callee.span().real_lo(),
-      expr.callee.span().real_hi(),
-      "require".into(),
-      None,
-    );
-    if let Some(last) = parser.dependencies.last()
-      && let Some(last) = last.downcast_ref::<CommonJsRequireContextDependency>()
-      && let options = last.options()
-      && options.recursive
-      && options.request == "."
-    {
-      parser.dependencies.pop();
-      // TODO: dependency getWarnings getErrors
-      parser.warning_diagnostics.pop();
+    let dep = ConstDependency::new(expr.callee(ast).span(ast).into(), "require".into());
+    if let Some(last) = parser.pop_dependency() {
+      if let Some(last) = last.downcast_ref::<CommonJsRequireContextDependency>()
+        && let options = last.options()
+        && options.recursive
+        && options.request == "."
+      {
+      } else {
+        parser.add_dependency(last);
+      }
     }
-    parser.presentational_dependencies.push(Box::new(dep));
+    parser.add_presentational_dependency(Arc::new(dep));
     Some(true)
+  }
+
+  fn tag_nested_require_data(
+    &self,
+    parser: &mut JavascriptParser,
+    name: Atom,
+    rename: String,
+    in_short_hand: bool,
+    start: u32,
+    end: u32,
+  ) {
+    parser.tag_variable(
+      name,
+      NESTED_IDENTIFIER_TAG,
+      Some(NestedRequireData {
+        name: rename,
+        update: false,
+        loc: DependencyRange::new(start, end),
+        in_short_hand,
+      }),
+    );
+  }
+
+  /// Materialize the declaration replacement before an export records the nested name.
+  /// A non-self-referential function would not otherwise visit the identifier hook.
+  pub(crate) fn update_nested_binding_declaration(
+    parser: &mut JavascriptParser,
+    name: &Atom,
+  ) -> Option<Atom> {
+    let (nested_name, dep) = {
+      let data = parser.get_tag_data_mut::<NestedRequireData>(name, NESTED_IDENTIFIER_TAG)?;
+      let nested_name = Atom::from(data.name.as_str());
+      let content = if data.in_short_hand {
+        format!("{name}: {}", data.name).into()
+      } else {
+        data.name.clone().into()
+      };
+      let dep = if data.update {
+        None
+      } else {
+        Some(ConstDependency::new(data.loc, content))
+      };
+      data.update = true;
+      (nested_name, dep)
+    };
+    if let Some(dep) = dep {
+      parser.add_presentational_dependency(Arc::new(dep));
+    }
+    Some(nested_name)
   }
 }
 
-impl JavascriptParserPlugin for CompatibilityPlugin {
-  fn pre_statement(
+#[rspack_macros::implemented_javascript_parser_hooks]
+impl<'p, 'a> JavascriptParserPlugin<'p, 'a> for CompatibilityPlugin {
+  fn program(&self, parser: &mut JavascriptParser<'p>, ast: Program) -> Option<bool> {
+    if ast.hashbang(parser.ast.ast).is_some() {
+      parser
+        .add_presentational_dependency(Arc::new(ConstDependency::new((0, 0).into(), "//".into())));
+    }
+
+    None
+  }
+
+  fn pre_declarator(
     &self,
-    parser: &mut JavascriptParser,
-    stmt: &swc_core::ecma::ast::Stmt,
+    parser: &mut JavascriptParser<'p>,
+    decl: VariableDeclarator,
+    _statement: VariableDeclaration,
   ) -> Option<bool> {
-    let Some(fn_decl) = stmt.as_decl().and_then(|decl| decl.as_fn_decl()) else {
+    let ast = parser.ast.ast;
+    let BindingPatternData::BindingIdentifier(ident) = ast.binding_pattern_data(decl.id(ast))
+    else {
+      // Register nested bindings before other pre-declarator hooks define them.
+      parser.enter_pattern(PatRef::Borrowed(decl.id(ast)), |_, _, _| {});
       return None;
     };
-    let name = fn_decl.ident.sym.as_str();
-    if name != RuntimeGlobals::REQUIRE.name() {
+    let name = ast.get_utf8(ident.name(ast));
+
+    if name == self.nested_require_name(parser) {
+      let span = ident.span(ast);
+      let start = span.real_lo();
+      let end = span.real_hi();
+      self.tag_nested_require_data(
+        parser,
+        Atom::from(name),
+        {
+          let mut start_buffer = itoa::Buffer::new();
+          let start_str = start_buffer.format(start);
+          let mut end_buffer = itoa::Buffer::new();
+          let end_str = end_buffer.format(end);
+          format!("__nested_rspack_require_{start_str}_{end_str}__")
+        },
+        parser.in_short_hand,
+        start,
+        end,
+      );
+      return Some(true);
+    } else if name == parser.parser_runtime_requirements.exports.as_ref() {
+      // Only top-level declarations can collide with the runtime exports
+      // binding. In nested scopes the declaration shadows it and keeps its
+      // original name.
+      if !parser.is_top_level_scope() {
+        return None;
+      }
+      let span = ident.span(ast);
+      self.tag_nested_require_data(
+        parser,
+        Atom::from(name),
+        "__nested_rspack_exports__".to_string(),
+        parser.in_short_hand,
+        span.real_lo(),
+        span.real_hi(),
+      );
+      return Some(true);
+    }
+
+    None
+  }
+
+  fn pattern(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    ident: PatternIdentifier,
+    for_name: &str,
+  ) -> Option<bool> {
+    let ast = parser.ast.ast;
+    // Keep the declaration tag and rewrite the target before another assignment
+    // hook can bail out, including targets inside destructuring assignments.
+    if for_name == NESTED_IDENTIFIER_TAG && parser.in_assignment_pattern {
+      return self.identifier(parser, ident.span(ast), for_name);
+    }
+    // Do not interpret assignments to the CommonJS factory parameter as
+    // declarations of a nested runtime binding. Automatic modules can also be
+    // ESM, so check the actual factory binding rather than the module type.
+    if for_name == "exports"
+      && parser.in_assignment_pattern
+      && parser.build_info.exports_argument == ExportsArgument::Exports
+    {
+      return None;
+    }
+    if for_name == parser.parser_runtime_requirements.exports.as_ref() {
+      // Only bindings in the top-level scope can collide with the runtime
+      // exports binding. Bindings in nested scopes shadow it and must not be
+      // renamed.
+      if !parser.is_top_level_scope() {
+        return None;
+      }
+      let name = ident.name(ast);
+      self.tag_nested_require_data(
+        parser,
+        Atom::from(name),
+        "__nested_rspack_exports__".to_string(),
+        parser.in_short_hand,
+        ident.span(ast).real_lo(),
+        ident.span(ast).real_hi(),
+      );
+      return None;
+    } else if for_name == self.nested_require_name(parser) {
+      // The require binding must be renamed in every scope: rewritten
+      // require() calls inject references to the runtime require name, which
+      // would otherwise be captured by a shadowing binding.
+      let name = ident.name(ast);
+      let span = ident.span(ast);
+      let start = span.real_lo();
+      let end = span.real_hi();
+      self.tag_nested_require_data(
+        parser,
+        Atom::from(name),
+        {
+          let mut start_buffer = itoa::Buffer::new();
+          let start_str = start_buffer.format(start);
+          let mut end_buffer = itoa::Buffer::new();
+          let end_str = end_buffer.format(end);
+          format!("__nested_rspack_require_{start_str}_{end_str}__")
+        },
+        parser.in_short_hand,
+        start,
+        end,
+      );
+      if !parser.is_top_level_scope() {
+        return Some(true);
+      }
+    }
+    None
+  }
+
+  fn pre_statement(&self, parser: &mut JavascriptParser<'p>, stmt: Stmt) -> Option<bool> {
+    let ast = parser.ast.ast;
+    let NodeKindData::Function(fn_decl) = ast.kind_data(stmt.node_id()) else {
+      return None;
+    };
+    let ident = fn_decl.id(ast)?;
+    let name = ast.get_utf8(ident.name(ast));
+    if name != self.nested_require_name(parser) {
       None
     } else {
-      let low = fn_decl.span().lo().0;
-      let hi = fn_decl.span().hi().0;
-      let data = NestedRequireData {
-        name: format!("__nested_webpack_require_{low}_{hi}__"),
-        update: false,
-        loc: DependencyLocation::new(
-          fn_decl.ident.span().real_lo(),
-          fn_decl.ident.span().real_hi(),
-        ),
-      };
-      parser.tag_variable(name.to_string(), NESTED_WEBPACK_IDENTIFIER_TAG, Some(data));
+      self.tag_nested_require_data(
+        parser,
+        Atom::from(name),
+        {
+          let mut lo_buffer = itoa::Buffer::new();
+          let lo_str = lo_buffer.format(fn_decl.span(ast).real_lo());
+          format!("__nested_rspack_require_{lo_str}__")
+        },
+        parser.in_short_hand,
+        ident.span(ast).real_lo(),
+        ident.span(ast).real_hi(),
+      );
       Some(true)
     }
   }
 
-  fn identifier(
+  fn declarator(
     &self,
     parser: &mut JavascriptParser,
-    ident: &swc_core::ecma::ast::Ident,
+    declarator: VariableDeclarator,
+    _stmt: VariableDeclaration,
+  ) -> Option<bool> {
+    let ast = parser.ast.ast;
+    if let BindingPatternData::BindingIdentifier(ident) =
+      ast.binding_pattern_data(declarator.id(ast))
+      && let name = ast.get_utf8(ident.name(ast))
+      && (name == parser.parser_runtime_requirements.exports.as_ref()
+        || name == self.nested_require_name(parser))
+    {
+      let data = parser.get_tag_data_mut::<NestedRequireData>(name, NESTED_IDENTIFIER_TAG)?;
+      if !data.update {
+        let dep = Arc::new(ConstDependency::new(data.loc, data.name.clone().into()));
+        data.update = true;
+        parser.add_presentational_dependency(dep);
+      }
+    }
+    None
+  }
+
+  fn identifier(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    span: Span,
     for_name: &str,
   ) -> Option<bool> {
-    if for_name != NESTED_WEBPACK_IDENTIFIER_TAG {
+    if for_name != NESTED_IDENTIFIER_TAG {
       return None;
     }
-    let name = ident.sym.as_str();
-    if name != RuntimeGlobals::REQUIRE.name() {
-      return None;
-    }
-    let Some(variable_info) = parser.get_mut_variable_info(name) else {
-      return None;
-    };
+    self.rewrite_nested_identifier(parser, span, parser.in_short_hand)
+  }
 
-    // FIXME: should find the `tag_info` which tag equal `NESTED_WEBPACK_IDENTIFIER_TAG`;
-    let Some(tag_info) = &mut variable_info.tag_info else {
-      unreachable!();
-    };
-    if tag_info.tag != NESTED_WEBPACK_IDENTIFIER_TAG {
+  fn r#typeof(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    expr: UnaryExpression,
+    for_name: &str,
+  ) -> Option<bool> {
+    if for_name != NESTED_IDENTIFIER_TAG {
       return None;
     }
-    let Some(data) = tag_info.data.as_mut().map(std::mem::take) else {
-      unreachable!();
-    };
-    let mut nested_require_data = NestedRequireData::deserialize(data);
-    let mut deps = Vec::with_capacity(2);
-    if !nested_require_data.update {
-      deps.push(ConstDependency::new(
-        nested_require_data.loc.start(),
-        nested_require_data.loc.end(),
-        nested_require_data.name.clone().into(),
-        None,
-      ));
-      nested_require_data.update = true;
-    }
-    tag_info.data = Some(NestedRequireData::serialize(&nested_require_data));
-
-    deps.push(ConstDependency::new(
-      ident.span.real_lo(),
-      ident.span.real_hi(),
-      nested_require_data.name.into(),
-      None,
-    ));
-    for dep in deps {
-      parser.presentational_dependencies.push(Box::new(dep));
-    }
-    Some(true)
+    // typeof operands are not walked through the identifier hook when another
+    // plugin claims the expression (e.g. ESM detection for exports), so the
+    // reference must be rewritten here to stay consistent with the renamed
+    // binding.
+    let ast = parser.ast.ast;
+    let ident = expr.argument(ast).as_identifier_reference(ast)?;
+    self.rewrite_nested_identifier(parser, ident.span(ast), false)
   }
 
   fn call(
     &self,
-    parser: &mut JavascriptParser,
-    expr: &swc_core::ecma::ast::CallExpr,
+    parser: &mut JavascriptParser<'p>,
+    expr: CallExpression,
     for_name: &str,
   ) -> Option<bool> {
     if for_name == expr_name::REQUIRE {

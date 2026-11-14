@@ -1,11 +1,9 @@
-use dyn_clone::clone_trait_object;
+use rspack_cacheable::cacheable_dyn;
 
 use super::Dependency;
-use crate::{
-  create_exports_object_referenced, DependencyCondition, ErrorSpan, ExtendedReferencedExport,
-  ModuleGraph, RuntimeSpec,
-};
+use crate::DependencyCondition;
 
+#[cacheable_dyn]
 pub trait ModuleDependency: Dependency {
   fn request(&self) -> &str;
 
@@ -13,20 +11,9 @@ pub trait ModuleDependency: Dependency {
     self.request()
   }
 
-  /// Span for precise source location.
-  /// For example: the source node in an `ImportDeclaration`.
-  /// This is only intended used to display better diagnostics.
-  /// So it might not be precise as it is using [crate::Dependency::span] as the default value.
-  fn source_span(&self) -> Option<ErrorSpan> {
-    self.span()
-  }
-
-  // TODO: move to ModuleGraphConnection
   fn weak(&self) -> bool {
-    false
+    self.lazy().is_some()
   }
-
-  fn set_request(&mut self, _request: String) {}
 
   fn get_optional(&self) -> bool {
     false
@@ -35,21 +22,7 @@ pub trait ModuleDependency: Dependency {
   fn get_condition(&self) -> Option<DependencyCondition> {
     None
   }
-
-  fn get_referenced_exports(
-    &self,
-    _module_graph: &ModuleGraph,
-    _runtime: Option<&RuntimeSpec>,
-  ) -> Vec<ExtendedReferencedExport> {
-    create_exports_object_referenced()
-  }
-
-  fn is_export_all(&self) -> Option<bool> {
-    None
-  }
 }
-
-clone_trait_object!(ModuleDependency);
 
 pub trait AsModuleDependency {
   fn as_module_dependency(&self) -> Option<&dyn ModuleDependency> {

@@ -1,33 +1,31 @@
-import { type Hero, HomeHero } from '../components/HomeHero';
-import { HomeFeature, type Feature } from '../components/HomeFeatures';
-import { NoSSR, usePageData } from 'rspress/runtime';
-import { Benchmark } from '../components/Benchmark';
 import { HomeFooter } from '../components/HomeFooter/index';
+import LandingPage from '../components/Landingpage';
 
-export function HomeLayout() {
-  const { page } = usePageData();
-  const { frontmatter } = page;
+const CopyRight = () => {
   return (
-    <div>
-      {/* Landing Page */}
-      <div
-        className="relative border-b"
-        style={{
-          paddingBottom: '56px',
-          borderColor: 'var(--rp-c-divider-light)',
-        }}
-      >
-        <div className="pt-14 pb-12">
-          <HomeHero hero={frontmatter.hero as Hero} />
-          <HomeFeature features={frontmatter.features as Feature[]} />
+    <footer
+      className="bottom-0 mt-12 py-8 px-6 sm:p-8 w-full border-t border-solid"
+      style={{ borderColor: 'var(--rp-c-divider-light)' }}
+    >
+      <div className="m-auto w-full text-center">
+        <div className="font-medium text-sm text-text-2">
+          <p className="mb-2">
+            Rspack is free and open source software released under the MIT
+            license.
+          </p>
+          <p>© 2022-present ByteDance Inc.</p>
         </div>
       </div>
-      {/* Benchmark Page */}
-      <NoSSR>
-        <Benchmark />
-      </NoSSR>
-      {/* Footer */}
+    </footer>
+  );
+};
+
+export function HomeLayout() {
+  return (
+    <>
+      <LandingPage />
       <HomeFooter />
-    </div>
+      <CopyRight />
+    </>
   );
 }

@@ -1,33 +1,47 @@
 use rspack_core::{
+  Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext, RuntimeTemplate,
   impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Compilation, RuntimeModule,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
-pub struct NodeModuleDecoratorRuntimeModule {
-  id: Identifier,
+#[derive(Debug)]
+pub struct NodeModuleDecoratorRuntimeModule {}
+
+impl NodeModuleDecoratorRuntimeModule {
+  pub fn new(runtime_template: &RuntimeTemplate) -> Self {
+    Self::with_default(runtime_template)
+  }
 }
 
-impl Default for NodeModuleDecoratorRuntimeModule {
-  fn default() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/node_module_decorator"),
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
+#[async_trait::async_trait]
+impl RuntimeModule for NodeModuleDecoratorRuntimeModule {
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
+  }
+
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define: { RuntimeGlobals::NODE_MODULE_DECORATOR },
+      ..Default::default()
     }
   }
-}
 
-impl RuntimeModule for NodeModuleDecoratorRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn template(&self) -> Vec<(String, String)> {
+    vec![(
+      self.id().to_string(),
+      include_str!("runtime/node_module_decorator.ejs").to_string(),
+    )]
   }
 
-  fn generate(&self, _compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    Ok(RawSource::from(include_str!("runtime/node_module_decorator.js")).boxed())
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let source = context.runtime_template.render(self.id(), None)?;
+
+    Ok(source)
   }
 }

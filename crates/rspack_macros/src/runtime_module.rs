@@ -1,149 +1,228 @@
 use quote::quote;
-use syn::{parse::Parser, parse_macro_input, ItemStruct};
+use syn::{ItemStruct, parse::Parser, parse_macro_input};
 
 pub fn impl_runtime_module(
-  _args: proc_macro::TokenStream,
+  args: proc_macro::TokenStream,
   tokens: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
+  parse_macro_input!(args as syn::parse::Nothing);
   let mut input = parse_macro_input!(tokens as ItemStruct);
   let name = &input.ident;
   let generics = &input.generics;
   let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+  let origin_fields = input.fields.clone();
+  let runtime_module_variable_provider = generics.params.is_empty().then(|| {
+    quote! {
+      ::rspack_core::inventory::submit! {
+        ::rspack_core::RuntimeModuleVariableProvider {
+          variables: <#name as ::rspack_core::RuntimeModule>::runtime_module_variables,
+        }
+      }
+    }
+  });
 
   if let syn::Fields::Named(ref mut fields) = input.fields {
     fields.named.push(
       syn::Field::parse_named
-        .parse2(quote! { pub source_map_kind: ::rspack_util::source_map::SourceMapKind })
-        .expect("Failed to parse new field for source_map_kind"),
-    );
-    fields.named.push(
-      syn::Field::parse_named
-        .parse2(quote! { pub custom_source: Option<::rspack_core::rspack_sources::BoxSource> })
-        .expect("Failed to parse new field for custom_source"),
+        .parse2(quote! { pub common: ::rspack_core::RuntimeModuleCommon })
+        .expect("Failed to parse new field for common"),
     );
   }
 
+  let field_names = origin_fields
+    .iter()
+    .map(|field| field.ident.as_ref().expect("Expected named struct"))
+    .collect::<Vec<_>>();
+  let field_tys: Vec<&syn::Type> = origin_fields.iter().map(|field| &field.ty).collect();
+  let with_default = quote! {
+    #[allow(clippy::too_many_arguments)]
+    fn with_default(runtime_template: &::rspack_core::RuntimeTemplate, #(#field_names: #field_tys,)*) -> Self {
+      Self {
+        common: ::rspack_core::RuntimeModuleCommon::with_default(runtime_template, stringify!(#name)),
+        #(#field_names,)*
+      }
+    }
+  };
+
+  let with_name = quote! {
+    #[allow(clippy::too_many_arguments)]
+    fn with_name(runtime_template: &::rspack_core::RuntimeTemplate, name: &str, #(#field_names: #field_tys,)*) -> Self {
+      Self {
+        common: ::rspack_core::RuntimeModuleCommon::with_name(runtime_template, name),
+        #(#field_names,)*
+      }
+    }
+  };
   quote! {
+    #[rspack_cacheable::cacheable]
     #input
 
-    impl #impl_generics ::rspack_core::CustomSourceRuntimeModule for #name #ty_generics #where_clause {
-      fn set_custom_source(&mut self, source: ::rspack_core::rspack_sources::BoxSource) -> () {
-        self.custom_source = Some(source);
+    impl #impl_generics #name #ty_generics #where_clause {
+      #with_default
+
+      #with_name
+
+      pub fn id(&self) -> &::rspack_collections::Identifier {
+        self.common.id()
       }
-      fn get_custom_source(&self) -> Option<::rspack_core::rspack_sources::BoxSource> {
-        self.custom_source.clone()
+
+      pub fn chunk(&self) -> Option<::rspack_core::ChunkUkey> {
+        self.common.chunk()
+      }
+
+      async fn get_generated_code(
+        &self,
+        compilation: &::rspack_core::Compilation,
+      ) -> ::rspack_error::Result<std::sync::Arc<dyn ::rspack_core::rspack_sources::Source>> {
+        ::rspack_core::runtime_module_get_generated_code(self, &self.common, compilation).await
+      }
+    }
+
+    impl #impl_generics ::rspack_core::CustomSourceRuntimeModule for #name #ty_generics #where_clause {
+      fn set_custom_source(&mut self, source: String) -> () {
+        self.common.set_custom_source(source);
+      }
+      fn get_custom_source(&self) -> Option<String> {
+        self.common.get_custom_source()
       }
       fn get_constructor_name(&self) -> String {
         String::from(stringify!(#name))
       }
     }
 
-    impl #impl_generics rspack_identifier::Identifiable for #name #ty_generics #where_clause {
-      fn identifier(&self) -> rspack_identifier::Identifier {
+    impl #impl_generics ::rspack_core::AttachableRuntimeModule for #name #ty_generics #where_clause {
+      fn attach(&mut self, chunk: ::rspack_core::ChunkUkey) -> () {
+        self.common.attach(chunk);
+      }
+    }
+
+    impl #impl_generics ::rspack_core::NamedRuntimeModule for #name #ty_generics #where_clause {
+      fn name(&self) -> ::rspack_collections::Identifier {
+        *self.id()
+      }
+    }
+
+    impl #impl_generics rspack_collections::Identifiable for #name #ty_generics #where_clause {
+      fn identifier(&self) -> rspack_collections::Identifier {
+        use rspack_core::NamedRuntimeModule;
         self.name()
       }
     }
 
-    impl #impl_generics PartialEq for #name #ty_generics #where_clause {
-      fn eq(&self, other: &Self) -> bool {
-        self.name() == other.name()
-      }
-    }
-
-    impl #impl_generics std::hash::Hash for #name #ty_generics #where_clause {
-      fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
-        unreachable!()
-      }
-    }
-
     impl #impl_generics ::rspack_core::DependenciesBlock for #name #ty_generics #where_clause {
-      fn add_block_id(&mut self, _: ::rspack_core::AsyncDependenciesBlockIdentifier) {
+      fn dependencies_block(&self) -> &::rspack_core::DependenciesBlockData {
         unreachable!()
       }
 
-      fn get_blocks(&self) -> &[::rspack_core::AsyncDependenciesBlockIdentifier] {
-        unreachable!()
-      }
-
-      fn add_dependency_id(&mut self, _: ::rspack_core::DependencyId) {
-        unreachable!()
-      }
-
-      fn get_dependencies(&self) -> &[::rspack_core::DependencyId] {
+      fn dependencies_block_mut(&mut self) -> &mut ::rspack_core::DependenciesBlockData {
         unreachable!()
       }
     }
 
+    #runtime_module_variable_provider
+
+    #[rspack_cacheable::cacheable_dyn]
+    #[async_trait::async_trait]
     impl #impl_generics ::rspack_core::Module for #name #ty_generics #where_clause {
       fn module_type(&self) -> &::rspack_core::ModuleType {
         &::rspack_core::ModuleType::Runtime
       }
 
-      fn source_types(&self) -> &[::rspack_core::SourceType] {
+      fn source_types(&self, module_graph: &::rspack_core::ModuleGraph) -> &[::rspack_core::SourceType] {
         &[::rspack_core::SourceType::JavaScript]
       }
 
-      fn size(&self, _source_type: &::rspack_core::SourceType) -> f64 {
-        // TODO
-        160.0
+      fn size(
+        &self,
+        _source_type: Option<&::rspack_core::SourceType>
+      ) -> f64 {
+        self.common.size()
       }
 
       fn readable_identifier(&self, _context: &::rspack_core::Context) -> std::borrow::Cow<str> {
+        use rspack_core::NamedRuntimeModule;
         self.name().as_str().into()
       }
 
-      fn original_source(&self) -> Option<&dyn ::rspack_core::rspack_sources::Source> {
+      fn source(&self) -> Option<&::rspack_core::rspack_sources::BoxSource> {
         None
       }
 
-      fn factory_meta(&self) -> Option<&::rspack_core::FactoryMeta> {
+      fn factory_meta(&self) -> Option<::std::sync::Arc<::rspack_core::FactoryMeta>> {
         None
       }
 
-      fn set_factory_meta(&mut self, v: ::rspack_core::FactoryMeta) {}
+      fn set_factory_meta(&self, v: ::rspack_core::FactoryMeta) {}
 
-      fn build_info(&self) -> Option<&::rspack_core::BuildInfo> {
-        None
+      fn reset_for_compilation(&self, _: Option<::std::sync::Arc<::rspack_core::FactoryMeta>>) {}
+
+      fn build_info(&self) -> ::rspack_core::FreezeReadGuard<'_, ::rspack_core::BuildInfo> {
+        unreachable!()
       }
 
-      fn set_build_info(&mut self, v: ::rspack_core::BuildInfo) {}
-
-      fn build_meta(&self) -> Option<&::rspack_core::BuildMeta> {
-        None
+      fn freeze_build_info(&self) {
+        unreachable!()
       }
 
-      fn set_build_meta(&mut self, v: ::rspack_core::BuildMeta) {}
-
-      fn get_diagnostics(&self) -> Vec<::rspack_error::Diagnostic> {
-        vec![]
+      fn extend_build_assets(&self, _: ::rspack_core::CompilationAssets) {
+        unreachable!()
       }
 
-      fn code_generation(
+      fn build_info_mut(&mut self) -> &mut ::rspack_core::BuildInfo {
+        unreachable!()
+      }
+
+      fn build_meta(&self) -> ::rspack_core::FreezeReadGuard<'_, ::rspack_core::BuildMeta> {
+        unreachable!()
+      }
+
+      fn freeze_build_meta(&self) -> &::rspack_core::SharedBuildMeta {
+        unreachable!()
+      }
+
+      async fn code_generation(
+        &self,
+        code_generation_context: &mut ::rspack_core::ModuleCodeGenerationContext,
+      ) -> rspack_error::Result<::rspack_core::CodeGenerationResultBuilder> {
+        ::rspack_core::runtime_module_code_generation(self, &self.common, code_generation_context).await
+      }
+
+      async fn get_runtime_hash(
         &self,
         compilation: &::rspack_core::Compilation,
         _runtime: Option<&::rspack_core::RuntimeSpec>,
-        _: Option<::rspack_core::ConcatenationScope>,
-      ) -> rspack_error::Result<::rspack_core::CodeGenerationResult> {
-        let mut result = ::rspack_core::CodeGenerationResult::default();
-        result.add(::rspack_core::SourceType::JavaScript, self.generate_with_custom(compilation)?);
-        result.set_hash(
-          &compilation.options.output.hash_function,
-          &compilation.options.output.hash_digest,
-          &compilation.options.output.hash_salt,
-        );
-        Ok(result)
+      ) -> rspack_error::Result<::rspack_hash::RspackHashDigest> {
+        ::rspack_core::runtime_module_get_runtime_hash(self, &self.common, compilation).await
+      }
+
+      async fn build(
+        self: Box<Self>,
+        _build_context: ::std::sync::Arc<::rspack_core::BuildContext>,
+        _compilation: Option<&::rspack_core::Compilation>,
+      ) -> ::rspack_error::Result<::rspack_core::BoxModule> {
+        Ok(::rspack_core::BoxModule::new(self))
       }
     }
 
-    impl #impl_generics rspack_error::Diagnosable for #name  #ty_generics #where_clause {}
+    impl #impl_generics rspack_error::Diagnosable for #name  #ty_generics #where_clause {
+      fn add_diagnostic(&mut self, _diagnostic: rspack_error::Diagnostic) {
+        unreachable!()
+      }
+      fn add_diagnostics(&mut self, _diagnostics: Vec<rspack_error::Diagnostic>) {
+        unreachable!()
+      }
+      fn diagnostics(&self) -> std::borrow::Cow<'_, [rspack_error::Diagnostic]> {
+        std::borrow::Cow::Owned(vec![])
+      }
+    }
 
     impl #impl_generics ::rspack_util::source_map::ModuleSourceMapConfig for #name #ty_generics #where_clause {
       fn get_source_map_kind(&self) -> &::rspack_util::source_map::SourceMapKind {
-        &self.source_map_kind
+        self.common.get_source_map_kind()
       }
 
       fn set_source_map_kind(&mut self, source_map_kind: ::rspack_util::source_map::SourceMapKind) {
-        self.source_map_kind = source_map_kind;
+        self.common.set_source_map_kind(source_map_kind);
       }
     }
   }

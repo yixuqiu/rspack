@@ -7,21 +7,18 @@ pub use context::*;
 pub use plugin_driver::*;
 use rspack_error::Result;
 
-use crate::CompilerOptions;
+use crate::CompilationId;
 
-#[async_trait::async_trait]
 pub trait Plugin: fmt::Debug + Send + Sync {
   fn name(&self) -> &'static str {
     "unknown"
   }
 
-  fn apply(
-    &self,
-    _ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, _ctx: &mut ApplyContext) -> Result<()> {
     Ok(())
   }
+
+  fn clear_cache(&self, _id: CompilationId) {}
 }
 
 pub type BoxPlugin = Box<dyn Plugin>;

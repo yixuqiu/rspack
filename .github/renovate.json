@@ -1,49 +1,122 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "timezone": "Asia/Shanghai",
-  "schedule": ["before 8am on wednesday"],
+  "extends": [
+    ":dependencyDashboard",
+    "helpers:pinGitHubActionDigests",
+    "github>rstackjs/renovate:security"
+  ],
+  "schedule": ["before 8am on saturday"],
   "enabledManagers": ["github-actions", "cargo", "npm"],
   "ignorePaths": [
     "**/fixtures/**",
-    "**/tests/**",
-    "npm/**",
-    "webpack-examples/**",
-    "webpack-test/**"
+    "**/no-override-loaded/**",
+    "**/share-plugin-dual-mode/**",
+    "**/resolve-plugin-context/**"
   ],
-  "assignees": ["@Boshen"],
+  "labels": ["dependencies"],
   "packageRules": [
     {
-      "groupName": "github-actions",
-      "matchManagers": ["github-actions"],
-      "excludePackageNames": ["actions/upload-artifact", "actions/download-artifact"]
-    },
-    {
-      "groupName": "upload-download-actions",
-      "matchManagers": ["github-actions"],
-      "matchPackageNames": ["actions/upload-artifact", "actions/download-artifact"],
+      "description": "Disable peer dependency updates so they can be updated manually.",
+      "matchDepTypes": ["peerDependencies"],
       "enabled": false
     },
     {
-      "groupName": "crates",
+      "description": "Use chore commits and always bump package.json dependency ranges.",
+      "semanticCommitType": "chore",
+      "rangeStrategy": "bump",
+      "matchPackageNames": ["*"]
+    },
+    {
+      "groupName": "patch crates",
       "matchManagers": ["cargo"],
-      "excludePackagePrefixes": ["swc", "napi"],
-      "excludePackageNames": ["ustr", "textwrap", "styled_components", "owo-colors", "miette", "rkyv"]
+      "matchUpdateTypes": ["patch"],
+      "matchPackageNames": [
+        "!swc{/,}**",
+        "!napi{/,}**",
+        "!ustr",
+        "!textwrap",
+        "!owo-colors",
+        "!miette",
+        "!mimalloc",
+        "!rkyv",
+        "!rspack_resolver",
+        "!inventory"
+      ]
     },
     {
       "groupName": "swc",
       "matchManagers": ["cargo"],
-      "matchPackagePrefixes": ["swc"],
-      "matchPackageNames": ["styled_components"]
+      "matchPackageNames": ["swc{/,}**"]
     },
     {
       "groupName": "napi",
+      "matchPackageNames": ["napi{/,}**", "@napi-rs/{/,}**"]
+    },
+    {
+      "groupName": "emnapi",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["emnapi", "/^@emnapi\\//"]
+    },
+    {
+      "description": "Group non-major Rstack npm package updates.",
+      "groupName": "Rstack",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchPackageNames": [
+        "/rstack/",
+        "/^@rspack/",
+        "/^@rsbuild/",
+        "/^@rstest/",
+        "/^@rslib/",
+        "/^@rsdoctor/",
+        "/^@rslint/",
+        "/^@rspress/"
+      ]
+    },
+    {
+      "description": "Group Babel npm packages.",
+      "groupName": "babel",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["/babel/"]
+    },
+    {
+      "description": "Group React npm packages.",
+      "groupName": "React",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["/react/"]
+    },
+    {
+      "description": "Group SWC npm packages.",
+      "groupName": "SWC",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["/^@swc/"]
+    },
+    {
+      "description": "Group Rspack crates.",
+      "groupName": "crate rspack_resolver",
       "matchManagers": ["cargo"],
-      "matchPackagePrefixes": ["napi"]
+      "matchPackageNames": ["rspack_resolver"]
     },
     {
       "groupName": "ignored crates",
       "matchManagers": ["cargo"],
-      "matchPackageNames": ["ustr", "textwrap", "owo-colors", "miette", "rkyv"],
+      "matchPackageNames": [
+        "ustr",
+        "textwrap",
+        "owo-colors",
+        "miette",
+        "mimalloc",
+        "rkyv",
+        "inventory",
+        "rspack-sources"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Keep pnp at 0.12.11 until swc_config supports regress 0.12 to avoid duplicate regress versions and binary size growth.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["pnp"],
       "enabled": false
     },
     {
@@ -54,28 +127,53 @@
       "enabled": false
     },
     {
-      "groupName": "npm dev dependencies",
-      "matchManagers": ["npm"],
-      "matchDepTypes": ["devDependencies"],
-      "excludePackagePrefixes": ["webpack", "sass"],
-      "excludePackageNames": ["@playwright/test", "react", "react-dom", "typescript", "pnpm"]
-    },
-    {
-      "groupName": "npm dependencies",
-      "matchManagers": ["npm"],
-      "matchDepTypes": ["dependencies"],
+      "groupName": "ignored linting crates",
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["linting/**/Cargo.toml"],
       "enabled": false
     },
     {
-      "groupName": "npm ignored dependencies",
+      "description": "Keep major and minor npm dependency updates in separate PRs from patch updates.",
+      "groupName": "patch npm dependencies",
       "matchManagers": ["npm"],
-      "matchPackageNames": ["@playwright/test", "react", "react-dom", "typescript", "pnpm", "sass"],
+      "matchUpdateTypes": ["patch"],
+      "matchPackageNames": ["!webpack{/,}**", "!typescript", "!playwright"]
+    },
+    {
+      "description": "Update the Playwright image in .github/workflows/reusable-build-test.yml together with playwright.",
+      "groupName": "playwright",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["playwright"]
+    },
+    {
+      "description": "Disable Node.js updates.",
+      "groupName": "node",
+      "matchPackageNames": ["node"],
       "enabled": false
     },
     {
-      "groupName": "webpack",
-      "matchManagers": ["npm"],
-      "matchPackagePrefixes": ["webpack"],
+      "groupName": "github-actions",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": [
+        "!actions/upload-artifact",
+        "!actions/download-artifact",
+        "!lynx-infra/download-artifact",
+        "!lynx-infra/upload-artifact",
+        "!lynx-infra/cache",
+        "!rstackjs/rust-cache"
+      ]
+    },
+    {
+      "groupName": "manually managed github-actions",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": [
+        "actions/upload-artifact",
+        "actions/download-artifact",
+        "lynx-infra/download-artifact",
+        "lynx-infra/upload-artifact",
+        "lynx-infra/cache",
+        "rstackjs/rust-cache"
+      ],
       "enabled": false
     }
   ]

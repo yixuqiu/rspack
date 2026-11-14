@@ -1,0 +1,125 @@
+# Case ensure-chunk-change-to-promise-all: Step 1
+
+## Changed Files
+- file.js
+
+## Asset Files
+- Bundle: bundle.js
+- Bundle: file_js.chunk.CURRENT_HASH.js
+- Bundle: vendors-node_modules_vue_js.chunk.CURRENT_HASH.js
+- Complete update: vendors-node_modules_vue_js.LAST_HASH.hot-update.js.full.js, size: 300
+  - ./node_modules/vue.js
+- Manifest: main.LAST_HASH.hot-update.json, size: 211
+- Update: file_js.LAST_HASH.hot-update.js, size: 380
+- Update: main.LAST_HASH.hot-update.js, size: 820
+- Update: vendors-node_modules_vue_js.LAST_HASH.hot-update.js, size: 300
+
+## Manifest
+
+### main.LAST_HASH.hot-update.json
+
+```json
+{"c":["file_js","main","vendors-node_modules_vue_js"],"r":["vendors-node_modules_react_js"],"m":["./node_modules/react.js"],"changed":{"./file.js":["file_js"]},"load":{"file_js":["vendors-node_modules_vue_js"]}}
+```
+
+
+## Update
+
+
+### file_js.LAST_HASH.hot-update.js
+
+#### Changed Modules
+- ./file.js
+
+#### Changed Runtime Modules
+
+
+#### Changed Content
+```js
+"use strict";
+self["rspackHotUpdate"]("file_js", {
+"./file.js"(__unused_rspack_module, __webpack_exports__, __webpack_require__) {
+__webpack_require__.r(__webpack_exports__);
+__webpack_require__.d(__webpack_exports__, {
+  Vue: () => (/* reexport safe */ vue__rspack_import_0.Vue)
+});
+/* import */ var vue__rspack_import_0 = __webpack_require__("./node_modules/vue.js");
+
+
+
+},
+
+});
+```
+
+
+
+### main.LAST_HASH.hot-update.js
+
+#### Changed Modules
+
+
+#### Changed Runtime Modules
+- webpack/runtime/chunk_group_map
+- webpack/runtime/get_full_hash
+- webpack/runtime/hot_module_replacement_chunk_versions
+
+#### Changed Content
+```js
+"use strict";
+self["rspackHotUpdate"]("main", {},function(__webpack_require__) {
+// webpack/runtime/get_full_hash
+(() => {
+__webpack_require__.h = () => ("CURRENT_HASH")
+})();
+// webpack/runtime/hot_module_replacement_chunk_versions
+(() => {
+__webpack_require__.hmrV["file_js"] = "CHUNK_VERSION";
+__webpack_require__.hmrV["vendors-node_modules_vue_js"] = "CHUNK_VERSION";
+delete __webpack_require__.hmrV["vendors-node_modules_react_js"];
+
+})();
+// webpack/runtime/chunk_group_map
+(() => {
+((groups) => {
+	var map = __webpack_require__.hmrS_chunkGroups = __webpack_require__.hmrS_chunkGroups || Object.create(null);
+	
+	Object.keys(groups).forEach((chunkId) => {
+		if (groups[chunkId] === null) delete map[chunkId];
+		else map[chunkId] = groups[chunkId];
+	});
+})({"file_js":["vendors-node_modules_vue_js"]});
+
+
+})();
+
+}
+);
+```
+
+
+
+### vendors-node_modules_vue_js.LAST_HASH.hot-update.js
+
+#### Changed Modules
+- ./node_modules/vue.js
+
+#### Changed Runtime Modules
+
+
+#### Changed Content
+```js
+"use strict";
+self["rspackHotUpdate"]("vendors-node_modules_vue_js", {
+"./node_modules/vue.js"(__unused_rspack_module, __webpack_exports__, __webpack_require__) {
+__webpack_require__.r(__webpack_exports__);
+__webpack_require__.d(__webpack_exports__, {
+  Vue: () => (Vue)
+});
+const Vue = 43;
+
+
+},
+
+});
+```

@@ -1,13 +1,14 @@
 import {
-	BuiltinPluginName,
-	RawEvalDevToolModulePluginOptions
-} from "@rspack/binding";
-import { create } from "./base";
+  BuiltinPluginName,
+  type RawEvalDevToolModulePluginOptions,
+} from '@rspack/binding';
+
+import { create } from './base';
 
 export type { RawEvalDevToolModulePluginOptions as EvalDevToolModulePluginOptions };
 
 export const EvalDevToolModulePlugin = create(
-	BuiltinPluginName.EvalDevToolModulePlugin,
-	(options: RawEvalDevToolModulePluginOptions) => options,
-	"compilation"
+  BuiltinPluginName.EvalDevToolModulePlugin,
+  (options: RawEvalDevToolModulePluginOptions) => options,
+  'compilation',
 );

@@ -1,6 +1,5 @@
-use rspack_core::SpanExt;
-use swc_core::common::Spanned;
-use swc_core::ecma::ast::{TaggedTpl, Tpl};
+use rspack_util::{SpanExt, swc::AstSubRangeExt};
+use swc_next_ecma_ast::{GetSpan, TaggedTemplateExpression, TemplateLiteral};
 
 use super::BasicEvaluatedExpression;
 use crate::visitors::JavascriptParser;
@@ -8,92 +7,84 @@ use crate::visitors::JavascriptParser;
 #[derive(Debug, Clone, Copy)]
 pub enum TemplateStringKind {
   Cooked,
-  // String.raw`./${a}.js`
   Raw,
 }
 
-fn get_simplified_template_result(
-  scanner: &mut JavascriptParser,
+fn get_simplified_template_result<'parser>(
+  parser: &mut JavascriptParser<'parser>,
   kind: TemplateStringKind,
-  node: &Tpl,
-) -> (Vec<BasicEvaluatedExpression>, Vec<BasicEvaluatedExpression>) {
-  let mut quasis: Vec<BasicEvaluatedExpression> = vec![];
-  let mut parts: Vec<BasicEvaluatedExpression> = vec![];
-  for i in 0..node.quasis.len() {
-    let quasi_expr = &node.quasis[i];
+  template: TemplateLiteral,
+) -> Option<Vec<BasicEvaluatedExpression<'parser>>> {
+  let ast = parser.ast.ast;
+  let quasis_nodes = template.quasis(ast);
+  let mut expressions = ast.nodes(template.expressions(ast));
+  let mut parts: Vec<BasicEvaluatedExpression<'parser>> = Vec::new();
+  for (index, quasi_node) in ast.nodes(quasis_nodes).enumerate() {
     let quasi = match kind {
-      TemplateStringKind::Cooked => quasi_expr
-        .cooked
-        .as_ref()
-        .expect("quasic should be not empty"),
-      TemplateStringKind::Raw => &quasi_expr.raw,
+      TemplateStringKind::Cooked if !quasi_node.is_cooked_undefined(ast) => {
+        ast.get_wtf8(quasi_node.cooked(ast)).as_str()?
+      }
+      TemplateStringKind::Cooked | TemplateStringKind::Raw => ast.get_utf8(quasi_node.raw(ast)),
     };
-    if i > 0 {
-      let len = parts.len();
-      let prev_expr = &mut parts[len - 1];
-      let expr = scanner.evaluate_expression(&node.exprs[i - 1]);
-      if !expr.could_have_side_effects()
-        && let Some(str) = expr.as_string()
+    let quasi_span = quasi_node.span(ast);
+    if index > 0 {
+      let previous = parts.last_mut().expect("template has a preceding quasi");
+      let expression = parser.evaluate_expression(
+        expressions
+          .next()
+          .expect("template has an expression before each non-leading quasi"),
+      );
+      if !expression.could_have_side_effects()
+        && let Some(value) = expression.as_string()
       {
-        // merge quasi + expr + quasi when expr is a const string
-        prev_expr.set_string(format!("{}{}{}", prev_expr.string(), str, quasi));
-        prev_expr.set_range(prev_expr.range().0, quasi_expr.span_hi().0);
-        // prev_expr.set_expression(None);
-
-        // also merge for quasis
-        let prev_expr = &mut quasis[len - 1];
-        prev_expr.set_string(format!("{}{}{}", prev_expr.string(), str, quasi));
-        prev_expr.set_range(prev_expr.range().0, quasi_expr.span_hi().0);
-
+        previous.set_string(format!("{}{}{}", previous.string(), value, quasi));
+        previous.set_range(previous.range().0, quasi_span.real_hi());
+        previous.set_expression(None);
         continue;
       }
-      parts.push(expr);
+      parts.push(expression);
     }
-
-    let part = || {
-      let mut part = BasicEvaluatedExpression::new();
-      part.set_string(quasi.to_string());
-      part.set_range(quasi_expr.span().real_lo(), quasi_expr.span_hi().0);
-      part
-    };
-    // part.set_expression(Some(quasi_expr));
-    quasis.push(part());
-    parts.push(part())
+    let mut part = BasicEvaluatedExpression::new();
+    part.set_string(quasi);
+    part.set_range(quasi_span.real_lo(), quasi_span.real_hi());
+    parts.push(part);
   }
-
-  (quasis, parts)
+  Some(parts)
 }
 
-pub fn eval_tpl_expression(
-  scanner: &mut JavascriptParser,
-  tpl: &Tpl,
-) -> Option<BasicEvaluatedExpression> {
+#[inline]
+pub fn eval_tpl_expression<'parser>(
+  parser: &mut JavascriptParser<'parser>,
+  template: TemplateLiteral,
+) -> Option<BasicEvaluatedExpression<'parser>> {
   let kind = TemplateStringKind::Cooked;
-  let (quasis, mut parts) = get_simplified_template_result(scanner, kind, tpl);
+  let mut parts = get_simplified_template_result(parser, kind, template)?;
+  let span = template.span(parser.ast.ast);
   if parts.len() == 1 {
     let mut part = parts.remove(0);
-    part.set_range(tpl.span().real_lo(), tpl.span().hi().0);
+    part.set_range(span.real_lo(), span.real_hi());
     Some(part)
   } else {
-    let mut res = BasicEvaluatedExpression::with_range(tpl.span().real_lo(), tpl.span().hi().0);
-    res.set_template_string(quasis, parts, kind);
-    Some(res)
+    let mut result = BasicEvaluatedExpression::with_range(span.real_lo(), span.real_hi());
+    result.set_template_string(parts, kind);
+    Some(result)
   }
 }
 
-pub fn eval_tagged_tpl_expression(
-  scanner: &mut JavascriptParser,
-  tagged_tpl: &TaggedTpl,
-) -> Option<BasicEvaluatedExpression> {
-  let tag = scanner.evaluate_expression(&tagged_tpl.tag);
+#[inline]
+pub fn eval_tagged_tpl_expression<'parser>(
+  parser: &mut JavascriptParser<'parser>,
+  tagged: TaggedTemplateExpression,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = parser.ast.ast;
+  let tag = parser.evaluate_expression(tagged.tag(ast));
   if !tag.is_identifier() || tag.identifier() != "String.raw" {
     return None;
-  };
+  }
   let kind = TemplateStringKind::Raw;
-  let tpl = &tagged_tpl.tpl;
-  let (quasis, parts) = get_simplified_template_result(scanner, kind, tpl);
-  let mut res =
-    BasicEvaluatedExpression::with_range(tagged_tpl.span().real_lo(), tagged_tpl.span().hi().0);
-  res.set_template_string(quasis, parts, kind);
-  Some(res)
+  let parts = get_simplified_template_result(parser, kind, tagged.quasi(ast))?;
+  let span = tagged.span(ast);
+  let mut result = BasicEvaluatedExpression::with_range(span.real_lo(), span.real_hi());
+  result.set_template_string(parts, kind);
+  Some(result)
 }

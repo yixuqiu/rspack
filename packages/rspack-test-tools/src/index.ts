@@ -1,11 +1,13 @@
-export * from "./type";
-export * from "./test/tester";
-export * from "./test/context";
-export * from "./test/simple";
-export * from "./processor";
-export * from "./reporter";
-export * from "./compare";
-export * from "./plugin";
-export * from "./helper";
-export * from "./runner";
-export * from "./case";
+import { disableIconvLiteWarning } from './helper/disable-iconv-lite-warning';
+
+export * from './case';
+export * from './helper';
+export * from './plugin';
+export * from './reporter';
+export * from './runner';
+export * from './test/context';
+export * from './test/creator';
+export * from './test/tester';
+export * from './type';
+
+disableIconvLiteWarning();

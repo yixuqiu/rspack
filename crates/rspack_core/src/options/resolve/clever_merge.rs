@@ -1,12 +1,12 @@
-use hashlink::LinkedHashMap;
+use rspack_util::fx_hash::FxLinkedHashMap;
 
-use super::value_type::{GetValueType, ValueType};
 use super::{
-  Alias, AliasFields, ConditionNames, ExportsField, ExtensionAlias, Extensions, Fallback,
-  FullySpecified, MainFields, MainFiles, Modules, PreferAbsolute, PreferRelative, Restrictions,
-  Roots, Symlink, TsconfigOptions,
+  Alias, AliasFields, ByDependency, ConditionNames, DependencyCategoryStr, DescriptionFiles,
+  EnforceExtension, ExportsFields, ExtensionAlias, Extensions, Fallback, FullySpecified,
+  ImportsFields, MainFields, MainFiles, Modules, PreferAbsolute, PreferRelative, Resolve,
+  Restrictions, Roots, Symlink, TsconfigOptions,
+  value_type::{GetValueType, ValueType},
 };
-use super::{ByDependency, DependencyCategoryStr, Resolve};
 
 pub(super) fn merge_resolve(first: Resolve, second: Resolve) -> Resolve {
   _merge_resolve(first, second)
@@ -30,7 +30,10 @@ fn is_empty(resolve: &Resolve) -> bool {
     && is_none!(modules)
     && is_none!(fallback)
     && is_none!(fully_specified)
-    && is_none!(exports_field)
+    && is_none!(exports_fields)
+    && is_none!(imports_fields)
+    && is_none!(description_files)
+    && is_none!(enforce_extension)
     && is_none!(extension_alias)
     && is_none!(alias_fields)
     && is_none!(restrictions)
@@ -42,7 +45,7 @@ fn is_empty(resolve: &Resolve) -> bool {
 #[derive(Default, Debug)]
 struct Entry<T: Default + std::fmt::Debug> {
   base: Option<T>,
-  by_values: Option<LinkedHashMap<DependencyCategoryStr, Option<T>>>,
+  by_values: Option<FxLinkedHashMap<DependencyCategoryStr, Option<T>>>,
 }
 
 #[derive(Debug)]
@@ -59,11 +62,15 @@ struct ResolveWithEntry {
   fallback: Entry<Fallback>,
   tsconfig: Entry<TsconfigOptions>,
   fully_specified: Entry<FullySpecified>,
-  exports_field: Entry<ExportsField>,
+  exports_fields: Entry<ExportsFields>,
+  imports_fields: Entry<ImportsFields>,
+  description_files: Entry<DescriptionFiles>,
+  enforce_extension: Entry<EnforceExtension>,
   extension_alias: Entry<ExtensionAlias>,
   alias_fields: Entry<AliasFields>,
   restrictions: Entry<Restrictions>,
   roots: Entry<Roots>,
+  pnp: Entry<bool>,
 }
 
 fn parse_resolve(resolve: Resolve) -> ResolveWithEntry {
@@ -88,11 +95,15 @@ fn parse_resolve(resolve: Resolve) -> ResolveWithEntry {
     fallback: entry!(fallback),
     tsconfig: entry!(tsconfig),
     fully_specified: entry!(fully_specified),
-    exports_field: entry!(exports_field),
+    exports_fields: entry!(exports_fields),
+    imports_fields: entry!(imports_fields),
+    description_files: entry!(description_files),
+    enforce_extension: entry!(enforce_extension),
     extension_alias: entry!(extension_alias),
     alias_fields: entry!(alias_fields),
     restrictions: entry!(restrictions),
     roots: entry!(roots),
+    pnp: entry!(pnp),
   };
   let Some(by_dependency) = resolve.by_dependency else {
     return res;
@@ -100,12 +111,13 @@ fn parse_resolve(resolve: Resolve) -> ResolveWithEntry {
   let mut by_dependency = by_dependency;
 
   macro_rules! update_by_value {
-    ($ident: ident) => {
-      let mut $ident = LinkedHashMap::new();
+    ($ident: ident, $should_insert_by_value_key: expr) => {
+      let mut $ident = FxLinkedHashMap::default();
       let by_values_key: Vec<_> = by_dependency.0.keys().cloned().collect();
       for by_value_key in &by_values_key {
         let obj = by_dependency.0.get_mut(by_value_key).expect("");
-        if obj.$ident.is_some() {
+        let should_insert_by_value_key = $should_insert_by_value_key(obj.$ident.as_ref());
+        if should_insert_by_value_key {
           $ident.insert(by_value_key.clone(), std::mem::take(&mut obj.$ident));
         }
         if by_value_key == "default" {
@@ -121,33 +133,45 @@ fn parse_resolve(resolve: Resolve) -> ResolveWithEntry {
       }
     };
   }
-  update_by_value!(extensions);
-  update_by_value!(alias);
-  update_by_value!(prefer_relative);
-  update_by_value!(prefer_absolute);
-  update_by_value!(symlinks);
-  update_by_value!(main_files);
-  update_by_value!(main_fields);
-  update_by_value!(condition_names);
-  update_by_value!(modules);
-  update_by_value!(fallback);
-  update_by_value!(fully_specified);
-  update_by_value!(exports_field);
-  update_by_value!(extension_alias);
-  update_by_value!(alias_fields);
-  update_by_value!(restrictions);
-  update_by_value!(roots);
-  update_by_value!(tsconfig);
+  update_by_value!(extensions, |i: Option<&_>| i.is_some());
+  update_by_value!(
+    alias,
+    |i: Option<&Alias>| matches!(i, Some(Alias::MergeAlias(i)) if !i.is_empty())
+  );
+  update_by_value!(prefer_relative, |i: Option<&_>| i.is_some());
+  update_by_value!(prefer_absolute, |i: Option<&_>| i.is_some());
+  update_by_value!(symlinks, |i: Option<&_>| i.is_some());
+  update_by_value!(main_files, |i: Option<&_>| i.is_some());
+  update_by_value!(main_fields, |i: Option<&_>| i.is_some());
+  update_by_value!(condition_names, |i: Option<&_>| i.is_some());
+  update_by_value!(modules, |i: Option<&_>| i.is_some());
+  update_by_value!(
+    fallback,
+    |i: Option<&Alias>| matches!(i, Some(Alias::MergeAlias(i)) if !i.is_empty())
+  );
+  update_by_value!(fully_specified, |i: Option<&_>| i.is_some());
+  update_by_value!(exports_fields, |i: Option<&_>| i.is_some());
+  update_by_value!(imports_fields, |i: Option<&_>| i.is_some());
+  update_by_value!(description_files, |i: Option<&_>| i.is_some());
+  update_by_value!(enforce_extension, |i: Option<&_>| i.is_some());
+  update_by_value!(
+    extension_alias,
+    |i: Option<&ExtensionAlias>| matches!(i, Some(i) if !i.is_empty())
+  );
+  update_by_value!(alias_fields, |i: Option<&_>| i.is_some());
+  update_by_value!(restrictions, |i: Option<&_>| i.is_some());
+  update_by_value!(roots, |i: Option<&_>| i.is_some());
+  update_by_value!(tsconfig, |i: Option<&_>| i.is_some());
 
   res
 }
 
 fn overwrite<T, F>(a: Option<T>, b: Option<T>, f: F) -> Option<T>
 where
-  F: FnOnce(&T, T) -> T,
+  F: FnOnce(T, T) -> T,
 {
   match (a, b) {
-    (Some(a), Some(b)) => Some(f(&a, b)),
+    (Some(a), Some(b)) => Some(f(a, b)),
     (Some(a), None) => Some(a),
     (None, Some(b)) => Some(b),
     (None, None) => None,
@@ -155,7 +179,7 @@ where
 }
 
 fn get_from_by_values<T: Default + Clone>(
-  by_values: &LinkedHashMap<DependencyCategoryStr, T>,
+  by_values: &FxLinkedHashMap<DependencyCategoryStr, T>,
   key: &str,
 ) -> Option<T> {
   let value = if key != "default" && by_values.contains_key(key) {
@@ -199,7 +223,7 @@ fn _merge_resolve(first: Resolve, second: Resolve) -> Resolve {
       } else if let Some(intermediate_by_values) = first.$ident.by_values {
         #[allow(clippy::redundant_closure_call)]
         let need_merge_base = $need_merge_base(&intermediate_by_values);
-        let mut intermediate_by_values: LinkedHashMap<_, _> = intermediate_by_values
+        let mut intermediate_by_values: FxLinkedHashMap<_, _> = intermediate_by_values
           .into_iter()
           .map(|(key, value)| {
             let value = overwrite(value, second.$ident.base.clone(), $deal_merge);
@@ -240,20 +264,22 @@ fn _merge_resolve(first: Resolve, second: Resolve) -> Resolve {
     }};
   }
 
-  let need_merge_base = |by_values: &LinkedHashMap<DependencyCategoryStr, Option<Vec<String>>>| {
-    by_values.values().all(|value| {
-      let value_type = value.get_value_type();
-      assert!(!matches!(value_type, ValueType::Other));
-      !matches!(value_type, ValueType::Extend)
-    })
-  };
+  let need_merge_base =
+    |by_values: &FxLinkedHashMap<DependencyCategoryStr, Option<Vec<String>>>| {
+      by_values.values().all(|value| {
+        let value_type = value.get_value_type();
+        assert!(!matches!(value_type, ValueType::Other));
+        !matches!(value_type, ValueType::Extend)
+      })
+    };
 
   let result_entry = ResolveWithEntry {
+    pnp: merge!(pnp, second.pnp.base.get_value_type(), |_| true, |_, b| b),
     extensions: merge!(
       extensions,
       second.extensions.base.get_value_type(),
       need_merge_base,
-      |a, b| normalize_string_array(a, b)
+      normalize_string_array
     ),
     prefer_relative: merge!(
       prefer_relative,
@@ -277,25 +303,25 @@ fn _merge_resolve(first: Resolve, second: Resolve) -> Resolve {
       main_files,
       second.main_files.base.get_value_type(),
       need_merge_base,
-      |a, b| normalize_string_array(a, b)
+      normalize_string_array
     ),
     main_fields: merge!(
       main_fields,
       second.main_fields.base.get_value_type(),
       need_merge_base,
-      |a, b| normalize_string_array(a, b)
+      normalize_string_array
     ),
     condition_names: merge!(
       condition_names,
       second.condition_names.base.get_value_type(),
       need_merge_base,
-      |a, b| normalize_string_array(a, b)
+      normalize_string_array
     ),
     modules: merge!(
       modules,
       second.modules.base.get_value_type(),
       need_merge_base,
-      |a, b| normalize_string_array(a, b)
+      normalize_string_array
     ),
     fully_specified: merge!(
       fully_specified,
@@ -303,9 +329,32 @@ fn _merge_resolve(first: Resolve, second: Resolve) -> Resolve {
       |_| true,
       |_, b| b
     ),
-    fallback: merge!(fallback, ValueType::Other, |_| false, extend_alias),
-    alias: merge!(alias, ValueType::Other, |_| false, extend_alias),
-    exports_field: merge!(exports_field, ValueType::Other, |_| false, |_, b| b),
+    fallback: merge!(
+      fallback,
+      second.fallback.base.get_value_type(),
+      |_| false,
+      extend_alias
+    ),
+    alias: merge!(
+      alias,
+      second.alias.base.get_value_type(),
+      |_| false,
+      extend_alias
+    ),
+    exports_fields: merge!(exports_fields, ValueType::Other, |_| false, |_, b| b),
+    imports_fields: merge!(imports_fields, ValueType::Other, |_| false, |_, b| b),
+    description_files: merge!(
+      description_files,
+      second.description_files.base.get_value_type(),
+      need_merge_base,
+      normalize_string_array
+    ),
+    enforce_extension: merge!(
+      enforce_extension,
+      second.enforce_extension.base.get_value_type(),
+      |_| true,
+      |_, b| b
+    ),
     tsconfig: merge!(tsconfig, ValueType::Other, |_| false, |_, b| b),
     extension_alias: merge!(extension_alias, ValueType::Other, |_| false, |a, b| {
       extend_extension_alias(a, b)
@@ -315,7 +364,8 @@ fn _merge_resolve(first: Resolve, second: Resolve) -> Resolve {
     roots: merge!(roots, ValueType::Other, |_| false, |_, b| b),
   };
 
-  let mut by_dependency: LinkedHashMap<DependencyCategoryStr, Resolve> = LinkedHashMap::new();
+  let mut by_dependency: FxLinkedHashMap<DependencyCategoryStr, Resolve> =
+    FxLinkedHashMap::default();
 
   macro_rules! setup_by_values {
     ($ident: ident) => {
@@ -341,7 +391,10 @@ fn _merge_resolve(first: Resolve, second: Resolve) -> Resolve {
   setup_by_values!(modules);
   setup_by_values!(fallback);
   setup_by_values!(fully_specified);
-  setup_by_values!(exports_field);
+  setup_by_values!(exports_fields);
+  setup_by_values!(imports_fields);
+  setup_by_values!(description_files);
+  setup_by_values!(enforce_extension);
   setup_by_values!(extension_alias);
   setup_by_values!(alias_fields);
   setup_by_values!(restrictions);
@@ -371,7 +424,10 @@ fn _merge_resolve(first: Resolve, second: Resolve) -> Resolve {
   to_resolve!(modules);
   to_resolve!(fallback);
   to_resolve!(fully_specified);
-  to_resolve!(exports_field);
+  to_resolve!(exports_fields);
+  to_resolve!(imports_fields);
+  to_resolve!(description_files);
+  to_resolve!(enforce_extension);
   to_resolve!(extension_alias);
   to_resolve!(alias_fields);
   to_resolve!(restrictions);
@@ -397,18 +453,23 @@ fn _merge_resolve(first: Resolve, second: Resolve) -> Resolve {
     modules: result_entry.modules.base,
     fallback: result_entry.fallback.base,
     fully_specified: result_entry.fully_specified.base,
-    exports_field: result_entry.exports_field.base,
+    exports_fields: result_entry.exports_fields.base,
+    imports_fields: result_entry.imports_fields.base,
+    description_files: result_entry.description_files.base,
+    enforce_extension: result_entry.enforce_extension.base,
     extension_alias: result_entry.extension_alias.base,
     alias_fields: result_entry.alias_fields.base,
     restrictions: result_entry.restrictions.base,
     roots: result_entry.roots.base,
+    pnp: result_entry.pnp.base,
+    builtin_modules: false,
   }
 }
 
-fn normalize_string_array(a: &[String], b: Vec<String>) -> Vec<String> {
+fn normalize_string_array(a: Vec<String>, b: Vec<String>) -> Vec<String> {
   b.into_iter().fold(vec![], |mut acc, item| {
     if item.eq("...") {
-      acc.append(&mut a.to_vec());
+      acc.extend(a.iter().cloned());
     } else {
       acc.push(item);
     }
@@ -416,20 +477,31 @@ fn normalize_string_array(a: &[String], b: Vec<String>) -> Vec<String> {
   })
 }
 
-fn extend_alias(a: &Alias, b: Alias) -> Alias {
-  let mut b = b;
-  // FIXME: I think this clone can be removed
-  b.extend(a.clone());
-  b.dedup();
-  b
+fn extend_alias(a: Alias, b: Alias) -> Alias {
+  match (a, b) {
+    (Alias::MergeAlias(mut a), Alias::MergeAlias(b)) => {
+      for (key, value) in b {
+        if let Some((_, v)) = a.iter_mut().find(|(k, _)| *k == key) {
+          *v = value;
+        } else {
+          a.push((key, value));
+        }
+      }
+      Alias::MergeAlias(a)
+    }
+    (_, b) => b,
+  }
 }
 
-fn extend_extension_alias(a: &ExtensionAlias, b: ExtensionAlias) -> ExtensionAlias {
-  let mut b = b;
-  // FIXME: I think this clone can be removed
-  b.extend(a.clone());
-  b.dedup();
-  b
+fn extend_extension_alias(mut a: ExtensionAlias, b: ExtensionAlias) -> ExtensionAlias {
+  for (key, value) in b {
+    if let Some((_, v)) = a.iter_mut().find(|(k, _)| *k == key) {
+      *v = value;
+    } else {
+      a.push((key, value));
+    }
+  }
+  a
 }
 
 #[cfg(test)]
@@ -438,7 +510,7 @@ mod test {
   use crate::AliasMap;
 
   fn string_list(a: &[&str]) -> Option<Vec<String>> {
-    Some(a.iter().map(|s| s.to_string()).collect())
+    Some(a.iter().map(|s| (*s).to_string()).collect())
   }
 
   fn first_case_1() -> Resolve {
@@ -567,7 +639,7 @@ mod test {
   fn test_merge_resolver_options_0() {
     let base = Resolve {
       extensions: string_list(&["a", "b"]),
-      alias: Some(vec![("c".to_string(), vec![AliasMap::Ignore])]),
+      alias: Some(vec![("c".to_string(), vec![AliasMap::Ignore])].into()),
       symlinks: Some(false),
       main_files: string_list(&["d", "e", "f"]),
       main_fields: string_list(&["g", "h", "i"]),
@@ -576,7 +648,7 @@ mod test {
     };
     let another = Resolve {
       extensions: string_list(&["a1", "b1"]),
-      alias: Some(vec![("c2".to_string(), vec![AliasMap::Ignore])]),
+      alias: Some(vec![("c2".to_string(), vec![AliasMap::Ignore])].into()),
       prefer_relative: Some(true),
       main_files: string_list(&["d1", "e", "..."]),
       main_fields: string_list(&["...", "h", "..."]),
@@ -598,9 +670,10 @@ mod test {
     assert_eq!(
       options.alias.expect("should be Ok"),
       vec![
-        ("c2".to_string(), vec![AliasMap::Ignore]),
-        ("c".to_string(), vec![AliasMap::Ignore])
+        ("c".to_string(), vec![AliasMap::Ignore]),
+        ("c2".to_string(), vec![AliasMap::Ignore])
       ]
+      .into()
     );
     assert_eq!(options.condition_names.expect("should be Ok").len(), 3);
   }
@@ -649,13 +722,13 @@ mod test {
     let first = Resolve {
       extensions: string_list(&["1"]),
       modules: string_list(&["1"]),
-      alias: Some(vec![]),
+      alias: Some(vec![].into()),
       ..Default::default()
     };
     let second = Resolve {
       extensions: string_list(&["2"]),
       modules: string_list(&["2", "...", "3"]),
-      alias: Some(vec![("2".to_string(), vec![AliasMap::Ignore])]),
+      alias: Some(vec![("2".to_string(), vec![AliasMap::Ignore])].into()),
       ..Default::default()
     };
     pretty_assertions::assert_eq!(
@@ -663,7 +736,7 @@ mod test {
       Resolve {
         extensions: string_list(&["2"]),
         modules: string_list(&["2", "1", "3"]),
-        alias: Some(vec![("2".to_string(), vec![AliasMap::Ignore])]),
+        alias: Some(vec![("2".to_string(), vec![AliasMap::Ignore])].into()),
         ..Default::default()
       }
     )
@@ -2206,6 +2279,101 @@ mod test {
             },
           ),
         ])),
+        ..Default::default()
+      }
+    )
+  }
+
+  #[test]
+  fn test_merge_resolver_options_19() {
+    let first = Resolve {
+      extensions: string_list(&[]),
+      by_dependency: Some(ByDependency::from_iter([(
+        "x".into(),
+        Resolve {
+          extensions: string_list(&["1", "2", "3"]),
+          ..Default::default()
+        },
+      )])),
+      ..Default::default()
+    };
+
+    let second = Resolve {
+      extensions: string_list(&[]),
+      ..Default::default()
+    };
+
+    pretty_assertions::assert_eq!(
+      merge_resolve(first, second),
+      Resolve {
+        extensions: string_list(&[]),
+        ..Default::default()
+      }
+    )
+  }
+
+  #[test]
+  fn test_merge_resolver_options_20() {
+    let first = Resolve {
+      alias: Some(vec![].into()),
+      fallback: Some(vec![].into()),
+      extension_alias: Some(vec![]),
+      by_dependency: Some(ByDependency::from_iter([(
+        "x".into(),
+        Resolve {
+          alias: Some(vec![].into()),
+          fallback: Some(vec![].into()),
+          extension_alias: Some(vec![]),
+          ..Default::default()
+        },
+      )])),
+      ..Default::default()
+    };
+
+    let second = Resolve {
+      alias: Some(vec![("fakemodule".to_string(), vec!["realmodule".into()])].into()),
+      fallback: Some(
+        vec![(
+          "fallbackmodule".to_string(),
+          vec!["fallbacktomodule".into()],
+        )]
+        .into(),
+      ),
+      extension_alias: Some(vec![(".js".to_string(), vec![".ts".to_string()])]),
+      ..Default::default()
+    };
+
+    pretty_assertions::assert_eq!(
+      merge_resolve(first, second),
+      Resolve {
+        alias: Some(vec![("fakemodule".to_string(), vec!["realmodule".into()])].into()),
+        fallback: Some(
+          vec![(
+            "fallbackmodule".to_string(),
+            vec!["fallbacktomodule".into()],
+          )]
+          .into(),
+        ),
+        extension_alias: Some(vec![(".js".to_string(), vec![".ts".to_string()])]),
+        ..Default::default()
+      }
+    )
+  }
+
+  #[test]
+  fn merge_resolver_options_false_alias() {
+    let first = Resolve {
+      alias: Some(vec![("2".to_string(), vec![AliasMap::Ignore])].into()),
+      ..Default::default()
+    };
+    let second = Resolve {
+      alias: Some(Alias::OverwriteToNoAlias),
+      ..Default::default()
+    };
+    pretty_assertions::assert_eq!(
+      merge_resolve(first, second),
+      Resolve {
+        alias: Some(Alias::OverwriteToNoAlias),
         ..Default::default()
       }
     )

@@ -1,0 +1,14 @@
+it("should have runtime __webpack_require__.f.j", async () => {
+	// Don't really call it, it will cause error in runtime
+	() => {
+		__webpack_chunk_load__("main");
+	};
+	const path = require("path");
+	const fs = require("fs");
+	const code = await fs.promises.readFile(path.resolve(__dirname, "runtime.js"), "utf-8");
+	if (__RSPACK_TEST_RUNTIME_MODE_RSPACK__) {
+		expect(code.includes("ensureChunkHandlers.j")).toBe(true);
+	} else {
+		expect(code.includes("__webpack_require__.f.j")).toBe(true);
+	}
+})

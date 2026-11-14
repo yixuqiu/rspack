@@ -1,124 +1,238 @@
-import type { RspackCLI } from "../rspack-cli";
-import type { RspackDevServer as RspackDevServerType } from "@rspack/dev-server";
-import { RspackCommand } from "../types";
+import type {
+  Compiler,
+  DevServer,
+  MultiCompiler,
+  MultiRspackOptions,
+} from '@rspack/core';
+import { rspack } from '@rspack/core';
+// @ts-ignore
+import type { RspackDevServer as RspackDevServerType } from '@rspack/dev-server';
+import type { RspackCLI } from '../cli';
+import { DEFAULT_SERVER_HOT } from '../constants';
+import type { RspackCommand } from '../types';
 import {
-	commonOptions,
-	ensureEnvObject,
-	setBuiltinEnvArg
-} from "../utils/options";
-import { Compiler, DevServer } from "@rspack/core";
+  type CommonOptionsForBuildAndServe,
+  commonOptions,
+  commonOptionsForBuildAndServe,
+  normalizeCommonOptions,
+  setDefaultNodeEnv,
+} from '../utils/options';
+
+type ServerOptions = CommonOptionsForBuildAndServe & {
+  hot?: boolean | 'only';
+  port?: number | string;
+  host?: string;
+  open?: boolean | string;
+};
+
+function normalizeHotOption(
+  value: boolean | 'true' | 'false' | 'only' | undefined,
+): ServerOptions['hot'] {
+  if (value === 'false') {
+    return false;
+  }
+  if (value === 'true') {
+    return true;
+  }
+  return value;
+}
 
 export class ServeCommand implements RspackCommand {
-	async apply(cli: RspackCLI): Promise<void> {
-		cli.program.command(
-			["serve", "server", "s", "dev"],
-			"run the rspack dev server.",
-			commonOptions,
-			async options => {
-				setBuiltinEnvArg(ensureEnvObject(options), "SERVE", true);
-				const rspackOptions = {
-					...options,
-					argv: {
-						...options
-					}
-				};
-				/**
-				 * webpack-dev-server will set `process.env.WEBPACK_SERVE` to true
-				 * when its module is imported, so we have to lazy load the package
-				 * to make sure the envvar is not set on build mode.
-				 * when run in serve mode, we have to load the package before config
-				 * module is imported so that the envvar `process.env.WEBPACK_SERVE`
-				 * got in config module could be `true`.
-				 * related issue: https://github.com/web-infra-dev/rspack/issues/6359
-				 */
-				const { RspackDevServer } = await import("@rspack/dev-server");
+  apply(cli: RspackCLI): void {
+    const command = cli.program
+      .command('serve', 'run the rspack dev server.')
+      .alias('server')
+      .alias('s')
+      .alias('dev');
 
-				const compiler = await cli.createCompiler(rspackOptions, "serve");
-				if (!compiler) return;
-				const compilers = cli.isMultipleCompiler(compiler)
-					? compiler.compilers
-					: [compiler];
-				const possibleCompilers = compilers.filter(
-					(compiler: Compiler) => compiler.options.devServer
-				);
+    commonOptionsForBuildAndServe(commonOptions(command))
+      .option('--hot [mode]', 'enables hot module replacement')
+      .option('--port <port>', 'allows to specify a port to use')
+      .option('--host <host>', 'allows to specify a hostname to use')
+      .option(
+        '--open [value]',
+        'open browser on server start; pass --no-open to disable, or --open <url> to open a specific URL',
+      );
 
-				const usedPorts: number[] = [];
-				const servers: RspackDevServerType[] = [];
+    command.action(
+      cli.wrapAction(async (cliOptions: ServerOptions) => {
+        setDefaultNodeEnv(cliOptions, 'development');
+        normalizeCommonOptions(cliOptions, 'serve');
+        cliOptions.hot = normalizeHotOption(cliOptions.hot);
 
-				/**
-				 * Webpack uses an Array of compilerForDevServer,
-				 * however according to it's doc https://webpack.js.org/configuration/dev-server/#devserverhot
-				 * It should use only the first one
-				 *
-				 * Choose the one for configure devServer
-				 */
-				const compilerForDevServer =
-					possibleCompilers.length > 0 ? possibleCompilers[0] : compilers[0];
+        // Lazy import @rspack/dev-server to avoid loading it on build mode
+        let RspackDevServer: new (
+          options: DevServer,
+          compiler: MultiCompiler | Compiler,
+        ) => RspackDevServerType;
+        try {
+          const devServerModule = await import('@rspack/dev-server');
+          RspackDevServer = devServerModule.RspackDevServer;
+        } catch (error: unknown) {
+          const logger = cli.getLogger();
+          if (
+            (error as Error & { code?: string })?.code === 'MODULE_NOT_FOUND' ||
+            (error as Error & { code?: string })?.code ===
+              'ERR_MODULE_NOT_FOUND'
+          ) {
+            logger.error(
+              'The "@rspack/dev-server" package is required to use the serve command.\n' +
+                'Please install it by running:\n' +
+                '  pnpm add -D @rspack/dev-server\n' +
+                '  or\n' +
+                '  npm install -D @rspack/dev-server',
+            );
+          } else {
+            logger.error(
+              'Failed to load "@rspack/dev-server":\n' +
+                ((error as Error)?.message || String(error)),
+            );
+          }
+          process.exit(1);
+        }
 
-				/**
-				 * Rspack relies on devServer.hot to enable HMR
-				 */
-				for (const compiler of compilers) {
-					const devServer = (compiler.options.devServer ??= {});
-					devServer.hot ??= true;
-					if (devServer.client !== false) {
-						if (devServer.client === true || devServer.client == null) {
-							devServer.client = {};
-						}
-						devServer.client = {
-							overlay: {
-								errors: true,
-								warnings: false
-							},
-							...devServer.client
-						};
-					}
-				}
+        const userConfig = await cli.buildCompilerConfig(cliOptions, 'serve');
+        const compiler = await cli.createCompiler(userConfig);
+        if (!compiler) {
+          return;
+        }
+        const isMultiCompiler = cli.isMultipleCompiler(compiler);
 
-				const result = (compilerForDevServer.options.devServer ??= {});
-				/**
-				 * Enable this to tell Rspack that we need to enable React Refresh by default
-				 */
-				result.hot ??= true;
-				if (result.client !== false) {
-					if (result.client === true || result.client == null) {
-						result.client = {};
-					}
-					result.client = {
-						overlay: {
-							errors: true,
-							warnings: false
-						},
-						...result.client
-					};
-				}
+        const compilers = isMultiCompiler ? compiler.compilers : [compiler];
+        const userConfigs = isMultiCompiler
+          ? (userConfig as MultiRspackOptions)
+          : ([userConfig] as MultiRspackOptions);
 
-				const devServerOptions = result as DevServer;
-				if (devServerOptions.port) {
-					const portNumber = Number(devServerOptions.port);
+        const possibleCompilers = compilers.filter(
+          (compiler: Compiler) => compiler.options.devServer,
+        );
 
-					if (usedPorts.find(port => portNumber === port)) {
-						throw new Error(
-							"Unique ports must be specified for each devServer option in your rspack configuration. Alternatively, run only 1 devServer config using the --config-name flag to specify your desired config."
-						);
-					}
+        const usedPorts: number[] = [];
+        const servers: RspackDevServerType[] = [];
 
-					usedPorts.push(portNumber);
-				}
+        /**
+         * webpack uses an Array of compilerForDevServer,
+         * however according to it's doc https://webpack.js.org/configuration/dev-server/#devserverhot
+         * It should use only the first one
+         *
+         * Choose the one for configure devServer
+         */
+        const compilerForDevServer =
+          possibleCompilers.length > 0 ? possibleCompilers[0] : compilers[0];
 
-				try {
-					const server = new RspackDevServer(devServerOptions, compiler);
+        /**
+         * Rspack relies on devServer.hot to enable HMR
+         */
+        for (const [index, compiler] of compilers.entries()) {
+          const userConfig = userConfigs[index];
+          const existingDevServer = compiler.options.devServer;
+          if (existingDevServer === false) {
+            continue;
+          }
 
-					await server.start();
+          const devServer: DevServer =
+            existingDevServer ?? (compiler.options.devServer = {});
+          const isWebAppOnly =
+            compiler.platform.web &&
+            !compiler.platform.node &&
+            !compiler.platform.nwjs &&
+            !compiler.platform.electron &&
+            !compiler.platform.webworker;
 
-					servers.push(server);
-				} catch (error) {
-					const logger = cli.getLogger();
-					logger.error(error);
+          if (isWebAppOnly && userConfig.lazyCompilation === undefined) {
+            compiler.options.lazyCompilation = {
+              imports: true,
+              entries: false,
+            };
+          }
 
-					process.exit(2);
-				}
-			}
-		);
-	}
+          devServer.hot = cliOptions.hot ?? devServer.hot ?? DEFAULT_SERVER_HOT;
+
+          if (devServer.client !== false) {
+            if (devServer.client === true || devServer.client == null) {
+              devServer.client = {};
+            }
+            devServer.client = {
+              overlay: {
+                errors: true,
+                warnings: false,
+              },
+              ...devServer.client,
+            };
+          }
+        }
+
+        const compilerForDevServerOptions =
+          compilerForDevServer.options.devServer;
+        const devServerOptions: DevServer =
+          compilerForDevServerOptions === false
+            ? {}
+            : (compilerForDevServerOptions ??
+              (compilerForDevServer.options.devServer = {}));
+        const { setupMiddlewares } = devServerOptions;
+
+        const lazyCompileMiddleware =
+          rspack.lazyCompilationMiddleware(compiler);
+
+        devServerOptions.setupMiddlewares = (middlewares, server) => {
+          let finalMiddlewares = middlewares;
+          if (setupMiddlewares) {
+            finalMiddlewares = setupMiddlewares(finalMiddlewares, server);
+          }
+          return [...finalMiddlewares, lazyCompileMiddleware];
+        };
+
+        /**
+         * Enable this to tell Rspack that we need to enable React Refresh by default
+         */
+        devServerOptions.hot =
+          cliOptions.hot ?? devServerOptions.hot ?? DEFAULT_SERVER_HOT;
+        devServerOptions.host = cliOptions.host || devServerOptions.host;
+        devServerOptions.port = cliOptions.port ?? devServerOptions.port;
+        if (cliOptions.open !== undefined) {
+          devServerOptions.open = cliOptions.open;
+        }
+        if (devServerOptions.client !== false) {
+          if (
+            devServerOptions.client === true ||
+            devServerOptions.client == null
+          ) {
+            devServerOptions.client = {};
+          }
+          devServerOptions.client = {
+            overlay: {
+              errors: true,
+              warnings: false,
+            },
+            ...devServerOptions.client,
+          };
+        }
+
+        if (devServerOptions.port) {
+          const portNumber = Number(devServerOptions.port);
+
+          if (!Number.isNaN(portNumber)) {
+            if (usedPorts.find((port) => portNumber === port)) {
+              throw new Error(
+                'Unique ports must be specified for each devServer option in your rspack configuration. Alternatively, run only 1 devServer config using the --config-name flag to specify your desired config.',
+              );
+            }
+
+            usedPorts.push(portNumber);
+          }
+        }
+
+        try {
+          const server = new RspackDevServer(devServerOptions, compiler);
+          await server.start();
+          servers.push(server);
+        } catch (error) {
+          const logger = cli.getLogger();
+          logger.error(error);
+
+          process.exit(2);
+        }
+      }),
+    );
+  }
 }

@@ -1,42 +1,21 @@
 use std::{ffi::CString, ptr};
 
-use napi::{bindgen_prelude::*, sys::napi_value, Env, Error, Result};
-use rspack_error::{
-  miette::{self, Diagnostic},
-  thiserror::{self, Error},
-};
+use napi::{Env, Error, bindgen_prelude::*, sys::napi_value};
+use rspack_error::Error as RspackError;
 
-#[derive(Debug, Error, Diagnostic)]
-#[diagnostic()]
-#[error("{0}\n{1}")]
-struct NodeError(String, String);
-
-pub trait NapiErrorExt {
-  fn into_rspack_error(self) -> rspack_error::Error;
-  fn into_rspack_error_with_detail(self, env: &Env) -> rspack_error::Error;
+pub trait NapiErrorToRspackErrorExt {
+  fn to_rspack_error(self, env: &Env) -> RspackError;
 }
 
-pub trait NapiResultExt<T> {
-  fn into_rspack_result(self) -> rspack_error::Result<T>;
-  fn into_rspack_result_with_detail(self, env: &Env) -> rspack_error::Result<T>;
-}
-
-impl NapiErrorExt for Error {
-  fn into_rspack_error(self) -> rspack_error::Error {
-    NodeError(self.reason, "".to_string()).into()
-  }
-  fn into_rspack_error_with_detail(self, env: &Env) -> rspack_error::Error {
-    let (reason, backtrace) = extract_stack_or_message_from_napi_error(env, self);
-    NodeError(reason, backtrace.unwrap_or_default()).into()
-  }
-}
-
-impl<T: 'static> NapiResultExt<T> for Result<T> {
-  fn into_rspack_result(self) -> rspack_error::Result<T> {
-    self.map_err(|e| e.into_rspack_error())
-  }
-  fn into_rspack_result_with_detail(self, env: &Env) -> rspack_error::Result<T> {
-    self.map_err(|e| e.into_rspack_error_with_detail(env))
+impl NapiErrorToRspackErrorExt for Error {
+  fn to_rspack_error(self, env: &Env) -> RspackError {
+    let (reason, stack, backtrace, hide_stack, code) =
+      extract_stack_or_message_from_napi_error(env, self);
+    let mut err = RspackError::error(format!("{reason}\n{}", backtrace.unwrap_or_default()));
+    err.stack = stack;
+    err.hide_stack = hide_stack;
+    err.code = code;
+    err
   }
 }
 
@@ -47,21 +26,48 @@ const fn get_backtrace() -> Option<String> {
 /// Extract stack or message from a native Node error object,
 /// otherwise we try to format the error from the given `Error` object that indicates which was created on the Rust side.
 #[inline(always)]
-fn extract_stack_or_message_from_napi_error(env: &Env, err: Error) -> (String, Option<String>) {
+fn extract_stack_or_message_from_napi_error(
+  env: &Env,
+  err: Error,
+) -> (
+  String,
+  Option<String>,
+  Option<String>,
+  Option<bool>,
+  Option<String>,
+) {
   let maybe_reason = err.reason.clone();
   match unsafe { ToNapiValue::to_napi_value(env.raw(), err) } {
-    Ok(napi_error) => match try_extract_string_value_from_property(env, napi_error, "stack") {
-      Err(_) => match try_extract_string_value_from_property(env, napi_error, "message") {
-        Err(e) => (format!("Unknown NAPI error {e}"), get_backtrace()),
-        Ok(message) => (message, get_backtrace()),
-      },
-      Ok(message) => (message, get_backtrace()),
-    },
+    Ok(napi_error) => {
+      let hide_stack = try_extract_string_value_from_property(env, napi_error, "hideStack")
+        .ok()
+        .map(|r| r == "true");
+      let message = match try_extract_string_value_from_property(env, napi_error, "message") {
+        Err(e) => format!("Unknown NAPI error {e}"),
+        Ok(message) => message,
+      };
+      let stack = try_extract_string_value_from_property(env, napi_error, "stack").ok();
+      let code = try_extract_string_value_from_property(env, napi_error, "code").ok();
+      (
+        if hide_stack.unwrap_or_default() {
+          message
+        } else {
+          stack.clone().unwrap_or(message)
+        },
+        stack,
+        get_backtrace(),
+        hide_stack,
+        code,
+      )
+    }
     Err(e) if maybe_reason.is_empty() => (
       format!("Failed to extract NAPI error stack or message: {e}"),
+      None,
       get_backtrace(),
+      None,
+      None,
     ),
-    Err(_) => (maybe_reason, None),
+    Err(_) => (maybe_reason, None, None, None, None),
   }
 }
 

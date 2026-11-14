@@ -1,66 +1,71 @@
 use itertools::Itertools;
 use rspack_core::{
+  Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext, RuntimeTemplate,
   impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  ChunkUkey, Compilation, RuntimeGlobals, RuntimeModule,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
-pub struct RuntimeIdRuntimeModule {
-  id: Identifier,
-  chunk: Option<ChunkUkey>,
+#[derive(Debug)]
+pub struct RuntimeIdRuntimeModule {}
+
+impl RuntimeIdRuntimeModule {
+  pub fn new(runtime_template: &RuntimeTemplate) -> Self {
+    Self::with_default(runtime_template)
+  }
 }
 
-impl Default for RuntimeIdRuntimeModule {
-  fn default() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/runtime_id"),
-      chunk: None,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
+#[async_trait::async_trait]
+impl RuntimeModule for RuntimeIdRuntimeModule {
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
+  }
+
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define: { RuntimeGlobals::RUNTIME_ID },
+      ..Default::default()
     }
   }
-}
 
-impl RuntimeModule for RuntimeIdRuntimeModule {
-  fn attach(&mut self, chunk: ChunkUkey) {
-    self.chunk = Some(chunk);
-  }
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
+    if let Some(chunk_ukey) = self.chunk() {
+      let chunk = compilation
+        .build_chunk_graph_artifact
+        .chunk_by_ukey
+        .expect_get(&chunk_ukey);
 
-  fn name(&self) -> Identifier {
-    self.id
-  }
-
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    if let Some(chunk_ukey) = self.chunk {
-      let chunk = compilation.chunk_by_ukey.expect_get(&chunk_ukey);
-
-      let runtime = &chunk.runtime;
+      let runtime = chunk.runtime();
 
       if runtime.len() > 1 {
         panic!("RuntimeIdRuntimeModule must be in a single runtime");
       }
 
-      let id = compilation.chunk_graph.get_runtime_id(
-        runtime
-          .iter()
-          .collect_vec()
-          .first()
-          .expect("At least one runtime")
-          .to_string(),
-      );
+      let id = compilation
+        .build_chunk_graph_artifact
+        .chunk_graph
+        .get_runtime_id(
+          runtime
+            .iter()
+            .collect_vec()
+            .first()
+            .expect("At least one runtime"),
+        );
 
-      Ok(
-        RawSource::from(format!(
-          "{} = {};",
-          RuntimeGlobals::RUNTIME_ID,
-          serde_json::to_string(&id).expect("Invalid json string")
-        ))
-        .boxed(),
-      )
+      Ok(format!(
+        "{} = {};",
+        context
+          .runtime_template
+          .render_runtime_global_definition(&RuntimeGlobals::RUNTIME_ID),
+        id.as_deref()
+          .map_or_else(|| "null".to_string(), rspack_util::json_stringify_str)
+      ))
     } else {
       unreachable!("should attach chunk for css_loading")
     }

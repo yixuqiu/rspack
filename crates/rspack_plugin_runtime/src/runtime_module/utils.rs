@@ -1,122 +1,112 @@
-use indexmap::{IndexMap, IndexSet};
-use itertools::Itertools;
+use std::fmt::Write as _;
+
 use rspack_core::{
-  get_chunk_from_ukey, get_js_chunk_filename_template, stringify_map, Chunk, ChunkKind,
-  ChunkLoading, ChunkUkey, Compilation, PathData, SourceType,
+  Chunk, ChunkLoading, ChunkLoadingType, ChunkUkey, Compilation, PathData, RuntimeCodeTemplate,
+  RuntimeVariable, SourceType,
+  chunk_graph_chunk::{ChunkId, ChunkIdSet},
+  get_js_chunk_filename_template, get_undo_path,
 };
-use rspack_util::test::{
-  HOT_TEST_ACCEPT, HOT_TEST_DISPOSE, HOT_TEST_OUTDATED, HOT_TEST_RUNTIME, HOT_TEST_UPDATED,
+use rspack_error::Result;
+use rspack_util::{
+  fx_hash::{FxIndexMap, FxIndexSet},
+  test::is_hot_test,
 };
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub fn get_initial_chunk_ids(
   chunk: Option<ChunkUkey>,
   compilation: &Compilation,
   filter_fn: impl Fn(&ChunkUkey, &Compilation) -> bool,
-) -> HashSet<String> {
+) -> ChunkIdSet {
   match chunk {
-    Some(chunk_ukey) => match get_chunk_from_ukey(&chunk_ukey, &compilation.chunk_by_ukey) {
+    Some(chunk_ukey) => match compilation
+      .build_chunk_graph_artifact
+      .chunk_by_ukey
+      .get(&chunk_ukey)
+    {
       Some(chunk) => {
         let mut js_chunks = chunk
-          .get_all_initial_chunks(&compilation.chunk_group_by_ukey)
+          .get_all_initial_chunks(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
           .iter()
           .filter(|key| !(chunk_ukey.eq(key) || filter_fn(key, compilation)))
           .map(|chunk_ukey| {
-            let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
-            chunk.expect_id().to_string()
+            let chunk = compilation
+              .build_chunk_graph_artifact
+              .chunk_by_ukey
+              .expect_get(chunk_ukey);
+            chunk.expect_id().clone()
           })
-          .collect::<HashSet<_>>();
-        js_chunks.insert(chunk.expect_id().to_string());
+          .collect::<ChunkIdSet>();
+        js_chunks.insert(chunk.expect_id().clone());
         js_chunks
       }
-      None => HashSet::default(),
+      None => ChunkIdSet::default(),
     },
-    None => HashSet::default(),
+    None => ChunkIdSet::default(),
   }
 }
 
-pub fn stringify_chunks(chunks: &HashSet<String>, value: u8) -> String {
-  let mut v = Vec::from_iter(chunks.iter());
+pub fn stringify_chunks(chunks: &ChunkIdSet, value: u8) -> String {
+  let mut v = chunks.iter().collect::<Vec<_>>();
   v.sort_unstable();
 
-  format!(
-    r#"{{{}}}"#,
-    v.iter().fold(String::new(), |prev, cur| {
-      prev
-        + format!(
-          r#"{}: {value},"#,
-          serde_json::to_string(cur).expect("chunk to_string failed")
-        )
-        .as_str()
-    })
-  )
+  let mut result = String::with_capacity(v.len() * 8 + 2);
+  result.push('{');
+  for chunk_id in v {
+    let key = rspack_util::json_stringify(chunk_id);
+    result.reserve(key.len() + 4);
+    result.push_str(&key);
+    result.push_str(": ");
+    write!(result, "{value},").expect("infallible write to String");
+  }
+  result.push('}');
+  result
 }
 
-pub fn chunk_has_js(chunk_ukey: &ChunkUkey, compilation: &Compilation) -> bool {
-  if compilation
-    .chunk_graph
-    .get_number_of_entry_modules(chunk_ukey)
-    > 0
-  {
-    return true;
-  }
+pub fn render_hmr_runtime_state_expression(
+  runtime_template: &RuntimeCodeTemplate,
+  key: &str,
+) -> String {
+  runtime_template.render_hmr_runtime_state_expression(key)
+}
 
-  !compilation
-    .chunk_graph
-    .get_chunk_modules_by_source_type(
-      chunk_ukey,
-      SourceType::JavaScript,
-      &compilation.get_module_graph(),
-    )
-    .is_empty()
+// renders the hmr state expression of whichever chunk loading runtime is
+// active for the chunk; falls back to jsonp for custom loaders (consumers
+// guard with typeof, so an absent state just reads as not loaded)
+pub fn render_chunk_loading_hmr_state_expression(
+  runtime_template: &RuntimeCodeTemplate,
+  chunk_ukey: &ChunkUkey,
+  compilation: &Compilation,
+) -> String {
+  let chunk_loading = compilation
+    .build_chunk_graph_artifact
+    .chunk_by_ukey
+    .get(chunk_ukey)
+    .and_then(|chunk| {
+      chunk.get_entry_options(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
+    })
+    .and_then(|options| options.chunk_loading.as_ref())
+    .unwrap_or(&compilation.options.output.chunk_loading);
+  let key = match chunk_loading {
+    ChunkLoading::Enable(ChunkLoadingType::Import) => "module",
+    ChunkLoading::Enable(ChunkLoadingType::ImportScripts) => "importScripts",
+    ChunkLoading::Enable(ChunkLoadingType::Require) => "require",
+    ChunkLoading::Enable(ChunkLoadingType::AsyncNode) => "readFileVm",
+    ChunkLoading::Enable(ChunkLoadingType::Jsonp) => "jsonp",
+    ChunkLoading::Enable(ChunkLoadingType::Custom(_)) => "custom",
+    // A Fallback value While Chunk loading disable, HMR throw Error in Browser.
+    ChunkLoading::Disable => "disable",
+  };
+  render_hmr_runtime_state_expression(runtime_template, key)
 }
 
 pub fn chunk_has_css(chunk: &ChunkUkey, compilation: &Compilation) -> bool {
-  !compilation
+  compilation
+    .build_chunk_graph_artifact
     .chunk_graph
-    .get_chunk_modules_by_source_type(chunk, SourceType::Css, &compilation.get_module_graph())
-    .is_empty()
+    .has_chunk_module_by_source_type(chunk, SourceType::Css, compilation.get_module_graph())
 }
 
-pub fn get_undo_path(filename: &str, p: String, enforce_relative: bool) -> String {
-  let mut depth: i32 = -1;
-  let mut append = String::new();
-  let mut p = p;
-  if p.ends_with('/') || p.ends_with('\\') {
-    p.pop();
-  }
-  for part in filename.split(&['/', '\\']) {
-    if part == ".." {
-      if depth > -1 {
-        depth -= 1
-      } else {
-        let pos = match (p.rfind('/'), p.rfind('\\')) {
-          (None, None) => {
-            p.push('/');
-            return p;
-          }
-          (None, Some(j)) => j,
-          (Some(i), None) => i,
-          (Some(i), Some(j)) => usize::max(i, j),
-        };
-        append = format!("{}/{append}", &p[pos + 1..]);
-        p = p[0..pos].to_string();
-      }
-    } else if part != "." {
-      depth += 1;
-    }
-  }
-
-  if depth > 0 {
-    format!("{}{append}", "../".repeat(depth as usize))
-  } else if enforce_relative {
-    format!("./{append}")
-  } else {
-    append
-  }
-}
-
-pub fn get_output_dir(
+pub async fn get_output_dir(
   chunk: &Chunk,
   compilation: &Compilation,
   enforce_relative: bool,
@@ -124,20 +114,29 @@ pub fn get_output_dir(
   let filename = get_js_chunk_filename_template(
     chunk,
     &compilation.options.output,
-    &compilation.chunk_group_by_ukey,
+    &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
   );
-  let output_dir = compilation.get_path(
-    filename,
-    PathData::default().chunk(chunk).content_hash_optional(
-      chunk
-        .content_hash
-        .get(&SourceType::JavaScript)
-        .map(|i| i.rendered(compilation.options.output.hash_digest_length)),
-    ),
-  )?;
+  let output_dir = compilation
+    .get_path(
+      &filename,
+      PathData::default()
+        .chunk(chunk.ukey(), compilation)
+        .chunk_id_optional(chunk.id().map(|id| id.as_str()))
+        .chunk_hash_optional(chunk.rendered_hash(
+          &compilation.chunk_hashes_artifact,
+          compilation.options.output.hash_digest_length,
+        ))
+        .chunk_name_optional(chunk.name_for_filename_template())
+        .content_hash_optional(chunk.rendered_content_hash_by_source_type(
+          &compilation.chunk_hashes_artifact,
+          &SourceType::JavaScript,
+          compilation.options.output.hash_digest_length,
+        )),
+    )
+    .await?;
   Ok(get_undo_path(
     output_dir.as_str(),
-    compilation.options.output.path.display().to_string(),
+    compilation.options.output.path.as_str().to_string(),
     enforce_relative,
   ))
 }
@@ -147,131 +146,201 @@ pub fn is_enabled_for_chunk(
   expected: &ChunkLoading,
   compilation: &Compilation,
 ) -> bool {
-  let chunk_loading = get_chunk_from_ukey(chunk_ukey, &compilation.chunk_by_ukey)
-    .and_then(|chunk| chunk.get_entry_options(&compilation.chunk_group_by_ukey))
+  let chunk_loading = compilation
+    .build_chunk_graph_artifact
+    .chunk_by_ukey
+    .get(chunk_ukey)
+    .and_then(|chunk| {
+      chunk.get_entry_options(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
+    })
     .and_then(|options| options.chunk_loading.as_ref())
     .unwrap_or(&compilation.options.output.chunk_loading);
   chunk_loading == expected
 }
 
-pub fn unquoted_stringify(chunk: &Chunk, str: &String) -> String {
-  if let Some(chunk_id) = &chunk.id {
-    if str.len() >= 5 && str == chunk_id {
-      return "\" + chunkId + \"".to_string();
-    }
+pub fn unquoted_stringify(chunk_id: Option<&ChunkId>, str: &str) -> String {
+  if let Some(chunk_id) = chunk_id
+    && str.len() >= 5
+    && str == chunk_id.as_str()
+  {
+    return "\" + chunkId + \"".to_string();
   }
-  let result = serde_json::to_string(&str).expect("invalid json to_string");
+  let result = rspack_util::json_stringify_str(str);
   result[1..result.len() - 1].to_string()
 }
 
 pub fn stringify_dynamic_chunk_map<F>(
   f: F,
-  chunks: &IndexSet<&ChunkUkey>,
-  chunk_map: &IndexMap<&ChunkUkey, &Chunk>,
+  chunks: &FxIndexSet<ChunkUkey>,
+  chunk_map: &FxIndexMap<ChunkUkey, &Chunk>,
 ) -> String
 where
   F: Fn(&Chunk) -> Option<String>,
 {
-  let mut result = HashMap::default();
+  let mut entries = Vec::with_capacity(chunks.len());
   let mut use_id = false;
-  let mut last_key = None;
-  let mut entries = 0;
 
   for chunk_ukey in chunks.iter() {
-    if let Some(chunk) = chunk_map.get(chunk_ukey) {
-      if let Some(chunk_id) = &chunk.id {
-        if let Some(value) = f(chunk) {
-          if value == *chunk_id {
-            use_id = true;
-          } else {
-            result.insert(
-              chunk_id.clone(),
-              serde_json::to_string(&value).expect("invalid json to_string"),
-            );
-            last_key = Some(chunk_id.clone());
-            entries += 1;
-          }
-        }
+    if let Some(chunk) = chunk_map.get(chunk_ukey)
+      && let Some(chunk_id) = chunk.id()
+      && let Some(value) = f(chunk)
+    {
+      if value.as_str() == chunk_id.as_str() {
+        use_id = true;
+      } else {
+        entries.push((chunk_id, rspack_util::json_stringify_str(&value)));
       }
     }
   }
 
-  let content = if entries == 0 {
-    "chunkId".to_string()
-  } else if entries == 1 {
-    if let Some(last_key) = last_key {
+  let content = match entries.as_mut_slice() {
+    [] => "chunkId".to_string(),
+    [(chunk_id, value)] => {
       if use_id {
         format!(
           "(chunkId === {} ? {} : chunkId)",
-          serde_json::to_string(&last_key).expect("invalid json to_string"),
-          result.get(&last_key).expect("cannot find last key value")
+          rspack_util::json_stringify(*chunk_id),
+          value
         )
       } else {
-        result
-          .get(&last_key)
-          .expect("cannot find last key value")
-          .clone()
+        value.clone()
       }
-    } else {
-      unreachable!();
     }
-  } else if use_id {
-    format!("({}[chunkId] || chunkId)", stringify_map(&result))
-  } else {
-    format!("{}[chunkId]", stringify_map(&result))
+    entries => {
+      let map = stringify_map(entries);
+      if use_id {
+        format!("({map}[chunkId] || chunkId)")
+      } else {
+        format!("{map}[chunkId]")
+      }
+    }
   };
   format!("\" + {content} + \"")
 }
 
-pub fn stringify_static_chunk_map(filename: &String, chunk_ids: &[&String]) -> String {
+pub fn stringify_static_chunk_map(filename: &str, chunk_ids: &[&ChunkId]) -> String {
   let condition = if chunk_ids.len() == 1 {
-    format!(
-      "chunkId === {}",
-      serde_json::to_string(&chunk_ids.first()).expect("invalid json to_string")
-    )
+    let mut condition = String::from("chunkId === ");
+    let chunk_id = chunk_ids.first().expect("should have one chunk id");
+    condition.push_str(&rspack_util::json_stringify(*chunk_id));
+    condition
   } else {
-    let content = chunk_ids
-      .iter()
-      .sorted_unstable()
-      .map(|chunk_id| {
-        format!(
-          "{}:1",
-          serde_json::to_string(chunk_id).expect("invalid json to_string")
-        )
-      })
-      .join(",");
-    format!("{{ {} }}[chunkId]", content)
+    let mut sorted_chunk_ids = chunk_ids.to_vec();
+    sorted_chunk_ids.sort_unstable();
+
+    let mut condition = String::with_capacity(sorted_chunk_ids.len() * 8 + 14);
+    condition.push('{');
+    condition.push(' ');
+    for (idx, chunk_id) in sorted_chunk_ids.iter().enumerate() {
+      if idx != 0 {
+        condition.push(',');
+      }
+      let key = rspack_util::json_stringify(*chunk_id);
+      condition.reserve(key.len() + 2);
+      condition.push_str(&key);
+      condition.push_str(":1");
+    }
+    condition.push_str(" }[chunkId]");
+    condition
   };
-  format!("if ({}) return {};", condition, filename)
+  let mut result = String::with_capacity(condition.len() + filename.len() + 14);
+  result.push_str("if (");
+  result.push_str(&condition);
+  result.push_str(") return ");
+  result.push_str(filename);
+  result.push(';');
+  result
 }
 
-pub fn create_fake_chunk(
-  id: Option<String>,
-  name: Option<String>,
-  rendered_hash: Option<String>,
-) -> Chunk {
-  let mut fake_chunk = Chunk::new(None, ChunkKind::Normal);
-  fake_chunk.name = name;
-  fake_chunk.rendered_hash = rendered_hash.map(|h| h.into());
-  fake_chunk.id = id;
-  fake_chunk
+fn stringify_map<T: std::fmt::Display>(entries: &mut [(&ChunkId, T)]) -> String {
+  entries.sort_unstable_by_key(|(left, _)| *left);
+
+  let mut result = String::with_capacity(entries.len() * 8 + 2);
+  result.push('{');
+  for (chunk_id, value) in entries.iter() {
+    let key = rspack_util::json_stringify(*chunk_id);
+    result.reserve(key.len() + 4);
+    result.push_str(&key);
+    result.push_str(": ");
+    write!(result, "{value},").expect("infallible write to String");
+  }
+  result.push('}');
+  result
 }
 
-#[test]
-fn test_get_undo_path() {
-  assert_eq!(get_undo_path("a", "/a/b/c".to_string(), true), "./");
-  assert_eq!(
-    get_undo_path("static/js/a.js", "/a/b/c".to_string(), false),
-    "../../"
-  );
+pub fn generate_javascript_hmr_runtime(
+  key: &str,
+  method: &str,
+  runtime_template: &RuntimeCodeTemplate,
+) -> Result<String> {
+  runtime_template.render(
+    key,
+    Some(serde_json::json!({
+      "_loading_method": method,
+      "_installed_chunks": format!("{method}InstalledChunks"),
+      "_loaded_chunk_state": if matches!(method, "require" | "importScripts") { 1 } else { 0 },
+      "_load_update_chunk": format!("{method}LoadUpdateChunk"),
+      "_install_full_chunks": match method {
+        "jsonp" => "__rspack_jsonp(0, [fullChunkIds, {}])".to_string(),
+        "importScripts" => "importScriptsInstallChunk([fullChunkIds, {}])".to_string(),
+        "module" => format!("moduleInstallChunk({{ __rspack_esm_ids: fullChunkIds, {}: {{}} }})", runtime_template.render_runtime_variable(&RuntimeVariable::Modules)),
+        _ => format!("{method}InstallChunk({{ ids: fullChunkIds, modules: {{}} }})"),
+      },
+      "_is_hot_test": is_hot_test(),
+    })),
+  )
 }
 
-pub fn generate_javascript_hmr_runtime(method: &str) -> String {
-  include_str!("runtime/javascript_hot_module_replacement.js")
-    .replace("$key$", method)
-    .replace("$HOT_TEST_OUTDATED$", &HOT_TEST_OUTDATED)
-    .replace("$HOT_TEST_DISPOSE$", &HOT_TEST_DISPOSE)
-    .replace("$HOT_TEST_UPDATED$", &HOT_TEST_UPDATED)
-    .replace("$HOT_TEST_RUNTIME$", &HOT_TEST_RUNTIME)
-    .replace("$HOT_TEST_ACCEPT$", &HOT_TEST_ACCEPT)
+#[cfg(test)]
+mod tests {
+  use rspack_core::chunk_graph_chunk::{ChunkId, ChunkIdSet};
+
+  use super::{stringify_chunks, stringify_map, stringify_static_chunk_map};
+
+  #[test]
+  fn stringify_chunks_keeps_sorted_numeric_ids() {
+    let mut chunks = ChunkIdSet::default();
+    chunks.insert(ChunkId::from("2"));
+    chunks.insert(ChunkId::from("10"));
+
+    assert_eq!(stringify_chunks(&chunks, 1), "{10: 1,2: 1,}");
+  }
+
+  #[test]
+  fn stringify_map_keeps_sorted_and_quoted_values() {
+    let chunk_a = ChunkId::from("a");
+    let chunk_b = ChunkId::from("b");
+    let mut entries = vec![
+      (&chunk_b, rspack_util::json_stringify_str("beta")),
+      (&chunk_a, rspack_util::json_stringify_str("alpha")),
+    ];
+
+    assert_eq!(
+      stringify_map(&mut entries),
+      r#"{"a": "alpha","b": "beta",}"#
+    );
+  }
+
+  #[test]
+  fn stringify_static_chunk_map_single_chunk_keeps_condition_shape() {
+    let filename = "\"style.css\"".to_string();
+    let chunk_id = ChunkId::from("main");
+
+    assert_eq!(
+      stringify_static_chunk_map(&filename, &[&chunk_id]),
+      r#"if (chunkId === "main") return "style.css";"#
+    );
+  }
+
+  #[test]
+  fn stringify_static_chunk_map_multiple_chunks_keeps_sorted_object_shape() {
+    let filename = "\"style.css\"".to_string();
+    let chunk_a = ChunkId::from("b");
+    let chunk_b = ChunkId::from("a");
+
+    assert_eq!(
+      stringify_static_chunk_map(&filename, &[&chunk_a, &chunk_b]),
+      r#"if ({ "a":1,"b":1 }[chunkId]) return "style.css";"#
+    );
+  }
 }

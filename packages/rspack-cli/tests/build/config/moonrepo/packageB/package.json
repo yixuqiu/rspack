@@ -1,7 +1,0 @@
-{
-  "name": "package-b",
-  "type":"module",
-  "dependencies": {
-    "test-deps": "2.0.0"
-  }
-}

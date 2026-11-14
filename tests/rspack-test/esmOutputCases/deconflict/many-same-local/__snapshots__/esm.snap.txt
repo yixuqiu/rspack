@@ -1,0 +1,50 @@
+```mjs title=main.mjs
+// ./a.js
+const value = 'a';
+const helper = value.toUpperCase();
+
+
+// ./b.js
+const b_value = 'b';
+const b_helper = b_value.toUpperCase();
+
+
+// ./c.js
+const c_value = 'c';
+const c_helper = c_value.toUpperCase();
+
+
+// ./d.js
+const d_value = 'd';
+const d_helper = d_value.toUpperCase();
+
+
+// ./e.js
+const e_value = 'e';
+const e_helper = e_value.toUpperCase();
+
+
+// ./index.js
+
+
+
+
+
+
+it('should deconflict many modules with same local variable names', async () => {
+	const mod = await import(/* webpackIgnore: true */ './main.mjs');
+	expect(mod.aValue).toBe('a');
+	expect(mod.aHelper).toBe('A');
+	expect(mod.bValue).toBe('b');
+	expect(mod.bHelper).toBe('B');
+	expect(mod.cValue).toBe('c');
+	expect(mod.cHelper).toBe('C');
+	expect(mod.dValue).toBe('d');
+	expect(mod.dHelper).toBe('D');
+	expect(mod.eValue).toBe('e');
+	expect(mod.eHelper).toBe('E');
+});
+
+export { b_helper as bHelper, b_value as bValue, c_helper as cHelper, c_value as cValue, d_helper as dHelper, d_value as dValue, e_helper as eHelper, e_value as eValue, helper as aHelper, value as aValue };
+
+```

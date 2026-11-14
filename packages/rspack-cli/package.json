@@ -1,51 +1,66 @@
 {
   "name": "@rspack/cli",
-  "version": "0.6.3",
-  "license": "MIT",
+  "version": "2.3.2",
   "description": "CLI for rspack",
-  "bin": {
-    "rspack": "./bin/rspack"
-  },
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "scripts": {
-    "build": "tsc -b ./tsconfig.build.json",
-    "dev": "tsc -b -w",
-    "test": "cross-env jest --runInBand"
-  },
-  "files": [
-    "bin",
-    "dist"
-  ],
-  "homepage": "https://rspack.dev",
+  "homepage": "https://rspack.rs",
   "bugs": "https://github.com/web-infra-dev/rspack/issues",
   "repository": {
     "type": "git",
     "url": "https://github.com/web-infra-dev/rspack",
     "directory": "packages/rspack-cli"
   },
-  "peerDependencies": {
-    "@rspack/core": ">=0.4.0"
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "rspack": "./bin/rspack.js"
+  },
+  "files": [
+    "bin",
+    "compiled",
+    "dist"
+  ],
+  "scripts": {
+    "build": "rs lib",
+    "dev": "rs lib -w",
+    "prepare": "prebundle",
+    "test": "rs test",
+    "test:configs": "tsc -p tests/tsconfig.configs.json"
   },
   "devDependencies": {
+    "@discoveryjs/json-ext": "catalog:",
+    "@microsoft/api-extractor": "catalog:",
+    "@rstackjs/load-config": "catalog:",
     "@rspack/core": "workspace:*",
-    "@types/rechoir": "^0.6.1",
-    "@types/semver": "^7.5.6",
-    "@types/webpack-bundle-analyzer": "^4.6.0",
-    "concat-stream": "^2.0.0",
-    "cross-env": "^7.0.3",
-    "execa": "^5.0.0",
-    "internal-ip": "6.2.0"
+    "@rspack/dev-server": "catalog:",
+    "cac": "catalog:",
+    "concat-stream": "catalog:",
+    "execa": "catalog:",
+    "exit-hook": "catalog:",
+    "jiti": "catalog:",
+    "prebundle": "catalog:",
+    "rspack-merge": "catalog:",
+    "rstack": "catalog:",
+    "typescript": "catalog:"
   },
-  "dependencies": {
-    "@discoveryjs/json-ext": "^0.5.7",
-    "@rspack/dev-server": "workspace:*",
-    "colorette": "2.0.19",
-    "exit-hook": "^3.2.0",
-    "interpret": "^3.1.1",
-    "rechoir": "^0.8.0",
-    "semver": "6.3.1",
-    "webpack-bundle-analyzer": "4.6.1",
-    "yargs": "17.6.2"
+  "peerDependencies": {
+    "@rspack/core": "^2.3.0-0",
+    "@rspack/dev-server": "^2.0.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@rspack/dev-server": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

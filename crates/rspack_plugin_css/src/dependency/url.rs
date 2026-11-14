@@ -1,30 +1,42 @@
-use once_cell::sync::Lazy;
-use regex::{Captures, Regex};
+use std::sync::LazyLock;
+
+use rspack_cacheable::{cacheable, cacheable_dyn};
 use rspack_core::{
-  AsContextDependency, CodeGenerationDataFilename, CodeGenerationDataUrl, Compilation, Dependency,
-  DependencyCategory, DependencyId, DependencyTemplate, DependencyType, ErrorSpan,
-  ModuleDependency, ModuleIdentifier, PublicPath, TemplateContext, TemplateReplaceSource,
+  AsContextDependency, CodeGenerationDataFilename, CodeGenerationDataUrl, Compilation,
+  CssExportType, Dependency, DependencyCategory, DependencyCodeGeneration, DependencyId,
+  DependencyRange, DependencyTemplate, DependencyTemplateType, DependencyType, ModuleDependency,
+  ModuleIdentifier, RuntimeSpec, TemplateContext, TemplateReplaceSource,
+};
+use rspack_hash::{RspackHasher, rspack_hash_object};
+use rspack_util::placeholder::PlaceholderFinder;
+
+use crate::{
+  css_syntax::serialize_url_value,
+  parser_and_generator::CssParserAndGenerator,
+  utils::{AUTO_PUBLIC_PATH_PLACEHOLDER, RUNTIME_PUBLIC_PATH_PLACEHOLDER, css_module_export_type},
 };
 
-use crate::utils::AUTO_PUBLIC_PATH_PLACEHOLDER;
+static ASSET_AUTO_PUBLIC_PATH_MATCHER: LazyLock<PlaceholderFinder> =
+  LazyLock::new(|| PlaceholderFinder::new("__RSPACK_PLUGIN_ASSET_AUTO_PUBLIC_PATH__"));
 
-#[derive(Debug, Clone)]
+/// An asset reference, for example `background: url("./logo.png")`.
+/// Resolves the asset module and replaces only the URL with its emitted URL.
+#[cacheable]
+#[derive(Debug)]
 pub struct CssUrlDependency {
   id: DependencyId,
   request: String,
-  span: Option<ErrorSpan>,
-  start: u32,
-  end: u32,
+  range: DependencyRange,
+  replace_function: bool,
 }
 
 impl CssUrlDependency {
-  pub fn new(request: String, span: Option<ErrorSpan>, start: u32, end: u32) -> Self {
+  pub fn new(request: String, range: DependencyRange, replace_function: bool) -> Self {
     Self {
       request,
-      span,
-      start,
-      end,
+      range,
       id: DependencyId::new(),
+      replace_function,
     }
   }
 
@@ -32,28 +44,50 @@ impl CssUrlDependency {
     &self,
     identifier: &ModuleIdentifier,
     compilation: &Compilation,
+    runtime_public_path: bool,
   ) -> Option<String> {
-    // TODO: how to handle if module related to multi runtime codegen
+    // url points to asset modules, and asset modules should have same codegen results for all runtimes
     let code_gen_result = compilation.code_generation_results.get_one(identifier);
-    if let Some(code_gen_result) = code_gen_result {
-      if let Some(url) = code_gen_result.data.get::<CodeGenerationDataUrl>() {
-        Some(url.inner().to_string())
-      } else if let Some(data) = code_gen_result.data.get::<CodeGenerationDataFilename>() {
-        let filename = data.filename();
-        let public_path = match data.public_path() {
-          PublicPath::String(p) => p,
-          PublicPath::Auto => AUTO_PUBLIC_PATH_PLACEHOLDER,
-        };
-        Some(format!("{public_path}{filename}"))
-      } else {
-        None
-      }
+
+    // When enabled, injected asset URLs use import.meta.rspackPublicPath.
+    // An explicit asset generator publicPath still takes precedence.
+    if runtime_public_path
+      && let Some(data) = code_gen_result.data().get::<CodeGenerationDataFilename>()
+      && let Some(module) = compilation
+        .get_module_graph()
+        .module_by_identifier(identifier)
+      && module
+        .as_normal_module()
+        .and_then(|module| module.get_generator_options())
+        .and_then(|options| options.asset_public_path())
+        .is_none()
+    {
+      let filename = code_gen_result
+        .data()
+        .get::<CodeGenerationDataUrl>()
+        .and_then(|url| url.inner().strip_prefix(data.public_path()))
+        .unwrap_or_else(|| data.filename());
+      return Some(format!("{RUNTIME_PUBLIC_PATH_PLACEHOLDER}{filename}"));
+    }
+
+    if let Some(url) = code_gen_result.data().get::<CodeGenerationDataUrl>() {
+      Some(
+        ASSET_AUTO_PUBLIC_PATH_MATCHER
+          .replace(url.inner(), AUTO_PUBLIC_PATH_PLACEHOLDER)
+          .into_owned(),
+      )
+    } else if let Some(data) = code_gen_result.data().get::<CodeGenerationDataFilename>() {
+      let filename = data.filename();
+      let public_path =
+        ASSET_AUTO_PUBLIC_PATH_MATCHER.replace(data.public_path(), AUTO_PUBLIC_PATH_PLACEHOLDER);
+      Some(format!("{public_path}{filename}"))
     } else {
-      Some("data:,".to_string())
+      None
     }
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for CssUrlDependency {
   fn id(&self) -> &DependencyId {
     &self.id
@@ -67,15 +101,17 @@ impl Dependency for CssUrlDependency {
     &DependencyType::CssUrl
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    self.span
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "CssUrlDependency"
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    // A changed URL can also affect parents embedding this stylesheet.
+    rspack_core::AffectType::Transitive
   }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for CssUrlDependency {
   fn request(&self) -> &str {
     &self.request
@@ -84,68 +120,87 @@ impl ModuleDependency for CssUrlDependency {
   fn user_request(&self) -> &str {
     &self.request
   }
-
-  fn set_request(&mut self, request: String) {
-    self.request = request;
-  }
 }
 
-impl DependencyTemplate for CssUrlDependency {
-  fn apply(
+#[cacheable_dyn]
+impl DependencyCodeGeneration for CssUrlDependency {
+  fn update_hash(
     &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
+    hasher: &mut RspackHasher,
+    compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
   ) {
-    let TemplateContext { compilation, .. } = code_generatable_context;
-    if let Some(mgm) = compilation
+    rspack_hash_object!(hasher, {
+      "request" => &self.request,
+      "range" => (self.range.start, self.range.end),
+      "replaceFunction" => self.replace_function,
+    });
+    // The emitted URL can contain the asset's content hash. Its build hash is
+    // available before codegen, unlike the generated filename or runtime hash.
+    if let Some(module) = compilation
       .get_module_graph()
-      .module_graph_module_by_dependency_id(self.id())
-      && let Some(target_url) = self.get_target_url(&mgm.module_identifier, compilation)
+      .get_module_by_dependency_id(&self.id)
     {
-      let content = format!("url({})", css_escape_string(&target_url));
-      source.replace(self.start, self.end, &content, None);
+      rspack_hash_object!(hasher, {
+        "buildHash" => &module.build_info().hash,
+      });
     }
   }
 
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(CssUrlDependencyTemplate::template_type())
   }
 }
 
 impl AsContextDependency for CssUrlDependency {}
 
-static WHITE_OR_BRACKET_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r#"[\n\t ()'"\\]"#).expect("Invalid Regexp"));
-static QUOTATION_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r#"[\n"\\]"#).expect("Invalid Regexp"));
-static APOSTROPHE_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r#"[\n'\\]"#).expect("Invalid Regexp"));
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct CssUrlDependencyTemplate;
 
-fn css_escape_string(s: &str) -> String {
-  let mut count_white_or_bracket = 0;
-  let mut count_quotation = 0;
-  let mut count_apostrophe = 0;
-  for c in s.chars() {
-    match c {
-      '\t' | '\n' | ' ' | '(' | ')' => count_white_or_bracket += 1,
-      '"' => count_quotation += 1,
-      '\'' => count_apostrophe += 1,
-      _ => {}
-    }
+impl CssUrlDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::CssUrl)
   }
-  if count_white_or_bracket < 2 {
-    WHITE_OR_BRACKET_REGEX
-      .replace_all(s, |caps: &Captures| format!("\\{}", &caps[0]))
-      .into_owned()
-  } else if count_quotation <= count_apostrophe {
-    format!(
-      "\"{}\"",
-      QUOTATION_REGEX.replace_all(s, |caps: &Captures| format!("\\{}", &caps[0]))
-    )
-  } else {
-    format!(
-      "\'{}\'",
-      APOSTROPHE_REGEX.replace_all(s, |caps: &Captures| format!("\\{}", &caps[0]))
-    )
+}
+
+impl DependencyTemplate for CssUrlDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<CssUrlDependency>()
+      .expect("CssUrlDependencyTemplate should be used for CssUrlDependency");
+
+    let module = code_generatable_context.module;
+    let runtime_public_path = css_module_export_type(module) == Some(CssExportType::Style)
+      && module
+        .as_normal_module()
+        .and_then(|module| {
+          module
+            .parser_and_generator()
+            .downcast_ref::<CssParserAndGenerator>()
+        })
+        .is_some_and(|parser_and_generator| parser_and_generator.runtime_public_path);
+
+    let TemplateContext { compilation, .. } = code_generatable_context;
+    if let Some(mgm) = compilation
+      .get_module_graph()
+      .module_graph_module_by_dependency_id(dep.id())
+      && let Some(target_url) =
+        dep.get_target_url(&mgm.module_identifier, compilation, runtime_public_path)
+    {
+      let target_url = serialize_url_value(&target_url);
+      let content = if dep.replace_function {
+        format!("url({target_url})")
+      } else {
+        target_url
+      };
+      source.replace(dep.range.start, dep.range.end, content, None);
+    }
   }
 }

@@ -1,7 +1,69 @@
+---
+description: 'The ContextModuleFactory module is used by the Compiler to generate dependencies from require.context API'
+---
+
+import { Collapse, CollapsePanel } from '@components/Collapse';
+
 # ContextModuleFactory
+
+The `ContextModuleFactory` module is used by the `Compiler` to generate dependencies from [require.context](/api/runtime-api/module-methods#requirecontext) API. It resolves the requested directory, generates requests for each file and filters against passed regExp. Matching dependencies then passes through [NormalModuleFactory](/api/plugin-api/normal-module-factory-hooks).
+
+## `beforeResolve`
+
+`AsyncSeriesWaterfallHook<[BeforeResolveResult], BeforeResolveResult | void>`
+
+Called before resolving the requested directory.
+
+Callbacks can return the resolve data or modify it directly without returning a value. Return `false` to ignore the request.
+
+<Collapse>
+  <CollapsePanel
+    className="collapse-code-panel"
+    header="BeforeResolveResult.ts"
+    key="BeforeResolveResult"
+  >
+```ts
+type BeforeResolveData = {
+  context: string;
+  request: string;
+  regExp: RegExp | undefined;
+  recursive: boolean;
+}
+
+export type BeforeResolveResult =
+  | false
+  | BeforeResolveData;
+```
+  </CollapsePanel>
+</Collapse>
 
 ## `afterResolve`
 
-`AsyncSeriesBailHook<[ResolveData]>`
+`AsyncSeriesWaterfallHook<[AfterResolveResult], AfterResolveResult | void>`
 
-Called after the requested directory resolved.
+Called after the requested directory has been resolved.
+
+Callbacks can return the resolve data or modify it directly without returning a value. Return `false` to ignore the request.
+
+<Collapse>
+  <CollapsePanel
+    className="collapse-code-panel"
+    header="AfterResolveResult.ts"
+    key="AfterResolveResult"
+  >
+```ts
+type AfterResolveData = {
+  resource: string;
+  context: string;
+  request: string;
+  regExp: RegExp | undefined;
+  recursive: boolean;
+  dependencies: Dependency[];
+}
+
+export type AfterResolveResult = 
+  | false
+  | AfterResolveData;
+```
+  </CollapsePanel>
+</Collapse>

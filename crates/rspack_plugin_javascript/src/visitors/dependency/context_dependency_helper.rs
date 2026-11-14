@@ -1,52 +1,72 @@
 use std::borrow::Cow;
 
+use concat_string::concat_string;
 use itertools::Itertools;
 use rspack_core::parse_resource;
-use rspack_error::Severity;
-use rspack_util::json_stringify;
+use rspack_error::{Diagnostic, Severity};
+use rspack_util::{json_stringify_str, quote_meta};
 
-use super::context_helper::{quote_meta, split_context_from_prefix};
-use super::{create_traceable_error, ContextModuleScanResult};
+use super::create_traceable_error;
 use crate::utils::eval::{BasicEvaluatedExpression, TemplateStringKind};
 
-// FIXME: delete this after `parserOptions.wrappedContextRegExp.source`
-const DEFAULT_WRAPPED_CONTEXT_REGEXP: &str = ".*";
+fn walk_evaluated_expression(
+  evaluated: &BasicEvaluatedExpression,
+  parser: &mut crate::visitors::JavascriptParser,
+) {
+  let Some(expression) = evaluated.expression() else {
+    return;
+  };
+  parser.walk_expression_in_ast(expression, evaluated.expression_ast());
+}
 
+// Match webpack by walking only the dynamic parts retained by evaluation. SWC
+// Next expression handles carry their owning flat AST through `BasicEvaluatedExpression`.
 pub fn create_context_dependency(
   param: &BasicEvaluatedExpression,
   parser: &mut crate::visitors::JavascriptParser,
 ) -> ContextModuleScanResult {
+  let mut critical = None;
+  let wrapped_context_reg_exp = parser
+    .javascript_options
+    .wrapped_context_reg_exp
+    .as_ref()
+    .expect("should have wrapped_context_reg_exp")
+    .source();
+
   if param.is_template_string() {
-    let quasis = param.quasis();
-    let Some(prefix) = quasis.first() else {
+    let mut quasis = param.quasis();
+    let Some(prefix) = quasis.next() else {
       unreachable!("the len of quasis should be great than 0")
     };
     // SAFETY: the type of `quasis` must be string
     let prefix_raw = prefix.string();
-    let postfix_raw = if quasis.len() > 1 {
-      Cow::Borrowed(quasis[quasis.len() - 1].string())
+    let postfix_raw = if let Some(postfix) = quasis.next_back() {
+      Cow::Borrowed(postfix.string())
     } else {
       Cow::Owned(String::new())
     };
 
-    let (context, prefix) = split_context_from_prefix(prefix_raw.to_string());
+    let (context, prefix) = split_context_from_prefix(prefix_raw.to_owned());
     let (postfix, query, fragment) = match parse_resource(&postfix_raw) {
       Some(data) => (
-        data.path.to_string_lossy().to_string(),
+        data.path.as_str().to_string(),
         data.query.unwrap_or_default(),
         data.fragment.unwrap_or_default(),
       ),
-      None => (postfix_raw.to_string(), String::new(), String::new()),
+      None => (postfix_raw.into_owned(), String::new(), String::new()),
     };
+
+    // When there are more than two quasis, the generated RegExp can be more precise
+    // We join the quasis with the expression regexp
+    let inner_quasis = quasis
+      .map(|q| quote_meta(q.string()) + wrapped_context_reg_exp)
+      .join("");
 
     let reg = format!(
       "^{}{}{}{}$",
       quote_meta(&prefix),
-      DEFAULT_WRAPPED_CONTEXT_REGEXP,
-      quasis[1..quasis.len() - 1]
-        .iter()
-        .map(|q| quote_meta(q.string().as_str()) + DEFAULT_WRAPPED_CONTEXT_REGEXP)
-        .join(""),
+      wrapped_context_reg_exp,
+      inner_quasis,
       quote_meta(&postfix)
     );
 
@@ -68,28 +88,29 @@ pub fn create_context_dependency(
           replaces.push((value, part.range().0, param.range().1));
         } else {
           let value = match param.template_string_kind() {
-            TemplateStringKind::Cooked => {
-              json_stringify(part.string()).trim_matches('"').to_owned()
-            }
+            TemplateStringKind::Cooked => json_stringify_str(part.string())
+              .trim_matches('"')
+              .to_owned(),
             TemplateStringKind::Raw => part.string().to_owned(),
           };
           let range = part.range();
           replaces.push((value, range.0, range.1));
         }
+      } else {
+        walk_evaluated_expression(part, parser);
       }
     }
 
-    if parser.javascript_options.wrapped_context_critical {
-      let range = param.range();
-      parser.warning_diagnostics.push(Box::new(
-        create_traceable_error(
-          "Critical dependency".into(),
-          "a part of the request of a dependency is an expression".to_string(),
-          parser.source_file,
-          rspack_core::ErrorSpan::new(range.0, range.1),
-        )
-        .with_severity(Severity::Warn),
+    if let Some(true) = parser.javascript_options.wrapped_context_critical {
+      let mut warn: Diagnostic = Diagnostic::from(create_traceable_error(
+        "Critical dependency".into(),
+        "a part of the request of a dependency is an expression".to_string(),
+        parser.source.to_string(),
+        param.range().into(),
       ));
+      warn.severity = Severity::Warning;
+      warn.module_identifier = Some(*parser.module_identifier);
+      critical = Some(warn);
     }
 
     ContextModuleScanResult {
@@ -98,6 +119,7 @@ pub fn create_context_dependency(
       query,
       fragment,
       replaces,
+      critical,
     }
   } else if param.is_wrapped()
     && let prefix_is_string = param
@@ -126,38 +148,47 @@ pub fn create_context_dependency(
     let (context, prefix) = split_context_from_prefix(prefix_raw.to_string());
     let (postfix, query, fragment) = match parse_resource(&postfix_raw) {
       Some(data) => (
-        data.path.to_string_lossy().to_string(),
+        data.path.as_str().to_string(),
         data.query.unwrap_or_default(),
         data.fragment.unwrap_or_default(),
       ),
-      None => (postfix_raw.to_string(), String::new(), String::new()),
+      None => (postfix_raw.into_owned(), String::new(), String::new()),
     };
 
     let reg = format!(
-      "^{}{DEFAULT_WRAPPED_CONTEXT_REGEXP}{}$",
+      "^{}{wrapped_context_reg_exp}{}$",
       quote_meta(&prefix),
       quote_meta(&postfix)
     );
 
     let mut replaces = Vec::new();
     if let Some(prefix_range) = prefix_range {
-      replaces.push((json_stringify(&prefix), prefix_range.0, prefix_range.1))
+      replaces.push((json_stringify_str(&prefix), prefix_range.0, prefix_range.1))
     }
     if let Some(postfix_range) = postfix_range {
-      replaces.push((json_stringify(&postfix), postfix_range.0, postfix_range.1))
+      replaces.push((
+        json_stringify_str(&postfix),
+        postfix_range.0,
+        postfix_range.1,
+      ))
     }
 
-    if parser.javascript_options.wrapped_context_critical {
-      let range = param.range();
-      parser.warning_diagnostics.push(Box::new(
-        create_traceable_error(
-          "Critical dependency".into(),
-          "a part of the request of a dependency is an expression".to_string(),
-          parser.source_file,
-          rspack_core::ErrorSpan::new(range.0, range.1),
-        )
-        .with_severity(Severity::Warn),
+    if let Some(true) = parser.javascript_options.wrapped_context_critical {
+      let mut warn: Diagnostic = Diagnostic::from(create_traceable_error(
+        "Critical dependency".into(),
+        "a part of the request of a dependency is an expression".to_string(),
+        parser.source.to_string(),
+        param.range().into(),
       ));
+      warn.severity = Severity::Warning;
+      warn.module_identifier = Some(*parser.module_identifier);
+      critical = Some(warn);
+    }
+
+    if let Some(inner_expressions) = param.wrapped_inner_expressions() {
+      for part in inner_expressions {
+        walk_evaluated_expression(part, parser);
+      }
     }
 
     ContextModuleScanResult {
@@ -166,27 +197,58 @@ pub fn create_context_dependency(
       query,
       fragment,
       replaces,
+      critical,
     }
-    // TODO: handle `param.wrappedInnerExpressions`
   } else {
-    if parser.javascript_options.expr_context_critical {
-      let range = param.range();
-      parser.warning_diagnostics.push(Box::new(
-        create_traceable_error(
-          "Critical dependency".into(),
-          "the request of a dependency is an expression".to_string(),
-          parser.source_file,
-          rspack_core::ErrorSpan::new(range.0, range.1),
-        )
-        .with_severity(Severity::Warn),
+    if let Some(true) = parser.javascript_options.expr_context_critical {
+      let mut warn: Diagnostic = Diagnostic::from(create_traceable_error(
+        "Critical dependency".into(),
+        "the request of a dependency is an expression".to_string(),
+        parser.source.to_string(),
+        param.range().into(),
       ));
+      warn.severity = Severity::Warning;
+      warn.module_identifier = Some(*parser.module_identifier);
+      critical = Some(warn);
     }
+
+    walk_evaluated_expression(param, parser);
+
     ContextModuleScanResult {
       context: String::from("."),
       reg: String::new(),
       query: String::new(),
       fragment: String::new(),
       replaces: Vec::new(),
+      critical,
     }
+  }
+}
+
+#[derive(Debug)]
+pub struct ContextModuleScanResult {
+  pub context: String,
+  pub reg: String,
+  pub query: String,
+  pub fragment: String,
+  pub replaces: Vec<(String, u32, u32)>,
+  pub critical: Option<Diagnostic>,
+}
+
+impl ContextModuleScanResult {
+  pub fn request(&self) -> String {
+    concat_string!(
+      self.context.as_str(),
+      self.query.as_str(),
+      self.fragment.as_str()
+    )
+  }
+}
+
+pub(super) fn split_context_from_prefix(prefix: String) -> (String, String) {
+  if let Some(idx) = prefix.rfind('/') {
+    (prefix[..idx].to_string(), format!(".{}", &prefix[idx..]))
+  } else {
+    (".".to_string(), prefix)
   }
 }

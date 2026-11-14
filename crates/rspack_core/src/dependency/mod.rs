@@ -4,41 +4,53 @@ mod context_dependency;
 mod context_element_dependency;
 mod dependency_category;
 mod dependency_id;
-mod dependency_macro;
+mod dependency_location;
+mod dependency_state;
 mod dependency_template;
 mod dependency_trait;
 mod dependency_type;
 mod entry;
-mod import_dependency_trait;
+mod loader_import;
 mod module_dependency;
 mod runtime_requirements_dependency;
-mod runtime_template;
-mod span;
 mod static_exports_dependency;
 
 use std::sync::Arc;
 
-pub use cached_const_dependency::CachedConstDependency;
-pub use const_dependency::ConstDependency;
+pub use cached_const_dependency::{
+  CachedConstDependency, CachedConstDependencyPlace, CachedConstDependencyTemplate,
+};
+pub use const_dependency::{ConstDependency, ConstDependencyTemplate};
 pub use context_dependency::{AsContextDependency, ContextDependency};
 pub use context_element_dependency::ContextElementDependency;
 pub use dependency_category::DependencyCategory;
 pub use dependency_id::*;
+pub use dependency_location::*;
+pub use dependency_state::*;
 pub use dependency_template::*;
 pub use dependency_trait::*;
 pub use dependency_type::DependencyType;
 pub use entry::*;
-pub use import_dependency_trait::ImportDependencyTrait;
+use itertools::Itertools;
+pub use loader_import::*;
 pub use module_dependency::*;
-pub use runtime_requirements_dependency::RuntimeRequirementsDependency;
-pub use runtime_template::*;
-pub use span::SpanExt;
+use rspack_cacheable::{
+  cacheable,
+  with::{AsPreset, AsVec},
+};
+use rspack_intern::Atom;
+pub use runtime_requirements_dependency::{
+  CodeGenerationRuntimeRequirementsWrite, RuntimeRequirementsDependency,
+  RuntimeRequirementsDependencyTemplate, RuntimeRequirementsDependencyWriteOperation,
+};
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Serialize;
 pub use static_exports_dependency::{StaticExportsDependency, StaticExportsSpec};
-use swc_core::ecma::atoms::Atom;
 
 use crate::{
-  ConnectionState, ModuleGraph, ModuleGraphConnection, ModuleIdentifier, ReferencedExport,
-  RuntimeSpec,
+  ConnectionState, EvaluatedInlinableValue, ExportProvided, ExportsInfoArtifact, ExportsInfoData,
+  ExportsType, ModuleGraph, ModuleGraphCacheArtifact, ModuleGraphConnection, ModuleIdentifier,
+  ReferencedExport, RuntimeSpec, SideEffectsStateArtifact, create_exports_object_referenced,
 };
 
 #[derive(Debug, Default)]
@@ -52,6 +64,7 @@ pub struct ExportSpec {
   pub hidden: Option<bool>,
   pub from: Option<ModuleGraphConnection>,
   pub from_export: Option<ModuleGraphConnection>,
+  pub inlinable: Option<EvaluatedInlinableValue>,
 }
 
 #[derive(Debug)]
@@ -60,14 +73,7 @@ pub enum Nullable<T> {
   Value(T),
 }
 
-impl ExportSpec {
-  pub fn new(name: String) -> Self {
-    Self {
-      name: Atom::from(name),
-      ..Default::default()
-    }
-  }
-}
+impl ExportSpec {}
 
 #[derive(Debug)]
 pub enum ExportNameOrSpec {
@@ -83,10 +89,10 @@ impl Default for ExportNameOrSpec {
 
 #[derive(Debug, Default)]
 pub enum ExportsOfExportsSpec {
-  True,
+  UnknownExports,
   #[default]
-  Null,
-  Array(Vec<ExportNameOrSpec>),
+  NoExports,
+  Names(Vec<ExportNameOrSpec>),
 }
 
 #[derive(Debug, Default)]
@@ -98,239 +104,282 @@ pub struct ExportsSpec {
   pub terminal_binding: Option<bool>,
   pub from: Option<ModuleGraphConnection>,
   pub dependencies: Option<Vec<ModuleIdentifier>>,
-  pub hide_export: Option<Vec<Atom>>,
-  pub exclude_exports: Option<Vec<Atom>>,
+  pub hide_export: Option<FxHashSet<Atom>>,
+  pub exclude_exports: Option<FxHashSet<Atom>>,
 }
 
-pub enum ExportsReferencedType {
-  No,     // NO_EXPORTS_REFERENCED
-  Object, // EXPORTS_OBJECT_REFERENCED
-  String(Box<Vec<Vec<Atom>>>),
-  Value(Box<Vec<ReferencedExport>>),
-}
-
-impl From<Atom> for ExportsReferencedType {
-  fn from(value: Atom) -> Self {
-    ExportsReferencedType::String(Box::new(vec![vec![value]]))
+impl ExportsSpec {
+  pub fn has_nested_exports(&self) -> bool {
+    match &self.exports {
+      ExportsOfExportsSpec::UnknownExports => false,
+      ExportsOfExportsSpec::NoExports => false,
+      ExportsOfExportsSpec::Names(exports) => exports.iter().any(|name| match name {
+        ExportNameOrSpec::String(_) => false,
+        ExportNameOrSpec::ExportSpec(spec) => spec.exports.is_some(),
+      }),
+    }
   }
 }
 
-impl From<Vec<Vec<Atom>>> for ExportsReferencedType {
-  fn from(value: Vec<Vec<Atom>>) -> Self {
-    ExportsReferencedType::String(Box::new(value))
+pub trait DependencyConditionFn: Sync + Send {
+  fn get_connection_state(
+    &self,
+    conn: &ModuleGraphConnection,
+    runtime: Option<&RuntimeSpec>,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> ConnectionState;
+
+  fn is_connection_active(
+    &self,
+    conn: &ModuleGraphConnection,
+    runtime: Option<&RuntimeSpec>,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> bool {
+    self
+      .get_connection_state(
+        conn,
+        runtime,
+        module_graph,
+        module_graph_cache,
+        side_effects_state_artifact,
+        exports_info_artifact,
+      )
+      .is_true()
   }
 }
-
-impl From<Vec<Atom>> for ExportsReferencedType {
-  fn from(value: Vec<Atom>) -> Self {
-    ExportsReferencedType::String(Box::new(vec![value]))
-  }
-}
-
-impl From<Vec<ReferencedExport>> for ExportsReferencedType {
-  fn from(value: Vec<ReferencedExport>) -> Self {
-    ExportsReferencedType::Value(Box::new(value))
-  }
-}
-
-pub type DependencyConditionFn = Arc<
-  dyn Fn(&ModuleGraphConnection, Option<&RuntimeSpec>, &ModuleGraph) -> ConnectionState
-    + Send
-    + Sync,
->;
 
 #[derive(Clone)]
-pub enum DependencyCondition {
-  False,
-  Fn(DependencyConditionFn),
+pub struct DependencyCondition(Arc<dyn DependencyConditionFn>);
+
+impl DependencyCondition {
+  pub fn new(f: impl DependencyConditionFn + 'static) -> Self {
+    Self(Arc::new(f))
+  }
+
+  pub fn get_connection_state(
+    &self,
+    connection: &ModuleGraphConnection,
+    runtime: Option<&RuntimeSpec>,
+    mg: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> ConnectionState {
+    self.0.get_connection_state(
+      connection,
+      runtime,
+      mg,
+      module_graph_cache,
+      side_effects_state_artifact,
+      exports_info_artifact,
+    )
+  }
+
+  pub fn is_connection_active(
+    &self,
+    connection: &ModuleGraphConnection,
+    runtime: Option<&RuntimeSpec>,
+    mg: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> bool {
+    self.0.is_connection_active(
+      connection,
+      runtime,
+      mg,
+      module_graph_cache,
+      side_effects_state_artifact,
+      exports_info_artifact,
+    )
+  }
 }
 
 impl std::fmt::Debug for DependencyCondition {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "DependencyCondition(...)")
+  }
+}
+
+/// Boxed to keep optional import attributes small in dependency structs.
+#[rspack_cacheable::cacheable]
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct ImportAttributes(Box<FxHashMap<String, String>>);
+
+impl FromIterator<(String, String)> for ImportAttributes {
+  fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
+    Self(Box::new(FxHashMap::from_iter(iter)))
+  }
+}
+
+impl ImportAttributes {
+  pub fn get(&self, k: &str) -> Option<&str> {
+    self.0.get(k).map(|v| v.as_str())
+  }
+
+  pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+    self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+  }
+
+  pub fn insert(&mut self, k: String, v: String) -> Option<String> {
+    self.0.insert(k, v)
+  }
+}
+
+#[rspack_cacheable::cacheable]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ImportPhase {
+  #[default]
+  Evaluation,
+  Source,
+  Defer,
+}
+
+impl ImportPhase {
+  pub fn is_defer(&self) -> bool {
+    matches!(self, ImportPhase::Defer)
+  }
+
+  pub fn is_source(&self) -> bool {
+    matches!(self, ImportPhase::Source)
+  }
+
+  pub fn as_str(&self) -> &'static str {
     match self {
-      // Self::Nil => write!(f, "Nil"),
-      Self::False => write!(f, "False"),
-      Self::Fn(_) => write!(f, "Fn"),
+      ImportPhase::Evaluation => "evaluation",
+      ImportPhase::Source => "source",
+      ImportPhase::Defer => "defer",
     }
   }
 }
 
-// TODO: should move to rspack_plugin_javascript once we drop old treeshaking
-pub mod needs_refactor {
-  use once_cell::sync::Lazy;
-  use regex::Regex;
-  use swc_core::{
-    common::{EqIgnoreSpan, Spanned, SyntaxContext, DUMMY_SP},
-    ecma::{
-      ast::{
-        Expr, ExprOrSpread, Id, Ident, ImportDecl, Lit, MemberExpr, MemberProp, MetaPropExpr,
-        MetaPropKind, ModuleExportName, NewExpr,
-      },
-      atoms::Atom,
-    },
-  };
-
-  use crate::SpanExt;
-
-  static IMPORT_META: Lazy<Expr> = Lazy::new(|| {
-    Expr::Member(MemberExpr {
-      span: DUMMY_SP,
-      obj: Box::new(Expr::MetaProp(MetaPropExpr {
-        span: DUMMY_SP,
-        kind: MetaPropKind::ImportMeta,
-      })),
-      prop: MemberProp::Ident(Ident {
-        span: DUMMY_SP,
-        sym: "url".into(),
-        optional: false,
-      }),
-    })
-  });
-
-  pub fn match_new_url(new_expr: &NewExpr) -> Option<(u32, u32, String)> {
-    fn is_import_meta_url(expr: &Expr) -> bool {
-      Ident::within_ignored_ctxt(|| expr.eq_ignore_span(&IMPORT_META))
+impl From<swc_core::ecma::ast::ImportPhase> for ImportPhase {
+  fn from(phase: swc_core::ecma::ast::ImportPhase) -> Self {
+    match phase {
+      swc_core::ecma::ast::ImportPhase::Evaluation => Self::Evaluation,
+      swc_core::ecma::ast::ImportPhase::Source => Self::Source,
+      swc_core::ecma::ast::ImportPhase::Defer => Self::Defer,
     }
+  }
+}
 
-    if matches!(&*new_expr.callee, Expr::Ident(Ident { sym, .. }) if sym == "URL")
-      && let Some(args) = &new_expr.args
-      && let (Some(first), Some(second)) = (args.first(), args.get(1))
-      && let (
-        ExprOrSpread {
-          spread: None,
-          expr: box Expr::Lit(Lit::Str(path)),
-        },
-        ExprOrSpread {
-          spread: None,
-          expr: box expr,
-        },
-      ) = (first, second)
-      && is_import_meta_url(expr)
+#[cacheable]
+#[derive(Debug, Clone)]
+pub struct ReferencedSpecifier {
+  #[cacheable(with=AsVec<AsPreset>)]
+  pub names: Vec<Atom>,
+  pub is_call: bool,
+  pub namespace_object_as_context: bool,
+}
+
+impl ReferencedSpecifier {
+  pub fn new(names: Vec<Atom>) -> Self {
+    Self {
+      names,
+      is_call: false,
+      namespace_object_as_context: false,
+    }
+  }
+
+  pub fn new_call(names: Vec<Atom>, namespace_object_as_context: bool) -> Self {
+    Self {
+      names,
+      is_call: true,
+      namespace_object_as_context,
+    }
+  }
+
+  pub fn to_identifier_string(&self) -> String {
+    let names = self.names.iter().join(".");
+    match (self.is_call, self.namespace_object_as_context) {
+      (true, true) => format!("*.{names}()"),
+      (true, false) => format!("{names}()"),
+      (false, _) => names,
+    }
+  }
+}
+
+/// Whether a member call `receiver.method()` should reference `receiver` as a whole
+/// rather than only `receiver.method`.
+///
+/// If the module is not known to provide the last name, the method probably comes from
+/// the receiver's prototype, so the receiver value itself must be kept:
+///
+/// ```js
+/// import arr from "./array.json";
+/// arr.map(fn);          // `map` is not provided -> reference the whole JSON
+///
+/// import obj from "./object.json";
+/// obj.list.includes(x); // `includes` is not provided -> reference `list`
+///
+/// import lib from "./lib.cjs";
+/// lib.used();           // `used` is provided -> reference only `used`
+/// ```
+pub fn should_reference_call_receiver(
+  names: &[Atom],
+  exports_type: ExportsType,
+  exports_info_artifact: &ExportsInfoArtifact,
+  exports_info: &ExportsInfoData,
+) -> bool {
+  (names.len() > 1 || !matches!(exports_type, ExportsType::Namespace))
+    && !matches!(
+      exports_info.is_export_provided(exports_info_artifact, names),
+      Some(ExportProvided::Provided)
+    )
+}
+
+pub fn create_referenced_exports_by_referenced_specifiers(
+  referenced_specifiers: &[ReferencedSpecifier],
+  exports_type: ExportsType,
+  exports_info_artifact: &ExportsInfoArtifact,
+  exports_info: &ExportsInfoData,
+) -> Vec<ReferencedExport> {
+  let mut refs = vec![];
+  for ReferencedSpecifier {
+    names,
+    is_call,
+    namespace_object_as_context,
+  } in referenced_specifiers
+  {
+    let mut names = names.as_slice();
+
+    if let Some(id) = names.first()
+      && id == "default"
     {
-      return Some((
-        path.span.real_lo(),
-        expr.span().real_hi(),
-        path.value.to_string(),
-      ));
-    }
-    None
-  }
-
-  pub static WORKER_FROM_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(.+?)(\(\))?\s+from\s+(.+)$").expect("invalid regex"));
-
-  #[derive(Debug, Default)]
-  pub struct WorkerSyntaxList {
-    variables: Vec<WorkerSyntax>,
-    globals: Vec<WorkerSyntax>,
-  }
-
-  impl WorkerSyntaxList {
-    pub fn push(&mut self, syntax: WorkerSyntax) {
-      if syntax.ctxt.is_some() {
-        self.variables.push(syntax);
-      } else {
-        self.globals.push(syntax);
-      }
-    }
-
-    fn find_worker_syntax(&self, ident: &Ident) -> Option<&WorkerSyntax> {
-      (self.variables.iter().chain(self.globals.iter())).find(|s| s.matches(ident))
-    }
-
-    pub fn match_new_worker(&self, new_expr: &NewExpr) -> bool {
-      matches!(&*new_expr.callee, Expr::Ident(ident) if self.find_worker_syntax(ident).is_some())
-    }
-  }
-
-  impl Extend<WorkerSyntax> for WorkerSyntaxList {
-    fn extend<T: IntoIterator<Item = WorkerSyntax>>(&mut self, iter: T) {
-      for i in iter {
-        self.push(i);
-      }
-    }
-  }
-
-  #[derive(Debug, PartialEq, Eq)]
-  pub struct WorkerSyntax {
-    word: Atom,
-    ctxt: Option<SyntaxContext>,
-  }
-
-  impl WorkerSyntax {
-    pub fn new(word: Atom, ctxt: Option<SyntaxContext>) -> Self {
-      Self { word, ctxt }
-    }
-
-    pub fn matches(&self, ident: &Ident) -> bool {
-      if let Some(ctxt) = self.ctxt {
-        let (word, id_ctxt) = ident.to_id();
-        word == self.word && id_ctxt == ctxt
-      } else {
-        self.word == ident.sym
-      }
-    }
-  }
-
-  pub const DEFAULT_WORKER_SYNTAX: &[&str] =
-    &["Worker", "SharedWorker", "Worker from worker_threads"];
-
-  pub fn init_worker_syntax_scanner(
-    syntax: &'static [&'static str],
-    caps: &mut Vec<(&str, &str)>,
-    list: &mut WorkerSyntaxList,
-  ) {
-    for s in syntax {
-      if let Some(captures) = WORKER_FROM_REGEX.captures(s)
-        && let Some(ids) = captures.get(1)
-        && let Some(source) = captures.get(3)
-      {
-        caps.push((ids.as_str(), source.as_str()));
-      } else {
-        list.push(WorkerSyntax::new(Atom::from(*s), None))
-      }
-    }
-  }
-
-  pub fn collect_from_import_decl(
-    caps: &[(&str, &str)],
-    decl: &ImportDecl,
-    list: &mut WorkerSyntaxList,
-  ) {
-    let source = &*decl.src.value;
-    let found = caps
-      .iter()
-      .filter(|cap| cap.1 == source)
-      .flat_map(|cap| {
-        if cap.0 == "default" {
-          decl
-            .specifiers
-            .iter()
-            .filter_map(|spec| spec.as_default())
-            .map(|spec| spec.local.to_id())
-            .collect::<Vec<Id>>()
-        } else {
-          decl
-            .specifiers
-            .iter()
-            .filter_map(|spec| {
-              spec.as_named().filter(|named| {
-                if let Some(imported) = &named.imported {
-                  let s = match imported {
-                    ModuleExportName::Ident(s) => &s.sym,
-                    ModuleExportName::Str(s) => &s.value,
-                  };
-                  s == cap.0
-                } else {
-                  &*named.local.sym == cap.0
-                }
-              })
-            })
-            .map(|spec| spec.local.to_id())
-            .collect::<Vec<Id>>()
+      match exports_type {
+        ExportsType::DefaultOnly | ExportsType::DefaultWithNamed => {
+          if names.len() == 1 {
+            return create_exports_object_referenced();
+          }
+          names = &names[1..];
         }
-      })
-      .map(|pair| WorkerSyntax::new(pair.0, Some(pair.1)));
-    list.extend(found);
+        ExportsType::Dynamic => {
+          return create_exports_object_referenced();
+        }
+        _ => {}
+      }
+    }
+
+    if *is_call
+      && (*namespace_object_as_context
+        || should_reference_call_receiver(names, exports_type, exports_info_artifact, exports_info))
+    {
+      names = &names[..names.len().saturating_sub(1)];
+      if names.is_empty() {
+        return create_exports_object_referenced();
+      }
+    }
+    refs.push(
+      ReferencedExport::from(names)
+        .with_can_mangle(false)
+        .with_can_inline(false),
+    );
   }
+  refs
 }

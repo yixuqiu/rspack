@@ -1,0 +1,118 @@
+---
+description: 'RuntimePlugin 用于生成 Rspack 运行时代码。它提供以下生命周期钩子，可用于修改这些代码。'
+---
+
+import { Collapse, CollapsePanel } from '@components/Collapse';
+import ChunkType from '../../types/chunk.mdx';
+
+# RuntimePlugin 钩子
+
+`RuntimePlugin` 用于生成 Rspack 运行时代码。它提供以下生命周期钩子，可用于修改这些代码。
+
+你可以通过参考如下代码获取这些钩子：
+
+```js title="rspack.config.mjs"
+export default {
+  plugins: [
+    {
+      apply: (compiler) => {
+        const { RuntimePlugin } = compiler.rspack;
+        compiler.hooks.compilation.tap('MyPlugin', (compilation) => {
+          const hooks = RuntimePlugin.getCompilationHooks(compilation);
+          // ...
+        });
+      },
+    },
+  ],
+};
+```
+
+## `createScript`
+
+`SyncWaterfallHook<[string, Chunk]>`
+
+可修改创建 `<script>` 标签时所执行的代码。
+
+如以下代码，可给 `<script>` 标签添加 `crossorigin` 属性：
+
+```js
+hooks.createScript.tap('MyPlugin', (code, chunk) => {
+  return `
+    ${code}
+    script.crossOrigin = 'anonymous';
+  `;
+});
+```
+
+<Collapse>
+  <CollapsePanel className="collapse-code-panel" header="Chunk.ts" key="Chunk">
+    <ChunkType />
+  </CollapsePanel>
+</Collapse>
+
+## `createLink`
+
+`SyncWaterfallHook<[string, Chunk]>`
+
+可修改创建通用 `<link>` 标签时所执行的代码。
+
+```js
+hooks.createLink.tap('MyPlugin', (code, chunk) => {
+  return `
+    ${code}
+    link.crossOrigin = 'anonymous';
+  `;
+});
+```
+
+<Collapse>
+  <CollapsePanel className="collapse-code-panel" header="Chunk.ts" key="Chunk">
+    <ChunkType />
+  </CollapsePanel>
+</Collapse>
+
+## `linkPrefetch`
+
+`SyncWaterfallHook<[string, Chunk]>`
+
+可修改创建[预取](/guide/optimization/code-splitting#prefetchingpreloading-模块)的 `<link rel="prefetch">` 标签时所执行的代码。
+
+如以下代码，可给用于预取的 `<link>` 标签添加 `crossorigin` 属性：
+
+```js
+hooks.linkPrefetch.tap('MyPlugin', (code, chunk) => {
+  return `
+    ${code}
+    link.crossOrigin = 'anonymous';
+  `;
+});
+```
+
+<Collapse>
+  <CollapsePanel className="collapse-code-panel" header="Chunk.ts" key="Chunk">
+    <ChunkType />
+  </CollapsePanel>
+</Collapse>
+
+## `linkPreload`
+
+`SyncWaterfallHook<[string, Chunk]>`
+
+可修改创建[预加载](/guide/optimization/code-splitting#prefetchingpreloading-模块)的 `<link rel="preload">` 标签时所执行的代码。
+
+如以下代码，可给用于预加载的 `<link>` 标签添加 `crossorigin` 属性：
+
+```js
+hooks.linkPreload.tap('MyPlugin', (code, chunk) => {
+  return `
+    ${code}
+    link.crossOrigin = 'anonymous';
+  `;
+});
+```
+
+<Collapse>
+  <CollapsePanel className="collapse-code-panel" header="Chunk.ts" key="Chunk">
+    <ChunkType />
+  </CollapsePanel>
+</Collapse>

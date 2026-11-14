@@ -1,0 +1,143 @@
+it("should load only used exports", async () => {
+	const m = await import("./dir1/a");
+	expect(m.default).toBe(3);
+	expect(m.usedExports).toEqual(["default", "usedExports"]);
+});
+
+it("should get warning on using 'webpackExports' with statically analyze-able dynamic import", async () => {
+	const m = await import(/* webpackExports: ["default"] */"./dir1/a?2");
+	expect(m.a).toBe(1);
+});
+
+it("should not tree-shake default export for exportsType=default module", async () => {
+	const m1 = await import("./dir2/json/object.json");
+	const m2 = await import("./dir2/json/array.json");
+	const m3 = await import("./dir2/json/primitive.json");
+	expect(m1.default).toEqual({ a: 1 });
+	expect(m2.default).toEqual(["a"]);
+	expect(m3.default).toBe("a");
+	const m4 = await import("./dir2/a");
+	expect(m4.default).toEqual({ a: 1, b: 2 });
+});
+
+it("should not tree-shake default export for exportsType=default context module", async () => {
+	const dir = "json";
+	const m1 = await import(`./dir3/${dir}/object.json`);
+	const m2 = await import(`./dir3/${dir}/array.json`);
+	const m3 = await import(`./dir3/${dir}/primitive.json`);
+	expect(m1.default).toEqual({ a: 1 });
+	expect(m2.default).toEqual(["a"]);
+	expect(m3.default).toBe("a");
+	const file = "a";
+	const m4 = await import(`./dir3/${file}`);
+	expect(m4.default).toEqual({ a: 1, b: 2 });
+});
+
+it("should not tree-shake if reassigin", async () => {
+	let m = await import("./dir1/a?3");
+	expect(m.default).toBe(3);
+	expect(m.usedExports).toBe(true);
+	m = {};
+});
+
+it("should tree-shake if its member call and strictThisContextOnImports is false", async () => {
+	let m = await import("./dir4/a");
+	expect(m.f()).toBe(undefined);
+	expect(m.usedExports).toEqual(["f", "usedExports"]);
+	let m2 = await import("./dir4/lib");
+	expect(m2.b.f()).toBe(1);
+	expect(m2.b.usedExports).toEqual(["f", "usedExports"]);
+	expect(m2.usedExports).toEqual(["b", "usedExports"]);
+});
+
+it("should analyze arguments in call member chain", async () => {
+	let m = await import("./dir4/lib?2");
+	m.b.f((async () => {
+		let m2 = await import("./dir4/a?2");
+		expect(m2.a).toBe(1);
+		expect(m2.usedExports).toEqual(["a", "usedExports"]);
+	})());
+});
+
+it("should analyze usage of variable that in correct scope", async () => {
+	let m = { b: 1 };
+	expect(m.b).toBe(1);
+	await (async () => {
+		let m = await import("./dir4/a?3");
+		expect(m.a).toBe(1);
+		expect(m.usedExports).toEqual(["a", "usedExports"]);
+	})();
+});
+
+it("should correctly analyze usage of variable for var declaration", async () => {
+	var m = await import("./dir4/a?4");
+	expect(m.a).toBe(1);
+	expect(m.usedExports).toEqual(true);
+	var m = await import("./dir4/a?5");
+	expect(m.a).toBe(1);
+	expect(m.usedExports).toEqual(true);
+});
+
+it("should analyze dynamic imports destructured from Promise.all", async () => {
+	const [namespace, { foo, usedExports: destructuredUsedExports }] = await Promise.all([
+		import("./promise-all/a"),
+		import("./promise-all/b")
+	]);
+
+	expect(namespace.bar).toBe("bar");
+	expect(namespace.usedExports).toEqual(["bar", "usedExports"]);
+	expect(foo).toBe("foo");
+	expect(destructuredUsedExports).toEqual(["foo", "usedExports"]);
+});
+
+it("should retain parent exports for empty nested patterns in Promise.all", async () => {
+	const [{ bar: {}, usedExports }] = await Promise.all([
+		import("./promise-all/a?empty-nested-pattern")
+	]);
+
+	expect(usedExports).toEqual(["bar", "usedExports"]);
+});
+
+it("should keep Promise.all imports without a matching pattern fully referenced", async () => {
+	const [namespace] = await Promise.all([
+		import("./promise-all/a?unmatched-pattern"),
+		import("./promise-all/b?unmatched-pattern")
+	]);
+
+	expect(namespace.bar).toBe("bar");
+	expect(namespace.usedExports).toEqual(["bar", "usedExports"]);
+
+	const unmatched = await import("./promise-all/b?unmatched-pattern");
+	expect(unmatched.usedExports).toBe(true);
+});
+
+it("should not analyze Promise.all when Promise is shadowed", async () => {
+	await (async Promise => {
+		const [{ foo, usedExports: destructuredUsedExports }, namespace] = await Promise.all([
+			import("./promise-all/a?shadowed"),
+			import("./promise-all/b?shadowed")
+		]);
+
+		expect(foo).toBe("foo");
+		expect(destructuredUsedExports).toBe(true);
+		expect(namespace.bar).toBe("bar");
+		expect(namespace.usedExports).toBe(true);
+	})({
+		all(values) {
+			return globalThis.Promise.all(values).then(([a, b]) => [b, a]);
+		}
+	});
+});
+
+it("should not analyze Promise.all when its input contains a spread", async () => {
+	const imports = [import("./promise-all/a?spread")];
+	const [namespace, { foo, usedExports: destructuredUsedExports }] = await Promise.all([
+		...imports,
+		import("./promise-all/b?spread")
+	]);
+
+	expect(namespace.bar).toBe("bar");
+	expect(namespace.usedExports).toBe(true);
+	expect(foo).toBe("foo");
+	expect(destructuredUsedExports).toBe(true);
+});

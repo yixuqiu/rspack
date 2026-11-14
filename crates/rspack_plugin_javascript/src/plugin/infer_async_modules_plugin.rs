@@ -1,66 +1,195 @@
-use std::collections::HashSet;
-
-use linked_hash_set::LinkedHashSet;
+use rayon::prelude::*;
+use rspack_collections::{IdentifierLinkedSet, IdentifierMap, IdentifierSet};
 use rspack_core::{
-  ApplyContext, Compilation, CompilationFinishModules, CompilerOptions, DependencyType, Plugin,
-  PluginContext,
+  AsyncModulesArtifact, Compilation, CompilationFinishModules, DependencyType, ExportsInfoArtifact,
+  Logger, ModuleGraph, Plugin, SideEffectsStateArtifact,
+  incremental::{IncrementalPasses, Mutation, Mutations},
 };
 use rspack_error::Result;
 use rspack_hook::{plugin, plugin_hook};
-use rspack_identifier::Identifier;
 
 #[plugin]
 #[derive(Debug, Default)]
 pub struct InferAsyncModulesPlugin;
 
 #[plugin_hook(CompilationFinishModules for InferAsyncModulesPlugin)]
-async fn finish_modules(&self, compilation: &mut Compilation) -> Result<()> {
-  // fix: mut for-in
-  let mut queue = LinkedHashSet::new();
-  let mut uniques = HashSet::new();
-
-  let mut modules: Vec<Identifier> = compilation
-    .get_module_graph()
-    .modules()
-    .values()
-    .filter(|m| {
-      if let Some(meta) = &m.build_meta() {
-        meta.has_top_level_await
-      } else {
-        false
-      }
-    })
-    .map(|m| m.identifier())
-    .collect();
-
-  modules.retain(|m| queue.insert(*m));
-
-  let mut module_graph = compilation.get_module_graph_mut();
-
-  while let Some(module) = queue.pop_front() {
-    module_graph.set_async(&module);
-    module_graph
-      .get_incoming_connections(&module)
+async fn finish_modules(
+  &self,
+  compilation: &Compilation,
+  async_modules_artifact: &mut AsyncModulesArtifact,
+  _exports_info_artifact: &mut ExportsInfoArtifact,
+  _side_effects_state_artifact: &mut SideEffectsStateArtifact,
+) -> Result<()> {
+  if let Some(mutations) = compilation
+    .incremental
+    .mutations_read(IncrementalPasses::FINISH_MODULES)
+  {
+    mutations
       .iter()
-      .filter(|con| {
-        if let Some(dep) = module_graph.dependency_by_id(&con.dependency_id) {
-          matches!(
-            dep.dependency_type(),
-            DependencyType::EsmImport(_) | DependencyType::EsmExport(_)
-          )
+      .filter_map(|mutation| {
+        if let Mutation::ModuleRemove { module } = mutation {
+          Some(module)
         } else {
-          false
+          None
         }
       })
-      .for_each(|con| {
-        if let Some(id) = &con.original_module_identifier {
-          if uniques.insert(*id) {
-            queue.insert(*id);
+      .for_each(|module| {
+        async_modules_artifact.remove(module);
+      });
+  }
+
+  let module_graph = compilation.get_module_graph();
+  let mut sync_modules = IdentifierLinkedSet::default();
+  let mut async_modules = IdentifierLinkedSet::default();
+  for (module_identifier, module) in module_graph.modules() {
+    let build_meta = module.build_meta();
+    if build_meta.has_top_level_await() {
+      async_modules.insert(*module_identifier);
+    } else {
+      sync_modules.insert(*module_identifier);
+    }
+  }
+
+  let mut mutations = compilation
+    .incremental
+    .mutations_writable()
+    .then(Mutations::default);
+
+  set_sync_modules(
+    module_graph,
+    async_modules_artifact,
+    sync_modules,
+    &mut mutations,
+  );
+  set_async_modules(
+    module_graph,
+    async_modules_artifact,
+    async_modules,
+    &mut mutations,
+  );
+
+  if compilation
+    .incremental
+    .mutations_readable(IncrementalPasses::FINISH_MODULES)
+    && let Some(mutations) = &mutations
+  {
+    let logger = compilation.get_logger("rspack.incremental.finishModules");
+    logger.log(format!(
+      "{} modules are updated by set_async",
+      mutations.len()
+    ));
+  }
+
+  if let Some(mut compilation_mutations) = compilation.incremental.mutations_write()
+    && let Some(mutations) = mutations
+  {
+    compilation_mutations.extend(mutations);
+  }
+
+  Ok(())
+}
+
+fn set_sync_modules(
+  module_graph: &ModuleGraph,
+  async_modules_artifact: &mut AsyncModulesArtifact,
+  modules: IdentifierLinkedSet,
+  mutations: &mut Option<Mutations>,
+) {
+  let mut outgoing_connections = modules
+    .iter()
+    .par_bridge()
+    .map(|mid| {
+      (
+        *mid,
+        module_graph
+          .get_outgoing_connections(mid)
+          .filter_map(|con| module_graph.module_identifier_by_dependency_id(&con.dependency_id))
+          .filter(|&out| out != mid)
+          .copied()
+          .collect::<Vec<_>>(),
+      )
+    })
+    .collect::<IdentifierMap<_>>();
+
+  let mut queue = modules;
+  while let Some(module) = queue.pop_front() {
+    let module_outgoing_connections = outgoing_connections.entry(module).or_insert_with(|| {
+      module_graph
+        .get_outgoing_connections(&module)
+        .filter_map(|con| module_graph.module_identifier_by_dependency_id(&con.dependency_id))
+        .filter(|&out| &module != out)
+        .copied()
+        .collect::<Vec<_>>()
+    });
+    if module_outgoing_connections
+      .iter()
+      .any(|out| ModuleGraph::is_async(async_modules_artifact, out))
+    {
+      // We can't safely reset is_async to false if there are any outgoing module is async
+      continue;
+    }
+    // The module is_async = false will also decide its parent module is_async, so if the module is_async = false
+    // is not changed, this means its parent module will be not affected, so we stop the infer at here.
+    if ModuleGraph::set_async(async_modules_artifact, module, false) {
+      if let Some(mutations) = mutations {
+        mutations.add(Mutation::ModuleSetAsync { module });
+      }
+      module_graph
+        .get_incoming_connections(&module)
+        .filter(|con| {
+          let dep = module_graph.dependency_by_id(&con.dependency_id);
+          matches!(
+            dep.dependency_type(),
+            DependencyType::EsmImport
+              | DependencyType::EsmExportImport
+              | DependencyType::EsmExportImportedSpecifier
+              | DependencyType::Provided
+          )
+        })
+        .for_each(|con| {
+          if let Some(id) = con.original_module_identifier {
+            queue.insert(id);
           }
+        });
+    }
+  }
+}
+
+fn set_async_modules(
+  module_graph: &ModuleGraph,
+  async_modules_artifact: &mut AsyncModulesArtifact,
+  modules: IdentifierLinkedSet,
+  mutations: &mut Option<Mutations>,
+) {
+  let mut queue = modules;
+  let mut visited: IdentifierSet = queue.iter().copied().collect();
+
+  while let Some(module) = queue.pop_front() {
+    if ModuleGraph::set_async(async_modules_artifact, module, true)
+      && let Some(mutations) = mutations
+    {
+      mutations.add(Mutation::ModuleSetAsync { module });
+    }
+    module_graph
+      .get_incoming_connections(&module)
+      .filter(|con| {
+        let dep = module_graph.dependency_by_id(&con.dependency_id);
+        matches!(
+          dep.dependency_type(),
+          DependencyType::EsmImport
+            | DependencyType::EsmExportImport
+            | DependencyType::EsmExportImportedSpecifier
+            | DependencyType::Provided
+        )
+      })
+      .for_each(|con| {
+        if let Some(id) = con.original_module_identifier
+          && visited.insert(id)
+        {
+          queue.insert(id);
         }
       });
   }
-  Ok(())
 }
 
 impl Plugin for InferAsyncModulesPlugin {
@@ -68,13 +197,8 @@ impl Plugin for InferAsyncModulesPlugin {
     "InferAsyncModulesPlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
     ctx
-      .context
       .compilation_hooks
       .finish_modules
       .tap(finish_modules::new(self));

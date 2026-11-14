@@ -1,35 +1,39 @@
-import WebpackLicense from '@components/webpack-license';
+---
+description: 'The mode configuration is used to set the build mode of Rspack to enable the default optimization strategy'
+---
 
-<WebpackLicense from="https://webpack.js.org/configuration/node/" />
+import Attribution from '@components/Attribution';
+import PropertyType from '@components/PropertyType';
 
 # Mode
 
+<PropertyType type="'production' | 'development' | 'none'" />
+
 The `mode` configuration is used to set the build mode of Rspack to enable the default optimization strategy.
 
-- **Type:**
+## Default value
 
-```ts
-type Mode = 'production' | 'development' | 'none';
-```
+If `mode` is not specified:
 
-- **Default:** `'production'`
+- When using `@rspack/cli`, `rspack dev` and `rspack serve` default to `'development'`, and `rspack build` defaults to `'production'`.
+- When using JavaScript API, the `mode` option defaults to `'production'`.
 
 ## Usage
 
-You can set the mode directly in `rspack.config.js`:
+You can set the mode directly in Rspack config:
 
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   mode: 'production',
 };
 ```
 
 In actual scenarios, you can dynamically set the mode according to `process.env.NODE_ENV`:
 
-```ts title="rspack.config.js"
+```js title="rspack.config.mjs"
 const isProduction = process.env.NODE_ENV === 'production';
 
-module.exports = {
+export default {
   mode: isProduction ? 'production' : 'development',
 };
 ```
@@ -41,10 +45,10 @@ rspack --mode=production
 ```
 
 :::info
-`--mode` option on the CLI takes precedence over `mode` in `rspack.config.js`.
+`--mode` option on the CLI has a higher priority than `mode` in Rspack config.
 :::
 
-## Optional Values
+## Optional values
 
 `mode` has the following optional values:
 
@@ -52,16 +56,25 @@ rspack --mode=production
 
 In production mode, Rspack automatically enables the following optimization strategies:
 
-- Replace `process.env.NODE_ENV` in code with `'production'`.
-- Set the default value of `optimization.minimize` to `true` to enable SWC minification.
+- Set the default value of [optimization.nodeEnv](/config/optimization#optimizationnodeenv) to `'production'`, which replaces `process.env.NODE_ENV` in code with `'production'`.
+- Set the default value of [optimization.minimize](/config/optimization#optimizationminimize) to `true`, and enable the default JavaScript and CSS minimizers.
+- Set the default value of [optimization.concatenateModules](/config/optimization#optimizationconcatenatemodules) to `true` to enable module concatenation (scope hoisting).
+- Set the default values of [optimization.sideEffects](/config/optimization#optimizationsideeffects), [optimization.usedExports](/config/optimization#optimizationusedexports), [optimization.mangleExports](/config/optimization#optimizationmangleexports), and [optimization.innerGraph](/config/optimization#optimizationinnergraph) for more aggressive tree shaking and export optimization.
+- Set the default values of [optimization.moduleIds](/config/optimization#optimizationmoduleids) and [optimization.chunkIds](/config/optimization#optimizationchunkids) to `'deterministic'` for more stable long-term caching.
+- Set the default value of [optimization.realContentHash](/config/optimization#optimizationrealcontenthash) to `true`.
 
 ### development
 
 In development mode, Rspack automatically enables the following optimization strategies:
 
-- Replace `process.env.NODE_ENV` in code with `'development'`.
-- Set proper naming format for modules and chunks.
+- Set the default value of [optimization.nodeEnv](/config/optimization#optimizationnodeenv) to `'development'`, which replaces `process.env.NODE_ENV` in code with `'development'`.
+- Set the default value of [devtool](/config/devtool) to `'cheap-module-source-map'` for easier debugging.
+- Set the default value of [cache](/config/cache) to `true` to enable memory caching for faster development builds.
+- Set the default values of [optimization.moduleIds](/config/optimization#optimizationmoduleids) and [optimization.chunkIds](/config/optimization#optimizationchunkids) to `'named'` for more readable module and chunk names.
+- Set the default value of [optimization.emitOnErrors](/config/optimization#optimizationemitonerrors) to `true`, which keeps emitting output when build fails to support local debugging.
 
 ### none
 
-When `mode` is set to `'none'`, Rspack will not enable any default optimization strategies.
+Setting `mode` to `'none'` skips the defaults that Rspack normally applies for development or production. It does not turn off all optimizations: [optimization.providedExports](/config/optimization#optimizationprovidedexports) and [optimization.removeEmptyChunks](/config/optimization#optimizationremoveemptychunks), for example, are still enabled. To disable an optimization, set its option to `false`.
+
+<Attribution url="https://webpack.js.org/configuration/mode/" />

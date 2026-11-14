@@ -1,8 +1,5 @@
-#![feature(get_mut_unchecked)]
 mod helpers;
 pub use helpers::*;
-mod lazy_compilation;
-pub use lazy_compilation::LazyCompilationPlugin;
 mod common_js_chunk_format;
 pub use common_js_chunk_format::CommonJsChunkFormatPlugin;
 mod runtime_plugin;
@@ -22,7 +19,8 @@ mod import_scripts_chunk_loading;
 pub use import_scripts_chunk_loading::ImportScriptsChunkLoadingPlugin;
 mod runtime_module;
 pub use runtime_module::{
-  chunk_has_css, is_enabled_for_chunk, stringify_chunks, GetChunkFilenameRuntimeModule,
+  EXPORT_REQUIRE_RUNTIME_MODULE_ID, GetChunkFilenameRuntimeModule, chunk_has_css,
+  is_enabled_for_chunk, render_chunk_loading_hmr_state_expression, stringify_chunks,
 };
 mod startup_chunk_dependencies;
 pub use startup_chunk_dependencies::StartupChunkDependenciesPlugin;
@@ -30,10 +28,18 @@ mod chunk_prefetch_preload;
 pub use chunk_prefetch_preload::ChunkPrefetchPreloadPlugin;
 mod bundler_info;
 pub use bundler_info::{BundlerInfoForceMode, BundlerInfoPlugin};
+mod runtime_module_from_js;
+pub use runtime_module_from_js::RuntimeModuleFromJs;
+mod drive;
+pub use drive::*;
 
 pub fn enable_chunk_loading_plugin(loading_type: ChunkLoadingType, plugins: &mut Vec<BoxPlugin>) {
   match loading_type {
     ChunkLoadingType::Jsonp => {
+      plugins.push(
+        StartupChunkDependenciesPlugin::new(ChunkLoading::Enable(ChunkLoadingType::Jsonp), true)
+          .boxed(),
+      );
       plugins.push(JsonpChunkLoadingPlugin::default().boxed());
     }
     ChunkLoadingType::Require => {
@@ -63,6 +69,13 @@ pub fn enable_chunk_loading_plugin(loading_type: ChunkLoadingType, plugins: &mut
       );
       plugins.push(ImportScriptsChunkLoadingPlugin::default().boxed());
     }
-    ChunkLoadingType::Import => plugins.push(ModuleChunkLoadingPlugin::default().boxed()),
+    ChunkLoadingType::Import => {
+      plugins.push(
+        StartupChunkDependenciesPlugin::new(ChunkLoading::Enable(ChunkLoadingType::Import), true)
+          .boxed(),
+      );
+      plugins.push(ModuleChunkLoadingPlugin::default().boxed())
+    }
+    ChunkLoadingType::Custom(_) => (),
   }
 }

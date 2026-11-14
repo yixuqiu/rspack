@@ -1,0 +1,29 @@
+const fs = require('fs');
+
+it("should use JSON.parse", () => {
+	const JSONParse = rstest.spyOn(JSON, 'parse');
+	JSONParse.mockClear();
+
+	const data = require('./data.json');
+	const data2 = require('data:application/json,{"this is a large JSON object": "that should be converted to JSON.parse by default"}');
+	const data3 = require('./data1.json');
+
+	expect(data).toMatchObject({["123this is a large JSON object"]: "that should be converted to JSON.parse by default"});
+	expect(data2).toMatchObject({["this is a large JSON object"]: "that should be converted to JSON.parse by default"});
+	expect(data3).toMatchObject([{"this is a large JSON object": "that should be converted to JSON.parse by default"}]);
+
+	expect(JSONParse).toHaveBeenCalledTimes(3);
+
+	const source = fs.readFileSync(__filename, 'utf-8').toString();
+	expect((source.match(/\/\*#__PURE__\*\/JSON\.parse/g) || []).length).toBe(3);
+});
+
+it("should not call JSON.parse when resourceQuery is JSONParse=false", () => {
+	const JSONParse = rstest.spyOn(JSON, 'parse');
+	JSONParse.mockClear();
+
+	const data = require('./data.json?JSONParse=false');
+
+	expect(data).toMatchObject({["123this is a large JSON object"]: "that should be converted to JSON.parse by default"});
+	expect(JSONParse).not.toHaveBeenCalled();
+});

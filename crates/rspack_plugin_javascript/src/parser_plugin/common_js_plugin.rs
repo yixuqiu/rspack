@@ -1,56 +1,300 @@
-use rspack_core::{ConstDependency, RuntimeGlobals, RuntimeRequirementsDependency, SpanExt};
-use swc_core::ecma::ast::{Expr, MemberExpr};
+use std::sync::Arc;
+
+use rspack_core::{
+  ConstDependency, JavascriptParserCommonjsExportsOption, OverrideStrict, RuntimeGlobals,
+  RuntimeRequirementsDependency,
+};
+use swc_next_ecma_ast::{
+  AssignmentExpression, CallExpression, GetSpan, MemberExpression, NewExpression, Program, Span,
+  Stmt, UnaryExpression,
+};
 
 use super::JavascriptParserPlugin;
-use crate::visitors::{expr_matcher, JavascriptParser};
+use crate::{
+  Atom,
+  utils::eval::{BasicEvaluatedExpression, evaluate_to_identifier},
+  visitors::{HookMemberExpression, JavascriptParser, VariableInfoFlags, expr_name},
+};
 
 pub struct CommonJsPlugin;
 
-impl JavascriptParserPlugin for CommonJsPlugin {
+const COMMONJS_REQUIRE_ACCESS_TAG: &str = "commonjs require access";
+
+impl CommonJsPlugin {
+  fn should_track_module_exports_access(parser: &JavascriptParser) -> bool {
+    if !parser.compiler_options.optimization.concatenate_modules {
+      return false;
+    }
+
+    let is_strict = parser
+      .javascript_options
+      .override_strict
+      .map_or(parser.build_info.strict, |strict| {
+        matches!(strict, OverrideStrict::Strict)
+      });
+
+    parser.module_type.is_js_auto()
+      && !parser.build_meta.esm()
+      && is_strict
+      && parser
+        .javascript_options
+        .commonjs
+        .as_ref()
+        .map_or(JavascriptParserCommonjsExportsOption::Enable, |commonjs| {
+          commonjs.exports
+        })
+        != JavascriptParserCommonjsExportsOption::Disable
+  }
+
+  fn mark_module_exports_accessed(parser: &mut JavascriptParser) {
+    if parser.build_info.module_exports_accessed.is_some() {
+      parser.build_info.module_exports_accessed = Some(true);
+    }
+  }
+
+  fn tag_require_access(parser: &mut JavascriptParser) {
+    if parser.build_info.module_exports_accessed != Some(false) {
+      return;
+    }
+
+    // `CallHooksName` dispatches variable tags before the original name. This gives the observer
+    // hooks below a chance to record an access before an earlier CommonJS or AMD hook SyncBails on
+    // `require`. Keep the binding free: an observer tag is not a local declaration.
+    // An existing binding has already been tagged, shadowed or renamed and must be preserved.
+    let require = Atom::from("require");
+    if parser.get_variable_info(&require).is_none() {
+      parser.tag_variable_with_flags::<()>(
+        require,
+        COMMONJS_REQUIRE_ACCESS_TAG,
+        None,
+        VariableInfoFlags::FREE | VariableInfoFlags::TAGGED,
+      );
+    }
+  }
+
+  fn observe_factory_binding(&self, parser: &mut JavascriptParser, for_name: &str) {
+    if parser.build_info.module_exports_accessed != Some(false) {
+      return;
+    }
+
+    let accessed = match for_name.split('.').next() {
+      Some(
+        COMMONJS_REQUIRE_ACCESS_TAG | "module" | "exports" | "require" | "__webpack_module__",
+      ) => true,
+      Some("arguments" | "this") => parser.is_top_level_this(),
+      _ => false,
+    };
+
+    if accessed {
+      Self::mark_module_exports_accessed(parser);
+    }
+  }
+}
+
+#[rspack_macros::implemented_javascript_parser_hooks]
+impl<'p, 'a> JavascriptParserPlugin<'p, 'a> for CommonJsPlugin {
+  fn program(&self, parser: &mut JavascriptParser<'p>, _ast: Program) -> Option<bool> {
+    parser.build_info.module_exports_accessed =
+      Self::should_track_module_exports_access(parser).then_some(false);
+    None
+  }
+
+  fn statement(&self, parser: &mut JavascriptParser<'p>, statement: Stmt) -> Option<bool> {
+    // Statement walking starts after scope pre-walking, so shadowed bindings are already known.
+    Self::tag_require_access(parser);
+    if statement.is_return_statement(parser.ast.ast) && parser.is_top_level_scope() {
+      parser.build_info.module_concatenation_bailout = Some("top-level return".into());
+    }
+    None
+  }
+
+  fn finish(&self, parser: &mut JavascriptParser<'p>) -> Option<bool> {
+    // CommonJS exports and AMD define parsing share this state. Reuse it instead of duplicating
+    // their syntax handling here. Observers return None; handled export syntax is covered here,
+    // and source replacements are checked separately by the concatenation candidate predicate.
+    // Like other parser analysis, this relies on plugins keeping their dependencies and metadata
+    // consistent when they consume a hook. It does not change global provided-export information.
+    if parser.parser_exports_state.is_some() {
+      Self::mark_module_exports_accessed(parser);
+    }
+    None
+  }
+
+  fn evaluate_identifier(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    for_name: &str,
+    _member_expr_info: Option<&crate::visitors::ExpressionExpressionInfo>,
+    start: u32,
+    end: u32,
+  ) -> Option<BasicEvaluatedExpression<'p>> {
+    // Evaluation is also used for generated expressions such as DefinePlugin values, which may
+    // be consumed without going through the normal identifier walker.
+    self.observe_factory_binding(parser, for_name);
+
+    if for_name == expr_name::MODULE_HOT {
+      Some(evaluate_to_identifier(
+        expr_name::MODULE_HOT.into(),
+        expr_name::MODULE.into(),
+        None,
+        start,
+        end,
+      ))
+    } else {
+      None
+    }
+  }
+
   fn r#typeof(
     &self,
-    parser: &mut JavascriptParser,
-    expr: &swc_core::ecma::ast::UnaryExpr,
-    _for_name: &str,
+    parser: &mut JavascriptParser<'p>,
+    expr: UnaryExpression,
+    for_name: &str,
   ) -> Option<bool> {
-    if expr_matcher::is_module(&*expr.arg) && parser.is_unresolved_ident("module") {
-      parser
-        .presentational_dependencies
-        .push(Box::new(ConstDependency::new(
-          expr.span.real_lo(),
-          expr.span.real_hi(),
-          "'object'".into(),
-          None,
-        )));
+    self.observe_factory_binding(parser, for_name);
+
+    if for_name == expr_name::MODULE {
+      parser.add_presentational_dependency(Arc::new(ConstDependency::new(
+        expr.span(parser.ast.ast).into(),
+        "'object'".into(),
+      )));
       Some(true)
     } else {
       None
     }
   }
 
-  fn member(&self, parser: &mut JavascriptParser, expr: &MemberExpr, _name: &str) -> Option<bool> {
-    // FIXME: delete this `.clone` after extract expression
-    let expr = Expr::Member(expr.clone());
-    if expr_matcher::is_module_id(&expr) {
-      parser
-        .presentational_dependencies
-        .push(Box::new(RuntimeRequirementsDependency::new(
-          RuntimeGlobals::MODULE_ID,
-        )));
+  fn member(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _expr: HookMemberExpression,
+    for_name: &str,
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
 
-      parser.build_info.module_concatenation_bailout = Some(RuntimeGlobals::MODULE_ID.to_string());
-      Some(true)
-    } else if expr_matcher::is_module_loaded(&expr) {
-      parser
-        .presentational_dependencies
-        .push(Box::new(RuntimeRequirementsDependency::new(
-          RuntimeGlobals::MODULE_LOADED,
-        )));
-      parser.build_info.module_concatenation_bailout =
-        Some(RuntimeGlobals::MODULE_LOADED.to_string());
-      Some(true)
-    } else {
-      None
+    if for_name == "module.id" {
+      parser.add_presentational_dependency(Arc::new(RuntimeRequirementsDependency::add_only(
+        RuntimeGlobals::MODULE_ID,
+      )));
+      parser.build_info.module_concatenation_bailout = Some(for_name.to_string());
+      return Some(true);
     }
+
+    if for_name == "module.loaded" {
+      parser.add_presentational_dependency(Arc::new(RuntimeRequirementsDependency::add_only(
+        RuntimeGlobals::MODULE_LOADED,
+      )));
+      parser.build_info.module_concatenation_bailout = Some(for_name.to_string());
+      return Some(true);
+    }
+
+    None
+  }
+
+  fn identifier(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _span: Span,
+    for_name: &str,
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
+    None
+  }
+
+  fn new_expression(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _expr: NewExpression,
+    for_name: &str,
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
+    None
+  }
+
+  fn call(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _call_expr: CallExpression,
+    for_name: &str,
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
+    None
+  }
+
+  fn assign(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _expr: AssignmentExpression,
+    _span: Span,
+    for_name: &str,
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
+    None
+  }
+
+  fn assign_member_chain(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _expr: AssignmentExpression,
+    _members: &[Atom],
+    _member_ranges: &[Span],
+    for_name: &str,
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
+    None
+  }
+
+  fn member_chain(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _expr: HookMemberExpression,
+    for_name: &str,
+    _members: &[Atom],
+    _members_optionals: &[bool],
+    _member_ranges: &[Span],
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
+    None
+  }
+
+  fn call_member_chain(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _expr: CallExpression,
+    for_name: &str,
+    _members: &[Atom],
+    _members_optionals: &[bool],
+    _member_ranges: &[Span],
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
+    None
+  }
+
+  fn member_chain_of_call_member_chain(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _member_expr: MemberExpression,
+    _callee_members: &[Atom],
+    _call_expr: CallExpression,
+    _members: &[Atom],
+    _member_ranges: &[Span],
+    for_name: &str,
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
+    None
+  }
+
+  fn call_member_chain_of_call_member_chain(
+    &self,
+    parser: &mut JavascriptParser<'p>,
+    _call_expr: CallExpression,
+    _callee_members: &[Atom],
+    _inner_call_expr: CallExpression,
+    _members: &[Atom],
+    _member_ranges: &[Span],
+    for_name: &str,
+  ) -> Option<bool> {
+    self.observe_factory_binding(parser, for_name);
+    None
   }
 }

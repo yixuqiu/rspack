@@ -1,15 +1,20 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://lf3-static.bytednsdoc.com/obj/eden-cn/rjhwzy/ljhwZthlaukjlkulzlp/rspack-banner-1610-dark.png">
-  <img alt="Rspack Banner" src="https://lf3-static.bytednsdoc.com/obj/eden-cn/rjhwzy/ljhwZthlaukjlkulzlp/rspack-banner-1610.png">
+  <img alt="Rspack Banner" src="https://assets.rspack.rs/rspack/rspack-banner.png">
 </picture>
 
 # @rspack/binding
 
-Node binding for rspack.
+Private node binding crate for rspack.
+
+> Rspack's internal package, don't use it directly in your project, This package does _NOT_ follow [semantic versioning](https://semver.org/).
 
 ## Documentation
 
-See [https://rspack.dev](https://rspack.dev) for details.
+See [https://rspack.rs](https://rspack.rs) for details.
+
+## Update Wasm binding
+
+The generation of `rspack.wasi-browser.js` and `rspack.wasi.js` is disabled by default because `@napi/cli` produces unstable output for these files. To update the Wasm bindings, add `wasm32-wasip1-threads` to the `napi.targets` field in `package.json` before building the project.
 
 ## License
 

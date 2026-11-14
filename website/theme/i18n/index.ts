@@ -1,4 +1,5 @@
-import { withBase, useLang } from 'rspress/runtime';
+import { useLang, withBase } from '@rspress/core/runtime';
+import { useCallback } from 'react';
 import { EN_US } from './enUS';
 import { ZH_CN } from './zhCN';
 
@@ -9,7 +10,19 @@ const translations = {
 
 export function useUrl(url: string) {
   const lang = useLang();
-  return withBase(lang === 'zh' ? url : `/en${url}`);
+  return withBase(lang === 'zh' ? `/zh${url}` : url);
+}
+export function useI18nUrl() {
+  const lang = useLang();
+
+  const tUrl = useCallback(
+    (url: string) => {
+      return lang === 'en' ? url : `/${lang}${url}`;
+    },
+    [lang],
+  );
+
+  return tUrl;
 }
 
 export function useI18n() {

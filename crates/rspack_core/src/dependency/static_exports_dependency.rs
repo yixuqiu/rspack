@@ -1,17 +1,25 @@
-use swc_core::ecma::atoms::Atom;
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsPreset, AsVec},
+};
+use rspack_intern::Atom;
 
+use super::AffectType;
 use crate::{
-  AsContextDependency, AsDependencyTemplate, AsModuleDependency, Dependency, DependencyId,
-  DependencyType, ExportNameOrSpec, ExportsOfExportsSpec, ExportsSpec, ModuleGraph,
+  AsContextDependency, AsDependencyCodeGeneration, AsModuleDependency, Dependency, DependencyId,
+  DependencyType, ExportNameOrSpec, ExportsInfoArtifact, ExportsOfExportsSpec, ExportsSpec,
+  ModuleGraph, ModuleGraphCacheArtifact,
 };
 
+#[cacheable]
 #[derive(Debug, Clone)]
 pub enum StaticExportsSpec {
   True,
-  Array(Vec<Atom>),
+  Array(#[cacheable(with=AsVec<AsPreset>)] Vec<Atom>),
 }
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct StaticExportsDependency {
   id: DependencyId,
   exports: StaticExportsSpec,
@@ -28,6 +36,7 @@ impl StaticExportsDependency {
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for StaticExportsDependency {
   fn id(&self) -> &DependencyId {
     &self.id
@@ -37,28 +46,33 @@ impl Dependency for StaticExportsDependency {
     &DependencyType::StaticExports
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "StaticExportsDependency"
-  }
-
-  fn get_exports(&self, _mg: &ModuleGraph) -> Option<ExportsSpec> {
+  fn get_exports(
+    &self,
+    _mg: &ModuleGraph,
+    _mg_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
+  ) -> Option<ExportsSpec> {
     Some(ExportsSpec {
       exports: match &self.exports {
-        StaticExportsSpec::Array(exports) => ExportsOfExportsSpec::Array(
+        StaticExportsSpec::Array(exports) => ExportsOfExportsSpec::Names(
           exports
             .iter()
             .map(|item| ExportNameOrSpec::String(item.clone()))
             .collect::<Vec<_>>(),
         ),
-        StaticExportsSpec::True => ExportsOfExportsSpec::True,
+        StaticExportsSpec::True => ExportsOfExportsSpec::UnknownExports,
       },
       can_mangle: Some(self.can_mangle),
       ..Default::default()
     })
   }
+
+  fn could_affect_referencing_module(&self) -> AffectType {
+    AffectType::True
+  }
 }
 
-impl AsDependencyTemplate for StaticExportsDependency {}
+impl AsDependencyCodeGeneration for StaticExportsDependency {}
 impl AsModuleDependency for StaticExportsDependency {}
 
 impl AsContextDependency for StaticExportsDependency {}

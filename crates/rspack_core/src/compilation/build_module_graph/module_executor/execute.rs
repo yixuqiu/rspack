@@ -1,0 +1,539 @@
+use std::{collections::VecDeque, fmt::Write, iter::once, sync::atomic::AtomicU32};
+
+use itertools::Itertools;
+use rspack_collections::{Identifier, IdentifierSet};
+use rspack_error::{Diagnostic, Error, Result};
+use rspack_paths::InternedPathSet;
+use rspack_sources::{RawStringSource, SourceExt};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet};
+use tokio::sync::oneshot::Sender;
+
+use super::context::{ExecutorTaskContext, ImportModuleMeta};
+use crate::{
+  Chunk, ChunkGraph, ChunkKind, ChunkUkey, CodeGenerationDataAssetInfo, CodeGenerationDataFilename,
+  CodeGenerationResult, CodeGenerationResultBuilder, Compilation, CompilationAsset,
+  CompilationAssets, EntryOptions, Entrypoint, ModuleCodeGenerationContext, ModuleType, PublicPath,
+  RuntimeSpec, SourceType,
+  compilation::{
+    code_generation::code_generation_modules,
+    create_module_hashes::create_module_hashes,
+    runtime_requirements::{
+      process_chunks_runtime_requirements, process_modules_runtime_requirements,
+    },
+  },
+  render_runtime_module_source,
+  runtime_globals::{RuntimeVariable, runtime_variable_name},
+  runtime_mode::RuntimeMode,
+  runtime_module_owned_define_fields,
+  utils::{
+    property_access,
+    task_loop::{Task, TaskResult, TaskType},
+  },
+};
+
+#[derive(Debug, Clone)]
+pub struct ExecutedRuntimeModule {
+  pub identifier: Identifier,
+  pub name: String,
+  pub name_for_condition: Option<String>,
+  pub module_type: ModuleType,
+  pub size: f64,
+  pub cacheable: bool,
+}
+
+static EXECUTE_MODULE_ID: AtomicU32 = AtomicU32::new(0);
+pub type ExecuteModuleId = u32;
+
+fn create_execute_runtime_source(
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  runtime_modules: &[Identifier],
+) -> Option<(Identifier, CodeGenerationResult)> {
+  if compilation.options.experiments.runtime_mode != RuntimeMode::Rspack {
+    return None;
+  }
+
+  let metadata = compilation
+    .runtime_proxy_metadata_artifact
+    .get(chunk_ukey)?;
+  let module_owned_fields = runtime_module_owned_define_fields(compilation, chunk_ukey);
+  let lexical_fields = metadata.lexical_fields().difference(module_owned_fields);
+  let context_fields = metadata.context_fields();
+  let execute_fields = lexical_fields | context_fields;
+  if execute_fields.is_empty() && runtime_modules.is_empty() {
+    return None;
+  }
+
+  let runtime_context = runtime_variable_name(&RuntimeVariable::Context);
+  let mut source = String::new();
+  let declarations = execute_fields
+    .iter_names()
+    .filter_map(|(_, runtime_global)| runtime_global.to_lexical_name().map(str::to_string))
+    .collect::<Vec<_>>();
+  if !declarations.is_empty() {
+    writeln!(source, "var {};", declarations.join(", ")).expect("write to string should succeed");
+  }
+  for (_, runtime_global) in execute_fields.iter_names() {
+    let (Some(property_name), Some(lexical_name)) = (
+      runtime_global.rspack_context_property_name(),
+      runtime_global.to_lexical_name(),
+    ) else {
+      continue;
+    };
+    writeln!(
+      source,
+      "{lexical_name}={runtime_context}{};",
+      property_access([property_name], 0)
+    )
+    .expect("write to string should succeed");
+    if runtime_global.should_initialize_as_object() {
+      writeln!(source, "{lexical_name}={lexical_name}||{{}};")
+        .expect("write to string should succeed");
+    } else if runtime_global.should_initialize_as_array() {
+      writeln!(source, "{lexical_name}={lexical_name}||[];")
+        .expect("write to string should succeed");
+    }
+  }
+  for runtime_id in runtime_modules {
+    let runtime_module = compilation
+      .runtime_modules
+      .get(runtime_id)
+      .expect("runtime module should exist");
+    let runtime_module_source = compilation
+      .code_generation_results
+      .get(runtime_id, None)
+      .get(&SourceType::JavaScript)
+      .expect("runtime module should have runtime source");
+    let should_isolate =
+      runtime_module.should_isolate(compilation.options.experiments.runtime_mode);
+    source.push_str(
+      &render_runtime_module_source(
+        runtime_module.identifier(),
+        runtime_module_source.clone(),
+        should_isolate,
+        compilation
+          .options
+          .output
+          .environment
+          .supports_arrow_function(),
+        !should_isolate,
+      )
+      .source()
+      .into_string_lossy(),
+    );
+  }
+  source.push_str(&metadata.render_context_setter_assignments(runtime_context));
+
+  (!source.is_empty()).then(|| {
+    let mut code_generation_result = CodeGenerationResultBuilder::default();
+    code_generation_result.add(
+      SourceType::JavaScript,
+      RawStringSource::from(source).boxed(),
+    );
+    (
+      Identifier::from("rspack/runtime/execute_module_runtime"),
+      code_generation_result.build(),
+    )
+  })
+}
+
+#[derive(Debug, Default)]
+pub struct ExecuteModuleResult {
+  pub errors: Vec<Diagnostic>,
+  pub cacheable: bool,
+  pub file_dependencies: InternedPathSet,
+  pub context_dependencies: InternedPathSet,
+  pub missing_dependencies: InternedPathSet,
+  pub build_dependencies: InternedPathSet,
+  pub code_generated_modules: IdentifierSet,
+  pub id: ExecuteModuleId,
+}
+
+#[derive(Debug)]
+pub struct ExecuteResult {
+  pub execute_result: ExecuteModuleResult,
+  pub assets: CompilationAssets,
+  pub code_generated_modules: IdentifierSet,
+  pub executed_runtime_modules: Vec<ExecutedRuntimeModule>,
+}
+
+pub type ExecuteResultSender = Sender<Result<ExecuteResult>>;
+
+#[derive(Debug)]
+pub struct ExecuteTask {
+  pub meta: ImportModuleMeta,
+  pub public_path: Option<PublicPath>,
+  pub base_uri: Option<String>,
+  pub result_sender: ExecuteResultSender,
+}
+
+impl ExecuteTask {
+  pub fn finish_with_error(self, error: Error) {
+    self
+      .result_sender
+      .send(Err(error))
+      .expect("should send result success");
+  }
+}
+
+#[async_trait::async_trait]
+impl Task<ExecutorTaskContext> for ExecuteTask {
+  fn get_task_type(&self) -> TaskType {
+    TaskType::Main
+  }
+
+  async fn main_run(
+    self: Box<Self>,
+    context: &mut ExecutorTaskContext,
+  ) -> TaskResult<ExecutorTaskContext> {
+    let Self {
+      meta,
+      public_path,
+      base_uri,
+      result_sender,
+    } = *self;
+
+    let ExecutorTaskContext {
+      origin_context,
+      entries,
+      ..
+    } = context;
+
+    let id = EXECUTE_MODULE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut execute_result = ExecuteModuleResult {
+      cacheable: true,
+      id,
+      ..Default::default()
+    };
+
+    let entry_dep_id = entries.get(&meta).expect("should have dep_id");
+    // collect module info
+    let mg = origin_context.artifact.get_module_graph();
+    let Some(entry_module_identifier) =
+      mg.module_identifier_by_dependency_id(entry_dep_id).copied()
+    else {
+      // no entry module, entry dependency factorize failed.
+      result_sender
+        .send(Ok(ExecuteResult {
+          execute_result,
+          assets: Default::default(),
+          code_generated_modules: Default::default(),
+          executed_runtime_modules: Default::default(),
+        }))
+        .expect("should send result success");
+
+      return Ok(vec![]);
+    };
+    let make_failed_module = &origin_context.artifact.make_failed_module;
+    let make_failed_dependencies = &origin_context.artifact.make_failed_dependencies;
+    let mut queue = VecDeque::from(vec![entry_module_identifier]);
+    let mut assets = CompilationAssets::default();
+    let mut modules = IdentifierSet::default();
+    let mut has_error = false;
+
+    while let Some(m) = queue.pop_front() {
+      // to avoid duplicate calculations in https://github.com/web-infra-dev/rspack/issues/10987
+      if !modules.insert(m) {
+        continue;
+      }
+      let module = mg.module_by_identifier(&m).expect("should have module");
+      let build_info = module.build_info();
+      execute_result
+        .file_dependencies
+        .extend(build_info.dependencies.file.iter().cloned());
+      execute_result
+        .context_dependencies
+        .extend(build_info.dependencies.context.iter().cloned());
+      execute_result
+        .missing_dependencies
+        .extend(build_info.dependencies.missing.iter().cloned());
+      execute_result
+        .build_dependencies
+        .extend(build_info.dependencies.build.iter().cloned());
+      if !build_info.cacheable {
+        execute_result.cacheable = false;
+      }
+      for (name, asset) in build_info.assets.as_ref() {
+        assets.insert(name.clone(), asset.clone());
+      }
+      if !has_error
+        && make_failed_module.contains(&m)
+        && module
+          .as_normal_module()
+          .is_none_or(|module| module.error().is_some())
+      {
+        let diagnostics = module
+          .diagnostics()
+          .iter()
+          .filter(|d| d.is_error())
+          .cloned()
+          .map(|mut diagnostic| {
+            diagnostic.module_identifier = Some(m);
+            diagnostic
+          })
+          .collect::<Vec<_>>();
+        if !diagnostics.is_empty() {
+          has_error = true;
+          execute_result.errors.extend(diagnostics);
+        }
+      }
+      for dep_id in module.get_dependency_ids() {
+        if !has_error && make_failed_dependencies.contains(dep_id) {
+          let diagnostics = origin_context
+            .artifact
+            .factorize_info(dep_id)
+            .expect("should have factorize info")
+            .diagnostics()
+            .iter()
+            .filter(|d| d.is_error())
+            .cloned()
+            .map(|mut diagnostic| {
+              diagnostic.module_identifier = mg.get_parent_module(dep_id).copied();
+              diagnostic
+            })
+            .collect::<Vec<_>>();
+          if !diagnostics.is_empty() {
+            has_error = true;
+            execute_result.errors.extend(diagnostics);
+          }
+        }
+        if let Some(c) = mg.connection_by_dependency_id(dep_id)
+          && !modules.contains(c.module_identifier())
+        {
+          queue.push_back(*c.module_identifier());
+        }
+      }
+    }
+
+    if has_error {
+      result_sender
+        .send(Ok(ExecuteResult {
+          execute_result,
+          assets: Default::default(),
+          code_generated_modules: Default::default(),
+          executed_runtime_modules: Default::default(),
+        }))
+        .expect("should send result success");
+
+      return Ok(vec![]);
+    }
+
+    let mut compilation = origin_context.transform_to_temp_compilation();
+    let main_compilation_plugin_driver = compilation.plugin_driver.clone();
+    compilation.plugin_driver = compilation.buildtime_plugin_driver.clone();
+    tracing::debug!("modules: {:?}", &modules);
+
+    let mut chunk_graph = ChunkGraph::default();
+
+    let mut chunk = Chunk::new(Some("build time chunk".into()), ChunkKind::Normal);
+
+    if let Some(name) = chunk.name() {
+      let name = name.to_string();
+      chunk.set_id(name);
+    }
+    let runtime: RuntimeSpec = once("build time".into()).collect();
+
+    chunk.set_runtime(runtime.clone());
+
+    let mut entrypoint = Entrypoint::new(crate::ChunkGroupKind::Entrypoint {
+      initial: true,
+      options: Box::new(EntryOptions {
+        name: Some("build time".into()),
+        runtime: Some("runtime".into()),
+        chunk_loading: Some(crate::ChunkLoading::Disable),
+        wasm_loading: Some(crate::WasmLoading::Disable),
+        async_chunks: Some(false),
+        public_path,
+        base_uri,
+        filename: None,
+        library: None,
+        depend_on: None,
+        layer: meta.layer,
+      }),
+    });
+
+    // add chunk to this compilation
+    let chunk = compilation
+      .build_chunk_graph_artifact
+      .chunk_by_ukey
+      .add(chunk);
+    let chunk_ukey = chunk.ukey();
+
+    chunk_graph.connect_chunk_and_entry_module(
+      chunk.ukey(),
+      entry_module_identifier,
+      entrypoint.ukey,
+    );
+    entrypoint.connect_chunk(chunk);
+    entrypoint.set_runtime_chunk(chunk.ukey());
+    entrypoint.set_entrypoint_chunk(chunk.ukey());
+
+    compilation
+      .build_chunk_graph_artifact
+      .chunk_group_by_ukey
+      .add(entrypoint);
+
+    // Assign ids to modules and modules to the chunk
+    for &m in &modules {
+      chunk_graph.add_module(m);
+      ChunkGraph::set_module_id(&mut compilation.module_ids_artifact, m, m.as_str().into());
+      chunk_graph.connect_chunk_and_module(chunk_ukey, m);
+    }
+
+    // Webpack uses this trick to make sure process_runtime_requirements access
+    // the new chunk_graph
+    // in rspack, if we decouple compilation and chunk_graph, we can't get exclusive ref
+    // to the chunk_graph in API that receives both compilation and chunk_graph
+    //
+    // replace code_generation_results is the same reason
+    compilation.build_chunk_graph_artifact.chunk_graph = chunk_graph;
+
+    create_module_hashes(&mut compilation, modules.clone()).await?;
+
+    code_generation_modules(&mut compilation, None, modules.clone()).await?;
+    let plugin_driver = compilation.plugin_driver.clone();
+    process_modules_runtime_requirements(&mut compilation, modules.clone(), plugin_driver.clone())
+      .await?;
+    process_chunks_runtime_requirements(
+      &mut compilation,
+      FxHashSet::from_iter([chunk_ukey]),
+      FxHashSet::from_iter([chunk_ukey]),
+      plugin_driver,
+    )
+    .await?;
+    let runtime_modules = compilation
+      .build_chunk_graph_artifact
+      .chunk_graph
+      .get_chunk_runtime_modules_in_order(&chunk_ukey, &compilation)
+      .map(|(identifier, _)| *identifier)
+      .collect_vec();
+
+    tracing::debug!(
+      "runtime modules: {:?}",
+      &runtime_modules.iter().collect::<Vec<_>>()
+    );
+
+    let mut runtime_module_size = HashMap::default();
+    for runtime_id in &runtime_modules {
+      let runtime_module = compilation
+        .runtime_modules
+        .get(runtime_id)
+        .expect("runtime module exist");
+
+      let mut runtime_template = compilation.runtime_template.create_module_code_template();
+      let mut code_generation_context = ModuleCodeGenerationContext {
+        compilation: &compilation,
+        runtime: None,
+        concatenation_scope: None,
+        runtime_template: &mut runtime_template,
+      };
+      let result = runtime_module
+        .code_generation(&mut code_generation_context)
+        .await?;
+      #[allow(clippy::unwrap_used)]
+      let runtime_module_source = result.get(&SourceType::Runtime).unwrap();
+      runtime_module_size.insert(
+        runtime_module.identifier(),
+        runtime_module_source.size() as f64,
+      );
+      let mut code_generation_result = CodeGenerationResultBuilder::default();
+      code_generation_result.add(SourceType::JavaScript, runtime_module_source.clone());
+      let result = code_generation_result.build();
+
+      compilation.code_generation_results.insert(
+        *runtime_id,
+        result,
+        std::iter::once(runtime.clone()),
+      );
+      compilation
+        .code_generated_modules
+        .insert(runtime_module.identifier());
+    }
+
+    let runtime_modules_to_execute = if let Some((runtime_identifier, runtime_result)) =
+      create_execute_runtime_source(&compilation, &chunk_ukey, &runtime_modules)
+    {
+      compilation.code_generation_results.insert(
+        runtime_identifier,
+        runtime_result,
+        std::iter::once(runtime.clone()),
+      );
+      compilation
+        .code_generated_modules
+        .insert(runtime_identifier);
+      vec![runtime_identifier]
+    } else {
+      runtime_modules.clone()
+    };
+
+    let exports = main_compilation_plugin_driver
+      .compilation_hooks
+      .execute_module
+      .call(
+        &entry_module_identifier,
+        &runtime_modules_to_execute,
+        &compilation.code_generation_results,
+        &id,
+      )
+      .await;
+
+    match exports {
+      Ok(_) => {
+        for m in modules.iter() {
+          let codegen_result = compilation.code_generation_results.get(m, Some(&runtime));
+
+          if let Some(source) = codegen_result.get(&SourceType::Asset)
+            && let Some(filename) = codegen_result.data().get::<CodeGenerationDataFilename>()
+            && let Some(asset_info) = codegen_result.data().get::<CodeGenerationDataAssetInfo>()
+          {
+            let filename = filename.filename();
+            compilation.emit_asset(
+              filename.to_owned(),
+              CompilationAsset::new(Some(source.clone()), asset_info.inner().clone()),
+            );
+          }
+        }
+      }
+      Err(e) => {
+        execute_result.cacheable = false;
+        execute_result.errors.push(e.into());
+      }
+    };
+
+    assets.extend(std::mem::take(compilation.assets_mut()));
+
+    let code_generated_modules = std::mem::take(&mut compilation.code_generated_modules);
+    let executed_runtime_modules = runtime_modules
+      .iter()
+      .map(|runtime_id| {
+        let runtime_module = compilation
+          .runtime_modules
+          .get(runtime_id)
+          .expect("runtime module exist");
+        let identifier = runtime_module.identifier();
+        ExecutedRuntimeModule {
+          identifier,
+          name: runtime_module
+            .readable_identifier(&compilation.options.context)
+            .into(),
+          name_for_condition: runtime_module.name_for_condition().map(|n| n.to_string()),
+          module_type: *runtime_module.module_type(),
+          cacheable: !(runtime_module.full_hash() || runtime_module.dependent_hash()),
+          size: runtime_module_size
+            .get(&identifier)
+            .map_or(0 as f64, |s| s.to_owned()),
+        }
+      })
+      .collect_vec();
+    origin_context.recovery_from_temp_compilation(compilation);
+    result_sender
+      .send(Ok(ExecuteResult {
+        execute_result,
+        assets,
+        code_generated_modules,
+        executed_runtime_modules,
+      }))
+      .expect("should send result success");
+    Ok(vec![])
+  }
+}

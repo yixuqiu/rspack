@@ -1,0 +1,24 @@
+{
+  "name": "examples-react",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "rspack dev",
+    "build": "rspack build",
+    "preview": "rspack preview"
+  },
+  "dependencies": {
+    "react": "catalog:",
+    "react-dom": "catalog:"
+  },
+  "devDependencies": {
+    "@rspack/cli": "workspace:*",
+    "@rspack/core": "workspace:*",
+    "@rspack/dev-server": "catalog:",
+    "@rspack/plugin-react-refresh": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "react-refresh": "catalog:",
+    "typescript": "catalog:"
+  }
+}

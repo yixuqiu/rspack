@@ -1,0 +1,100 @@
+---
+description: 'Customize stats generation and text output with StatsFactory and StatsPrinter hooks.'
+---
+
+# Stats hooks
+
+## StatsFactory
+
+### StatsFactory.hooks.extract
+
+A HookMap that is called when generating the specified stats item.
+
+- **Type:** `HookMap<SyncBailHook<[Record<string, any>, any, StatsFactoryContext], undefined>>`
+- **Arguments:**
+  - `object`: result stats item object to which properties should be added
+  - `data`: original data of the stats item
+  - `StatsFactoryContext`: generating context
+
+```ts
+// Only common context fields are listed here. Different stats item types may provide additional fields.
+type StatsFactoryContext = {
+  type: string;
+  compilation: Compilation;
+  makePathsRelative?: (value: string) => string;
+  [key: string]: any;
+};
+```
+
+For the following example, the `customProperty` attribute is added in the finally generated `stats.compilation` through `MyPlugin`:
+
+```js
+compilation.hooks.statsFactory.tap('MyPlugin', (statsFactory, options) => {
+  statsFactory.hooks.extract
+    .for('compilation')
+    .tap('MyPlugin', (object, compilation) => {
+      object.customProperty = MyPlugin.getCustomValue(compilation);
+    });
+});
+```
+
+### StatsFactory.hooks.result
+
+A HookMap that is called after generating the specified stats item.
+
+- **Type:** `HookMap<SyncWaterfallHook<[any, StatsFactoryContext]>>`
+- **Arguments:**
+  - `any`: generated stats item result
+  - `StatsFactoryContext`: generating context
+
+## StatsPrinter
+
+### StatsPrinter.hooks.print
+
+A HookMap that is called when generating the printed string of the specified stats item.
+
+Return a string to override the printed output. Return `undefined`, or omit the return value, to let subsequent taps, less specific hooks, or the default printing logic handle the item. An empty string suppresses the output and stops further processing by this bail hook.
+
+- **Type:** `HookMap<SyncBailHook<[{}, StatsPrinterContext], string | void>>`
+- **Arguments:**
+  - `object`: stats item object
+  - `StatsPrinterContext`: printing context
+
+```ts
+// Only common context fields are listed here. Different stats item types may provide additional fields.
+type StatsPrinterContext = {
+  type?: string;
+  compilation?: StatsCompilation;
+  chunkGroup?: StatsChunkGroup;
+  asset?: StatsAsset;
+  module?: StatsModule;
+  chunk?: StatsChunk;
+  moduleReason?: StatsModuleReason;
+  bold?: (str: string) => string;
+  yellow?: (str: string) => string;
+  red?: (str: string) => string;
+  green?: (str: string) => string;
+  magenta?: (str: string) => string;
+  cyan?: (str: string) => string;
+  formatFilename?: (file: string, oversize?: boolean) => string;
+  formatModuleId?: (id: string) => string;
+  formatChunkId?:
+    | ((id: string, direction?: 'parent' | 'child' | 'sibling') => string)
+    | undefined;
+  formatSize?: (size: number) => string;
+  formatDateTime?: (dateTime: number) => string;
+  formatFlag?: (flag: string) => string;
+  formatTime?: (time: number, boldQuantity?: boolean) => string;
+  chunkGroupKind?: string;
+  [key: string]: any;
+};
+```
+
+### StatsPrinter.hooks.result
+
+A HookMap that is called after generating the printed string of the specified stats item.
+
+- **Type:** `HookMap<SyncWaterfallHook<[string, StatsPrinterContext]>>`
+- **Arguments:**
+  - `string`: printed string of the stats item
+  - `StatsPrinterContext`: printing context

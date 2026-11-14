@@ -1,0 +1,328 @@
+---
+description: '使用 Stats 和 MultiStats 查看构建结果、检查错误和警告，并导出 JSON 或格式化文本。'
+---
+
+import Columns from '@components/Columns';
+import { Collapse, CollapsePanel } from '@components/Collapse';
+import CompilationType from '../../types/compilation.mdx';
+import { Badge } from '@theme';
+
+# Stats
+
+`Stats` 对象会作为 `rspack()` 回调函数的第二个参数，可以通过它获取到一次 Compilation 执行过程中的信息，包括：
+
+- 错误和警告（如果存在）
+- 计时信息
+- 模块和 chunk 信息
+
+`Stats` 对象提供了两个重要方法：
+
+- `toJson()`: 以 [Stats JSON](/api/javascript-api/stats-json) 对象的形式输出信息，常用于产物分析工具
+- `toString()`: 以字符串形式输出信息，常用于控制台输出
+
+同时 Rspack 也提供了 `StatsFactory` 和 `StatsPrinter` 来更细粒度地控制输出的对象或字符串。
+
+```txt title=Stats 输出
+Compilation ===============> Stats JSON =================> Stats Output
+           ╰─ StatsFactory ─╯           ╰─ StatsPrinter ─╯
+╰─────────── stats.toJson() ───────────╯
+╰───────────────────────── stats.toString() ──────────────────────────╯
+```
+
+通过 [`compilation.getStats()`](/api/javascript-api/compilation#getstats) 或 `new Stats(compilation)` 以创建一个 Compilation 关联的 Stats 对象。
+
+:::warning 注意时机
+
+`stats.toJson()` 和 `stats.toString()` 依赖在 `compiler.hooks.done` 阶段才最终稳定的编译产物。如果在其他时机调用（例如复用更早阶段拿到的旧 `Stats` 对象），部分 Stats 字段可能不完整。
+
+为了拿到完整且稳定的 Stats 输出，建议在 `compiler.hooks.done` 中调用这些方法：
+
+```js
+compiler.hooks.done.tap('MyPlugin', (stats) => {
+  const statsJson = stats.toJson({ all: false, errors: true, warnings: true });
+  const statsText = stats.toString({ preset: 'errors-warnings' });
+  console.log(statsJson.errors);
+  console.log(statsText);
+});
+```
+
+:::
+
+## Stats 方法
+
+### hasErrors
+
+用来检查编译期是否有错误。
+
+**类型：**
+
+```ts
+hasErrors(): boolean;
+```
+
+可以根据返回值处理编译错误：
+
+```js
+if (stats.hasErrors()) {
+  console.error('编译失败');
+}
+```
+
+### hasWarnings
+
+用来检查编译期是否有警告。
+
+**类型：**
+
+```ts
+hasWarnings(): boolean;
+```
+
+可以根据返回值处理编译警告：
+
+```js
+if (stats.hasWarnings()) {
+  console.warn('编译完成，但存在警告');
+}
+```
+
+### toJson
+
+以 [Stats JSON](/api/javascript-api/stats-json) 对象形式返回编译信息。可以传入[预设名称或配置对象](/config/stats)，选择要包含的信息。
+
+`assets` 数组中各对象的结构和字段说明见 [Asset 对象结构](/api/javascript-api/stats-json#asset-object)。
+
+**类型：**
+
+```ts
+toJson(options?: StatsValue): StatsCompilation;
+```
+
+使用 `'minimal'` 预设并打印错误数量：
+
+```js
+const statsJson = stats.toJson('minimal');
+console.log(statsJson.errorsCount);
+```
+
+也可以通过配置对象选择要输出的字段，然后打印编译哈希：
+
+```js
+const statsJson = stats.toJson({
+  assets: false,
+  hash: true,
+});
+console.log(statsJson.hash);
+```
+
+### toString
+
+以格式化的字符串形式返回描述编译信息（类似 [CLI](/api/cli) 的输出）。
+
+**类型：**
+
+```ts
+toString(opts?: StatsValue): string;
+```
+
+可以通过 [Stats 配置](/config/stats) 控制输出内容，也可以通过 `colors` 控制文字颜色：
+
+```js
+stats.toString({
+  // 增加控制台颜色开关
+  colors: true,
+});
+```
+
+下面是 `stats.toString()` 用法的示例：
+
+```js
+import { rspack } from '@rspack/core';
+
+rspack(
+  {
+    // ...
+  },
+  (err, stats) => {
+    if (err) {
+      console.error(err);
+      return;
+    }
+
+    console.log(
+      stats.toString({
+        chunks: false, // 使构建过程更静默无输出
+        colors: true, // 在控制台展示颜色
+      }),
+    );
+  },
+);
+```
+
+## Stats 属性
+
+### compilation
+
+**类型：** `Compilation`
+
+获取关联的 Compilation 对象。
+
+<Collapse>
+  <CollapsePanel className="collapse-code-panel" header="Stats.ts" key="stats">
+    <CompilationType />
+  </CollapsePanel>
+</Collapse>
+
+### hash
+
+**类型：** `string | null`
+
+获取此次构建的哈希值，等同于 [`Compilation.hash`](/api/javascript-api/compilation#hashfullhash)。
+
+将其作为字符串使用前，先检查是否为 `null`：
+
+```js
+if (stats.hash !== null) {
+  console.log(stats.hash);
+}
+```
+
+## MultiStats
+
+当使用 [`MultiCompiler`](/api/javascript-api/compiler#multicompiler) 执行多个编译任务时，编译结果会被包装为一个 `MultiStats` 对象。它提供合并后的哈希，以及用于检查、序列化和格式化所有子编译结果的方法。
+
+### hash
+
+<Badge text="只读" type="info" />
+
+**类型：** `string`
+
+获取由所有子编译哈希依次拼接而成的字符串。
+
+打印拼接后的哈希：
+
+```js
+console.log(multiStats.hash);
+```
+
+### hasErrors
+
+任一子编译存在错误时返回 `true`。
+
+**类型：**
+
+```ts
+hasErrors(): boolean;
+```
+
+可以根据返回值处理所有子编译中的错误：
+
+```js
+if (multiStats.hasErrors()) {
+  console.error('至少一个编译失败');
+}
+```
+
+### hasWarnings
+
+任一子编译存在警告时返回 `true`。
+
+**类型：**
+
+```ts
+hasWarnings(): boolean;
+```
+
+可以根据返回值处理所有子编译中的警告：
+
+```js
+if (multiStats.hasWarnings()) {
+  console.warn('至少一个编译存在警告');
+}
+```
+
+### toJson
+
+返回一个 `StatsCompilation`，其 `children` 数组包含每个子编译的 [Stats JSON](/api/javascript-api/stats-json)。对所有子编译均启用的字段（如 `errors` 和 `warnings`）还会汇总到顶层。
+
+**类型：**
+
+```ts
+toJson(options: boolean | StatsPresets | MultiStatsOptions): StatsCompilation;
+```
+
+为所有子编译使用同一个预设，并查看结果数量：
+
+```js
+const statsJson = multiStats.toJson('minimal');
+console.log(statsJson.children?.length);
+```
+
+`MultiStatsOptions` 还支持通过 `children` 选项分别配置每个子编译。以下示例打印第一个子编译的错误信息：
+
+```js
+const statsJson = multiStats.toJson({
+  children: [
+    { all: false, errors: true },
+    { all: false, assets: true },
+  ],
+});
+console.log(statsJson.children?.[0]?.errors);
+```
+
+### toString
+
+根据 [Stats 配置](/config/stats) 格式化每个子编译，再将结果拼接成一个字符串。
+
+**类型：**
+
+```ts
+toString(options: boolean | StatsPresets | MultiStatsOptions): string;
+```
+
+为所有子编译使用同一个预设，并打印合并后的输出：
+
+```js
+const statsText = multiStats.toString('minimal');
+console.log(statsText);
+```
+
+## Stats factory
+
+用于从 Compilation 生成 Stats JSON 对象，并且提供了钩子以在生成过程中进行细粒度的控制。
+
+可通过 [`compilation.hooks.statsFactory`](/api/plugin-api/compilation-hooks#statsfactory) 获取。或者通过 `new StatsFactory()` 创建新实例。
+
+### Hooks
+
+详见 [StatsFactory 钩子](/api/plugin-api/stats-hooks#statsfactory)
+
+### create
+
+`StatsFactory` 的核心方法，根据 `type` 指定当前数据结构，查找并运行对应的生成器以生成 Stats 项目。
+
+```ts
+stats = statsFactory.create('compilation', compilation, {});
+```
+
+> `StatsFactory` 对象仅负责处理调用钩子，对应类型的处理代码的处理代码可在 [`DefaultStatsFactoryPlugin`](https://github.com/web-infra-dev/rspack/blob/main/packages/rspack/src/stats/DefaultStatsFactoryPlugin.ts) 中找到。
+
+## Stats printer
+
+用于从 Stats JSON 对象生成输出字符串，并且提供了钩子以在生成过程中进行细粒度的控制。
+
+可通过 [`compilation.hooks.statsPrinter`](/api/plugin-api/compilation-hooks#statsprinter) 获取。或者通过 `new StatsPrinter()` 创建新实例。
+
+### Hooks
+
+详见 [StatsPrinter 钩子](/api/plugin-api/stats-hooks#statsprinter)
+
+### print
+
+`StatsPrinter` 的核心方法，根据 `type` 指定当前数据结构，查找并运行对应的生成器以生成 Stats 项目的输出字符串。
+
+```ts
+stats = statsPrinter.print('compilation', stats, {});
+```
+
+> `StatsPrinter` 对象仅负责处理调用钩子，对应类型的处理代码的处理代码可在 [`DefaultStatsPrinterPlugin`](https://github.com/web-infra-dev/rspack/blob/main/packages/rspack/src/stats/DefaultStatsPrinterPlugin.ts) 中找到。

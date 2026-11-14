@@ -1,0 +1,27 @@
+---
+description: '通过实验性的 rspack.experiments.resolver API 和 ResolverFactory，同步或异步解析模块路径。'
+---
+
+# Resolver API
+
+Rspack 使用 Rust 编写的更高性能的 [rspack-resolver](https://github.com/rstackjs/rspack-resolver) 来代替 webpack 中的 [enhanced-resolve](https://github.com/webpack/enhanced-resolve)，并通过 `rspack.experiments.resolver` 实验性地重导出了这些 API。这使你能够直接调用 rspack-resolver 的 `resolver.sync` 或 `resolver.async` 等功能。
+
+完整的用法以及选项参见 [rspack-resolver](https://github.com/rstackjs/rspack-resolver)，以下是一个简单的示例，演示如何使用 Rspack 解析模块的路径：
+
+```js
+import { rspack } from '@rspack/core';
+
+const { resolver } = rspack.experiments;
+
+// 直接使用默认选项的 Resolver API
+const { path: syncResolvedPath } = resolver.sync(contextPath, './index.js');
+const { path: asyncResolvedPath } = await resolver.async(
+  contextPath,
+  './index.js',
+);
+
+// 使用 ResolverFactory 自定义选项
+const customResolver = new resolver.ResolverFactory(resolveOptions);
+const syncResult = customResolver.sync(contextPath, './request.js');
+const asyncResult = await customResolver.async(contextPath, './request.js');
+```

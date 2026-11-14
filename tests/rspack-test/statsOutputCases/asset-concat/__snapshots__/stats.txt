@@ -1,0 +1,7 @@
+asset xxx.png xx KiB [emitted] [immutable] [from: images/file.png] (auxiliary name: main)
+asset bundle.js xx KiB [emitted] (name: main)
+asset static/file.html xx bytes [emitted] [from: static/file.html] (auxiliary name: main)
+orphan modules xx KiB (javascript) xx KiB (asset) [orphan] 10 modules
+runtime modules xx KiB 2 modules
+./index.js + 9 modules xx KiB [code generated]
+Rspack x.x.x compiled successfully in X s

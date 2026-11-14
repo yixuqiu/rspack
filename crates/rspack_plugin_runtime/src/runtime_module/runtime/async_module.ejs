@@ -1,0 +1,103 @@
+<%- var("hasSymbol") %> = typeof Symbol === "function";
+<%- var("rspackQueues") %> = hasSymbol ? Symbol("rspack queues") : "__rspack_queues";
+<% if (_uses_lexical_runtime_globals) { %><%- define(ASYNC_MODULE_EXPORT_SYMBOL) %> = hasSymbol ? Symbol("rspack exports") : "<%- EXPORTS %>";
+<%- var("rspackExports") %> = <%- ASYNC_MODULE_EXPORT_SYMBOL %>;<% } else { %><%- var("rspackExports") %> = <%- define(ASYNC_MODULE_EXPORT_SYMBOL) %> = hasSymbol ? Symbol("rspack exports") : "<%- EXPORTS %>";<% } %>
+<%- var("rspackError") %> = hasSymbol ? Symbol("rspack error") : "__rspack_error";
+<%- var("rspackDone") %> = hasSymbol ? Symbol("rspack done") : "__rspack_done";
+<% if (_uses_lexical_runtime_globals) { %><%- define(DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES_SYMBOL) %> = hasSymbol ? Symbol("rspack defer") : "__rspack_defer";
+<%- var("rspackDefer") %> = <%- DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES_SYMBOL %>;<% } else { %><%- var("rspackDefer") %> = <%- define(DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES_SYMBOL) %> = hasSymbol ? Symbol("rspack defer") : "__rspack_defer";<% } %>
+<%- define(DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES) %> = <%- basicFunction("asyncDeps") %> {
+	var hasUnresolvedAsyncSubgraph = asyncDeps.some((id) => {
+		var cache = <%- MODULE_CACHE %>[id];
+		return !cache || cache[rspackDone] === false;
+	});
+	if (hasUnresolvedAsyncSubgraph) {
+		return ({ then(onFulfilled, onRejected) { return Promise.all(asyncDeps.map(<%- REQUIRE %>)).then(onFulfilled, onRejected) } });
+	}
+}
+<%- var("resolveQueue") %> = <%- basicFunction("queue") %> {
+	if (queue && queue.d < 1) {
+		queue.d = 1;
+    	queue.forEach(<%- expressionFunction("fn.r--", "fn") %>);
+		queue.forEach(<%- expressionFunction("fn.r-- ? fn.r++ : fn()", "fn") %>);
+	}
+}
+<%- var("wrapDeps") %> = <%- basicFunction("deps") %> {
+	return deps.map(<%- basicFunction("dep") %> {
+		if (dep !== null && typeof dep === "object") {
+			if(!dep[rspackQueues] && dep[rspackDefer]) {
+				var asyncDeps = <%- DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES %>(dep[rspackDefer]);
+				if (asyncDeps) {
+					var d = dep;
+					dep = {
+						then(onFulfilled, onRejected) {
+							asyncDeps.then(<%- returningFunction("onFulfilled(d)", "") %>, onRejected);
+						}
+					};
+				} else return dep;
+			}
+			if (dep[rspackQueues]) return dep;
+			if (dep.then) {
+				var queue = [];
+				queue.d = 0;
+				dep.then(<%- basicFunction("r") %> {
+					obj[rspackExports] = r;
+					resolveQueue(queue);
+				},<%- basicFunction("e") %> {
+					obj[rspackError] = e;
+					resolveQueue(queue);
+				});
+				var obj = {};
+				obj[rspackDefer] = false;
+				obj[rspackQueues] = <%- expressionFunction("fn(queue)", "fn") %>;
+				return obj;
+			}
+		}
+		var ret = {};
+		ret[rspackQueues] = <%- emptyFunction() %>;
+		ret[rspackExports] = dep;
+		return ret;
+	});
+};
+<%- define(ASYNC_MODULE) %> = <%- basicFunction("module, body, hasAwait, useModuleExports") %> {
+	var queue;
+	hasAwait && ((queue = []).d = -1);
+	var depQueues = new Set();
+	var exports = module.exports;
+	var currentDeps;
+	var outerResolve;
+	var reject;
+	var promise = new Promise(<%- basicFunction("resolve, rej") %> {
+		reject = rej;
+		outerResolve = resolve;
+	});
+	promise[rspackExports] = exports;
+	promise[rspackQueues] = <%- basicFunction("fn") %> { queue && fn(queue), depQueues.forEach(fn), promise["catch"](<%- emptyFunction() %>); };
+	module.exports = promise;
+	var asyncModule = module;
+	if (useModuleExports) {
+		asyncModule = Object.create(module);
+		asyncModule.exports = exports;
+	}
+	var handle = <%- basicFunction("deps") %> {
+		currentDeps = wrapDeps(deps);
+		var fn;
+		var getResult = <%- basicFunction("") %> {
+			return currentDeps.map(<%- basicFunction("d") %> {
+				if(d[rspackDefer]) return d;
+				if (d[rspackError]) throw d[rspackError];
+				return d[rspackExports];
+			});
+		}
+		var promise = new Promise(<%- basicFunction("resolve") %> {
+			fn = <%- expressionFunction("resolve(getResult)", "") %>;
+			fn.r = 0;
+			var fnQueue = <%- expressionFunction("q !== queue && !depQueues.has(q) && (depQueues.add(q), q && !q.d && (fn.r++, q.push(fn)))", "q") %>;
+			currentDeps.map(<%- expressionFunction("dep[rspackDefer] || dep[rspackQueues](fnQueue)", "dep") %>);
+		});
+		return fn.r ? promise : getResult();
+	};
+	var done = <%- expressionFunction("(err ? reject(promise[rspackError] = err) : (useModuleExports && (exports = promise[rspackExports] = asyncModule.exports), outerResolve(exports))), resolveQueue(queue), promise[rspackDone] = true", "err") %>;
+	body(handle, done, asyncModule);
+	queue && queue.d < 0 && (queue.d = 0);
+};

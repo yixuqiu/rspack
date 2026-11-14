@@ -1,31 +1,56 @@
-# 功能规划
+---
+description: '我们正在开发 Rspack 2.0 与 Rsbuild 2.0，这一版本的重点在于改进 API 和内部架构、提升性能，进一步拥抱现代 Web 标准，并提供更优秀的开发体验。'
+---
 
-当前文档列出了 Rspack 正在支持的一些重要功能，其中一部分功能已经在实现过程中，一部分将在 Rspack 未来的版本中实现。
+# 路线图
 
-## Rspack v1.0
+这里将持续记录 Rspack 的最新规划与进展，内容会随版本演进而更新。
 
-我们计划在 2024 年 7 月发布 Rspack v1.0 正式版，该版本旨在改进 Rspack 的 API 稳定性，并发布一些重要功能，比如 Lazy Compilation。
+> 更新时间：2026-04
 
-> 请参考 [Rspack v1.0 Release Plan](https://github.com/web-infra-dev/rspack/discussions/6315) 了解更多。
+## 进阶的产物优化
 
-## Rsbuild v1.0
+Rspack 在默认优化上会优先保证产物行为的稳定性，尤其在 side effects 判断等环节会采取保守策略。这种取舍适合大多数项目，但在追求极致体积的场景下，仍有继续优化的空间。
 
-Rsbuild 是基于 Rspack 的新一代构建工具，由 Rspack 团队开发。Rsbuild v1.0 版本将在 2024 年 7 月与 Rspack 同步发布。
+Rspack 已支持基于 pure annotation 的细粒度优化。后续我们会继续加强 tree shaking，并提供边界清晰、可分级的优化配置，使用户可以根据场景在默认安全性与优化激进程度之间进行选择。
 
-> 请参考 [Rsbuild v1.0 Release Plan](https://github.com/web-infra-dev/rsbuild/discussions/1678) 了解更多。
+我们也会结合静态类型信息继续完善优化分析，借鉴 Prepack、Closure Compiler 和 React Compiler 的相关思路，将源代码中可用于优化的信息进一步引入打包流程。
 
-## 性能优化
+在代码拆分方面，后续会继续推进更细粒度的拆分策略。当前的 code splitting 最小粒度通常仍是模块，模块内部的局部复用仍可能带来额外加载。接下来，我们会参考 esbuild、Turbopack 等工具在 module splitting 方向上的经验，基于实际复用关系将公共模块拆分为更小的单元，在保证缓存稳定性、调试体验和运行时行为可控的前提下，尽量减少不必要的加载。同时，我们也会结合 `import defer` 等模块能力，探索新的加载策略。
 
-我们仍然存在着很多的性能优化空间，我们将在未来和上游项目如 [SWC](https://github.com/swc-project/swc) 和 [NAPI-RS](https://github.com/napi-rs/napi-rs) 一起持续地进行性能优化。
+## 提升构建性能
 
-## Webpack 生态兼容性
+Rspack 会继续优化自身的算法、数据结构和增量构建路径。但在真实项目中，性能瓶颈并不总在打包主流程本身，很多时候会出现在 linter、type checker、Tailwind CSS 等配套工具上。
 
-由于 webpack 包含了大量的 API，我们需要逐步支持。我们将根据社区的反馈，优先支持一些高频使用的 loaders 和 plugins。
+因此，后续的性能工作不会只聚焦于 Rspack 内核。我们也会继续推进 Rstack 生态中相关工具的演进，例如在 Rslint 中探索基于 tsgo 的 lint 和 typecheck 方案，作为当前常见的 `eslint-webpack-plugin` 与 `ts-checker-rspack-plugin` 组合的替代选择，从而改善整个构建链路的性能表现。
 
-## Lazy Compilation
+## 对 agent 的支持
 
-尽管 Rspack 目前有很好的性能，但是面对具有大量页面的项目，其性能仍然具有较大的提升空间，Lazy Compilation 是一个提升性能的良好手段，我们将在未来支持该功能。
+越来越多开发者已经开始使用 coding agent 处理构建相关问题，包括性能分析、产物优化和自动化迁移。我们已经通过 [Rstack Skills](https://github.com/rstackjs/agent-skills) 为这类工作提供了一定支持。与此同时，我们也逐渐明确，AI 是否能够有效解决构建问题，很大程度上取决于三个前提：是否能够获得准确的上下文，是否能够稳定复现问题，以及是否能够以较低成本快速验证假设。
 
-## Persistent Cache
+接下来，这部分工作会主要围绕四个方向展开：
 
-Persistent Cache 能够大幅的优化项目的二次编译性能，即使 Rspack 目前在绝大部分项目里都能够达到不错的性能，但是在某些超大规模的项目的场景下，Persistent Cache 仍然能够带来很大的性能提升，我们将在未来计划支持该功能。
+- 完善调试能力，使 coding agent 可以基于 Rspack 的调试版本排查问题，并建立编译期与运行时信息之间的关联。
+- 完善诊断信息，在编译阶段暴露更多可被机器消费的过程数据，例如 tree shaking、scope hoisting 等优化阶段的 bailout reason，以及模块、chunk 和插件链路信息，用于自动分析和迭代优化。
+- 完善上下文采集与问题复现能力，例如暴露配置解析结果、环境信息和关键编译路径，使 AI 生成的建议具备复现和验证条件。
+- 缩短反馈闭环，面向 agent 场景探索效率更高的编译模式，降低“提出假设、执行验证、继续迭代”的成本。
+
+## 现代化的产物格式
+
+过去，Rspack 一直保持对 webpack 产物格式的兼容。这对于迁移正确性和生态兼容都很重要，但也意味着需要继承一部分历史设计。为了同时支持 CJS、UMD、ESM 等不同输出格式，以及 HMR、Module Federation 等运行时能力，传统打包工具的产物往往需要在可读性与二次静态分析能力之间做出取舍。
+
+未来，我们会在保留关键运行时能力的前提下，继续探索更现代的产物形态，例如更纯净的 ESM 输出，以及基于 import maps、module fragments 等新标准的组织方式。
+
+## 跟进社区规范与平台能力
+
+JavaScript 社区仍在持续演进，新的语法、模块能力和运行时接口也在不断成熟。Rspack 会持续跟进这些变化，例如对 `import.meta` 和 `import defer` 的支持。
+
+## 支持上层框架
+
+今天的打包工具已经不只是将模块打成捆绑包的工具。对于框架和上层工具来说，它还需要承担多环境编译、服务端与客户端边界分析、样式与资源收集、运行时协调等底层职责。
+
+Rspack 已经为 React Server Components 提供了实验性支持。接下来，我们会继续将更多能力沉淀为稳定的基础能力，降低上层框架和工具的接入成本，并减少适配代码。
+
+## 社区合作
+
+Rspack 已经帮助我们在实践中解决了诸多性能与效率问题，我们也希望它能为更广泛的社区带来价值。我们非常期待能与社区内的框架团队深入合作，如果你的框架或者工具链对与 Rspack 合作感兴趣，欢迎与我们联系以获取进一步的支持。

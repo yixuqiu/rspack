@@ -1,0 +1,14 @@
+# Case split-chunks: Step 0
+
+## Changed Files
+
+
+## Asset Files
+- Bundle: common.chunk.mjs
+- Bundle: main.mjs
+- Bundle: vendor.chunk.mjs
+
+## Manifest
+
+
+## Update

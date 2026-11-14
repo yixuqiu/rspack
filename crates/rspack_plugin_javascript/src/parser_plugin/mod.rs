@@ -1,54 +1,86 @@
+mod amd;
 mod api_plugin;
-mod check_var_decl;
 mod common_js_exports_parse_plugin;
 mod common_js_imports_parse_plugin;
 mod common_js_plugin;
 mod compatibility_plugin;
 mod r#const;
 mod drive;
-mod exports_info_api_plugin;
-mod harmony_detection_parser_plugin;
-mod harmony_export_dependency_parser_plugin;
-mod harmony_import_dependency_parser_plugin;
-mod harmony_top_level_this_plugin;
-mod hot_module_replacement_plugin;
+mod esm_detection_parser_plugin;
+mod esm_export_dependency_parser_plugin;
+mod esm_import_dependency_parser_plugin;
+mod esm_top_level_this_plugin;
 mod import_meta_context_dependency_parser_plugin;
+mod import_meta_path;
 mod import_meta_plugin;
 mod import_parser_plugin;
+mod import_phase;
 mod initialize_evaluating;
-mod node_stuff_plugin;
-mod provide;
+mod inline_const;
+pub(crate) mod inner_graph;
+mod javascript_meta_info_plugin;
+pub mod node_stuff_plugin;
+mod override_strict_plugin;
 mod require_context_dependency_parser_plugin;
+mod require_ensure_dependencies_block_parse_plugin;
+mod side_effects_analysis;
 mod r#trait;
 mod url_plugin;
-mod webpack_included_plugin;
+mod use_strict_plugin;
 mod worker_plugin;
-/// TODO: should move to rspack_plugin_javascript once we drop old treeshaking
-mod worker_syntax_plugin;
 
-pub(crate) use self::api_plugin::APIPlugin;
-pub(crate) use self::check_var_decl::CheckVarDeclaratorIdent;
-pub(crate) use self::common_js_exports_parse_plugin::CommonJsExportsParserPlugin;
-pub(crate) use self::common_js_imports_parse_plugin::CommonJsImportsParserPlugin;
-pub(crate) use self::common_js_plugin::CommonJsPlugin;
-pub(crate) use self::compatibility_plugin::CompatibilityPlugin;
-pub(crate) use self::drive::JavaScriptParserPluginDrive;
-pub(crate) use self::exports_info_api_plugin::ExportsInfoApiPlugin;
-pub(crate) use self::harmony_detection_parser_plugin::HarmonyDetectionParserPlugin;
-pub(crate) use self::harmony_export_dependency_parser_plugin::HarmonyExportDependencyParserPlugin;
-pub(crate) use self::harmony_import_dependency_parser_plugin::HarmonyImportDependencyParserPlugin;
-pub(crate) use self::harmony_top_level_this_plugin::HarmonyTopLevelThisParserPlugin;
-pub(crate) use self::hot_module_replacement_plugin::hot_module_replacement;
-pub(crate) use self::import_meta_context_dependency_parser_plugin::ImportMetaContextDependencyParserPlugin;
-pub(crate) use self::import_meta_plugin::ImportMetaPlugin;
-pub(crate) use self::import_parser_plugin::ImportParserPlugin;
-pub(crate) use self::initialize_evaluating::InitializeEvaluating;
-pub(crate) use self::node_stuff_plugin::NodeStuffPlugin;
-pub(crate) use self::provide::ProviderPlugin;
-pub(crate) use self::r#const::{is_logic_op, ConstPlugin};
-pub(crate) use self::r#trait::{BoxJavascriptParserPlugin, JavascriptParserPlugin};
-pub(crate) use self::require_context_dependency_parser_plugin::RequireContextDependencyParserPlugin;
-pub(crate) use self::url_plugin::URLPlugin;
-pub(crate) use self::webpack_included_plugin::WebpackIsIncludedPlugin;
-pub(crate) use self::worker_plugin::WorkerPlugin;
-pub(crate) use self::worker_syntax_plugin::WorkerSyntaxScanner;
+pub mod define_plugin;
+pub mod hot_module_replacement_plugin;
+pub mod provide_plugin;
+pub mod side_effects_parser_plugin;
+
+pub(crate) use self::{
+  amd::{
+    AMDDefineDependencyParserPlugin, AMDParserPlugin, AMDRequireDependenciesBlockParserPlugin,
+  },
+  api_plugin::APIPlugin,
+  common_js_exports_parse_plugin::CommonJsExportsParserPlugin,
+  common_js_imports_parse_plugin::{
+    CREATE_REQUIRE_EVALUATED_TAG, CREATE_REQUIRE_SPECIFIER_TAG, CREATED_REQUIRE_IDENTIFIER_TAG,
+    CommonJsImportsParserPlugin, CreatedRequireReferencesState, CreatedRequireTagData,
+    RequireReferencesState, evaluate_create_require_new_expression,
+    is_create_require_namespace_member, is_create_require_specifier,
+  },
+  common_js_plugin::CommonJsPlugin,
+  compatibility_plugin::{CompatibilityPlugin, NESTED_IDENTIFIER_TAG, NestedRequireData},
+  r#const::ConstPlugin,
+  drive::JavaScriptParserPluginDrive,
+  esm_detection_parser_plugin::ESMDetectionParserPlugin,
+  esm_export_dependency_parser_plugin::ESMExportDependencyParserPlugin,
+  esm_import_dependency_parser_plugin::ESMImportDependencyParserPlugin,
+  esm_top_level_this_plugin::ESMTopLevelThisParserPlugin,
+  import_meta_context_dependency_parser_plugin::ImportMetaContextDependencyParserPlugin,
+  import_meta_plugin::{ImportMetaDisabledPlugin, ImportMetaPlugin},
+  import_parser_plugin::{ImportParserPlugin, ImportsReferencesState},
+  initialize_evaluating::InitializeEvaluating,
+  inline_const::{ConstValue, ConstValuePlugin},
+  inner_graph::{connection_active_used_by_exports, plugin::*, runtime_condition_used_by_exports},
+  javascript_meta_info_plugin::JavascriptMetaInfoPlugin,
+  node_stuff_plugin::NodeStuffPlugin,
+  override_strict_plugin::OverrideStrictPlugin,
+  require_context_dependency_parser_plugin::RequireContextDependencyParserPlugin,
+  require_ensure_dependencies_block_parse_plugin::RequireEnsureDependenciesBlockParserPlugin,
+  side_effects_parser_plugin::SideEffectsParserPlugin,
+  url_plugin::{URLPlugin, get_url_request},
+  use_strict_plugin::UseStrictPlugin,
+  worker_plugin::WorkerPlugin,
+};
+pub use self::{
+  inner_graph::{deferred_pure_check_is_impure, has_impure_deferred_pure_checks},
+  r#trait::{
+    BoxJavascriptParserPlugin, JavascriptParserPlugin, JavascriptParserPluginHook,
+    JavascriptParserPluginHooks,
+  },
+};
+use crate::Atom;
+
+pub static JS_DEFAULT_KEYWORD: std::sync::LazyLock<Atom> =
+  std::sync::LazyLock::new(|| Atom::from("default"));
+
+pub static DEFAULT_STAR_JS_WORD: std::sync::LazyLock<Atom> =
+  std::sync::LazyLock::new(|| Atom::from("*default*"));

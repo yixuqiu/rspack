@@ -1,32 +1,32 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use rspack_core::{
-  ApplyContext, BoxModule, ChunkUkey, Compilation, CompilationParams,
-  CompilationRuntimeRequirementInTree, CompilerCompilation, CompilerOptions, DependencyType,
-  ExternalType, ModuleExt, ModuleFactoryCreateData, NormalModuleFactoryFactorize, Plugin,
-  PluginContext, RuntimeGlobals,
+  BoxModule, ChunkUkey, Compilation, CompilationParams, CompilationRuntimeRequirementInTree,
+  CompilerCompilation, DependencyType, ExternalType, ModuleExt, ModuleFactoryCreateData,
+  NormalModuleFactoryFactorize, Plugin, RuntimeGlobals, RuntimeModule,
 };
 use rspack_error::Result;
 use rspack_hook::{plugin, plugin_hook};
+use rspack_util::itoa;
 
 use super::{
   fallback_module_factory::FallbackModuleFactory, remote_module::RemoteModule,
   remote_runtime_module::RemoteRuntimeModule,
 };
+use crate::{ShareScope, utils::module_identifier_namespace};
 
 #[derive(Debug)]
 pub struct ContainerReferencePluginOptions {
   pub remote_type: ExternalType,
   pub remotes: Vec<(String, RemoteOptions)>,
-  pub share_scope: Option<String>,
+  pub share_scope: Option<ShareScope>,
   pub enhanced: bool,
 }
 
 #[derive(Debug)]
 pub struct RemoteOptions {
   pub external: Vec<String>,
-  pub share_scope: String,
+  pub share_scope: ShareScope,
 }
 
 #[plugin]
@@ -64,11 +64,7 @@ async fn compilation(
 
 #[plugin_hook(NormalModuleFactoryFactorize for ContainerReferencePlugin)]
 async fn factorize(&self, data: &mut ModuleFactoryCreateData) -> Result<Option<BoxModule>> {
-  let dependency = data
-    .dependency
-    .as_module_dependency()
-    .expect("should be module dependency");
-  let request = dependency.request();
+  let request = &data.request;
   if !request.contains('!') {
     for (key, config) in &self.options.remotes {
       let key_len = key.len();
@@ -76,6 +72,8 @@ async fn factorize(&self, data: &mut ModuleFactoryCreateData) -> Result<Option<B
         && (request.len() == key_len || request[key_len..].starts_with('/'))
       {
         let internal_request = &request[key_len..];
+        let runtime_mode = data.build_context.compiler_options.experiments.runtime_mode;
+        let namespace = module_identifier_namespace(runtime_mode);
         let remote = RemoteModule::new(
           request.to_owned(),
           config
@@ -86,19 +84,21 @@ async fn factorize(&self, data: &mut ModuleFactoryCreateData) -> Result<Option<B
               if let Some(stripped) = e.strip_prefix("internal ") {
                 stripped.to_string()
               } else {
-                format!(
-                  "webpack/container/reference/{}{}",
-                  key,
-                  (i > 0)
-                    .then(|| format!("/fallback-{}", i))
-                    .unwrap_or_default()
-                )
+                let fallback_suffix = if i > 0 {
+                  let mut i_buffer = itoa::Buffer::new();
+                  let i_str = i_buffer.format(i);
+                  format!("/fallback-{i_str}")
+                } else {
+                  Default::default()
+                };
+                format!("{namespace}/container/reference/{key}{fallback_suffix}")
               }
             })
             .collect(),
-          format!(".{}", internal_request),
+          format!(".{internal_request}"),
           config.share_scope.clone(),
-          key.to_string(),
+          key.clone(),
+          runtime_mode,
         )
         .boxed();
         return Ok(Some(remote));
@@ -109,50 +109,39 @@ async fn factorize(&self, data: &mut ModuleFactoryCreateData) -> Result<Option<B
 }
 
 #[plugin_hook(CompilationRuntimeRequirementInTree for ContainerReferencePlugin)]
-fn runtime_requirements_in_tree(
+async fn runtime_requirements_in_tree(
   &self,
-  compilation: &mut Compilation,
+  compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
+  _all_runtime_requirements: &RuntimeGlobals,
   runtime_requirements: &RuntimeGlobals,
-  runtime_requirements_mut: &mut RuntimeGlobals,
+  _runtime_requirements_mut: &mut RuntimeGlobals,
+  runtime_modules_to_add: &mut Vec<(ChunkUkey, Box<dyn RuntimeModule>)>,
 ) -> Result<Option<()>> {
   if runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK_HANDLERS) {
-    runtime_requirements_mut.insert(RuntimeGlobals::MODULE);
-    runtime_requirements_mut.insert(RuntimeGlobals::MODULE_FACTORIES_ADD_ONLY);
-    runtime_requirements_mut.insert(RuntimeGlobals::HAS_OWN_PROPERTY);
-    runtime_requirements_mut.insert(RuntimeGlobals::INITIALIZE_SHARING);
-    runtime_requirements_mut.insert(RuntimeGlobals::SHARE_SCOPE_MAP);
-    compilation.add_runtime_module(
-      chunk_ukey,
-      Box::new(RemoteRuntimeModule::new(self.options.enhanced)),
-    )?;
+    runtime_modules_to_add.push((
+      *chunk_ukey,
+      Box::new(RemoteRuntimeModule::new(
+        &compilation.runtime_template,
+        self.options.enhanced,
+      )),
+    ));
   }
   Ok(None)
 }
 
-#[async_trait]
 impl Plugin for ContainerReferencePlugin {
   fn name(&self) -> &'static str {
     "rspack.ContainerReferencePlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
     ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
-    ctx
-      .context
       .normal_module_factory_hooks
       .factorize
       .tap(factorize::new(self));
     ctx
-      .context
       .compilation_hooks
       .runtime_requirement_in_tree
       .tap(runtime_requirements_in_tree::new(self));

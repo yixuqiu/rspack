@@ -1,0 +1,450 @@
+use std::{
+  fmt::Debug,
+  future::Future,
+  sync::{Arc, LazyLock},
+};
+
+use rspack_collections::IdentifierSet;
+use rspack_core::{
+  BoxModule, Compilation, CompilationId, CompilationParams, CompilerCompilation, CompilerId,
+  CompilerMake, DependencyId, DependencyType, EntryDependency, LibIdentOptions, Module, ModuleExt,
+  ModuleFactory, ModuleFactoryCreateData, ModuleIdentifier, ModuleLayer, ModuleRule,
+  NormalModuleCreateData, NormalModuleFactoryModule, Plugin,
+};
+use rspack_error::Result;
+use rspack_hook::{plugin, plugin_hook};
+use rspack_regex::RspackRegex;
+use rspack_util::fx_hash::FxHashSet;
+use tokio::sync::{Mutex, OnceCell, RwLock};
+
+use crate::{
+  backend::Backend,
+  factory::LazyCompilationDependencyFactory,
+  module::{LazyCompilationProxyModule, ReservedLayerExternals, has_closure_library},
+  utils::calc_value_dependency_key,
+};
+
+static DEV_SERVER_CLIENT_RE: LazyLock<RspackRegex> = LazyLock::new(|| {
+  RspackRegex::new(
+    r#"(webpack|rspack)[/\\]hot[/\\]|(webpack|rspack)-dev-server[/\\]client|(webpack|rspack)-hot-middleware[/\\]client"#,
+  )
+  .expect("should compile regex")
+});
+
+#[derive(Debug, Hash, Clone)]
+pub enum LazyCompilationTest<F: LazyCompilationTestCheck> {
+  Regex(RspackRegex),
+  Fn(F),
+}
+
+pub trait LazyCompilationTestCheck: Send + Sync + Debug {
+  fn test<'a>(
+    &'a self,
+    compiler_id: CompilerId,
+    compilation_id: CompilationId,
+    module: &'a dyn Module,
+  ) -> impl Future<Output = bool> + Send + 'a;
+}
+
+impl<F: LazyCompilationTestCheck> LazyCompilationTest<F> {
+  async fn test(
+    &self,
+    compiler_id: CompilerId,
+    compilation_id: CompilationId,
+    module: &dyn Module,
+  ) -> bool {
+    match self {
+      LazyCompilationTest::Regex(regex) => {
+        regex.test(&module.name_for_condition().unwrap_or("".into()))
+      }
+      LazyCompilationTest::Fn(f) => f.test(compiler_id, compilation_id, module).await,
+    }
+  }
+}
+
+#[derive(Debug)]
+#[plugin]
+pub struct LazyCompilationPlugin<T: Backend, F: LazyCompilationTestCheck> {
+  backend: Mutex<T>,
+  entries: bool, // enable for entries
+  imports: bool, // enable for imports
+  test: Option<LazyCompilationTest<F>>,
+  client: String,
+  active_modules: RwLock<IdentifierSet>,
+  reserved_layer_externals: OnceCell<Arc<[ReservedLayerExternals]>>,
+}
+
+impl<T: Backend, F: LazyCompilationTestCheck> LazyCompilationPlugin<T, F> {
+  pub fn new(
+    backend: T,
+    test: Option<LazyCompilationTest<F>>,
+    entries: bool,
+    imports: bool,
+    client: String,
+  ) -> Self {
+    Self::new_inner(
+      Mutex::new(backend),
+      entries,
+      imports,
+      test,
+      client,
+      Default::default(),
+      Default::default(),
+    )
+  }
+
+  async fn check_test(
+    &self,
+    compiler_id: CompilerId,
+    compilation_id: CompilationId,
+    module: &BoxModule,
+  ) -> bool {
+    if let Some(test) = &self.inner.test {
+      test
+        .test(compiler_id, compilation_id, module.as_ref())
+        .await
+    } else {
+      true
+    }
+  }
+}
+
+#[plugin_hook(CompilerCompilation for LazyCompilationPlugin<T: Backend, F: LazyCompilationTestCheck>)]
+async fn compilation(
+  &self,
+  compilation: &mut Compilation,
+  params: &mut CompilationParams,
+) -> Result<()> {
+  compilation.set_dependency_factory(
+    DependencyType::LazyImport,
+    Arc::new(LazyCompilationDependencyFactory::new(
+      params.normal_module_factory.clone(),
+    )) as Arc<dyn ModuleFactory>,
+  );
+
+  compilation
+    .value_cache_versions
+    .insert(calc_value_dependency_key("client"), self.client.clone());
+
+  Ok(())
+}
+
+#[plugin_hook(NormalModuleFactoryModule for LazyCompilationPlugin<T: Backend, F: LazyCompilationTestCheck>)]
+async fn normal_module_factory_module(
+  &self,
+  module_factory_create_data: &mut ModuleFactoryCreateData,
+  create_data: &NormalModuleCreateData,
+  module: &mut BoxModule,
+) -> Result<()> {
+  let dep_type = module_factory_create_data.dependencies[0].dependency_type();
+
+  if matches!(dep_type, DependencyType::LazyImport) {
+    return Ok(());
+  };
+
+  let is_imports = matches!(
+    dep_type,
+    DependencyType::DynamicImport
+      | DependencyType::DynamicImportEager
+      | DependencyType::ContextElement(rspack_core::ContextTypePrefix::Import)
+  );
+  let is_entries = matches!(dep_type, DependencyType::Entry);
+
+  #[allow(clippy::if_same_then_else)]
+  if matches!(
+    dep_type,
+    DependencyType::ModuleHotAccept
+      | DependencyType::ModuleHotDecline
+      | DependencyType::ImportMetaHotAccept
+      | DependencyType::ImportMetaHotDecline
+  ) {
+    // TODO: we cannot access module graph at this stage
+    // if hmr point to a module that is already been dyn imported
+    // eg: import('./foo'); module.hot.accept('./foo')
+    // however we cannot access module graph at this time, so we cannot
+    // detect this case easily
+    return Ok(());
+  } else if !is_entries && !is_imports {
+    return Ok(());
+  }
+
+  if is_entries {
+    if !self.entries {
+      return Ok(());
+    }
+
+    // ignore global entry
+    let entry: Option<&EntryDependency> = module_factory_create_data.dependencies[0].downcast_ref();
+    let Some(entry) = entry else {
+      return Ok(());
+    };
+
+    if entry.is_global() {
+      return Ok(());
+    }
+  }
+
+  if !self.imports && is_imports {
+    return Ok(());
+  }
+
+  self
+    .create_proxy_module(module_factory_create_data, create_data, module)
+    .await
+}
+
+impl<T: Backend, F: LazyCompilationTestCheck> LazyCompilationPlugin<T, F> {
+  #[allow(
+    clippy::manual_async_fn,
+    reason = "inline must apply to the async block"
+  )]
+  fn create_proxy_module(
+    &self,
+    module_factory_create_data: &mut ModuleFactoryCreateData,
+    create_data: &NormalModuleCreateData,
+    module: &mut BoxModule,
+  ) -> impl Future<Output = Result<()>> + Send {
+    #[inline(never)]
+    async move {
+      if DEV_SERVER_CLIENT_RE.test(create_data.resource_resolve_data().resource())
+        || !self
+          .check_test(
+            module_factory_create_data.build_context.compiler_id,
+            module_factory_create_data.build_context.compilation_id,
+            module,
+          )
+          .await
+      {
+        return Ok(());
+      }
+
+      let module_identifier: ModuleIdentifier =
+        format!("lazy-compilation-proxy|{}", module.identifier()).into();
+      let readable_identifier = format!(
+        "lazy-compilation-proxy|{}",
+        module_factory_create_data
+          .context
+          .shorten(&module.identifier())
+      );
+      let active = self
+        .active_modules
+        .read()
+        .await
+        .contains(&module_identifier);
+      let lib_ident = module.lib_ident(LibIdentOptions {
+        context: module_factory_create_data
+          .build_context
+          .compiler_options
+          .context
+          .as_str(),
+      });
+      let layer = module.get_layer().cloned();
+      let needs_reservation = !active
+        && has_closure_library(
+          &module_factory_create_data
+            .build_context
+            .compiler_options
+            .output,
+        );
+      let reserved_layer_externals = if needs_reservation {
+        self
+          .reserved_layer_externals
+          .get_or_try_init(|| async {
+            let mut layers = FxHashSet::default();
+            collect_rule_layers(
+              &module_factory_create_data
+                .build_context
+                .compiler_options
+                .module
+                .rules,
+              &mut layers,
+            );
+            let mut backend = self.backend.lock().await;
+            let mut reserved = Vec::new();
+            for layer in layers {
+              let requests = backend
+                .collect_reserved_externals(Some(layer.clone()))
+                .await?;
+              if !requests.is_empty() {
+                reserved.push(ReservedLayerExternals { layer, requests });
+              }
+            }
+            Result::<Arc<[ReservedLayerExternals]>>::Ok(reserved.into())
+          })
+          .await?
+          .clone()
+      } else {
+        Arc::default()
+      };
+      let reserved_externals = if needs_reservation {
+        self
+          .backend
+          .lock()
+          .await
+          .collect_reserved_externals(layer.clone())
+          .await?
+      } else {
+        Arc::default()
+      };
+
+      *module = LazyCompilationProxyModule::new(
+        module_identifier,
+        readable_identifier,
+        lib_ident.map(|ident| ident.into_owned()),
+        module_factory_create_data,
+        create_data.resource_resolve_data().resource().to_owned(),
+        active,
+        self.client.clone(),
+        layer,
+        reserved_externals,
+        reserved_layer_externals,
+      )
+      .boxed();
+
+      Ok(())
+    }
+  }
+}
+
+fn collect_rule_layers(rules: &[ModuleRule], layers: &mut FxHashSet<ModuleLayer>) {
+  for rule in rules {
+    if let Some(layer) = &rule.effect.layer {
+      layers.insert(layer.clone());
+    }
+    for nested in rule.rules.iter().chain(rule.one_of.iter()) {
+      collect_rule_layers(nested, layers);
+    }
+  }
+}
+
+#[plugin_hook(CompilerMake for LazyCompilationPlugin<T: Backend, F: LazyCompilationTestCheck>)]
+async fn compiler_make(&self, compilation: &mut Compilation) -> Result<()> {
+  // Set this after artifact recovery, including full rebuilds and cache hits.
+  // Local consumers must see a complete barrel before its first execution.
+  compilation
+    .build_module_graph_artifact
+    .module_to_lazy_make
+    .eager_on_local_reference = true;
+
+  self.activate_modules(compilation).await
+}
+
+impl<T: Backend, F: LazyCompilationTestCheck> LazyCompilationPlugin<T, F> {
+  #[allow(
+    clippy::manual_async_fn,
+    reason = "inline must apply to the async block"
+  )]
+  fn activate_modules(
+    &self,
+    compilation: &mut Compilation,
+  ) -> impl Future<Output = Result<()>> + Send {
+    #[inline(never)]
+    async move {
+      let newly_active_modules = self
+        .backend
+        .lock()
+        .await
+        .take_newly_active_modules()
+        .await?;
+
+      // An activated module never goes back to inactive, so the set must outlive
+      // the module graph: without incremental make every proxy is re-created each
+      // compilation and reads its `active` flag from here.
+      self
+        .active_modules
+        .write()
+        .await
+        .extend(newly_active_modules.iter().copied());
+
+      // Dep ids of every entry dependency the current compilation knows about.
+      // Used below to detect an entry proxy whose only remaining edge points to
+      // an entry dep that has just been dropped.
+      let current_entry_dep_ids: FxHashSet<DependencyId> = compilation
+        .entries
+        .values()
+        .flat_map(|e| e.all_dependencies())
+        .copied()
+        .collect();
+
+      let mut to_invalidate: IdentifierSet = IdentifierSet::default();
+      {
+        let module_graph = compilation.build_module_graph_artifact.get_module_graph();
+        let entry_target = |dep_id: &DependencyId| {
+          let dep = module_graph.dependency_by_id(dep_id);
+          dep
+            .as_module_dependency()
+            .map(|module_dep| (dep.get_context(), module_dep.request()))
+        };
+        // A dynamic entry whose options changed gets a new dep id for the same
+        // context and request, so the proxy is not stale and must still be
+        // activated.
+        let current_entry_targets: FxHashSet<_> = current_entry_dep_ids
+          .iter()
+          .filter_map(entry_target)
+          .collect();
+        for module_id in &newly_active_modules {
+          let Some(active_module) = module_graph.module_by_identifier(module_id) else {
+            continue;
+          };
+          let Some(proxy) = active_module.downcast_ref::<LazyCompilationProxyModule>() else {
+            continue;
+          };
+
+          // Skip the rebuild when the proxy's sole incoming edge is an entry dep
+          // that no longer belongs to any current entry: rebuilding it would
+          // resolve a removed entry source.
+          let mut incoming = module_graph.get_incoming_connections(module_id);
+          let only = incoming.next();
+          let is_stale = incoming.next().is_none()
+            && only.is_some_and(|con| {
+              matches!(
+                module_graph
+                  .dependency_by_id(&con.dependency_id)
+                  .dependency_type(),
+                DependencyType::Entry
+              ) && !current_entry_dep_ids.contains(&con.dependency_id)
+                && entry_target(&con.dependency_id)
+                  .is_none_or(|target| !current_entry_targets.contains(&target))
+            });
+
+          // A proxy created after the activation request already carries its lazy
+          // block. Rebuilding it would emit a hot update, which makes the client
+          // re-activate and request another rebuild.
+          if !is_stale && !proxy.is_active() {
+            to_invalidate.insert(*module_id);
+          }
+        }
+      }
+
+      let module_graph = compilation
+        .build_module_graph_artifact
+        .get_module_graph_mut();
+      for module_id in &to_invalidate {
+        if let Some(active_module) = module_graph.module_by_identifier(module_id)
+          && let Some(active_module) = active_module.downcast_ref::<LazyCompilationProxyModule>()
+        {
+          active_module.invalid();
+        }
+      }
+
+      Ok(())
+    }
+  }
+}
+
+#[async_trait::async_trait]
+impl<T: Backend + 'static, F: LazyCompilationTestCheck + 'static> Plugin
+  for LazyCompilationPlugin<T, F>
+{
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
+
+    ctx
+      .normal_module_factory_hooks
+      .module
+      .tap(normal_module_factory_module::new(self));
+
+    ctx.compiler_hooks.make.tap(compiler_make::new(self));
+    Ok(())
+  }
+}

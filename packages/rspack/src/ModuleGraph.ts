@@ -1,0 +1,77 @@
+import type {
+  Dependency,
+  EntryDependency,
+  JsModuleGraph,
+} from '@rspack/binding';
+import { ExportsInfo } from './ExportsInfo';
+import type { ModuleGraphConnection } from './ModuleGraphConnection';
+import type { Module } from './Module';
+
+export default class ModuleGraph {
+  static __from_binding(binding: JsModuleGraph) {
+    return new ModuleGraph(binding);
+  }
+
+  #inner: JsModuleGraph;
+
+  constructor(binding: JsModuleGraph) {
+    this.#inner = binding;
+  }
+
+  getModule(dependency: Dependency | EntryDependency): Module | null {
+    return this.#inner.getModule(dependency);
+  }
+
+  getResolvedModule(dependency: Dependency | EntryDependency): Module | null {
+    return this.#inner.getResolvedModule(dependency);
+  }
+
+  getUsedExports(
+    module: Module,
+    runtime: string | string[],
+  ): string[] | boolean | null {
+    return this.#inner.getUsedExports(module, runtime);
+  }
+
+  getProvidedExports(module: Module): true | string[] | null {
+    return this.#inner.getProvidedExports(module);
+  }
+
+  getParentModule(dependency: Dependency | EntryDependency): Module | null {
+    return this.#inner.getParentModule(dependency);
+  }
+
+  getIssuer(module: Module): Module | null {
+    return this.#inner.getIssuer(module);
+  }
+
+  getExportsInfo(module: Module): ExportsInfo {
+    return ExportsInfo.__from_binding(this.#inner.getExportsInfo(module));
+  }
+
+  getConnection(
+    dependency: Dependency | EntryDependency,
+  ): ModuleGraphConnection | null {
+    return this.#inner.getConnection(dependency);
+  }
+
+  getOutgoingConnections(module: Module): ModuleGraphConnection[] {
+    return this.#inner.getOutgoingConnections(module);
+  }
+
+  getIncomingConnections(module: Module): ModuleGraphConnection[] {
+    return this.#inner.getIncomingConnections(module);
+  }
+
+  getParentBlockIndex(dependency: Dependency | EntryDependency): number {
+    return this.#inner.getParentBlockIndex(dependency);
+  }
+
+  isAsync(module: Module): boolean {
+    return this.#inner.isAsync(module);
+  }
+
+  getOutgoingConnectionsInOrder(module: Module): ModuleGraphConnection[] {
+    return this.#inner.getOutgoingConnectionsInOrder(module);
+  }
+}

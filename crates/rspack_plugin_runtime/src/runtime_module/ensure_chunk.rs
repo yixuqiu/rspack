@@ -1,51 +1,113 @@
 use rspack_core::{
+  Compilation, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext, RuntimeTemplate,
   impl_runtime_module,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  ChunkUkey, Compilation, RuntimeGlobals, RuntimeModule,
 };
-use rspack_identifier::Identifier;
-use rspack_util::source_map::SourceMapKind;
 
 use crate::get_chunk_runtime_requirements;
 
 #[impl_runtime_module]
-#[derive(Debug, Eq)]
+#[derive(Debug)]
 pub struct EnsureChunkRuntimeModule {
-  id: Identifier,
-  chunk: Option<ChunkUkey>,
+  has_async_chunks: bool,
 }
 
-impl Default for EnsureChunkRuntimeModule {
-  fn default() -> Self {
-    Self {
-      id: Identifier::from("webpack/runtime/ensure_chunk"),
-      chunk: None,
-      source_map_kind: SourceMapKind::None,
-      custom_source: None,
+impl EnsureChunkRuntimeModule {
+  pub fn new(runtime_template: &RuntimeTemplate, has_async_chunks: bool) -> Self {
+    Self::with_default(runtime_template, has_async_chunks)
+  }
+}
+
+enum TemplateId {
+  Raw,
+  WithInline,
+}
+
+impl EnsureChunkRuntimeModule {
+  fn template_id(&self, id: TemplateId) -> String {
+    match id {
+      TemplateId::Raw => self.id().to_string(),
+      TemplateId::WithInline => format!("{}_inline", self.id()),
     }
   }
 }
 
+#[async_trait::async_trait]
 impl RuntimeModule for EnsureChunkRuntimeModule {
-  fn name(&self) -> Identifier {
-    self.id
+  fn runtime_module_variables() -> &'static [&'static str] {
+    &[]
   }
 
-  fn generate(&self, compilation: &Compilation) -> rspack_error::Result<BoxSource> {
-    let chunk_ukey = self.chunk.expect("should have chunk");
+  fn template(&self) -> Vec<(String, String)> {
+    vec![
+      (
+        self.template_id(TemplateId::Raw),
+        include_str!("runtime/ensure_chunk.ejs").to_string(),
+      ),
+      (
+        self.template_id(TemplateId::WithInline),
+        include_str!("runtime/ensure_chunk_with_inline.ejs").to_string(),
+      ),
+    ]
+  }
+
+  async fn generate(
+    &self,
+    context: &RuntimeModuleGenerateContext<'_>,
+  ) -> rspack_error::Result<String> {
+    let compilation = context.compilation;
+    let runtime_template = context.runtime_template;
+    let chunk_ukey = self.chunk().expect("should have chunk");
     let runtime_requirements = get_chunk_runtime_requirements(compilation, &chunk_ukey);
-    Ok(
-      RawSource::from(
-        match runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK_HANDLERS) {
-          true => include_str!("runtime/ensure_chunk.js"),
-          false => include_str!("runtime/ensure_chunk_with_inline.js"),
-        },
-      )
-      .boxed(),
-    )
-  }
+    let source = if runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK_HANDLERS) {
+      let with_hmr = runtime_requirements.contains(RuntimeGlobals::HMR_DOWNLOAD_UPDATE_HANDLERS);
+      let fetch_priority = if runtime_requirements.contains(RuntimeGlobals::HAS_FETCH_PRIORITY) {
+        ", fetchPriority"
+      } else {
+        ""
+      };
 
-  fn attach(&mut self, chunk: ChunkUkey) {
-    self.chunk = Some(chunk);
+      runtime_template.render(
+        &self.template_id(TemplateId::Raw),
+        Some(serde_json::json!({
+          "_fetch_priority": fetch_priority,
+          "_with_hmr": with_hmr,
+          "_hmr": compilation.hot,
+        })),
+      )?
+    } else {
+      runtime_template.render(&self.template_id(TemplateId::WithInline), None)?
+    };
+
+    Ok(source)
+  }
+  fn runtime_requirements(
+    &self,
+    compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    let mut dependencies = RuntimeGlobals::default();
+    let mut define = RuntimeGlobals::ENSURE_CHUNK;
+    let mut force_context = RuntimeGlobals::default();
+    if compilation.hot {
+      dependencies.insert(RuntimeGlobals::REQUIRE_SCOPE);
+      force_context = RuntimeGlobals::ENSURE_CHUNK;
+    }
+    if let Some(chunk_ukey) = self.chunk() {
+      if self.has_async_chunks
+        || get_chunk_runtime_requirements(compilation, &chunk_ukey)
+          .contains(RuntimeGlobals::ENSURE_CHUNK_HANDLERS)
+      {
+        dependencies.insert(RuntimeGlobals::ENSURE_CHUNK_HANDLERS);
+        define.insert(RuntimeGlobals::ENSURE_CHUNK_HANDLERS);
+      }
+    } else if self.has_async_chunks {
+      dependencies.insert(RuntimeGlobals::ENSURE_CHUNK_HANDLERS);
+      define.insert(RuntimeGlobals::ENSURE_CHUNK_HANDLERS);
+    }
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      dependencies,
+      define,
+      force_context,
+      ..Default::default()
+    }
   }
 }

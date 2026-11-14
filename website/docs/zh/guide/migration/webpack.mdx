@@ -1,192 +1,611 @@
-# 迁移 Webpack
+---
+description: 'Rspack 的配置是基于 webpack 的设计实现的，以此你能够非常轻松地将项目从 webpack 迁移至 Rspack。'
+---
 
-虽然 Rspack 尽可能地兼容了 webpack 的常用 API，但是不可避免地存在一些不同，或是相同的功能在 Rspack 中有更高性能的实现方式。
+import { PackageManagerTabs } from '@theme';
+
+# 迁移 webpack
+
+Rspack 的配置是基于 webpack 的设计实现的，以此你能够非常轻松地将项目从 webpack 迁移至 Rspack。
+
+文档主要针对使用 webpack 5 的项目，因为目前 Rspack 的配置是基于 webpack 5 的设计实现的。如果你的项目使用的不是 webpack 5，可以参考以下迁移指南：
+
+- 对于使用 webpack 4 或更低版本的项目，可以参考 [webpack - 从 v4 升级到 v5](https://webpack.docschina.org/migrate/5/) 了解相关差异。
+- 对于使用 [create-react-app](https://create-react-app.dev/) 或 [CRACO](https://craco.js.org/) 的项目，可以参考 [迁移 Create React App](/guide/migration/cra)。
+- 对于使用 [Vue CLI](https://cli.vuejs.org/zh/) 的项目，可以参考 [Rsbuild - 从 Vue CLI 迁移](https://rsbuild.rs/zh/guide/migration/vue-cli)。
+
+## 检查 Node.js 版本
+
+迁移前，请确保所有构建环境使用 Rspack 支持的 Node.js 版本。`@rspack/core@2` 要求 Node.js `^20.19.0 || >=22.12.0`。
+
+请确保本地开发、CI 和部署构建环境使用一致的 Node.js 版本，并按需更新 `.nvmrc`、Volta 配置和构建镜像等版本设置。
+
+## 安装 Rspack
+
+在你的项目目录下安装 Rspack：
+
+<PackageManagerTabs command="add @rspack/core @rspack/cli @rspack/dev-server -D" />
+
+其中 `@rspack/cli` 和 `@rspack/dev-server` 为可选依赖：
+
+- 未使用 `webpack-cli` 时，不需要安装 `@rspack/cli`
+- 未使用 `webpack-dev-server` 时，不需要安装 `@rspack/dev-server`
+- `@rspack/core` 和 `@rspack/cli` 应使用相同版本。`@rspack/dev-server` 的版本可能不同，无需保持一致。
+
+## 修改 package.json
+
+更新构建脚本以使用 Rspack 代替 webpack，查看 [CLI](/api/cli) 了解更多。
+
+```diff title="package.json"
+{
+  "scripts": {
+-   "dev": "webpack serve",
+-   "build": "webpack build",
++   "dev": "rspack dev",
++   "build": "rspack build",
++   "preview": "rspack preview",
+  }
+}
+```
+
+## 移除不支持的 CLI 参数
+
+Rspack CLI 不支持部分 webpack CLI 参数，例如 `--progress`、`--color`、`--bail` 和 `--output-pathinfo`。保留这些参数会在读取配置前报 `Unknown option`。
+
+迁移时，应从构建命令中删除这些不支持的参数；如果仍需保留对应行为，请改用 Rspack 配置：
+
+```diff title="package.json"
+{
+  "scripts": {
+-   "build": "webpack --mode production --progress --color",
++   "build": "rspack --mode production",
+  }
+}
+```
+
+```js title="rspack.config.mjs"
+export default {
+  stats: {
+    // 对应 webpack CLI 的 --color
+    colors: true,
+  },
+};
+```
 
 ## 修改配置
 
-可以参考[「Webpack 配置兼容性」](/guide/compatibility/config-diff)进行配置迁移。
+将 `webpack.config.js` 文件重命名为 `rspack.config.js`。
 
-## 处理 Loader
+:::tip 提示
+Rspack 命令与 webpack 命令相同，均可通过 `-c` 或 `--config` 指定配置文件。但与 webpack 不同的是，如果你未显式指定配置文件，Rspack 默认使用 `rspack.config.js`。
+:::
 
-### 使用 builtin:swc-loader 替代 babel-loader
+Rspack 兼容 webpack 的绝大部分配置项，查阅 [配置 Rspack](/config/) 来了解 Rspack 支持的所有配置。
 
-Rspack 使用 builtin:swc-loader 对 TypeScript、JSX 以及最新的 JavaScript 语法进行转换，这意味着如果你的 babel-loader 只是为了支持 TypeScript、JSX 以及更新的 JavaScript 语法，那么完全可以使用 builtin:swc-loader 替代 babel-loader。
+## 缓存配置 \{#cache-configuration}
 
-如果你的 babel-loader 是为了支持自定义的转换逻辑，那么这部分的 babel-loader 可以保留，但是我们不鼓励用户对大量的文件使用 babel-loader，因为这会导致严重的性能恶化。
+webpack 和 Rspack 的缓存配置结构并不完全相同。迁移时不建议直接复制 webpack 的 cache 配置，而应根据 Rspack 的 [cache 配置](/config/cache) 做对应调整。
 
-```diff
+仅就 Cache 存储而言，禁用缓存和内存缓存的写法可以直接映射到 Rspack：`cache: false`、
+`cache: true` 和 `cache: { type: 'memory' }`。
+
+如果 webpack 使用文件系统缓存，应迁移为 Rspack [持久化缓存](/config/cache#持久化缓存)，并按下面的字段映射进行调整。
+
+webpack 的 `cache.cacheUnaffected` 优化在概念上对应 Rspack 顶层的
+[`incremental`](/config/incremental) 选项。Rspack 中该选项与 Cache 相互独立，因此
+`cache: false` 不会禁用 Incremental。如需同时阻止两种机制复用跨 compilation 状态，还需要设置
+`incremental: false`。由于 Rspack Incremental 覆盖更多 compilation 阶段，并且有独立的默认值，
+迁移时应单独评估该选项，而不是把它当作 Cache 字段重命名。
+
+1. 将 webpack 的 `cache.type: 'filesystem'` 改为 Rspack 的 `cache.type: 'persistent'`。
+
+```diff title="rspack.config.mjs"
+export default {
+- cache: {
+-   type: 'filesystem',
+- },
++ cache: {
++   type: 'persistent',
++ },
+};
+```
+
+2. 将 webpack 的 `cache.buildDependencies` 展平为 Rspack [`cache.buildDependencies`](/config/cache#builddependencies) 所需的文件路径数组。
+
+```diff title="rspack.config.mjs"
+export default {
+- cache: {
+-   buildDependencies: {
+-     config: [__filename, path.join(__dirname, 'package.json')],
+-     ts: [path.join(__dirname, 'tsconfig.json')]
+-   }
+- },
++ cache: {
++   type: 'persistent',
++   buildDependencies: [
++     __filename,
++     path.join(import.meta.dirname, 'package.json'),
++     path.join(import.meta.dirname, 'tsconfig.json')
++   ]
++ },
+};
+```
+
+3. webpack 的 [`cache.name`](/config/cache#name) 和 [`cache.version`](/config/cache#version) 可以保持不变。Rspack 使用相同的 `cache.name` 语义创建可同时存在的缓存。
+
+4. 将 webpack 顶层的 `snapshot` 配置移动到 Rspack [`cache.snapshot`](/config/cache#snapshot)。
+
+```diff title="rspack.config.mjs"
+export default {
+- snapshot: {
+-   immutablePaths: [path.join(__dirname, 'constant')],
+-   managedPaths: [path.join(__dirname, 'node_modules')],
+-   unmanagedPaths: []
+- },
++ cache: {
++   type: 'persistent',
++   snapshot: {
++     immutablePaths: [path.join(import.meta.dirname, 'constant')],
++     managedPaths: [path.join(import.meta.dirname, 'node_modules')],
++     unmanagedPaths: []
++   }
++ },
+};
+```
+
+5. 将 webpack 的 `cache.cacheDirectory` 移动到 Rspack [`cache.storage.directory`](/config/cache#storagedirectory)，并将 webpack 的 `cache.cacheLocation` 移动到 Rspack [`cache.storage.location`](/config/cache#storagelocation)。它们的配置名称不同，但语义一致。Rspack 同样会将 `storage.location` 默认设置为 `storage.directory/cache.name`。
+
+```diff title="rspack.config.mjs"
+export default {
+- cache: {
+-   type: 'filesystem',
+-   cacheDirectory: path.join(__dirname, 'node_modules/.cache/test'),
+-   cacheLocation: path.join(__dirname, 'node_modules/.cache/test/client')
+- },
++ cache: {
++   type: 'persistent',
++   storage: {
++     type: 'filesystem',
++     directory: path.join(import.meta.dirname, 'node_modules/.cache/test'),
++     location: path.join(import.meta.dirname, 'node_modules/.cache/test/client')
++   }
++ },
+};
+```
+
+下面的示例自动转换 Cache 存储配置；Incremental 应作为独立的迁移决策处理。
+
+```js
+function transform(webpackConfig, rspackConfig) {
+  if (webpackConfig.cache === undefined) {
+    webpackConfig.cache = webpackConfig.mode === 'development';
+  }
+
+  if (!webpackConfig.cache) {
+    rspackConfig.cache = false;
+    return;
+  }
+
+  if (webpackConfig.cache === true || webpackConfig.cache.type === 'memory') {
+    rspackConfig.cache = true;
+    return;
+  }
+
+  rspackConfig.cache = { type: 'persistent' };
+
+  rspackConfig.cache.buildDependencies = Object.values(
+    webpackConfig.cache.buildDependencies || {},
+  ).flat();
+
+  rspackConfig.cache.name = webpackConfig.cache.name;
+  rspackConfig.cache.version = webpackConfig.cache.version;
+
+  rspackConfig.cache.snapshot = {
+    immutablePaths: webpackConfig.snapshot?.immutablePaths,
+    managedPaths: webpackConfig.snapshot?.managedPaths,
+    unmanagedPaths: webpackConfig.snapshot?.unmanagedPaths,
+  };
+
+  rspackConfig.cache.storage = {
+    type: 'filesystem',
+    directory: webpackConfig.cache.cacheDirectory,
+    location: webpackConfig.cache.cacheLocation,
+  };
+}
+```
+
+## webpack 内置插件
+
+Rspack 实现了大部分 webpack 内置插件，其命名和参数配置与 webpack 保持一致，你可以非常轻松地替换它们。
+
+例如替换 [DefinePlugin](/plugins/define-plugin)：
+
+```js title="rspack.config.js"
+const webpack = require('webpack'); // [!code --]
+const { rspack } = require('@rspack/core'); // [!code ++]
+
 module.exports = {
-   module: {
-     rules: [
--      {
--        test: /\.tsx?$/i,
--        use: [
--          {
--            loader: 'babel-loader',
--            options: {
--              presets: ['@babel/preset-typescript'],
--            },
--          },
--        ],
--        test: /\.jsx?$/i,
--        use: [
--          {
--            loader: 'babel-loader',
--            options: {
--              presets: ['@babel/preset-react'],
--            },
--          },
--        ],
--      },
-+      {
-+        test: /\.(j|t)s$/,
-+        exclude: [/[\\/]node_modules[\\/]/],
-+        loader: 'builtin:swc-loader',
-+        options: {
-+          jsc: {
-+            parser: {
-+              syntax: 'typescript',
-+            },
-+            externalHelpers: true,
-+            transform: {
-+              react: {
-+                runtime: 'automatic',
-+                development: !prod,
-+                refresh: !prod,
-+              },
-+            },
-+          },
-+          env: {
-+            targets: 'Chrome >= 48',
-+          },
-+        },
-+      },
-+      {
-+        test: /\.(j|t)sx$/,
-+        loader: 'builtin:swc-loader',
-+        exclude: [/[\\/]node_modules[\\/]/],
-+        options: {
-+          jsc: {
-+            parser: {
-+              syntax: 'typescript',
-+              tsx: true,
-+            },
-+            transform: {
-+              react: {
-+                runtime: 'automatic',
-+                development: !prod,
-+                refresh: !prod,
-+              },
-+            },
-+            externalHelpers: true,
-+          },
-+          env: {
-+            targets: 'Chrome >= 48', // browser compatibility
-+          },
-+        },
-+      },
-     ],
-   },
+  //...
+  plugins: [
+    new webpack.DefinePlugin({ // [!code --]
+    new rspack.DefinePlugin({ // [!code ++]
+      // ...
+    }),
+  ],
+}
+```
+
+查看 [webpack 内置插件兼容性](/plugins/webpack-built-in-plugin-support)，了解 Rspack 对 webpack 内置插件和部分内部插件的兼容状态。
+
+## 社区插件
+
+Rspack 支持大部分 webpack 社区插件，并为暂不支持的插件提供了替代方案。
+
+查看[社区插件兼容性](/plugins/community-plugin-compatibility)，了解 Rspack 对 webpack 常见社区插件的兼容情况。
+
+部分 webpack 生态包需要升级到较新版本才能兼容 Rspack，例如 [`webpack-node-externals`](https://www.npmjs.com/package/webpack-node-externals) 和 [`node-polyfill-webpack-plugin`](https://www.npmjs.com/package/node-polyfill-webpack-plugin)。复用社区包前，建议升级到最新版本，因为旧版本可能依赖不兼容的 webpack API。
+
+### html-webpack-plugin
+
+大多数项目从 [`html-webpack-plugin`](https://github.com/jantimon/html-webpack-plugin) 迁移时，建议使用 [`html-rspack-plugin`](https://github.com/rstackjs/html-rspack-plugin)。它是面向 Rspack 的 JavaScript fork，能够更好地兼容已有的选项、模板和集成。
+
+<PackageManagerTabs command="add html-rspack-plugin -D" />
+
+在 Rspack 配置中更新导入和构造函数名称：
+
+```diff title="rspack.config.mjs"
+-import HtmlWebpackPlugin from 'html-webpack-plugin';
++import HtmlRspackPlugin from 'html-rspack-plugin';
+
+ export default {
+   plugins: [
+-    new HtmlWebpackPlugin({
++    new HtmlRspackPlugin({
+       // ...
+     }),
+   ],
  };
 ```
 
-### 移除 css-loader 、 style-loader 和 mini-css-extract-plugin
+完成迁移后，从项目依赖中移除 `html-webpack-plugin`。
 
-Rspack 内置支持了 css 模块类型 ，原生 css 模块类型内置了对 css、css hmr、css module 以及 css 提取功能的支持，这意味着你不需要再为 css 文件单独配置 css-loader、style-loader 和 mini-css-extract-plugin。
+如果更关注构建性能，也可以选择内置的 Rust 插件 [`rspack.HtmlRspackPlugin`](/plugins/html-rspack-plugin)。详情请参阅 [HTML 指南](/guide/languages/html#选择插件)。
 
-```diff
--const MiniCssExtractPlugin = require("mini-css-extract-plugin");
+### unplugin
 
- module.exports = {
-   module: {
-     rules: [
--      {
--        test: /\.css$/i,
--        use: [
--          isDev ? "style-loader" : MiniCssExtractPlugin.loader,
--          "css-loader",
--        ],
--      },
-+      {
-+        test: /\.css$/i,
-+        type: "css", // this is enabled by default for .css, so you don't need to specify it
-+      },
-     ],
-   },
-   plugins: [],
- };
+部分 [unplugin](/guide/features/plugin#unplugin) 包会为不同构建工具提供独立入口。如果提供了 `/rspack` 入口，请使用它代替 `/webpack`，以选择 Rspack 适配层：
+
+```diff title="rspack.config.mjs"
+- import AutoImport from 'unplugin-auto-import/webpack';
+- import Components from 'unplugin-vue-components/webpack';
++ import AutoImport from 'unplugin-auto-import/rspack';
++ import Components from 'unplugin-vue-components/rspack';
 ```
 
-对于 [css-modules](https://github.com/css-modules/css-modules) 的功能，通过指明 css/module 作为模块类型即可开启。
+### copy-webpack-plugin
 
-```diff
- module.exports = {
-   module: {
-     rules: [
-+      {
-+        test: /\.module\.css$/i,
-+        type: "css/module", // this is enabled by default for module.css,   so you don't need to specify it
-+      },
-     ],
-   },
- };
-```
+使用 [rspack.CopyRspackPlugin](/plugins/copy-rspack-plugin) 代替 [copy-webpack-plugin](https://github.com/webpack/copy-webpack-plugin)：
 
-### CssExtractPlugin
-
-如果依赖 css-loader，例如 css-loader 提供的一些更加定制化的配置项，仍然可以使用 style-loader + css-loader 方案，如果你想要在生产环境将 css 提取成单独的文件，可以使用 Rspack 内置的 CssExtractRspackPlugin 插件。
-
-CssExtractRspackPlugin 插件功能和配置与 mini-css-extract-plugin 类似，使用前请确保开启了 `experiments.rspackFuture.newTreeshaking`，v0.6 之后的版本默认开启。
-
-```diff
-+ const { CssExtractRspackPlugin } = require("@rspack/core");
-- const CssExtractPlugin = require("mini-css-extract-plugin");
+```js title="rspack.config.js"
+const CopyWebpackPlugin = require('copy-webpack-plugin'); // [!code --]
+const { rspack } = require('@rspack/core'); // [!code ++]
 
 module.exports = {
   plugins: [
-+    new CssExtractRspackPlugin(),
--    new CssExtractPlugin(),
+    new CopyWebpackPlugin({ // [!code --]
+    new rspack.CopyRspackPlugin({ // [!code ++]
+      // ...
+    }),
+  ]
+}
+```
+
+### mini-css-extract-plugin
+
+使用 [rspack.CssExtractRspackPlugin](/plugins/css-extract-rspack-plugin) 代替 [mini-css-extract-plugin](https://github.com/webpack/mini-css-extract-plugin)：
+
+```diff title="rspack.config.js"
+- const CssExtractWebpackPlugin = require('mini-css-extract-plugin');
++ const { rspack } = require('@rspack/core');
+
+module.exports = {
+  plugins: [
+-   new CssExtractWebpackPlugin({
++   new rspack.CssExtractRspackPlugin({
+      // ...
+    }),
   ]
   module: {
     rules: [
       {
         test: /\.css$/i,
         use: [
-+          CssExtractRspackPlugin.loader,
--          CssExtractPlugin.loader,
+-         CssExtractWebpackPlugin.loader,
++         rspack.CssExtractRspackPlugin.loader,
           "css-loader"
-        ]
+        ],
       }
     ]
   }
 }
 ```
 
-### 使用 Asset Modules 来代替 file-loader、url-loader 和 raw-loader
+### tsconfig-paths-webpack-plugin
 
-Rspack 对齐 webpack 5 的 Asset Modules，这意味着你可以使用 Asset Modules 来代替 file-loader 和 url-loader。
+Rspack 不支持 webpack 的 `resolve.plugins` 选项。使用 [resolve.tsConfig](/config/resolve#resolvetsconfig) 选项代替 [tsconfig-paths-webpack-plugin](https://github.com/dividab/tsconfig-paths-webpack-plugin)：
 
-```diff
+```diff title="rspack.config.mjs"
+-import TsconfigPathsPlugin from 'tsconfig-paths-webpack-plugin';
++import path from 'node:path';
+
+ export default {
+  resolve: {
+-    plugins: [new TsconfigPathsPlugin()],
++    tsConfig: path.resolve(import.meta.dirname, 'tsconfig.json'),
+  },
+};
+```
+
+### fork-ts-checker-webpack-plugin
+
+使用 [ts-checker-rspack-plugin](https://github.com/rstackjs/ts-checker-rspack-plugin) 代替 [fork-ts-checker-webpack-plugin](https://github.com/TypeStrong/fork-ts-checker-webpack-plugin)：
+
+```js title="rspack.config.js"
+const ForkTsCheckerWebpackPlugin = require('fork-ts-checker-webpack-plugin'); // [!code --]
+const { TsCheckerRspackPlugin } = require('ts-checker-rspack-plugin'); // [!code ++]
+
+module.exports = {
+  plugins: [
+    new ForkTsCheckerWebpackPlugin(), // [!code --]
+    new TsCheckerRspackPlugin(), // [!code ++]
+  ],
+};
+```
+
+### terser-webpack-plugin
+
+对于使用 [terser-webpack-plugin](https://github.com/webpack/terser-webpack-plugin) 压缩 JavaScript 的项目，建议改用 [rspack.SwcJsMinimizerRspackPlugin](/plugins/swc-js-minimizer-rspack-plugin) 以获得更好的构建性能：
+
+```js title="rspack.config.js"
+const TerserPlugin = require('terser-webpack-plugin'); // [!code --]
+const { rspack } = require('@rspack/core'); // [!code ++]
+
+module.exports = {
+  optimization: {
+    minimizer: [
+      new TerserPlugin(), // [!code --]
+      new rspack.SwcJsMinimizerRspackPlugin(), // [!code ++]
+      new rspack.LightningCssMinimizerRspackPlugin(),
+    ],
+  },
+};
+```
+
+:::tip
+当显式配置 [optimization.minimizer](/config/optimization#optimizationminimizer) 时，Rspack 默认的压缩器会被禁用，因此建议同时保留 JavaScript 和 CSS 的压缩器。
+:::
+
+### css-minimizer-webpack-plugin
+
+对于使用 [css-minimizer-webpack-plugin](https://github.com/webpack/css-minimizer-webpack-plugin) 压缩 CSS 的项目，建议改用 [rspack.LightningCssMinimizerRspackPlugin](/plugins/lightning-css-minimizer-rspack-plugin) 以获得更好的构建性能：
+
+```js title="rspack.config.js"
+const CssMinimizerPlugin = require('css-minimizer-webpack-plugin'); // [!code --]
+const { rspack } = require('@rspack/core'); // [!code ++]
+
+module.exports = {
+  optimization: {
+    minimizer: [
+      new rspack.SwcJsMinimizerRspackPlugin(),
+      new CssMinimizerPlugin(), // [!code --]
+      new rspack.LightningCssMinimizerRspackPlugin(), // [!code ++]
+    ],
+  },
+};
+```
+
+## Loaders
+
+Rspack 与绝大多数 webpack loader 保持兼容，因此通常可以直接复用现有的 loader 生态，无需额外改造。
+
+不过，为了获得更优的构建性能与更稳定的行为，我们仍然建议按照下面的方式进行适当迁移：
+
+### babel-loader
+
+将 [babel-loader](https://github.com/babel/babel-loader) 迁移为 [builtin:swc-loader](/guide/builtin-loaders/swc-loader)，以使用 Rspack 内置的 SWC 转换能力并获得更高性能。
+
+如果你需要通过 babel 插件进行自定义转换逻辑，可以保留 `babel-loader`，但不建议对大量文件使用 `babel-loader`，因为这会导致显著的性能下降。
+
+- 将 [@babel/preset-typescript](http://npmjs.com/package/@babel/preset-typescript) 替换为使用 `detectSyntax: 'auto'` 的 `builtin:swc-loader`：
+
+```diff title="rspack.config.js"
+module.exports = {
+  module: {
+    rules: [
+      {
+-        test: /\.(j|t)sx?$/,
++        test: /\.(?:js|mjs|jsx|ts|tsx)$/,
+        exclude: [/[\\/]node_modules[\\/]/],
+        use: [
+          {
+-           loader: 'babel-loader',
++           loader: 'builtin:swc-loader',
++           options: {
++             detectSyntax: 'auto',
++           },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+- 将 [@babel/preset-react](http://npmjs.com/package/@babel/preset-react) 替换为 SWC 的 `jsc.transform.react` 选项：
+
+```diff title="rspack.config.js"
++const isDev = process.env.NODE_ENV === 'development';
+
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(?:js|mjs|jsx|ts|tsx)$/,
+        exclude: [/[\\/]node_modules[\\/]/],
+        use: [
+          {
+-            loader: 'babel-loader',
++            loader: 'builtin:swc-loader',
+            options: {
+-              presets: ['@babel/preset-typescript', '@babel/preset-react'],
++              jsc: {
++                transform: {
++                  react: {
++                    runtime: 'automatic',
++                    development: isDev,
++                    refresh: isDev,
++                  },
++                },
++              },
++              detectSyntax: 'auto',
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+### swc-loader
+
+将外置 [swc-loader](https://swc.rs/docs/usage/swc-loader) 迁移为 [builtin:swc-loader](/guide/builtin-loaders/swc-loader) 时，除了 loader 名称改为 `builtin:swc-loader` 外，其余选项与原 `swc-loader` 完全一致。
+
+```js title="rspack.config.js"
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(j|t)sx?$/,
+        use: [
+          {
+            loader: 'swc-loader', // [!code --]
+            loader: 'builtin:swc-loader', // [!code ++]
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+### file-loader
+
+将 [file-loader](https://github.com/webpack-contrib/file-loader) 迁移为 [资源模块](/guide/features/asset-module) 的 `asset/resource` 类型。
+
+```diff title="rspack.config.js"
  module.exports = {
    module: {
      rules: [
-+      {
-+        test: /\.(png|jpe?g|gif)$/i,
-+        type: "asset/resource",
-+      },
-+      {
-+        test: /^BUILD_ID$/,
-+        type: "asset/source",
-+      },
 -      {
 -        test: /\.(png|jpe?g|gif)$/i,
 -        use: ["file-loader"],
 -      },
--      {
--        test: /^BUILD_ID$/,
--        use: ["raw-loader",],
--      },
++      {
++        test: /\.(png|jpe?g|gif)$/i,
++        type: "asset/resource",
++      },
      ],
    },
  };
 ```
+
+### url-loader
+
+将 [url-loader](https://github.com/webpack-contrib/url-loader) 迁移为 [资源模块](/guide/features/asset-module) 的 `asset/inline` 类型。
+
+```diff title="rspack.config.js"
+ module.exports = {
+   module: {
+     rules: [
+-      {
+-        test: /\.(png|jpe?g|gif)$/i,
+-        use: ["url-loader"],
+-      },
++      {
++        test: /\.(png|jpe?g|gif)$/i,
++        type: "asset/inline",
++      },
+     ],
+   },
+ };
+```
+
+### raw-loader
+
+将 [raw-loader](https://github.com/webpack-contrib/raw-loader) 迁移为 [资源模块](/guide/features/asset-module) 的 `asset/source` 类型。
+
+```diff title="rspack.config.js"
+ module.exports = {
+   module: {
+     rules: [
+-      {
+-        test: /^BUILD_ID$/,
+-        use: ["raw-loader",],
+-      },
++      {
++        test: /^BUILD_ID$/,
++        type: "asset/source",
++      },
+     ],
+   },
+ };
+```
+
+### vue-loader
+
+对于 Vue 3 项目，请将 `vue-loader` 替换为 [`rspack-vue-loader`](/guide/integrations/vue#vue-3)，并同步更新插件导入和 loader 名称：
+
+```diff title="rspack.config.mjs"
+-import { VueLoaderPlugin } from 'vue-loader';
++import { VueLoaderPlugin } from 'rspack-vue-loader';
+
+export default {
+  plugins: [new VueLoaderPlugin()],
+  module: {
+    rules: [
+      {
+        test: /\.vue$/,
+-       loader: 'vue-loader',
++       loader: 'rspack-vue-loader',
++       options: {
++         experimentalInlineMatchResource: true,
++       },
+      },
+    ],
+  },
+};
+```
+
+## 常见 webpack 库替换
+
+迁移 webpack 生态中的配套库时，下面这些非插件类包通常需要替换：
+
+| webpack 库               | Rspack 替代方案                                                               | 说明                            |
+| ------------------------ | ----------------------------------------------------------------------------- | ------------------------------- |
+| `webpack`                | [`@rspack/core`](https://www.npmjs.com/package/@rspack/core)                  | 核心包。                        |
+| `webpack-cli`            | [`@rspack/cli`](https://www.npmjs.com/package/@rspack/cli)                    | Rspack CLI 命令。               |
+| `webpack-dev-server`     | [`@rspack/dev-server`](https://github.com/rstackjs/rspack-dev-server)         | Rspack 开发服务器。             |
+| `webpack-dev-middleware` | [`@rspack/dev-middleware`](https://github.com/rstackjs/rspack-dev-middleware) | 自定义 Node.js 服务中的中间件。 |
+| `webpack-chain`          | [`rspack-chain`](https://github.com/rstackjs/rspack-chain)                    | 链式生成 Rspack 配置。          |
+| `webpack-merge`          | [`rspack-merge`](https://github.com/rstackjs/rspack-merge)                    | 合并 Rspack 配置。              |
+
+> 对于插件类包，请查看[社区插件兼容性](/plugins/community-plugin-compatibility)。
+
+## 移除 webpack 依赖
+
+使用 Rspack 构建成功后，请检查 loader、插件或自定义构建脚本是否仍导入 `webpack` 或 `webpack/lib/*`。
+
+如果仍存在相关导入，请暂时保留 `webpack` 作为兼容依赖。替换相关依赖或确认不再需要后，再移除 webpack 相关依赖：
+
+<PackageManagerTabs command="remove webpack webpack-cli webpack-dev-server" />

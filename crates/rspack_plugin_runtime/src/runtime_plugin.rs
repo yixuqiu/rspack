@@ -1,170 +1,106 @@
-use std::{hash::Hash, sync::Arc};
+use std::sync::{Arc, LazyLock};
 
-use async_trait::async_trait;
-use once_cell::sync::Lazy;
+use atomic_refcell::AtomicRefCell;
 use rspack_core::{
-  get_css_chunk_filename_template, get_js_chunk_filename_template, has_hash_placeholder,
-  ApplyContext, ChunkLoading, ChunkUkey, Compilation, CompilationParams,
+  ChunkLoading, ChunkUkey, Compilation, CompilationId, CompilationParams,
   CompilationRuntimeRequirementInModule, CompilationRuntimeRequirementInTree, CompilerCompilation,
-  CompilerOptions, ModuleIdentifier, Plugin, PluginContext, PublicPath, RuntimeGlobals,
-  RuntimeModuleExt, SourceType,
+  MODULE_GLOBALS, ModuleIdentifier, Plugin, PublicPath, REQUIRE_SCOPE_GLOBALS, RuntimeGlobals,
+  RuntimeModule, RuntimeModuleExt, SourceType, get_css_chunk_filename_template,
+  get_js_chunk_filename_template,
 };
 use rspack_error::Result;
+use rspack_hash::{RspackHash, RspackHasher};
 use rspack_hook::{plugin, plugin_hook};
 use rspack_plugin_javascript::{
-  JavascriptModulesPluginPlugin, JsChunkHashArgs, JsPlugin, PluginJsChunkHashHookOutput,
+  JavascriptModulesChunkHash, JsPlugin, impl_plugin_for_js_plugin::chunk_has_js,
+};
+use rspack_util::fx_hash::FxDashMap;
+#[cfg(allocative)]
+use rspack_util::rspack_allocative;
+
+use crate::{
+  RuntimePluginHooks,
+  runtime_module::{
+    AmdDefineRuntimeModule, AmdOptionsRuntimeModule, AsyncRuntimeModule,
+    AutoPublicPathRuntimeModule, BaseUriRuntimeModule, ChunkNameRuntimeModule,
+    ChunkPrefetchPreloadFunctionRuntimeModule, CompatGetDefaultExportRuntimeModule,
+    CreateFakeNamespaceObjectRuntimeModule, CreateScriptRuntimeModule,
+    CreateScriptUrlRuntimeModule, DefinePropertyGettersRuntimeModule,
+    ESMModuleDecoratorRuntimeModule, EnsureChunkRuntimeModule, GetChunkFilenameRuntimeModule,
+    GetChunkUpdateFilenameRuntimeModule, GetFullHashRuntimeModule, GetMainFilenameRuntimeModule,
+    GetTrustedTypesPolicyRuntimeModule, GlobalRuntimeModule, HasOwnPropertyRuntimeModule,
+    LoadScriptRuntimeModule, MakeDeferredNamespaceObjectRuntimeModule,
+    MakeNamespaceObjectRuntimeModule, MakeOptimizedDeferredNamespaceObjectRuntimeModule,
+    NodeModuleDecoratorRuntimeModule, NonceRuntimeModule, OnChunkLoadedRuntimeModule,
+    PublicPathRuntimeModule, ReexportRuntimeModule, RelativeUrlRuntimeModule,
+    RuntimeIdRuntimeModule, SystemContextRuntimeModule, ToBinaryRuntimeModule, chunk_has_css,
+    is_enabled_for_chunk,
+  },
 };
 
-use crate::runtime_module::{
-  chunk_has_css, is_enabled_for_chunk, AsyncRuntimeModule, AutoPublicPathRuntimeModule,
-  BaseUriRuntimeModule, ChunkNameRuntimeModule, ChunkPrefetchPreloadFunctionRuntimeModule,
-  CompatGetDefaultExportRuntimeModule, CreateFakeNamespaceObjectRuntimeModule,
-  CreateScriptUrlRuntimeModule, DefinePropertyGettersRuntimeModule, EnsureChunkRuntimeModule,
-  GetChunkFilenameRuntimeModule, GetChunkUpdateFilenameRuntimeModule, GetFullHashRuntimeModule,
-  GetMainFilenameRuntimeModule, GetTrustedTypesPolicyRuntimeModule, GlobalRuntimeModule,
-  HarmonyModuleDecoratorRuntimeModule, HasOwnPropertyRuntimeModule, LoadScriptRuntimeModule,
-  MakeNamespaceObjectRuntimeModule, NodeModuleDecoratorRuntimeModule, NonceRuntimeModule,
-  NormalRuntimeModule, OnChunkLoadedRuntimeModule, PublicPathRuntimeModule,
-  RelativeUrlRuntimeModule, RuntimeIdRuntimeModule, SystemContextRuntimeModule,
-};
+/// Safety with [atomic_refcell::AtomicRefCell]:
+///
+/// We should make sure that there's no read-write and write-write conflicts for each hook instance by looking up [RuntimePlugin::get_compilation_hooks_mut]
+type ArcRuntimePluginHooks = Arc<AtomicRefCell<RuntimePluginHooks>>;
 
-static GLOBALS_ON_REQUIRE: Lazy<Vec<RuntimeGlobals>> = Lazy::new(|| {
-  vec![
-    RuntimeGlobals::CHUNK_NAME,
-    RuntimeGlobals::RUNTIME_ID,
-    RuntimeGlobals::COMPAT_GET_DEFAULT_EXPORT,
-    RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT,
-    RuntimeGlobals::CREATE_SCRIPT,
-    RuntimeGlobals::CREATE_SCRIPT_URL,
-    RuntimeGlobals::GET_TRUSTED_TYPES_POLICY,
-    RuntimeGlobals::DEFINE_PROPERTY_GETTERS,
-    RuntimeGlobals::ENSURE_CHUNK,
-    RuntimeGlobals::ENTRY_MODULE_ID,
-    RuntimeGlobals::GET_FULL_HASH,
-    RuntimeGlobals::GLOBAL,
-    RuntimeGlobals::MAKE_NAMESPACE_OBJECT,
-    RuntimeGlobals::MODULE_CACHE,
-    RuntimeGlobals::MODULE_FACTORIES,
-    RuntimeGlobals::MODULE_FACTORIES_ADD_ONLY,
-    RuntimeGlobals::INTERCEPT_MODULE_EXECUTION,
-    RuntimeGlobals::PUBLIC_PATH,
-    RuntimeGlobals::BASE_URI,
-    RuntimeGlobals::RELATIVE_URL,
-    RuntimeGlobals::SCRIPT_NONCE,
-    // RuntimeGlobals::UNCAUGHT_ERROR_HANDLER,
-    RuntimeGlobals::ASYNC_MODULE,
-    // RuntimeGlobals::WASM_INSTANCES,
-    RuntimeGlobals::INSTANTIATE_WASM,
-    RuntimeGlobals::SHARE_SCOPE_MAP,
-    RuntimeGlobals::INITIALIZE_SHARING,
-    RuntimeGlobals::LOAD_SCRIPT,
-    RuntimeGlobals::SYSTEM_CONTEXT,
-    RuntimeGlobals::ON_CHUNKS_LOADED,
-  ]
-});
+#[cfg_attr(allocative, rspack_allocative::root)]
+static COMPILATION_HOOKS_MAP: LazyLock<FxDashMap<CompilationId, ArcRuntimePluginHooks>> =
+  LazyLock::new(Default::default);
 
-static MODULE_DEPENDENCIES: Lazy<Vec<(RuntimeGlobals, Vec<RuntimeGlobals>)>> = Lazy::new(|| {
-  vec![
-    (RuntimeGlobals::MODULE_LOADED, vec![RuntimeGlobals::MODULE]),
-    (RuntimeGlobals::MODULE_ID, vec![RuntimeGlobals::MODULE]),
-    (
-      RuntimeGlobals::HARMONY_MODULE_DECORATOR,
-      vec![RuntimeGlobals::MODULE, RuntimeGlobals::REQUIRE_SCOPE],
-    ),
-    (
-      RuntimeGlobals::NODE_MODULE_DECORATOR,
-      vec![RuntimeGlobals::MODULE, RuntimeGlobals::REQUIRE_SCOPE],
-    ),
-  ]
-});
+const MODULE_DEPENDENCIES: &[(RuntimeGlobals, RuntimeGlobals)] = &[
+  (
+    RuntimeGlobals::ESM_MODULE_DECORATOR,
+    RuntimeGlobals::MODULE.union(RuntimeGlobals::MODULE_ID),
+  ),
+  (
+    RuntimeGlobals::NODE_MODULE_DECORATOR,
+    RuntimeGlobals::MODULE,
+  ),
+  (RuntimeGlobals::AMD_DEFINE, RuntimeGlobals::REQUIRE),
+];
 
-static TREE_DEPENDENCIES: Lazy<Vec<(RuntimeGlobals, Vec<RuntimeGlobals>)>> = Lazy::new(|| {
-  vec![
-    (
-      RuntimeGlobals::COMPAT_GET_DEFAULT_EXPORT,
-      vec![RuntimeGlobals::DEFINE_PROPERTY_GETTERS],
-    ),
-    (
-      RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT,
-      vec![
-        RuntimeGlobals::DEFINE_PROPERTY_GETTERS,
-        RuntimeGlobals::MAKE_NAMESPACE_OBJECT,
-        RuntimeGlobals::REQUIRE,
-      ],
-    ),
-    (
-      RuntimeGlobals::DEFINE_PROPERTY_GETTERS,
-      vec![RuntimeGlobals::HAS_OWN_PROPERTY],
-    ),
-    (
-      RuntimeGlobals::INITIALIZE_SHARING,
-      vec![RuntimeGlobals::SHARE_SCOPE_MAP],
-    ),
-    (
-      RuntimeGlobals::SHARE_SCOPE_MAP,
-      vec![RuntimeGlobals::HAS_OWN_PROPERTY],
-    ),
-    (
-      RuntimeGlobals::HARMONY_MODULE_DECORATOR,
-      vec![RuntimeGlobals::MODULE, RuntimeGlobals::REQUIRE_SCOPE],
-    ),
-    (
-      RuntimeGlobals::NODE_MODULE_DECORATOR,
-      vec![RuntimeGlobals::MODULE, RuntimeGlobals::REQUIRE_SCOPE],
-    ),
-  ]
-});
-
-fn handle_require_scope_globals(
+fn handle_scope_globals(
   runtime_requirements: &RuntimeGlobals,
   runtime_requirements_mut: &mut RuntimeGlobals,
 ) {
-  if GLOBALS_ON_REQUIRE
-    .iter()
-    .any(|requirement| runtime_requirements.contains(*requirement))
-  {
+  if runtime_requirements.intersects(*REQUIRE_SCOPE_GLOBALS) {
     runtime_requirements_mut.insert(RuntimeGlobals::REQUIRE_SCOPE);
+  }
+  if runtime_requirements.intersects(*MODULE_GLOBALS) {
+    runtime_requirements_mut.insert(RuntimeGlobals::MODULE);
   }
 }
 
 fn handle_dependency_globals(
   runtime_requirements: &RuntimeGlobals,
   runtime_requirements_mut: &mut RuntimeGlobals,
-  dependencies: &[(RuntimeGlobals, Vec<RuntimeGlobals>)],
+  dependencies: &[(RuntimeGlobals, RuntimeGlobals)],
 ) {
-  for (requirement, dependencies) in dependencies.iter() {
-    if runtime_requirements.contains(*requirement) {
-      runtime_requirements_mut.extend(dependencies.clone());
+  for &(requirement, dependencies) in dependencies.iter() {
+    if runtime_requirements.contains(requirement) {
+      *runtime_requirements_mut |= dependencies;
     }
-  }
-}
-
-#[derive(Debug, Default)]
-struct RuntimeJavascriptModulesPluginPlugin;
-
-impl JavascriptModulesPluginPlugin for RuntimeJavascriptModulesPluginPlugin {
-  fn js_chunk_hash(&self, args: &mut JsChunkHashArgs) -> PluginJsChunkHashHookOutput {
-    for identifier in args
-      .compilation
-      .chunk_graph
-      .get_chunk_runtime_modules_iterable(args.chunk_ukey)
-    {
-      if let Some((hash, _)) = args
-        .compilation
-        .runtime_module_code_generation_results
-        .get(identifier)
-      {
-        hash.hash(&mut args.hasher);
-      }
-    }
-    Ok(())
   }
 }
 
 #[plugin]
 #[derive(Debug, Default)]
-pub struct RuntimePlugin {
-  js_plugin: Arc<RuntimeJavascriptModulesPluginPlugin>,
+pub struct RuntimePlugin;
+
+impl RuntimePlugin {
+  pub fn get_compilation_hooks(id: CompilationId) -> ArcRuntimePluginHooks {
+    if !COMPILATION_HOOKS_MAP.contains_key(&id) {
+      COMPILATION_HOOKS_MAP.insert(id, Default::default());
+    }
+    COMPILATION_HOOKS_MAP
+      .get(&id)
+      .expect("should have js plugin drive")
+      .clone()
+  }
+
+  pub fn get_compilation_hooks_mut(id: CompilationId) -> ArcRuntimePluginHooks {
+    COMPILATION_HOOKS_MAP.entry(id).or_default().clone()
+  }
 }
 
 #[plugin_hook(CompilerCompilation for RuntimePlugin)]
@@ -173,338 +109,437 @@ async fn compilation(
   compilation: &mut Compilation,
   _params: &mut CompilationParams,
 ) -> Result<()> {
-  let mut drive = JsPlugin::get_compilation_drives_mut(compilation);
-  drive.add_plugin(self.js_plugin.clone());
+  let hooks = JsPlugin::get_compilation_hooks_mut(compilation.id());
+  let mut hooks = hooks.write().await;
+  hooks.chunk_hash.tap(js_chunk_hash::new(self));
   Ok(())
 }
 
-#[plugin_hook(CompilationRuntimeRequirementInModule for RuntimePlugin)]
-fn runtime_requirements_in_module(
+#[plugin_hook(JavascriptModulesChunkHash for RuntimePlugin)]
+async fn js_chunk_hash(
   &self,
-  _compilation: &mut Compilation,
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+  hasher: &mut RspackHasher,
+) -> Result<()> {
+  for identifier in compilation
+    .build_chunk_graph_artifact
+    .chunk_graph
+    .get_chunk_runtime_modules_iterable(chunk_ukey)
+  {
+    if let Some(hash) = compilation.runtime_modules_hash.get(identifier) {
+      hash.hash(hasher);
+    }
+  }
+  Ok(())
+}
+
+#[plugin_hook(CompilationRuntimeRequirementInModule for RuntimePlugin,tracing=false)]
+async fn runtime_requirements_in_module(
+  &self,
+  _compilation: &Compilation,
   _module: &ModuleIdentifier,
+  _all_runtime_requirements: &RuntimeGlobals,
   runtime_requirements: &RuntimeGlobals,
   runtime_requirements_mut: &mut RuntimeGlobals,
 ) -> Result<Option<()>> {
-  handle_require_scope_globals(runtime_requirements, runtime_requirements_mut);
+  handle_scope_globals(runtime_requirements, runtime_requirements_mut);
   handle_dependency_globals(
     runtime_requirements,
     runtime_requirements_mut,
-    &MODULE_DEPENDENCIES,
+    MODULE_DEPENDENCIES,
   );
 
   Ok(None)
 }
 
 #[plugin_hook(CompilationRuntimeRequirementInTree for RuntimePlugin)]
-fn runtime_requirements_in_tree(
+async fn runtime_requirements_in_tree(
   &self,
-  compilation: &mut Compilation,
+  compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
+  _all_runtime_requirements: &RuntimeGlobals,
   runtime_requirements: &RuntimeGlobals,
   runtime_requirements_mut: &mut RuntimeGlobals,
+  runtime_modules_to_add: &mut Vec<(ChunkUkey, Box<dyn RuntimeModule>)>,
 ) -> Result<Option<()>> {
-  if runtime_requirements.contains(RuntimeGlobals::EXPORT_STAR) {
-    compilation.add_runtime_module(
-      chunk_ukey,
-      NormalRuntimeModule::new(
-        RuntimeGlobals::EXPORT_STAR,
-        include_str!("runtime/common/_export_star.js"),
-      )
-      .boxed(),
-    )?
+  handle_scope_globals(runtime_requirements, runtime_requirements_mut);
+
+  if runtime_requirements.contains(RuntimeGlobals::INITIALIZE_SHARING) {
+    runtime_requirements_mut.insert(RuntimeGlobals::SHARE_SCOPE_MAP);
   }
 
-  if compilation.options.output.trusted_types.is_some() {
-    if runtime_requirements.contains(RuntimeGlobals::LOAD_SCRIPT) {
-      runtime_requirements_mut.insert(RuntimeGlobals::CREATE_SCRIPT_URL);
-    }
-    if runtime_requirements.contains(RuntimeGlobals::CREATE_SCRIPT)
-      || runtime_requirements.contains(RuntimeGlobals::CREATE_SCRIPT_URL)
-    {
-      runtime_requirements_mut.insert(RuntimeGlobals::GET_TRUSTED_TYPES_POLICY);
-    }
-  }
-
-  if (runtime_requirements.contains(RuntimeGlobals::GET_CHUNK_UPDATE_SCRIPT_FILENAME)
-    && has_hash_placeholder(
-      compilation
-        .options
-        .output
-        .hot_update_chunk_filename
-        .as_str(),
-    ))
-    || (runtime_requirements.contains(RuntimeGlobals::GET_UPDATE_MANIFEST_FILENAME)
-      && has_hash_placeholder(compilation.options.output.hot_update_main_filename.as_str()))
-  {
-    runtime_requirements_mut.insert(RuntimeGlobals::GET_FULL_HASH);
-  }
-
-  handle_require_scope_globals(runtime_requirements, runtime_requirements_mut);
-  handle_dependency_globals(
-    runtime_requirements,
-    runtime_requirements_mut,
-    &TREE_DEPENDENCIES,
-  );
-
-  let public_path = compilation
-    .chunk_by_ukey
-    .expect_get(chunk_ukey)
-    .get_entry_options(&compilation.chunk_group_by_ukey)
-    .and_then(|options| options.public_path.clone())
-    .unwrap_or_else(|| compilation.options.output.public_path.clone());
-
-  // TODO check output.scriptType
-  if matches!(public_path, PublicPath::Auto)
-    && runtime_requirements.contains(RuntimeGlobals::PUBLIC_PATH)
-  {
-    runtime_requirements_mut.insert(RuntimeGlobals::GLOBAL);
-  }
-
-  if runtime_requirements.contains(RuntimeGlobals::GET_CHUNK_SCRIPT_FILENAME)
-    && matches!(compilation.options.output.chunk_filename.template(), Some(template) if has_hash_placeholder(template))
-  {
-    runtime_requirements_mut.insert(RuntimeGlobals::GET_FULL_HASH);
-  }
-
-  if runtime_requirements.contains(RuntimeGlobals::GET_CHUNK_CSS_FILENAME)
-    && matches!(compilation.options.output.css_chunk_filename.template(), Some(template) if has_hash_placeholder(template))
-  {
-    runtime_requirements_mut.insert(RuntimeGlobals::GET_FULL_HASH);
-  }
-
-  if runtime_requirements.contains(RuntimeGlobals::PREFETCH_CHUNK) {
-    runtime_requirements_mut.insert(RuntimeGlobals::PREFETCH_CHUNK_HANDLERS);
-  }
-
-  if runtime_requirements.contains(RuntimeGlobals::PRELOAD_CHUNK) {
-    runtime_requirements_mut.insert(RuntimeGlobals::PRELOAD_CHUNK_HANDLERS);
-  }
-
-  if runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK) {
-    let c = compilation.chunk_by_ukey.expect_get(chunk_ukey);
-    let has_async_chunks = c.has_async_chunks(&compilation.chunk_group_by_ukey);
-    if has_async_chunks {
-      runtime_requirements_mut.insert(RuntimeGlobals::ENSURE_CHUNK_HANDLERS);
-    }
-    compilation.add_runtime_module(chunk_ukey, EnsureChunkRuntimeModule::default().boxed())?;
+  if runtime_requirements.contains(RuntimeGlobals::SHARE_SCOPE_MAP) {
+    runtime_requirements_mut.insert(RuntimeGlobals::HAS_OWN_PROPERTY);
   }
 
   if runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK_INCLUDE_ENTRIES) {
     runtime_requirements_mut.insert(RuntimeGlobals::ENSURE_CHUNK_HANDLERS);
   }
 
+  if runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK)
+    || (!compilation.options.output.module
+      && runtime_requirements.contains(RuntimeGlobals::ENSURE_CHUNK_HANDLERS))
+  {
+    let c = compilation
+      .build_chunk_graph_artifact
+      .chunk_by_ukey
+      .expect_get(chunk_ukey);
+    let has_async_chunks =
+      c.has_async_chunks(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey);
+    runtime_modules_to_add.push((
+      *chunk_ukey,
+      EnsureChunkRuntimeModule::new(&compilation.runtime_template, has_async_chunks).boxed(),
+    ));
+    if compilation.hot && has_async_chunks {
+      runtime_modules_to_add.push((
+        *chunk_ukey,
+        crate::runtime_module::ChunkGroupMapRuntimeModule::new(&compilation.runtime_template)
+          .boxed(),
+      ));
+    }
+  }
+
   let library_type = {
-    let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+    let chunk = compilation
+      .build_chunk_graph_artifact
+      .chunk_by_ukey
+      .expect_get(chunk_ukey);
     chunk
-      .get_entry_options(&compilation.chunk_group_by_ukey)
+      .get_entry_options(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
       .and_then(|options| options.library.as_ref())
       .or(compilation.options.output.library.as_ref())
       .map(|library| library.library_type.clone())
   };
 
+  #[allow(clippy::collapsible_match)]
   for runtime_requirement in runtime_requirements.iter() {
     match runtime_requirement {
       RuntimeGlobals::ASYNC_MODULE => {
-        compilation.add_runtime_module(chunk_ukey, AsyncRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          AsyncRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::BASE_URI
         if is_enabled_for_chunk(chunk_ukey, &ChunkLoading::Disable, compilation) =>
       {
-        compilation.add_runtime_module(chunk_ukey, BaseUriRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          BaseUriRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::PUBLIC_PATH => {
+        let public_path = compilation
+          .build_chunk_graph_artifact
+          .chunk_by_ukey
+          .expect_get(chunk_ukey)
+          .get_entry_options(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
+          .and_then(|options| options.public_path.clone())
+          .unwrap_or_else(|| compilation.options.output.public_path.clone());
         match &public_path {
-          // TODO string publicPath support [hash] placeholder
-          PublicPath::String(str) => {
-            compilation.add_runtime_module(
-              chunk_ukey,
-              PublicPathRuntimeModule::new(str.as_str().into()).boxed(),
-            )?;
+          PublicPath::Filename(filename) => {
+            runtime_modules_to_add.push((
+              *chunk_ukey,
+              PublicPathRuntimeModule::new(
+                &compilation.runtime_template,
+                Box::new(filename.clone()),
+              )
+              .boxed(),
+            ));
           }
           PublicPath::Auto => {
-            compilation
-              .add_runtime_module(chunk_ukey, AutoPublicPathRuntimeModule::default().boxed())?;
+            runtime_modules_to_add.push((
+              *chunk_ukey,
+              AutoPublicPathRuntimeModule::new(&compilation.runtime_template).boxed(),
+            ));
           }
         }
       }
       RuntimeGlobals::GET_CHUNK_SCRIPT_FILENAME => {
-        compilation.add_runtime_module(
-          chunk_ukey,
+        let runtime_template = compilation
+          .runtime_template
+          .create_runtime_module_code_template();
+        runtime_modules_to_add.push((
+          *chunk_ukey,
           GetChunkFilenameRuntimeModule::new(
-            "javascript",
-            "javascript",
+            &compilation.runtime_template,
+            ("javascript", "javascript"),
             SourceType::JavaScript,
-            RuntimeGlobals::GET_CHUNK_SCRIPT_FILENAME.to_string(),
-            |_| false,
-            |chunk, compilation| {
-              Some(
-                get_js_chunk_filename_template(
-                  chunk,
-                  &compilation.options.output,
-                  &compilation.chunk_group_by_ukey,
-                )
-                .clone(),
-              )
-            },
-          )
-          .boxed(),
-        )?;
-      }
-      RuntimeGlobals::GET_CHUNK_CSS_FILENAME => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          GetChunkFilenameRuntimeModule::new(
-            "css",
-            "css",
-            SourceType::Css,
-            RuntimeGlobals::GET_CHUNK_CSS_FILENAME.to_string(),
+            runtime_template.render_runtime_globals(&RuntimeGlobals::GET_CHUNK_SCRIPT_FILENAME),
             |runtime_requirements| {
               runtime_requirements.contains(RuntimeGlobals::HMR_DOWNLOAD_UPDATE_HANDLERS)
             },
             |chunk, compilation| {
-              chunk_has_css(&chunk.ukey, compilation).then(|| {
+              chunk_has_js(&chunk.ukey(), compilation).then(|| {
+                get_js_chunk_filename_template(
+                  chunk,
+                  &compilation.options.output,
+                  &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
+                )
+              })
+            },
+            *chunk_ukey,
+          )
+          .with_full_hash(
+            compilation.options.output.filename.has_full_hash_digest()
+              || compilation
+                .options
+                .output
+                .chunk_filename
+                .has_full_hash_digest(),
+          )
+          .boxed(),
+        ));
+      }
+      RuntimeGlobals::GET_CHUNK_CSS_FILENAME => {
+        let runtime_template = compilation
+          .runtime_template
+          .create_runtime_module_code_template();
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          GetChunkFilenameRuntimeModule::new(
+            &compilation.runtime_template,
+            ("css", "css"),
+            SourceType::Css,
+            runtime_template.render_runtime_globals(&RuntimeGlobals::GET_CHUNK_CSS_FILENAME),
+            |runtime_requirements| {
+              runtime_requirements.contains(RuntimeGlobals::HMR_DOWNLOAD_UPDATE_HANDLERS)
+            },
+            |chunk, compilation| {
+              chunk_has_css(&chunk.ukey(), compilation).then(|| {
                 get_css_chunk_filename_template(
                   chunk,
                   &compilation.options.output,
-                  &compilation.chunk_group_by_ukey,
+                  &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
                 )
                 .clone()
               })
             },
+            *chunk_ukey,
           )
-          .boxed(),
-        )?;
-      }
-      RuntimeGlobals::GET_CHUNK_UPDATE_SCRIPT_FILENAME => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          GetChunkUpdateFilenameRuntimeModule::default().boxed(),
-        )?;
-      }
-      RuntimeGlobals::GET_UPDATE_MANIFEST_FILENAME => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          GetMainFilenameRuntimeModule::new(
-            "update manifest",
-            RuntimeGlobals::GET_UPDATE_MANIFEST_FILENAME,
+          .with_initial_chunks_in_async_groups()
+          .with_full_hash(
             compilation
               .options
               .output
-              .hot_update_main_filename
-              .clone()
-              .into(),
+              .css_filename
+              .has_full_hash_digest()
+              || compilation
+                .options
+                .output
+                .css_chunk_filename
+                .has_full_hash_digest(),
           )
           .boxed(),
-        )?;
+        ));
+      }
+      RuntimeGlobals::GET_CHUNK_UPDATE_SCRIPT_FILENAME => {
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          GetChunkUpdateFilenameRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
+      }
+      RuntimeGlobals::GET_UPDATE_MANIFEST_FILENAME => {
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          GetMainFilenameRuntimeModule::new(
+            &compilation.runtime_template,
+            "update manifest",
+            RuntimeGlobals::GET_UPDATE_MANIFEST_FILENAME,
+            compilation.options.output.hot_update_main_filename.clone(),
+          )
+          .boxed(),
+        ));
       }
       RuntimeGlobals::LOAD_SCRIPT => {
-        compilation.add_runtime_module(
-          chunk_ukey,
+        runtime_modules_to_add.push((
+          *chunk_ukey,
           LoadScriptRuntimeModule::new(
+            &compilation.runtime_template,
             compilation.options.output.unique_name.clone(),
             compilation.options.output.trusted_types.is_some(),
+            *chunk_ukey,
           )
           .boxed(),
-        )?;
+        ));
       }
       RuntimeGlobals::HAS_OWN_PROPERTY => {
-        compilation
-          .add_runtime_module(chunk_ukey, HasOwnPropertyRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          HasOwnPropertyRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::GET_FULL_HASH => {
-        compilation.add_runtime_module(chunk_ukey, GetFullHashRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          GetFullHashRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::GLOBAL => {
-        compilation.add_runtime_module(chunk_ukey, GlobalRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          GlobalRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::CREATE_SCRIPT_URL => {
-        compilation
-          .add_runtime_module(chunk_ukey, CreateScriptUrlRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          CreateScriptUrlRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
+      }
+      RuntimeGlobals::CREATE_SCRIPT => {
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          CreateScriptRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::ON_CHUNKS_LOADED => {
-        compilation
-          .add_runtime_module(chunk_ukey, OnChunkLoadedRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          OnChunkLoadedRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::DEFINE_PROPERTY_GETTERS => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          DefinePropertyGettersRuntimeModule::default().boxed(),
-        )?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          DefinePropertyGettersRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
+      }
+      RuntimeGlobals::REEXPORT => {
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          ReexportRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::GET_TRUSTED_TYPES_POLICY => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          Box::<GetTrustedTypesPolicyRuntimeModule>::default(),
-        )?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          GetTrustedTypesPolicyRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          CreateFakeNamespaceObjectRuntimeModule::default().boxed(),
-        )?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          CreateFakeNamespaceObjectRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::MAKE_NAMESPACE_OBJECT => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          MakeNamespaceObjectRuntimeModule::default().boxed(),
-        )?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          MakeNamespaceObjectRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::COMPAT_GET_DEFAULT_EXPORT => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          CompatGetDefaultExportRuntimeModule::default().boxed(),
-        )?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          CompatGetDefaultExportRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
-      RuntimeGlobals::HARMONY_MODULE_DECORATOR => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          HarmonyModuleDecoratorRuntimeModule::default().boxed(),
-        )?;
+      RuntimeGlobals::ESM_MODULE_DECORATOR => {
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          ESMModuleDecoratorRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::NODE_MODULE_DECORATOR => {
-        compilation.add_runtime_module(
-          chunk_ukey,
-          NodeModuleDecoratorRuntimeModule::default().boxed(),
-        )?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          NodeModuleDecoratorRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::SYSTEM_CONTEXT if matches!(&library_type, Some(t) if t == "system") => {
-        compilation
-          .add_runtime_module(chunk_ukey, SystemContextRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          SystemContextRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::SCRIPT_NONCE => {
-        compilation.add_runtime_module(chunk_ukey, NonceRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          NonceRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::RELATIVE_URL => {
-        compilation.add_runtime_module(chunk_ukey, RelativeUrlRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          RelativeUrlRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::CHUNK_NAME => {
-        compilation.add_runtime_module(chunk_ukey, ChunkNameRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          ChunkNameRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::RUNTIME_ID => {
-        compilation.add_runtime_module(chunk_ukey, RuntimeIdRuntimeModule::default().boxed())?;
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          RuntimeIdRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       RuntimeGlobals::PREFETCH_CHUNK => {
-        compilation.add_runtime_module(
-          chunk_ukey,
+        runtime_modules_to_add.push((
+          *chunk_ukey,
           ChunkPrefetchPreloadFunctionRuntimeModule::new(
+            &compilation.runtime_template,
             "prefetch",
             RuntimeGlobals::PREFETCH_CHUNK,
             RuntimeGlobals::PREFETCH_CHUNK_HANDLERS,
           )
           .boxed(),
-        )?;
+        ));
       }
       RuntimeGlobals::PRELOAD_CHUNK => {
-        compilation.add_runtime_module(
-          chunk_ukey,
+        runtime_modules_to_add.push((
+          *chunk_ukey,
           ChunkPrefetchPreloadFunctionRuntimeModule::new(
+            &compilation.runtime_template,
             "preload",
             RuntimeGlobals::PRELOAD_CHUNK,
             RuntimeGlobals::PRELOAD_CHUNK_HANDLERS,
           )
           .boxed(),
-        )?;
+        ));
+      }
+      RuntimeGlobals::AMD_DEFINE => {
+        if compilation.options.amd.is_some() {
+          runtime_modules_to_add.push((
+            *chunk_ukey,
+            AmdDefineRuntimeModule::new(&compilation.runtime_template).boxed(),
+          ));
+        }
+      }
+      RuntimeGlobals::AMD_OPTIONS => {
+        if let Some(options) = &compilation.options.amd {
+          runtime_modules_to_add.push((
+            *chunk_ukey,
+            AmdOptionsRuntimeModule::new(&compilation.runtime_template, options.clone()).boxed(),
+          ));
+        }
+      }
+      RuntimeGlobals::MAKE_DEFERRED_NAMESPACE_OBJECT => {
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          MakeDeferredNamespaceObjectRuntimeModule::new(&compilation.runtime_template, *chunk_ukey)
+            .boxed(),
+        ));
+      }
+      RuntimeGlobals::MAKE_OPTIMIZED_DEFERRED_NAMESPACE_OBJECT => {
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          MakeOptimizedDeferredNamespaceObjectRuntimeModule::new(
+            &compilation.runtime_template,
+            *chunk_ukey,
+          )
+          .boxed(),
+        ));
+      }
+      RuntimeGlobals::TO_BINARY => {
+        runtime_modules_to_add.push((
+          *chunk_ukey,
+          ToBinaryRuntimeModule::new(&compilation.runtime_template).boxed(),
+        ));
       }
       _ => {}
     }
@@ -513,32 +548,25 @@ fn runtime_requirements_in_tree(
   Ok(None)
 }
 
-#[async_trait]
 impl Plugin for RuntimePlugin {
   fn name(&self) -> &'static str {
     "rspack.RuntimePlugin"
   }
 
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
     ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
-    ctx
-      .context
       .compilation_hooks
       .runtime_requirement_in_module
       .tap(runtime_requirements_in_module::new(self));
     ctx
-      .context
       .compilation_hooks
       .runtime_requirement_in_tree
       .tap(runtime_requirements_in_tree::new(self));
     Ok(())
+  }
+
+  fn clear_cache(&self, id: CompilationId) {
+    COMPILATION_HOOKS_MAP.remove(&id);
   }
 }

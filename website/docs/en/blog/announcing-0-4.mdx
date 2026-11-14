@@ -1,38 +1,49 @@
 ---
+description: 'Rspack 0.4 is out, removing support for some builtin features.'
 date: 2023-11-22 17:31:00
+sidebar: false
+authors:
+  - name: Rspack Team
+    avatar: 'https://assets.rspack.rs/rspack/rspack-logo-with-background.png'
+    title: '@rspack_dev'
+    x: 'https://x.com/rspack_dev'
 ---
 
-# Announcing Rspack v0.4
+import { BlogAuthors } from '@rstackjs/doc-ui/blog-authors';
 
-> November 02, 2023
+# Announcing Rspack 0.4
 
-## Rspack 0.4 Major Changes
+_November 22, 2023_
 
-### Drop NodeJS 14 Support
+<BlogAuthors />
+
+## Major changes
+
+### Drop Node.js 14 support
 
 Rspack no longer supports Node.js 14, Node.js 16+ is now required.
 
 ### Make @rspack/core as peer dependency of @rspack/cli
 
-`@rspack/core` is now a peer dependency of `@rspack/cli` rather than a direct dependency. This means that you need to manually install `@rspack/core` with `@rspack/cli` now. aligning Rspack more closely with webpack. In the long term, the positioning of `@rspack/cli` will no longer be an out-of-the-box solution. We will align `@rspack/cli` with webpack-cli and may even directly support the use of `@rspack/core` in `webpack-cli`. We recommend [Rsbuild](https://rsbuild.dev/) as an out-of-the-box solution.
+`@rspack/core` is now a peer dependency of `@rspack/cli` rather than a direct dependency. This means that you need to manually install `@rspack/core` with `@rspack/cli` now. aligning Rspack more closely with webpack. In the long term, the positioning of `@rspack/cli` will no longer be an out-of-the-box solution. We will align `@rspack/cli` with webpack-cli and may even directly support the use of `@rspack/core` in `webpack-cli`. We recommend [Rsbuild](https://rsbuild.rs/) as an out-of-the-box solution.
 
 ### Deprecating default transformation
 
 `experiments.rspackFuture.disableTransformByDefault` is enabled by default in v0.4.0. For people that still need the legacy behavior, you may manually set this option to `false`.
 
-This feature primarily addresses three categories of problems: [builtins](/config/builtins) code transformation features, [target](/config/target), and custom [Rule.type](/config/module#ruletype).
+This feature primarily addresses three categories of problems: [builtins](https://v0.rspack.rs/config/builtins) code transformation features, [target](/config/target), and custom [rules[].type](/config/module-rules#rulestype).
 
-1. Removal of support for some [builtins](/config/builtins) features:
+1. Removal of support for some [builtins](https://v0.rspack.rs/config/builtins) features:
 
-- [builtins.relay](/config/builtins#builtinsrelay): moved to `rspackExperiments.relay`
-- [builtins.react](/config/builtins#builtinsreact): moved to `jsc.transform.react`
-- [builtins.emotion](/config/builtins#builtinsemotion): moved to `rspackExperiments.emotion`
-- [builtins.pluginImport](/config/builtins#builtinspluginimport): moved to `rspackExperiments.import`
-- [builtins.decorator](/config/builtins#builtinsdecorator): moved to `jsc.parser.decorator`
-- [builtins.presetEnv](/config/builtins#builtinspresetenv): moved to `jsc.env`
+- [builtins.relay](https://v0.rspack.rs/config/builtins#builtinsrelay): moved to `rspackExperiments.relay`
+- [builtins.react](https://v0.rspack.rs/config/builtins#builtinsreact): moved to `jsc.transform.react`
+- [builtins.emotion](https://v0.rspack.rs/config/builtins#builtinsemotion): moved to `rspackExperiments.emotion`
+- [builtins.pluginImport](https://v0.rspack.rs/config/builtins#builtinspluginimport): moved to `rspackExperiments.import`
+- [builtins.decorator](https://v0.rspack.rs/config/builtins#builtinsdecorator): moved to `jsc.parser.decorators`
+- [builtins.presetEnv](https://v0.rspack.rs/config/builtins#builtinspresetenv): moved to `jsc.env`
 
-```js
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   module: {
     rules: [
       {
@@ -54,7 +65,6 @@ module.exports = {
             emotion: true, // The same as `builtins`
           },
         },
-        type: 'javascript/auto',
       },
     ],
   },
@@ -68,8 +78,8 @@ module.exports = {
 
 2. [target](/config/target) will not downgrade user-side code(including `node_modules`)
 
-```diff
-module.exports = {
+```diff title="rspack.config.mjs"
+export default {
   target: ["web", "es5"],
   module: {
     rules: [
@@ -88,14 +98,13 @@ module.exports = {
 +         targets: "chrome >= 48"
 +        }
         }
-        type: 'javascript/auto',
       },
     ],
   }
 };
 ```
 
-3. Removed non-webpack compatible [Rule.type](/config/module#ruletype)
+3. Removed non-webpack compatible [rules[].type](/config/module-rules#rulestype)
 
 These types have been removed:
 
@@ -109,7 +118,7 @@ For JS-related types, only the following will be retained:
 - `"javascript/esm"`
 - `"javascript/dynamic"`
 
-Refer to [this](/config/experiments#experimentsrspackfuturedisabletransformbydefault) for the complete migration guide.
+Refer to [this](https://v0.rspack.rs/config/experiments#experimentsrspackfuturedisabletransformbydefault) for the complete migration guide.
 
 Check out our previous discussion [here](https://github.com/web-infra-dev/rspack/discussions/4070).
 
@@ -117,12 +126,12 @@ Check out our previous discussion [here](https://github.com/web-infra-dev/rspack
 
 With `experiments.rspackFuture.disableTransformByDefault` is enabled by default in v0.4.0, `builtin.react.refresh` has also been deprecated. Now we recommend using `@rspack/plugin-react-refresh` to enable react fast refresh.
 
-```diff
-+ const ReactRefreshPlugin = require('@rspack/plugin-react-refresh');
+```diff title="rspack.config.mjs"
++ import { ReactRefreshRspackPlugin } from '@rspack/plugin-react-refresh';
+
 const isDev = process.env.NODE_ENV === 'development';
 
-module.exports = {
-  // ...
+export default {
   mode: isDev ? 'development' : 'production',
   module: {
     rules: [
@@ -154,12 +163,12 @@ module.exports = {
 -    }
 -  },
   plugins: [
-+    isDev && new ReactRefreshPlugin()
-  ].filter(Boolean),
++    isDev && new ReactRefreshRspackPlugin()
+  ],
 };
 ```
 
-Checkout [here](/guide/tech/react#fast-refresh) for more details.
+Checkout [here](/guide/integrations/react#fast-refresh) for more details.
 
 ### Deprecating builtin:sass-loader
 
@@ -169,7 +178,7 @@ Checkout [here](/guide/tech/react#fast-refresh) for more details.
 
 `experiments.incrementalRebuild` has now been deprecated. Rspack will remove it in v0.5.0.
 
-### Refactoring export api in @rspack/core
+### Refactoring export API in @rspack/core
 
 Before, some APIs should not be exported accidentally exported through re-export from @rspack/core. Now with this refactor, we clean up the export APIs from @rspack/core.
 
@@ -183,27 +192,27 @@ In order to full migrate to Webpack's split chunks implementation, these fields 
 
 ### Enable newResolver by default
 
-[oxc_resolver](https://crates.io/crates/oxc_resolver) is now enabled by default.
+New resolver is now enabled by default.
 
-`oxc_resolver` is a module resolver written in Rust provided by the [oxc project](https://github.com/oxc-project/oxc). The new resolver has passed all of [enhanced-resolve](https://www.npmjs.com/package/enhanced-resolve)'s test suite. It is 5 times faster than previous implementation, and 28 times faster than enhanced-resolve.
+The new resolver has passed all of [enhanced-resolve](https://www.npmjs.com/package/enhanced-resolve)'s test suite. It is 5 times faster than previous implementation, and 28 times faster than enhanced-resolve.
 
 The new resolver can be configured to read `tsconfig.json`'s `compilerOptions.paths` and `references` field and provides better support for nested path alias. See API [resolve.tsConfig](/config/resolve#resolvetsconfig) for details.
 
 To opt out of the new resolver, set `experiments.rspackFuture.newResolver` to `false`.
 
-## Migration Guide
+## Migration guide
 
-There is a [migrate example](https://github.com/rspack-contrib/rspack-examples/pull/2) demonstrating how to migrate from Rspack 0.3.14 to Rspack 0.4.0.
+There is a [migrate example](https://github.com/rstackjs/rstack-examples/pull/2) demonstrating how to migrate from Rspack 0.3.14 to Rspack 0.4.0.
 
 ### Choose `@rspack/cli` or `Rsbuild`?
 
 If your application is a CSR application, we strongly encourage you to use Rsbuild instead of configuring Rspack yourself, as Rsbuild is much easier to use compared to `@rspack/cli`.
 
-### Upgrade Node.js Version
+### Upgrade Node.js version
 
 Rspack no longer supports Node.js 14 as of version 0.4.0; Node.js 16+ is now required.
 
-### Install `@rspack/core` Manually with `@rspack/cli`
+### Install `@rspack/core` manually with `@rspack/cli`
 
 ```diff title=package.json
 {
@@ -214,7 +223,7 @@ Rspack no longer supports Node.js 14 as of version 0.4.0; Node.js 16+ is now req
 }
 ```
 
-### Use `builtin:swc-loader` to Support Module Transformation
+### Use `builtin:swc-loader` to support module transformation
 
 Rspack no longer transforms files by default as of version 0.4.0, you can still enable old transform behavior by the following setting
 
@@ -230,7 +239,7 @@ Rspack no longer transforms files by default as of version 0.4.0, you can still 
 
 But we suggest you use `builtin:swc-loader` to transform files now. More details are available in [Deprecating Default Transformation](#deprecating-default-transformation).
 
-### Use `@rspack/plugin-react-refresh` for React Applications
+### Use `@rspack/plugin-react-refresh` for React applications
 
 `builtin.react.refresh` does not work when we disable the default transformation, so you need to use `@rspack/plugin-react-refresh` to enable fast refresh. More details are available in [Deprecating builtin.react.refresh](#deprecating-builtinreactrefresh).
 
@@ -245,9 +254,10 @@ Currently, Rspack's internal plugins are divided into two categories:
 
 The original `builtins.define` can be migrated as follows:
 
-```diff
-+ const rspack = require("@rspack/core")
-module.exports = {
+```diff title="rspack.config.mjs"
++ import { rspack } from '@rspack/core';
+
+export default {
 -  builtins: {
 -    define: { process.env.NODE_ENV: JSON.stringify(process.env.NODE_ENV) }
 -  },
@@ -257,11 +267,12 @@ module.exports = {
 }
 ```
 
-For `builtins.html`, it can be directly migrated to [HtmlRspackPlugin](/plugins/rspack/html-rspack-plugin):
+For `builtins.html`, it can be directly migrated to [HtmlRspackPlugin](/plugins/html-rspack-plugin):
 
-```diff
-+ const rspack = require("@rspack/core")
-module.exports = {
+```diff title="rspack.config.mjs"
++ import { rspack } from '@rspack/core';
+
+export default {
 -  builtins: {
 -    html: [{ template: "./index.html" }]
 -  },
@@ -273,9 +284,10 @@ module.exports = {
 
 When there are multiple configurations in `builtins.html`, multiple plugin instances can be created:
 
-```js
-const rspack = require('@rspack/core');
-module.exports = {
+```js title="rspack.config.mjs"
+import { rspack } from '@rspack/core';
+
+export default {
   plugins: [
     new rspack.HtmlRspackPlugin({ template: './index.html' }),
     new rspack.HtmlRspackPlugin({ template: './foo.html' }),
@@ -283,13 +295,14 @@ module.exports = {
 };
 ```
 
-For `builtins.copy`, it can be directly migrated to [CopyRspackPlugin](/plugins/rspack/copy-rspack-plugin).
+For `builtins.copy`, it can be directly migrated to [CopyRspackPlugin](/plugins/copy-rspack-plugin).
 
-For the original `builtins.minifyOptions`, we provide [SwcJsMinimizerRspackPlugin](/plugins/rspack/swc-js-minimizer-rspack-plugin):
+For the original `builtins.minifyOptions`, we provide [SwcJsMinimizerRspackPlugin](/plugins/swc-js-minimizer-rspack-plugin):
 
-```js
-const rspack = require('@rspack/core');
-module.exports = {
+```js title="rspack.config.mjs"
+import { rspack } from '@rspack/core';
+
+export default {
   optimization: {
     minimizer: [
       new rspack.SwcJsMinimizerRspackPlugin({

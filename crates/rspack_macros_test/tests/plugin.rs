@@ -1,7 +1,7 @@
 use rspack_macros::{plugin, plugin_hook};
 
 mod mock_hook {
-  pub trait AsyncSeries<T, R> {
+  pub trait Series<T, R> {
     fn run(&self, a: T) -> R;
     fn stage(&self) -> i32 {
       0
@@ -26,39 +26,49 @@ mod named_struct {
     state: usize,
   }
 
-  #[plugin_hook(mock_hook::AsyncSeries<mock_core::Compilation, String> for Plugin)]
+  #[plugin_hook(mock_hook::Series<mock_core::Compilation, String> for Plugin)]
   fn process_assets(&self, _a: mock_core::Compilation) -> String {
     format!("process_assets {} {}", self.options, self.state)
   }
 
-  #[plugin_hook(mock_hook::AsyncSeries<mock_core::Compilation, String> for Plugin, stage = 100)]
+  #[plugin_hook(mock_hook::Series<mock_core::Compilation, String> for Plugin, stage = 100)]
   fn make(&self, _a: mock_core::Compilation) -> String {
     format!("make {} {}", self.options, self.state)
   }
 
-  #[plugin_hook(mock_hook::AsyncSeries<mock_core::Compilation, String> for Plugin, stage = mock_core::BASIC_STAGE)]
+  #[plugin_hook(mock_hook::Series<mock_core::Compilation, String> for Plugin, stage = mock_core::BASIC_STAGE)]
   fn compilation(&self, _a: mock_core::Compilation) -> String {
     format!("compilation {} {}", self.options, self.state)
   }
 
+  #[plugin_hook(mock_hook::Series<mock_core::Compilation, String> for Plugin, stage = self.state as i32)]
+  fn dynamic_stage(&self, _a: mock_core::Compilation) -> String {
+    format!("dynamic_stage {} {}", self.options, self.state)
+  }
+
   #[test]
   fn test() {
-    let plugin = Plugin::new_inner("aa".to_string(), 0);
+    let plugin = Plugin::new_inner("aa".to_string(), 7);
     let hook1 = &compilation::new(&plugin);
     let hook2 = &make::new(&plugin);
     let hook3 = &process_assets::new(&plugin);
-    let r = mock_hook::AsyncSeries::run(hook1, mock_core::Compilation);
-    assert_eq!(r, "compilation aa 0");
-    let s = mock_hook::AsyncSeries::stage(hook1);
+    let hook4 = &dynamic_stage::new(&plugin);
+    let r = mock_hook::Series::run(hook1, mock_core::Compilation);
+    assert_eq!(r, "compilation aa 7");
+    let s = mock_hook::Series::stage(hook1);
     assert_eq!(s, 20);
-    let r = mock_hook::AsyncSeries::run(hook2, mock_core::Compilation);
-    assert_eq!(r, "make aa 0");
-    let s = mock_hook::AsyncSeries::stage(hook2);
+    let r = mock_hook::Series::run(hook2, mock_core::Compilation);
+    assert_eq!(r, "make aa 7");
+    let s = mock_hook::Series::stage(hook2);
     assert_eq!(s, 100);
-    let r = mock_hook::AsyncSeries::run(hook3, mock_core::Compilation);
-    assert_eq!(r, "process_assets aa 0");
-    let s = mock_hook::AsyncSeries::stage(hook3);
+    let r = mock_hook::Series::run(hook3, mock_core::Compilation);
+    assert_eq!(r, "process_assets aa 7");
+    let s = mock_hook::Series::stage(hook3);
     assert_eq!(s, 0);
+    let r = mock_hook::Series::run(hook4, mock_core::Compilation);
+    assert_eq!(r, "dynamic_stage aa 7");
+    let s = mock_hook::Series::stage(hook4);
+    assert_eq!(s, 7);
   }
 }
 
@@ -69,17 +79,17 @@ mod unit_struct {
   #[derive(Debug, Default, Clone)]
   struct Plugin;
 
-  #[plugin_hook(mock_hook::AsyncSeries<mock_core::Compilation, String> for Plugin)]
+  #[plugin_hook(mock_hook::Series<mock_core::Compilation, String> for Plugin)]
   fn process_assets(&self, _a: mock_core::Compilation) -> String {
     "process_assets".to_string()
   }
 
-  #[plugin_hook(mock_hook::AsyncSeries<mock_core::Compilation, String> for Plugin, stage = 100)]
+  #[plugin_hook(mock_hook::Series<mock_core::Compilation, String> for Plugin, stage = 100)]
   fn make(&self, _a: mock_core::Compilation) -> String {
     "make".to_string()
   }
 
-  #[plugin_hook(mock_hook::AsyncSeries<mock_core::Compilation, String> for Plugin, stage = mock_core::BASIC_STAGE)]
+  #[plugin_hook(mock_hook::Series<mock_core::Compilation, String> for Plugin, stage = mock_core::BASIC_STAGE)]
   fn compilation(&self, _a: mock_core::Compilation) -> String {
     "compilation".to_string()
   }
@@ -90,17 +100,17 @@ mod unit_struct {
     let hook1 = &compilation::new(&plugin);
     let hook2 = &make::new(&plugin);
     let hook3 = &process_assets::new(&plugin);
-    let r = mock_hook::AsyncSeries::run(hook1, mock_core::Compilation);
+    let r = mock_hook::Series::run(hook1, mock_core::Compilation);
     assert_eq!(r, "compilation");
-    let s = mock_hook::AsyncSeries::stage(hook1);
+    let s = mock_hook::Series::stage(hook1);
     assert_eq!(s, 20);
-    let r = mock_hook::AsyncSeries::run(hook2, mock_core::Compilation);
+    let r = mock_hook::Series::run(hook2, mock_core::Compilation);
     assert_eq!(r, "make");
-    let s = mock_hook::AsyncSeries::stage(hook2);
+    let s = mock_hook::Series::stage(hook2);
     assert_eq!(s, 100);
-    let r = mock_hook::AsyncSeries::run(hook3, mock_core::Compilation);
+    let r = mock_hook::Series::run(hook3, mock_core::Compilation);
     assert_eq!(r, "process_assets");
-    let s = mock_hook::AsyncSeries::stage(hook3);
+    let s = mock_hook::Series::stage(hook3);
     assert_eq!(s, 0);
   }
 }

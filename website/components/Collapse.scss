@@ -1,0 +1,27 @@
+.ant-collapse-header {
+  padding: 6px 10px !important;
+}
+
+.collapse-code-panel {
+  .ant-collapse-content-box {
+    padding: 0 !important;
+  }
+
+  .ant-collapse-content-box > div {
+    margin: 0 !important;
+    border-radius: 0 !important;
+  }
+
+  .rp-codeblock:only-child {
+    margin: 0 -1rem;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+  }
+}
+
+.dark {
+  .ant-collapse-header {
+    color: #fff !important;
+  }
+}

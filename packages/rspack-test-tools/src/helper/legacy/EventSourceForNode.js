@@ -9,41 +9,40 @@
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
 
-"use strict";
+import http from 'node:http';
+import https from 'node:https';
 
-module.exports = class EventSource {
-	constructor(url) {
-		this.response = undefined;
-		const request = (
-			url.startsWith("https:") ? require("https") : require("http")
-		).request(
-			url,
-			{
-				agent: false,
-				headers: { accept: "text/event-stream" }
-			},
-			res => {
-				this.response = res;
-				res.on("error", err => {
-					if (this.onerror) this.onerror(err);
-				});
-			}
-		);
-		request.on("error", err => {
-			if (this.onerror) this.onerror({ message: err });
-		});
-		request.end();
-	}
+export class EventSource {
+  constructor(url) {
+    this.response = undefined;
+    const request = (url.startsWith('https:') ? https : http).request(
+      url,
+      {
+        agent: false,
+        headers: { accept: 'text/event-stream' },
+      },
+      (res) => {
+        this.response = res;
+        res.on('error', (err) => {
+          if (this.onerror) this.onerror(err);
+        });
+      },
+    );
+    request.on('error', (err) => {
+      if (this.onerror) this.onerror({ message: err });
+    });
+    request.end();
+  }
 
-	close() {
-		this.response.destroy();
-	}
+  close() {
+    this.response.destroy();
+  }
 
-	set onopen(value) {
-		throw new Error("not implemented");
-	}
+  set onopen(value) {
+    throw new Error('not implemented');
+  }
 
-	set onmessage(value) {
-		throw new Error("not implemented");
-	}
-};
+  set onmessage(value) {
+    throw new Error('not implemented');
+  }
+}

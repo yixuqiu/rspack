@@ -1,10 +1,21 @@
-use std::cmp::Ordering;
-use std::hash::Hash;
+use std::{cmp::Ordering, collections::BTreeSet, hash::Hash, sync::atomic::AtomicU32};
 
 use rspack_core::ChunkUkey;
-use rspack_database::{Database, DatabaseItem, Ukey};
+use rustc_hash::FxHashMap;
 
-pub type ChunkCombinationUkey = Ukey<ChunkCombination>;
+static NEXT_CHUNK_COMBINATION_UKEY: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkCombinationUkey(u32, std::marker::PhantomData<ChunkCombination>);
+
+impl ChunkCombinationUkey {
+  pub fn new() -> Self {
+    Self(
+      NEXT_CHUNK_COMBINATION_UKEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+      std::marker::PhantomData,
+    )
+  }
+}
 
 pub struct ChunkCombination {
   pub ukey: ChunkCombinationUkey,
@@ -17,12 +28,6 @@ pub struct ChunkCombination {
   pub b_idx: usize,
   pub a_size: f64,
   pub b_size: f64,
-}
-
-impl DatabaseItem for ChunkCombination {
-  fn ukey(&self) -> Ukey<Self> {
-    self.ukey
-  }
 }
 
 impl PartialEq for ChunkCombination {
@@ -40,80 +45,159 @@ impl Hash for ChunkCombination {
   }
 }
 
+/// The fields that order a combination, copied when it enters the bucket.
+#[derive(Debug, Clone, Copy)]
+struct SortKey {
+  size_diff: f64,
+  integrated_size: f64,
+  a_idx: usize,
+  b_idx: usize,
+  ukey: ChunkCombinationUkey,
+}
+
+impl SortKey {
+  fn new(combination: &ChunkCombination) -> Self {
+    Self {
+      size_diff: ordered_size_diff(combination.size_diff, combination.integrated_size),
+      integrated_size: combination.integrated_size,
+      a_idx: combination.a_idx,
+      b_idx: combination.b_idx,
+      ukey: combination.ukey,
+    }
+  }
+}
+
+/// `<` and `>` treat a NaN `size_diff` as equal to everything, so the order then falls
+/// through to `integrated_size`. With finite options, `size_diff` is NaN only when
+/// `integrated_size` is infinite. Ranking it at the matching end gives the same order
+/// and keeps the order total for any option.
+fn ordered_size_diff(size_diff: f64, integrated_size: f64) -> f64 {
+  if !size_diff.is_nan() {
+    size_diff
+  } else if integrated_size == f64::NEG_INFINITY {
+    f64::INFINITY
+  } else {
+    f64::NEG_INFINITY
+  }
+}
+
+impl Ord for SortKey {
+  /// The greatest key is merged first.
+  fn cmp(&self, other: &Self) -> Ordering {
+    // Layer 1: ordered by largest size benefit
+    if self.size_diff < other.size_diff {
+      return Ordering::Less;
+    }
+    if self.size_diff > other.size_diff {
+      return Ordering::Greater;
+    }
+    // Layer 2: ordered by smallest combined size. A NaN size, which only non-finite
+    // options produce, is merged last.
+    match (
+      self.integrated_size.is_nan(),
+      other.integrated_size.is_nan(),
+    ) {
+      (false, false) => {
+        if self.integrated_size < other.integrated_size {
+          return Ordering::Greater;
+        }
+        if self.integrated_size > other.integrated_size {
+          return Ordering::Less;
+        }
+      }
+      (true, false) => return Ordering::Less,
+      (false, true) => return Ordering::Greater,
+      (true, true) => {}
+    }
+    // Layer 3: ordered by position difference in orderedChunk (-> to be deterministic)
+    (other.b_idx - other.a_idx)
+      .cmp(&(self.b_idx - self.a_idx))
+      // Layer 4: ordered by position in orderedChunk (-> to be deterministic)
+      .then_with(|| other.b_idx.cmp(&self.b_idx))
+      // No two combinations share both positions, so this only keeps the order total.
+      .then_with(|| self.ukey.cmp(&other.ukey))
+  }
+}
+
+impl PartialOrd for SortKey {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl PartialEq for SortKey {
+  fn eq(&self, other: &Self) -> bool {
+    self.cmp(other) == Ordering::Equal
+  }
+}
+
+impl Eq for SortKey {}
+
+/// Live combinations, ordered so that `pop_first` returns the next one to merge.
 pub struct ChunkCombinationBucket {
-  combinations_by_ukey: Database<ChunkCombination>,
-  sorted_combinations: Vec<ChunkCombinationUkey>,
-  out_of_date: bool,
+  combinations_by_ukey: FxHashMap<ChunkCombinationUkey, ChunkCombination>,
+  sorted_combinations: BTreeSet<SortKey>,
 }
 
 impl ChunkCombinationBucket {
-  pub fn new() -> Self {
+  pub fn new(combinations: Vec<ChunkCombination>) -> Self {
+    let sorted_combinations = combinations.iter().map(SortKey::new).collect();
+    let combinations_by_ukey = combinations
+      .into_iter()
+      .map(|combination| (combination.ukey, combination))
+      .collect();
     Self {
-      combinations_by_ukey: Default::default(),
-      sorted_combinations: vec![],
-      out_of_date: false,
+      combinations_by_ukey,
+      sorted_combinations,
     }
   }
 
-  pub fn get_mut(&mut self, ukey: &ChunkCombinationUkey) -> &mut ChunkCombination {
-    self.combinations_by_ukey.expect_get_mut(ukey)
+  pub fn get(&self, ukey: &ChunkCombinationUkey) -> &ChunkCombination {
+    self
+      .combinations_by_ukey
+      .get(ukey)
+      .unwrap_or_else(|| panic!("ChunkCombination({ukey:?}) not found"))
   }
 
-  pub fn add(&mut self, combination: ChunkCombination) {
-    self.sorted_combinations.push(combination.ukey);
-    self.combinations_by_ukey.add(combination);
-    self.out_of_date = true;
+  fn get_mut(&mut self, ukey: &ChunkCombinationUkey) -> &mut ChunkCombination {
+    self
+      .combinations_by_ukey
+      .get_mut(ukey)
+      .unwrap_or_else(|| panic!("ChunkCombination({ukey:?}) not found"))
   }
 
-  fn sort_combinations(&mut self) {
-    self.sorted_combinations.sort_by(|a_ukey, b_ukey| {
-      let a = self.combinations_by_ukey.expect_get(a_ukey);
-      let b = self.combinations_by_ukey.expect_get(b_ukey);
-      // Layer 1: ordered by largest size benefit
-      if a.size_diff < b.size_diff {
-        Ordering::Less
-      } else if a.size_diff > b.size_diff {
-        Ordering::Greater
-      } else {
-        // Layer 2: ordered by smallest combined size
-        if a.integrated_size < b.integrated_size {
-          Ordering::Greater
-        } else if a.integrated_size > b.integrated_size {
-          Ordering::Less
-        } else {
-          // Layer 3: ordered by position difference in orderedChunk (-> to be deterministic)
-          match a.b_idx.cmp(&b.a_idx) {
-            Ordering::Less => Ordering::Greater,
-            Ordering::Greater => Ordering::Less,
-            Ordering::Equal => {
-              // Layer 4: ordered by position in orderedChunk (-> to be deterministic)
-              match a.b_idx.cmp(&b.b_idx) {
-                Ordering::Less => Ordering::Greater,
-                Ordering::Greater => Ordering::Less,
-                Ordering::Equal => Ordering::Equal,
-              }
-            }
-          }
-        }
-      }
-    });
-    self.out_of_date = false;
-  }
-
+  /// Removes the combination to merge next and marks it as deleted.
   pub fn pop_first(&mut self) -> Option<ChunkCombinationUkey> {
-    if self.out_of_date {
-      self.sort_combinations();
-    }
-    self.sorted_combinations.pop()
+    let ukey = self.sorted_combinations.pop_last()?.ukey;
+    self.get_mut(&ukey).deleted = true;
+    Some(ukey)
   }
 
-  pub fn delete(&mut self, combination: &ChunkCombinationUkey) {
-    self.out_of_date = true;
-    self.sorted_combinations.retain(|ukey| ukey != combination);
+  /// Marks a live combination as deleted and removes it from the order.
+  pub fn delete(&mut self, ukey: &ChunkCombinationUkey) {
+    let combination = self
+      .combinations_by_ukey
+      .get_mut(ukey)
+      .unwrap_or_else(|| panic!("ChunkCombination({ukey:?}) not found"));
+    combination.deleted = true;
+    let removed = self.sorted_combinations.remove(&SortKey::new(combination));
+    debug_assert!(removed, "ChunkCombination({ukey:?}) is not in the order");
   }
 
-  pub fn update(&mut self) {
-    self.out_of_date = true;
+  /// Changes a live combination and moves it to its new place in the order.
+  pub fn update(
+    &mut self,
+    ukey: &ChunkCombinationUkey,
+    update: impl FnOnce(&mut ChunkCombination),
+  ) {
+    let combination = self
+      .combinations_by_ukey
+      .get_mut(ukey)
+      .unwrap_or_else(|| panic!("ChunkCombination({ukey:?}) not found"));
+    let removed = self.sorted_combinations.remove(&SortKey::new(combination));
+    debug_assert!(removed, "ChunkCombination({ukey:?}) is not in the order");
+    update(combination);
+    self.sorted_combinations.insert(SortKey::new(combination));
   }
 }
 
@@ -132,10 +216,10 @@ mod test {
     let chunk_4 = ChunkUkey::new();
     let chunk_5 = ChunkUkey::new();
 
-    let mut combinations = ChunkCombinationBucket::new();
+    let mut list = vec![];
 
     let combination_0 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_0,
       a: chunk_0,
       a_idx: 0,
@@ -149,7 +233,7 @@ mod test {
     });
 
     let combination_1 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_1,
       a: chunk_0,
       a_idx: 0,
@@ -163,7 +247,7 @@ mod test {
     });
 
     let combination_2 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_2,
       a: chunk_1,
       a_idx: 1,
@@ -177,7 +261,7 @@ mod test {
     });
 
     let combination_3 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_3,
       a: chunk_0,
       a_idx: 0,
@@ -191,7 +275,7 @@ mod test {
     });
 
     let combination_4 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_4,
       a: chunk_1,
       a_idx: 1,
@@ -205,7 +289,7 @@ mod test {
     });
 
     let combination_5 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_5,
       a: chunk_2,
       a_idx: 2,
@@ -219,7 +303,7 @@ mod test {
     });
 
     let combination_6 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_6,
       a: chunk_0,
       a_idx: 0,
@@ -233,7 +317,7 @@ mod test {
     });
 
     let combination_7 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_7,
       a: chunk_1,
       a_idx: 1,
@@ -247,7 +331,7 @@ mod test {
     });
 
     let combination_8 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_8,
       a: chunk_2,
       a_idx: 2,
@@ -261,7 +345,7 @@ mod test {
     });
 
     let combination_9 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_9,
       a: chunk_3,
       a_idx: 3,
@@ -275,7 +359,7 @@ mod test {
     });
 
     let combination_10 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_10,
       a: chunk_0,
       a_idx: 0,
@@ -289,7 +373,7 @@ mod test {
     });
 
     let combination_11 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_11,
       a: chunk_1,
       a_idx: 1,
@@ -303,7 +387,7 @@ mod test {
     });
 
     let combination_12 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_12,
       a: chunk_2,
       a_idx: 2,
@@ -317,7 +401,7 @@ mod test {
     });
 
     let combination_13 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_13,
       a: chunk_3,
       a_idx: 3,
@@ -331,7 +415,7 @@ mod test {
     });
 
     let combination_14 = ChunkCombinationUkey::new();
-    combinations.add(ChunkCombination {
+    list.push(ChunkCombination {
       ukey: combination_14,
       a: chunk_4,
       a_idx: 4,
@@ -344,6 +428,8 @@ mod test {
       size_diff: 9802_f64,
     });
 
+    let mut combinations = ChunkCombinationBucket::new(list);
+
     assert_eq!(combinations.pop_first().unwrap(), combination_0);
 
     combinations.delete(&combination_1);
@@ -351,33 +437,33 @@ mod test {
     combinations.delete(&combination_6);
     combinations.delete(&combination_10);
 
-    let c = combinations.get_mut(&combination_2);
-    c.a = chunk_1;
-    c.integrated_size = 10074_f64;
-    c.a_size = 10044_f64;
-    c.size_diff = 10000_f64;
-    combinations.update();
+    combinations.update(&combination_2, |c| {
+      c.a = chunk_1;
+      c.integrated_size = 10074_f64;
+      c.a_size = 10044_f64;
+      c.size_diff = 10000_f64;
+    });
 
-    let c = combinations.get_mut(&combination_4);
-    c.a = chunk_1;
-    c.integrated_size = 10074_f64;
-    c.a_size = 10044_f64;
-    c.size_diff = 10000_f64;
-    combinations.update();
+    combinations.update(&combination_4, |c| {
+      c.a = chunk_1;
+      c.integrated_size = 10074_f64;
+      c.a_size = 10044_f64;
+      c.size_diff = 10000_f64;
+    });
 
-    let c = combinations.get_mut(&combination_7);
-    c.a = chunk_1;
-    c.integrated_size = 10066_f64;
-    c.a_size = 10044_f64;
-    c.size_diff = 10000_f64;
-    combinations.update();
+    combinations.update(&combination_7, |c| {
+      c.a = chunk_1;
+      c.integrated_size = 10066_f64;
+      c.a_size = 10044_f64;
+      c.size_diff = 10000_f64;
+    });
 
-    let c = combinations.get_mut(&combination_8);
-    c.a = chunk_1;
-    c.integrated_size = 11450_f64;
-    c.a_size = 10044_f64;
-    c.size_diff = 9604_f64;
-    combinations.update();
+    combinations.update(&combination_8, |c| {
+      c.a = chunk_1;
+      c.integrated_size = 11450_f64;
+      c.a_size = 10044_f64;
+      c.size_diff = 9604_f64;
+    });
 
     assert_eq!(combinations.pop_first().unwrap(), combination_9);
   }

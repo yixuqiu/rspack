@@ -1,0 +1,85 @@
+use std::ops::{Deref, DerefMut};
+
+use rayon::prelude::{FromParallelIterator, IntoParallelIterator, ParallelIterator};
+use rspack_intern::Atom;
+use rustc_hash::FxHashMap;
+
+use crate::{
+  ArtifactExt, DependencyId, ExportInfo, ModuleIdentifier, incremental::IncrementalPasses,
+};
+
+#[derive(Debug, Clone)]
+pub struct SideEffectsDoOptimize {
+  pub ids: Vec<Atom>,
+  pub target_module: ModuleIdentifier,
+  pub need_move_target: Option<SideEffectsDoOptimizeMoveTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SideEffectsDoOptimizeMoveTarget {
+  pub export_info: ExportInfo,
+  pub target_export: Option<Vec<Atom>>,
+}
+
+#[derive(Debug, Default)]
+pub struct SideEffectsOptimizeArtifact(FxHashMap<DependencyId, SideEffectsDoOptimize>);
+
+impl Deref for SideEffectsOptimizeArtifact {
+  type Target = FxHashMap<DependencyId, SideEffectsDoOptimize>;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+impl DerefMut for SideEffectsOptimizeArtifact {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.0
+  }
+}
+
+impl From<FxHashMap<DependencyId, SideEffectsDoOptimize>> for SideEffectsOptimizeArtifact {
+  fn from(value: FxHashMap<DependencyId, SideEffectsDoOptimize>) -> Self {
+    Self(value)
+  }
+}
+
+impl From<SideEffectsOptimizeArtifact> for FxHashMap<DependencyId, SideEffectsDoOptimize> {
+  fn from(value: SideEffectsOptimizeArtifact) -> Self {
+    value.0
+  }
+}
+
+impl FromIterator<<FxHashMap<DependencyId, SideEffectsDoOptimize> as IntoIterator>::Item>
+  for SideEffectsOptimizeArtifact
+{
+  fn from_iter<
+    T: IntoIterator<Item = <FxHashMap<DependencyId, SideEffectsDoOptimize> as IntoIterator>::Item>,
+  >(
+    iter: T,
+  ) -> Self {
+    Self(FxHashMap::from_iter(iter))
+  }
+}
+
+impl IntoIterator for SideEffectsOptimizeArtifact {
+  type Item = <FxHashMap<DependencyId, SideEffectsDoOptimize> as IntoIterator>::Item;
+  type IntoIter = <FxHashMap<DependencyId, SideEffectsDoOptimize> as IntoIterator>::IntoIter;
+
+  fn into_iter(self) -> Self::IntoIter {
+    self.0.into_iter()
+  }
+}
+
+impl FromParallelIterator<(DependencyId, SideEffectsDoOptimize)> for SideEffectsOptimizeArtifact {
+  fn from_par_iter<I>(par_iter: I) -> Self
+  where
+    I: IntoParallelIterator<Item = (DependencyId, SideEffectsDoOptimize)>,
+  {
+    Self(par_iter.into_par_iter().collect())
+  }
+}
+
+impl ArtifactExt for SideEffectsOptimizeArtifact {
+  const PASS: IncrementalPasses = IncrementalPasses::OPTIMIZE_DEPENDENCIES;
+}

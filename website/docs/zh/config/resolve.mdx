@@ -1,4 +1,8 @@
-import { ApiMeta } from '../../../components/ApiMeta';
+---
+description: '配置模块解析的路径别名、扩展名、包导出条件、查找目录和 TypeScript 路径。'
+---
+
+import Attribution from '@components/Attribution';
 
 # Resolve
 
@@ -8,110 +12,324 @@ import { ApiMeta } from '../../../components/ApiMeta';
 
 ## resolve.alias
 
-- **类型：** `Record<string, false | string | (string | false)[]>`
-- **默认值：** `{}`
-
-路径别名，例如：
+- **类型：**
 
 ```ts
-{
-  "@": path.resolve(__dirname, './src'),
-  "abc$": path.resolve(__dirname, './src/abc')
-}
+type ResolveAlias = false | Record<string, false | string | (false | string)[]>;
 ```
 
-此时：
-
-- `require("@/a")` 会尝试解析 `<root>/src/a`。
-- `require("abc")` 会尝试解析 `<root>/src/abc`。
-- `require("abc/file.js")` 不会命中匹配规则，它会尝试去解析 `node_modules/abc/files.js`。
-
-## resolve.aliasFields
-
-<ApiMeta addedVersion="0.5.1" />
-
-- **Type:** `string[]`
-- **Default:** `['browser']`
-
-定义一个字段，例如 `browser`，以依照[此规范](https://github.com/defunctzombie/package-browser-field-spec)进行解析。
-
-## resolve.browserField
-
-<ApiMeta deprecatedVersion="0.5.1" />
-
-- **类型：** `boolean`
-- **默认值：** `true`
-
-是否按照 [package-browser-filed-spec](https://github.com/defunctzombie/package-browser-field-spec) 规则解析。
-
-等同于 enhanced-resolve 的 `resolve.aliasFields = ["browser"]`。
-
-## resolve.conditionNames
-
-- **类型：** `string[]`
-- **默认值：** `[]`
-
-与 node 的 [conditionNames](https://nodejs.org/api/packages.html#conditional-exports) 相同，用于 package.json 中的 `exports` 和 `imports` 字段。
-
-## resolve.extensions
-
-- **类型：** `string[]`
-- **默认值：** `[".js", ".json", ".wasm"]`
-
-按照顺序解析模块，例如 `require('./index')`，会依次尝试解析 `'./index.js'`、`'./index.json'`...
-
-## resolve.extensionAlias
-
-- **类型：** `Record<string, string[] | string>`
 - **默认值：** `{}`
 
-定义拓展名的别名，例如
+使用 `resolve.alias` 可以将模块请求重定向到其他路径：
 
-```js
-// rspack.config.js
-module.exports = {
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
   resolve: {
-    extensionAlias: {
-      '.js': ['.ts', '.js'],
+    alias: {
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
 };
 ```
 
-在 `require('./index.js')` 时，会依次尝试解析 `'./index.ts'`, `./index.js`。
+使用上述配置时，`import '@/a'` 会尝试解析 `<root>/src/a`。
 
-## resolve.fallback
+### 精确匹配
 
-- **类型：** `Record<string, false | string>`
-- **默认值：** `{}`
+在别名键的末尾添加 `$`，可以让该别名只匹配完整的模块请求。`$` 是 `resolve.alias` 的特殊标记，不属于实际的模块请求：
 
-解析失败时的重定向。
+```js title="rspack.config.mjs"
+import path from 'node:path';
 
-## resolve.mainFields
+export default {
+  resolve: {
+    alias: {
+      abc$: path.resolve(import.meta.dirname, './src/abc'),
+    },
+  },
+};
+```
+
+使用上述配置时：
+
+- `import 'abc'` 会尝试解析 `<root>/src/abc`。
+- `import 'abc/file.js'` 不会命中该别名，而是继续按照常规模块解析规则查找，通常会尝试解析 `node_modules/abc/file.js`。
+
+如果不添加 `$`，别名 `abc` 也会匹配 `import 'abc/file.js'` 这样的子路径请求。
+
+### 对包解析的影响
+
+使用 `resolve.alias` 将 `import 'lib'` 这样的包请求重定向到 monorepo 或 `node_modules` 中的文件系统路径时，会改变 Rspack 解析该请求的方式：
+
+- **未配置别名时**：`lib` 会被视为包请求。Rspack 会读取该包的 `package.json`，并按照 [`exports`](https://nodejs.org/api/packages.html#exports) 等包解析规则选择入口文件或子路径。
+- **配置别名后**：Rspack 会先将 `lib` 替换为别名指定的文件系统路径。例如，将 `lib` 映射到 `./node_modules/lib` 后，Rspack 会把替换结果作为普通路径继续解析，因此针对包名 `lib` 的 `exports` 映射不再生效。
+
+这种行为符合 `exports` 字段的语义：它用于控制包名及包子路径的解析，不适用于直接指定的文件系统路径。
+
+### Monorepo 场景
+
+如果希望 monorepo 中的包与普通 npm 依赖采用相同的解析方式，包括支持 `exports`，请避免使用 `alias` 将包名直接映射到源码目录。
+
+推荐使用包管理器的工作区功能将这些包链接到 `node_modules`，并继续通过包名导入。这样，Rspack 仍会将其视为包请求，并应用相应的 `package.json` 解析规则。
+
+### 禁用别名
+
+将 `resolve.alias` 设置为 `false` 会清空合并后的 resolve 选项中的所有别名。它不同于不配置 `resolve.alias` 或设置为 `{}`，后者只是不会新增别名，不会清除从其他 resolve 选项合并来的别名。
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    alias: false,
+  },
+};
+```
+
+## resolve.aliasFields
 
 - **类型：** `string[]`
-- **默认值：**
-  - `target` 为 web 时为 `["browser", "module", "main"]`
-  - 其他则为 `["module", "main"]`
+- **默认值：** 取决于 [target](/config/target) 和[模块引用方式](#resolvebydependency)。
 
-尝试解析 package.json 中的字段，例如：
+指定从 `package.json` 的哪些字段读取模块别名，用于将模块替换为其他实现。
 
-```json
-// package.json
+常见默认值如下：
+
+| 场景                                      | 默认值        |
+| ----------------------------------------- | ------------- |
+| 模块导入，目标为 `'web'` 或 `'webworker'` | `['browser']` |
+| 模块导入，目标为 Node.js                  | `[]`          |
+| CSS `@import` 或 URL 引用                 | `[]`          |
+
+例如，下面的配置会使用 `browser` 字段中的别名映射，将模块替换为包提供的浏览器版本。映射规则遵循 [browser 字段规范](https://github.com/defunctzombie/package-browser-field-spec)。
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    aliasFields: ['browser'],
+  },
+};
+```
+
+例如，某个包的 `package.json` 包含以下映射：
+
+```json title="package.json"
 {
-  "name": "lib",
-  "module": "es/index.js"
+  "browser": {
+    "./storage.js": "./storage.browser.js"
+  }
 }
 ```
 
-则 `import value from 'lib'` 的结果为 `lib/es/index.js`。
+使用上述配置时，该包根目录下的 `index.js` 中的 `import './storage.js'` 会解析到同一目录下的 `storage.browser.js`。
 
-## resolve.mainFiles
+## resolve.byDependency
+
+- **类型：** `Record<string, ResolveOptions>`
+
+根据依赖类型来配置解析选项。依赖类型表示模块在源代码中的引用方式，例如 ES 模块的 `import`、CommonJS 的 `require`，或基于 `URL` 的资源请求。
+
+当不同的依赖类型需要采用不同的解析策略时，这个配置会非常有用。
+
+每一个 key 表示一种依赖类型，对应的 value 是一组标准的 `resolve` 选项，这些选项只会应用于该类型的请求。
+
+### 依赖类型
+
+Rspack 支持以下依赖类型：
+
+- `esm`：通过 `import` 语句或动态 `import()` 引用的模块。
+- `commonjs`：通过 CommonJS 的 `require()` 引用的模块。
+- `amd`：使用 AMD 风格定义（如 `define()`）引用的模块。
+- `url`：通过 URL 形式引用的模块，例如 `new URL('./asset.png', import.meta.url)`。
+- `wasm`：以 ES 模块语义引用的 WebAssembly 模块。
+- `worker`：通过 `new Worker(new URL('./worker.js', import.meta.url))` 引用的模块。
+- `css-import`：通过 `@import` 引用的 CSS 模块。
+- `unknown`：当无法确定依赖类型时使用的兜底类型。
+
+### 示例
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    byDependency: {
+      esm: {
+        mainFields: ['browser', 'module'],
+      },
+      commonjs: {
+        aliasFields: ['browser'],
+      },
+      url: {
+        preferRelative: true,
+      },
+    },
+  },
+};
+```
+
+在这个示例中：
+
+- ES 模块引用会优先使用 `browser` 和 `module` 字段。
+- CommonJS 引用会从 `browser` 字段中读取别名配置。
+- 基于 URL 的引用在解析时会优先使用相对路径。
+
+### 合并规则
+
+当请求命中 `resolve.byDependency.esm`、`resolve.byDependency.commonjs` 这类条目时，Rspack 会先取顶层 `resolve` 中的值，再对这个请求类型继续应用对应的 `byDependency` 条目。
+
+- 对象选项按普通对象合并。
+- 数组选项默认会替换当前值。
+- 如果数组里写了 `'...'`，则会在该位置插入顶层的值。
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    extensions: ['.ts', '.tsx', '.js', '.json'],
+    byDependency: {
+      esm: {
+        extensions: ['.mjs'],
+        // esm 的最终值：['.mjs']
+      },
+      commonjs: {
+        extensions: ['.cjs', '...'],
+        // commonjs 的最终值：['.cjs', '.ts', '.tsx', '.js', '.json']
+      },
+    },
+  },
+};
+```
+
+## resolve.conditionNames
 
 - **类型：** `string[]`
-- **默认值：** `["index"]`
 
-解析目录时的文件名后缀，例如 `require('./dir/')` 会尝试解析 `'./dir/index'`。
+指定用于匹配包 [`exports` 字段](https://nodejs.org/api/packages.html#packages_exports) 入口点的 condition names（条件名称）。
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    conditionNames: ['require', 'node'],
+  },
+};
+```
+
+### 默认值
+
+Rspack 默认的 `conditionNames` 由 [mode](/config/mode)、[target](/config/target) 和[依赖类型](#resolvebydependency)共同决定。常见请求的默认值如下：
+
+```js
+// ES 模块请求
+['import', 'module', 'webpack', modeCondition, ...targetConditions];
+
+// CommonJS 请求
+['require', 'module', 'webpack', modeCondition, ...targetConditions];
+
+// CSS @import 请求
+[modeCondition, 'style'];
+```
+
+其中，`modeCondition` 在开发模式下为 `'development'`，其他情况下为 `'production'`，包括 `mode` 为 `'none'` 时。
+
+`targetConditions` 取决于目标：
+
+| Target                                      | `targetConditions`                |
+| ------------------------------------------- | --------------------------------- |
+| `'web'`                                     | `['browser']`                     |
+| `'webworker'`                               | `['worker', 'browser']`           |
+| `'node'`                                    | `['node']`                        |
+| `'electron-main'`                           | `['node', 'electron']`            |
+| `'electron-preload'`, `'electron-renderer'` | `['node', 'browser', 'electron']` |
+| `'nwjs'`                                    | `['node', 'browser', 'nwjs']`     |
+| `false`, `'es2022'`                         | `[]`                              |
+
+CSS `@import` 请求使用独立的条件名称，默认不包含这些平台条件。
+
+### 示例
+
+Rspack 会匹配 `resolve.conditionNames` 数组中列出的 [export conditions](https://nodejs.org/api/packages.html#conditional-exports)。
+
+注意，`exports` 对象中 key 的顺序决定了优先级。在条件匹配时，前面的入口优先级高于后面的入口。
+
+例如：
+
+```json title="package.json"
+{
+  "name": "foo",
+  "exports": {
+    ".": {
+      "import": "./index-import.js",
+      "require": "./index-require.js",
+      "node": "./index-node.js"
+    },
+    "./bar": {
+      "node": "./bar-node.js",
+      "require": "./bar-require.js"
+    },
+    "./baz": {
+      "import": "./baz-import.js",
+      "node": "./baz-node.js"
+    }
+  }
+}
+```
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    conditionNames: ['require', 'node'],
+  },
+};
+```
+
+导入时：
+
+- `'foo'` 会被解析为 `'foo/index-require.js'`
+- `'foo/bar'` 会被解析为 `'foo/bar-node.js'`，因为在条件导出对象中 `"node"` 键优先于 `"require"` 键
+- `'foo/baz'` 会被解析为 `'foo/baz-node.js'`
+
+### 扩展默认值
+
+如果你希望在保留 Rspack 默认值的同时添加自定义的 condition names，可以使用 `"..."`：
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    conditionNames: ['my-custom-condition', '...'],
+  },
+};
+```
+
+`conditionNames` 的顺序（包括 `'...'` 的位置）不影响解析优先级；优先级由包的 `exports` 对象中键的顺序决定。
+
+## resolve.descriptionFiles
+
+- **类型：** `string[]`
+- **默认值：** `['package.json']`
+
+用于描述的 JSON 文件。
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    descriptionFiles: ['package.json'],
+  },
+};
+```
+
+## resolve.enforceExtension
+
+- **类型：** `boolean`
+
+默认情况下，当 [resolve.extensions](#resolveextensions) 包含空字符串时，`enforceExtension` 会设置为 `true`；否则，将设置为 `false`。
+
+如果是 `true`，将不允许无扩展名文件。默认如果 `./foo` 有 `.js` 扩展，`require('./foo')` 可以正常运行。但如果启用此选项，只有 `require('./foo.js')` 能够正常工作。
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    enforceExtension: false,
+  },
+};
+```
 
 ## resolve.exportsFields
 
@@ -120,8 +338,7 @@ module.exports = {
 
 自定义 package.json 中的 exports 字段，例如：
 
-```json
-// lib/package.json
+```json title="lib/package.json"
 {
   "name": "lib",
   "testExports": {
@@ -135,12 +352,360 @@ module.exports = {
 
 则当配置为 `["testExports", "exports"]` 时, `import value from 'lib'` 的结果为 `lib/test.js`。
 
+## resolve.extensionAlias
+
+- **类型：** `Record<string, string[] | string>`
+- **默认值：** `{}`
+
+定义拓展名的别名，例如：
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    extensionAlias: {
+      '.js': ['.ts', '.js'],
+    },
+  },
+};
+```
+
+这对于 TypeScript 项目来说非常有用，因为 TypeScript 推荐使用 `.js` 扩展名来引用 TypeScript 文件。
+
+```ts title="index.ts"
+import { foo } from './foo.js'; // 实际引用的是 foo.ts
+```
+
+Rspack 在解析 `import './foo.js'` 时，会依次尝试解析 `'./foo.ts'` 和 `./foo.js`。
+
+## resolve.extensions
+
+- **类型：** `string[]`
+- **默认值：** 取决于依赖类型。常见 JavaScript 模块请求默认是 `[".js", ".json"]`，CSS `@import` 默认是 `[".css"]`。
+
+自动添加导入文件的扩展名。这意味着你可以导入文件，而不需要显式地写它们的扩展名。
+
+例如，对于常见的 JavaScript 模块请求，当导入 `./index` 时，Rspack 默认会按以下顺序解析：
+
+- `./index.js`
+- `./index.json`
+
+而在 CSS 中写 `@import './base'` 时，Rspack 默认会尝试：
+
+- `./base.css`
+
+### 示例
+
+下面演示如何配置自定义扩展名来包含 TypeScript 和 JSX 文件：
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    extensions: ['.ts', '.tsx', '.mjs', '.js', '.jsx', '.json'],
+  },
+};
+```
+
+当同一目录下存在同名但扩展名不同的多个文件时，Rspack 会选择在数组中位置更靠前的扩展名对应的文件进行解析。
+
+例如，如果同一目录下同时存在 `index.js` 和 `index.ts`，而你的配置是 `['.ts', '.js']`，那么 `import './index'` 将会解析为 `index.ts`。
+
+### 默认值
+
+从实现上看，顶层 `resolve.extensions` 的默认值其实是 `[]`。之所以大多数场景仍然会自动尝试 `.js`、`.json` 或 `.css`，是因为 Rspack 会根据请求类型，从 [resolve.byDependency](#resolvebydependency) 应用对应的默认配置。
+
+如果你不熟悉 [resolve.byDependency](#resolvebydependency)，可以把它理解为"不同引用方式使用不同的 `resolve` 默认值"。例如：
+
+- `import`、`require()` 等常见 JavaScript 模块请求默认使用 `[".js", ".json"]`
+- CSS 的 `@import` 默认使用 `[".css"]`
+
+### 扩展默认值
+
+如果你希望在添加自定义扩展名的同时保留 Rspack 针对当前依赖类型的默认扩展名，可以使用展开语法 `'...'`：
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    // 对常见 JavaScript 模块请求，等价于 ['.ts', '.js', '.json']
+    extensions: ['.ts', '...'],
+  },
+};
+```
+
+### 性能建议
+
+- 避免添加过多扩展名，因为每个扩展名都会增加解析开销。尽量保持 `extensions` 数组精简以提升解析性能。
+- 将最常用的扩展名放在数组前面。
+
+## resolve.fallback
+
+- **类型：**
+
+```ts
+type ResolveFallback =
+  false | Record<string, false | string | (false | string)[]>;
+```
+
+- **默认值：** `{}`
+
+当常规解析失败时重定向模块请求。
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  resolve: {
+    fallback: {
+      abc: false, // 不为 abc 引入 polyfill
+      xyz: path.resolve(import.meta.dirname, 'path/to/file.js'), // 为 xyz 引入 polyfill
+    },
+  },
+};
+```
+
+Rspack 默认不会为 Node.js 核心模块提供 polyfills，这意味着如果你在浏览器或类似环境中运行的代码中使用它们，你将需要从 NPM 安装兼容的模块并自行包含它们。
+
+你可以使用 [node-polyfill-webpack-plugin](https://www.npmjs.com/package/node-polyfill-webpack-plugin) 来自动 polyfill Node.js 核心模块。
+
+```js title="rspack.config.mjs"
+import NodePolyfillPlugin from 'node-polyfill-webpack-plugin';
+
+export default {
+  plugins: [new NodePolyfillPlugin()],
+};
+```
+
+或者参考 webpack 4 使用的 Node.js polyfills 列表：
+
+```js title="rspack.config.mjs"
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+
+export default {
+  resolve: {
+    fallback: {
+      assert: require.resolve('assert'),
+      buffer: require.resolve('buffer'),
+      console: require.resolve('console-browserify'),
+      constants: require.resolve('constants-browserify'),
+      crypto: require.resolve('crypto-browserify'),
+      domain: require.resolve('domain-browser'),
+      events: require.resolve('events'),
+      http: require.resolve('stream-http'),
+      https: require.resolve('https-browserify'),
+      os: require.resolve('os-browserify/browser'),
+      path: require.resolve('path-browserify'),
+      punycode: require.resolve('punycode'),
+      process: require.resolve('process/browser'),
+      querystring: require.resolve('querystring-es3'),
+      stream: require.resolve('stream-browserify'),
+      string_decoder: require.resolve('string_decoder'),
+      sys: require.resolve('util'),
+      timers: require.resolve('timers-browserify'),
+      tty: require.resolve('tty-browserify'),
+      url: require.resolve('url'),
+      util: require.resolve('util'),
+      vm: require.resolve('vm-browserify'),
+      zlib: require.resolve('browserify-zlib'),
+    },
+  },
+};
+```
+
+## resolve.fullySpecified
+
+- **类型：** `boolean`
+
+控制模块导入路径是否必须包含完整的文件名和扩展名。
+
+设为 `true` 时，Rspack 不会自动补全导入路径：
+
+- 导入文件时，写成 `import './utils.js'`，不能省略为 `import './utils'`。
+- 导入目录中的入口文件时，写成 `import './components/index.js'`，不能省略为 `import './components'`。
+
+通过 [resolve.mainFields](#resolvemainfields)、[resolve.aliasFields](#resolvealiasfields) 或 [resolve.alias](#resolvealias) 解析得到的路径不受此选项影响。
+
+### 默认行为
+
+顶层的 `resolve.fullySpecified` 默认为 `false`。模块规则中的 `resolve` 配置优先于顶层配置。
+
+为与 [Node.js 原生 ESM 对完整导入路径的要求](https://nodejs.org/api/esm.html#mandatory-file-extensions)保持一致，Rspack 的默认模块规则会对以下文件中的 ESM 导入设置 `fullySpecified: true`：
+
+- `.mjs` 文件。
+- 所属包的 `package.json` 设置了 `"type": "module"` 的 `.js` 文件。
+
+### 示例
+
+如果第三方包省略了导入路径的扩展名，导致构建时报错，可以通过 [module.rules[].resolve](/config/module-rules#rulesresolve) 允许这种写法：
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.m?js$/,
+        resolve: {
+          fullySpecified: false,
+        },
+      },
+    ],
+  },
+};
+```
+
+配置后，`.js` 和 `.mjs` 文件中的导入路径可以省略扩展名或目录入口文件名，Rspack 会根据 [resolve.extensions](#resolveextensions) 和 [resolve.mainFiles](#resolvemainfiles) 自动补全。由于默认的 ESM 规则优先于顶层配置，需要在 `module.rules` 中设置 `resolve.fullySpecified: false`。
+
+## resolve.importsFields
+
+- **类型：** `string[]`
+- **默认值:** `['imports']`
+
+自定义 `package.json` 中的 `imports` 字段，用于提供包的内部请求（以 `#` 开头的请求被视为内部请求）。
+
+例如：
+
+```json title="package.json"
+{
+  "name": "lib",
+  "imports": {
+    "#foo": "./src/foo.js",
+    "#common/*": "./src/common/*.js"
+  },
+  "testImports": {
+    "#foo": "./src/test/foo.js"
+  }
+}
+```
+
+则当配置为 `["testImports", "imports"]` 时, 当前包内 `import value from '#foo'` 的结果为 `src/test/foo.js`。
+
+> 查看 [模块解析 - package.json `imports`](/guide/features/module-resolution#packagejson-imports) 了解更多。
+
+## resolve.mainFields
+
+- **类型：** `string[]`
+- **默认值：** 取决于 [target](/config/target) 和[依赖类型](#resolvebydependency)。
+
+控制用于定位包入口文件的 package.json 字段优先级。Rspack 在解析 npm 包入口时，会按该列表的顺序依次尝试这些字段。
+
+对于以 `'web'` 或 `'webworker'` 为目标的 JavaScript 请求，默认值为 `["browser", "module", "main"]`。
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    mainFields: ['browser', 'module', 'main'],
+  },
+};
+```
+
+以 Node.js 为目标时，JavaScript 请求的默认值为 `["module", "main"]`。
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    mainFields: ['module', 'main'],
+  },
+};
+```
+
+CSS `@import` 请求的默认值为 `["style", "main"]`，URL 请求的默认值为 `["main"]`。可通过 [resolve.byDependency](#resolvebydependency) 分别配置。
+
+例如，对于一个名为 `foo` 的库，它的 `package.json` 包含以下字段：
+
+```json title="package.json"
+{
+  "name": "foo",
+  "browser": "./dist/browser.js",
+  "module": "./dist/module.js"
+}
+```
+
+配置 `mainFields: ['browser', 'module', 'main']` 时，`import foo from 'foo'` 会解析到 `browser` 字段中的模块，因为该字段在数组中的优先级最高。
+
+注意 [`exports` 字段](https://nodejs.org/api/packages.html#packages_exports) 的优先级高于 `mainFields`。如果入口通过 `exports` 解析成功，Rspack 会忽略 `browser`、`module` 和 `main` 字段。
+
+例如，下面的 package.json 中，`lib` 会通过 `exports` 字段解析到 `./dist/index.mjs`，而 `main` 字段将被忽略。
+
+```json title="package.json"
+{
+  "name": "lib",
+  "main": "./dist/index.cjs",
+  "exports": {
+    ".": "./dist/index.mjs"
+  }
+}
+```
+
+## resolve.mainFiles
+
+- **类型：** `string[]`
+- **默认值：** `["index"]`
+
+解析目录时的文件名后缀，例如 `require('./dir/')` 会尝试解析 `'./dir/index'`。
+
+可以配置多个文件名后缀：
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    mainFiles: ['index', 'main'],
+  },
+};
+```
+
 ## resolve.modules
 
 - **类型：** `string[]`
 - **默认值：** `["node_modules"]`
 
-解析依赖时的目录名。
+指定 Rspack 解析非相对模块请求时要搜索的目录，例如 `import 'react'` 或 `import 'utils/format'`。`import './utils/format'` 这类相对路径请求仍然从发起导入的文件所在位置解析，不会通过 `resolve.modules` 查找。
+
+Rspack 会按照数组顺序依次尝试每一项。数组项可以是目录名、相对路径或绝对路径：
+
+- 对于目录名或相对路径，Rspack 会从发起导入的文件所在目录开始，逐级向父目录查找。例如，`node_modules` 会依次查找 `<导入方所在目录>/node_modules` 以及各级父目录下的 `node_modules`。
+- 对于绝对路径，Rspack 只会使用该路径所指向的固定目录，不会基于各级父目录再次解析。
+
+从名为 `node_modules` 的目录中解析 `foo` 或 `@scope/foo` 这样的包名时，Rspack 会先尝试包目录，再尝试同级的 `foo.js` 等带扩展名的文件。如果包目录没有可解析的入口，则回退到文件解析。匹配 `resolve.extensionAlias` 的请求仍沿用原有解析顺序。其他模块目录和包内子路径请求仍优先尝试文件。
+
+例如，下面的配置支持使用非相对模块请求导入 `src` 中的模块，同时保留从 `node_modules` 查找第三方依赖的默认行为：
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  resolve: {
+    modules: [path.resolve(import.meta.dirname, 'src'), 'node_modules'],
+  },
+};
+```
+
+在此配置下，`import 'utils/format'` 可以解析到 `<project>/src/utils/format.js`。如果请求在 `src` 中不存在，Rspack 会继续从 `node_modules` 中查找。
+
+显式设置 `resolve.modules` 会替换默认数组。如果仍需正常解析第三方依赖，应在数组中保留 `'node_modules'`。
+
+## resolve.pnp
+
+- **类型:** `boolean`
+- **默认值:** `!!process.versions.pnp`
+
+启用时，将使用 [Yarn PnP](https://yarnpkg.com/features/pnp) 算法进行路径解析。
+
+当 [`!!process.versions.pnp`](https://yarnpkg.com/advanced/pnpapi#processversionspnp) 为 `true` 时（即应用在 Yarn PnP 环境中运行时），它默认是启用的。
+
+```js title="rspack.config.mjs"
+export default {
+  resolve: {
+    pnp: true,
+  },
+};
+```
+
+## resolve.preferAbsolute
+
+- **类型：** `boolean`
+- **默认值：**`false`
+
+在解析时，倾向使用与 `resolve.roots` 相关的绝对路径。
 
 ## resolve.preferRelative
 
@@ -149,73 +714,88 @@ module.exports = {
 
 当开启时，`require('file')` 会首先寻找当前目录下的 `./file` 文件，而不是 `<modules>/file`。
 
-## resolve.preferAbsolute
+## resolve.restrictions
 
-<ApiMeta addedVersion="0.5.1" />
+- **类型：** `(string | RegExp)[]`
+- **默认值：**`[]`
 
-- **Type:** `boolean`
-- **Default:** `false`
+限制请求解析路径的解析限制列表。
 
-在解析时，倾向使用与 `resolve.roots` 相关的绝对路径。
+## resolve.roots
 
-## resolve.tsConfigPath
+- **类型：** `string[]`
+- **默认值：**`[]`
 
-- **类型：** `string | undefined`
-- **默认值：** `undefined`
+一个目录列表，用于解析服务器相对 URL（以'/'开头的 URL）。在非 Windows 系统上，这些请求首先作为绝对路径进行解析。
 
-这个选项接受的是 `tsconfig.json` 的文件路径。在开启这个选项后， Rspack 会基于 `tsconfig.json` 中 的 `paths` 和 `baseUrl` 来寻找模块，其功能等同于 [tsconfig-paths-webpack-plugin](https://www.npmjs.com/package/tsconfig-paths-webpack-plugin)。
+例如，导入 `'/static/app.js'` 时，期望其相对于项目根目录进行解析：
 
-```js rspack.config.js
-const path = require('path');
-
-/** @type {import('@rspack/cli').Configuration} */
-const config = {
-  // ...
+```js title="rspack.config.mjs"
+export default {
   resolve: {
-    tsConfigPath: path.resolve(__dirname, 'tsconfig.json'),
+    roots: [import.meta.dirname],
   },
-  // ...
 };
-module.exports = config;
 ```
 
-[点击查看例子](https://github.com/rspack-contrib/rspack-examples/tree/main/rspack/basic-ts)。
+## resolve.symlinks
 
-:::warning
+- **类型：** `boolean`
+- **默认值：**`true`
 
-不支持 `tsconfig.json#extends` 字段。
+是否将符号链接（symlink）解析到它们的符号链接位置（symlink location）。
 
-:::
+启用时，符号链接的资源，将解析为其**真实**路径，而不是其符号链接的位置。注意，当使用创建符号链接包的工具（如 `npm link`）时，这种方式可能会导致模块解析失败。
 
 ## resolve.tsConfig
 
-<ApiMeta addedVersion="0.3.7" />
+Rspack 中用来替代 [tsconfig-paths-webpack-plugin](https://www.npmjs.com/package/tsconfig-paths-webpack-plugin) 的配置。
 
-- **类型:** `object`
+- **类型：** `string | object | undefined`
 - **默认值:** `undefined`
 
-```js title="rspack.config.js"
-module.exports = {
+- string:
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
   resolve: {
-    tsconfig: {
-      configFile: path.resolve(__dirname, './tsconfig.json'),
+    tsConfig: path.resolve(import.meta.dirname, './tsconfig.json'),
+  },
+};
+```
+
+- object:
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  resolve: {
+    tsConfig: {
+      configFile: path.resolve(import.meta.dirname, './tsconfig.json'),
       references: 'auto',
     },
   },
 };
 ```
 
+[点击查看例子](https://github.com/rstackjs/rstack-examples/tree/main/rspack/basic-ts)。
+
 ### resolve.tsConfig.configFile
 
-- **类型:** `string`
-
-同 [resolve.tsConfigPath](#resolvetsconfigpath).
+- **类型：** `string`
 
 这个选项接受的是 `tsconfig.json` 的文件路径。在开启这个选项后， Rspack 会基于 `tsconfig.json` 中 的 `paths` 和 `baseUrl` 来寻找模块，其功能等同于 [tsconfig-paths-webpack-plugin](https://www.npmjs.com/package/tsconfig-paths-webpack-plugin)。
 
+当 `extends` 为数组时，后面的配置优先于前面的配置。当前 tsconfig 中声明的 `paths` 和 `baseUrl` 优先于继承的值。
+
+`paths` 中的路径以最终合并后的 `baseUrl` 为基准。如果没有配置 `baseUrl`，则以声明 `paths` 的 tsconfig 所在目录为基准。
+
 ### resolve.tsConfig.references
 
-- **类型:** `string[] | "auto" | undefined`
+- **类型：** `string[] | "auto" | undefined`
 - **默认值:** `undefined`
 
 支持 [tsconfig-paths-webpack-plugin](https://github.com/dividab/tsconfig-paths-webpack-plugin#references-_string-defaultundefined) 中定义的 [tsconfig project references](https://www.typescriptlang.org/docs/handbook/project-references.html).
@@ -224,33 +804,70 @@ module.exports = {
 
 使用 `undefined` 将会关闭该功能。
 
-## resolve.fullySpecified
+#### reference 匹配规则
 
-- **类型：** `boolean`
-- **默认值：** `false`
+解析非相对路径的请求时，Rspack 会逐个检查被引用的 tsconfig，都不匹配时才使用主 tsconfig。检查顺序与 `references` 中的书写顺序一致；如果被引用的 tsconfig 自己也有 references，会先检查这些嵌套的 reference，再检查它本身：
 
-不再解析扩展名，不再解析 package.json 中的 mainFiles（但不会影响来自 mainFiles, browser, alias 的请求）。
+1. 每个 reference 的基准路径默认是该 tsconfig 所在的目录（如果配置了 `baseUrl`，则使用 `baseUrl`）。
+2. 第一个基准路径包含发起导入的文件所在目录的 reference 生效。Rspack 使用这个 reference 的 `paths`，不再继续查找，即使它没有定义 `paths`。
+3. 所有 reference 都不匹配时，才使用主 tsconfig 的 `paths`。
 
-## resolve.restrictions
+只按目录匹配。和 `tsc` 不同，Rspack 不会读取 `include`、`files` 或 `exclude` 来判断文件属于哪个 project。
 
-<ApiMeta addedVersion="0.5.1" />
+例如下面的目录结构：
 
-- **Type:** `string[]`
-- **Default:** `[]`
+```
+.
+├── tsconfig.json             # paths: { "@/*": ["./src/*"] }
+│                             # references: [{ "path": "./packages/ui" }, { "path": "./packages/utils" }]
+├── src/
+│   └── index.ts
+└── packages/
+    ├── ui/
+    │   ├── tsconfig.json     # paths: { "@ui/*": ["./src/*"] }
+    │   └── src/button.ts
+    └── utils/
+        ├── tsconfig.json     # 没有 paths
+        └── src/format.ts
+```
 
-限制请求解析路径的解析限制列表。
+| 发起导入的文件                 | 匹配到的 tsconfig                       | 结果                                           |
+| ------------------------------ | --------------------------------------- | ---------------------------------------------- |
+| `src/index.ts`                 | `tsconfig.json`（没有匹配的 reference） | `@/*` 可以解析                                 |
+| `packages/ui/src/button.ts`    | `packages/ui/tsconfig.json`             | `@ui/*` 可以解析，`@/*` 不能解析               |
+| `packages/utils/src/format.ts` | `packages/utils/tsconfig.json`          | 所有别名都不能解析，包括主 tsconfig 中的 `@/*` |
 
-## resolve.roots
+:::tip
+使用 `references: 'auto'` 时，Rspack 会加载 tsconfig 中 `references` 字段列出的所有 tsconfig。应避免把多个被引用的 tsconfig（或被引用的 tsconfig 与主 tsconfig）放在同一个目录下，因为该目录下的文件只能匹配到其中一个。推荐像上面的例子一样，把每个被引用的 tsconfig 放到它所覆盖的文件所在的目录中。这只影响 Rspack 如何解析 `paths` 别名，不影响相对路径导入，也不影响 `tsc`。
 
-<ApiMeta addedVersion="0.5.1" />
+例如，把多个 tsconfig 并排放在项目根目录：
 
-- **Type:** `string[]`
-- **Default:** `[]`
+```
+.
+├── tsconfig.json         # references: [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }]
+├── tsconfig.app.json     # include: ["src"]，paths: { "@/*": ["./src/*"] }
+├── tsconfig.node.json    # include: ["scripts"]，paths: { "@scripts/*": ["./scripts/*"] }
+├── src/
+└── scripts/
+```
 
-一个目录列表，用于解析服务器相对 URL（以'/'开头的 URL）。默认使用 context 配置选项。在非 Windows 系统上，这些请求首先作为绝对路径进行解析。
+两个 reference 的基准路径都是项目根目录，`src/` 和 `scripts/` 下的文件都会匹配到 `references` 中排在前面的 `tsconfig.app.json`。结果是 `@/*` 在 `scripts/` 中也能解析，而 `tsconfig.node.json` 中的 `@scripts/*` 和主 `tsconfig.json` 中的 `paths` 都不会生效。
 
-## resolve.byDependency
+如果无法调整目录结构，也可以把 `references` 配置为数组，只列出目录互不重叠的 reference，明确指定要使用哪个 reference：
 
-- **类型：** `Record<string, Resolve>`.
+```js title="rspack.config.mjs"
+import path from 'node:path';
 
-依据模块类型自定义 Resolve 配置。
+export default {
+  resolve: {
+    tsConfig: {
+      configFile: path.resolve(import.meta.dirname, './tsconfig.json'),
+      references: [path.resolve(import.meta.dirname, './tsconfig.app.json')],
+    },
+  },
+};
+```
+
+:::
+
+<Attribution url="https://webpack.js.org/configuration/resolve/" />

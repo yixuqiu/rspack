@@ -1,0 +1,83 @@
+[
+  {
+    "text": "指南",
+    "link": "/guide/start/introduction",
+    "activeMatch": "/guide"
+  },
+  {
+    "text": "配置",
+    "link": "/config/",
+    "activeMatch": "/config"
+  },
+  {
+    "text": "插件",
+    "link": "/plugins/",
+    "activeMatch": "(?!\\/config\\/).*\\/plugins\\/.*"
+  },
+  {
+    "text": "API",
+    "link": "/api/",
+    "activeMatch": "/api"
+  },
+  {
+    "text": "博客",
+    "link": "/blog/index",
+    "activeMatch": "/blog"
+  },
+  {
+    "text": "资源",
+    "items": [
+      {
+        "text": "FAQ",
+        "link": "/misc/faq",
+        "activeMatch": "/misc/faq"
+      },
+      {
+        "text": "团队",
+        "link": "/misc/team/core-team",
+        "activeMatch": "/misc/team"
+      },
+      {
+        "text": "品牌",
+        "link": "/misc/branding/guideline",
+        "activeMatch": "/misc/branding"
+      },
+      {
+        "text": "术语表",
+        "link": "/misc/glossary",
+        "activeMatch": "/misc/glossary"
+      },
+      {
+        "text": "功能规划",
+        "link": "/misc/planning/roadmap",
+        "activeMatch": "/misc/planning"
+      },
+      {
+        "text": "贡献指南",
+        "link": "/contribute/index",
+        "activeMatch": "/contribute"
+      },
+      {
+        "text": "在线体验",
+        "link": "https://playground.rspack.rs"
+      }
+    ]
+  },
+  {
+    "text": "版本",
+    "items": [
+      {
+        "text": "更新日志",
+        "link": "https://github.com/web-infra-dev/rspack/releases"
+      },
+      {
+        "text": "Rspack 1.x 文档",
+        "link": "http://v1.rspack.rs/zh/"
+      },
+      {
+        "text": "Rspack 0.x 文档",
+        "link": "http://v0.rspack.rs/zh/"
+      }
+    ]
+  }
+]

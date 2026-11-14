@@ -1,156 +1,464 @@
-import WebpackLicense from '@components/webpack-license';
-import { ApiMeta, Stability } from '../../../components/ApiMeta';
+---
+description: '外部依赖（externals）用于指定哪些模块不需要被 Rspack 打包，而是直接使用外部环境中提供的实现。'
+---
 
-<WebpackLicense from="https://webpack.docschina.org/configuration/externals/" />
+import Attribution from '@components/Attribution';
+import { Stability } from '../../../components/ApiMeta';
 
 # Externals
 
-外部依赖：该选项提供了「从输出的 bundle 中排除依赖」的方法。相反，所创建的 bundle 依赖于那些存在于用户环境（consumer's environment）中的依赖。此功能通常对**库开发人员**来说是最有用的，然而也会有各种各样的应用程序用到它。
+外部依赖（externals）用于指定哪些模块不需要被 Rspack 打包，而是直接使用外部环境中提供的实现。
 
-## externals
+例如，当页面已经通过 CDN 引入了 `React`，或你开发的库希望由使用方自行安装 `react` 时，可以将其声明为 external。这可以减少打包产物的体积，同时避免重复引入相同依赖。
 
-- **类型：** `string | object | function | RegExp | Array<string | object | function | RegExp>`
+该能力常用于库开发场景，同时在应用侧接入 CDN、使用宿主环境注入依赖等场景中也同样适用。
 
-**防止**将某些 `import` 的包（package）**打包**到 bundle 中，而是在运行时（runtime）再去从外部获取这些*扩展依赖*（external dependencies）。
+- **类型：**
 
-例如，从 CDN 引入 [jQuery](https://jquery.com/)，而不是把它打包：
+```ts
+type ExternalItem =
+  | string
+  | RegExp
+  | Function
+  | { [x: string]: ExternalItemValue }
+  | {
+      byLayer:
+        | Record<string, ExternalItem>
+        | ((layer: string | null) => ExternalItem | undefined);
+    };
 
-**index.html**
-
-```html
-<script
-  src="https://code.jquery.com/jquery-3.1.0.js"
-  integrity="sha256-slogkvB1K3VOkzAI8QITxV3VzpOnkeNVsKvtkYLMjfk="
-  crossorigin="anonymous"
-></script>
+type Externals = ExternalItem | ExternalItem[];
 ```
 
-**rspack.config.js**
+## 基本用法
 
-```javascript
-module.exports = {
-  //...
+例如，当页面已通过 CDN 引入 [Day.js](https://day.js.org/) 包时，可以将其声明为 external，避免被重复打包：
+
+```html title="index.html"
+<script src="https://cdn.jsdelivr.net/npm/dayjs@1/dayjs.min.js"></script>
+```
+
+```js title="rspack.config.mjs"
+export default {
   externals: {
-    jquery: 'jQuery',
+    dayjs: 'dayjs',
   },
 };
 ```
 
-这样就剥离了那些不需要改动的依赖模块，换句话，下面展示的代码还可以正常运行：
+此时，`dayjs` 模块会从打包产物中剥离，转而在运行时从外部环境中获取，因此下面的代码仍然可以正常运行：
 
-```javascript
-import $ from 'jquery';
+```js
+import dayjs from 'dayjs';
 
-$('.my-element').animate(/* ... */);
+console.log(dayjs().format('YYYY-MM-DD'));
 ```
 
-上面 `rspack.config.js` 中 `externals` 下指定的属性名称 `jquery` 表示 `import $ from 'jquery'` 中的模块 `jquery` 应该从打包产物中排除。为了替换这个模块，`jQuery` 值将用于检索全局 `jQuery` 变量，因为默认的外部库类型是 `var`，请参阅 [externalsType](#externalstype)。
+在上述配置中，`externals` 的键名 `dayjs` 对应 `import dayjs from 'dayjs'` 中的模块标识符，表示该模块不会被打包。
 
-虽然我们在上面展示了一个使用外部全局变量的示例，但实际上可以以以下任何形式使用外部变量：全局变量、CommonJS、AMD、ES2015 模块，在 [externalsType](#externalstype) 中查看更多信息。
+对应的值 `dayjs` 则用于在运行时访问全局变量。在这个基础配置中，[externalsType](#externalstype) 的默认值为 `var`，即从全局作用域中读取该变量。在浏览器环境下，这通常等价于访问 `window.dayjs`。
 
 ### 字符串
 
-根据 [externalsType](#externalstype)，这可能是全局变量的名称（参见 [`'global'`](#externalstypeglobal)、[`'this'`](#externalstypethis)、[`'var '`](#externalstypevar)、[`'window'`](#externalstypewindow)）或模块的名称（参见 `amd`、[`commonjs`](#externalstypecommonjs)、[`module`](#externalstypemodule)、`umd`）。
+在前面的示例中，`externals` 的值使用了字符串形式，该字符串的具体含义取决于 [externalsType](#externalstype) 配置。
 
-如果你只定义 1 个 external，您也可以使用快捷语法：
+通常情况下，这个字符串可以表示：
 
-```javascript
-module.exports = {
-  //...
-  externals: 'jquery',
+- 一个**全局变量名**（如 [`'var'`](#externalstypevar)、[`'window'`](#externalstypewindow)、[`'global'`](#externalstypeglobal)、[`'this'`](#externalstypethis) 等类型）
+- 或一个**模块名称**（如 [`module`](#externalstypemodule)、[`commonjs`](#externalstypecommonjs) 等类型）
+
+#### 简写语法
+
+当只需要声明一个 external 时，也可以使用更简洁的写法：
+
+```js title="rspack.config.mjs"
+export default {
+  externals: 'lodash', // 等价于 externals: { lodash: 'lodash' }
 };
 ```
 
-equals to
+#### 匹配规则
 
-```javascript
-module.exports = {
-  //...
+需要注意的是，字符串形式是**精确匹配**。
+
+例如，下面的配置只会匹配 `react-dom`，不会匹配 `react-dom/client` 这样的子路径导入：
+
+```js title="rspack.config.mjs"
+export default {
   externals: {
-    jquery: 'jquery',
+    'react-dom': 'react-dom',
+  },
+  externalsType: 'module-import',
+};
+```
+
+如果你也希望这些子路径导入同样被 external，可以把它们一并列出来：
+
+```js title="rspack.config.mjs"
+export default {
+  externals: {
+    'react-dom': 'react-dom',
+    'react-dom/client': 'react-dom/client',
+  },
+  externalsType: 'module-import',
+};
+```
+
+如果需要匹配一组相似的导入形式，也可以改用[正则表达式](#正则表达式)。
+
+#### 指定外部模块类型
+
+此外，还可以通过 `${externalsType} ${libraryName}` 的语法显式指定外部模块类型，这会覆盖 [externalsType](#externalstype) 的默认值。
+
+例如，当外部依赖以 ES module 形式提供时，可以这样配置：
+
+```js title="rspack.config.mjs"
+export default {
+  externals: {
+    react: 'module-import react',
   },
 };
 ```
 
-您可以使用 `${externalsType} ${libraryName}` 语法为外部指定[外部库类型](#externalstype)。它将覆盖 [externalsType](#externalstype) 选项中指定的默认外部库类型。
+### 字符串数组
 
-例如，如果外部库是一个 [CommonJS 模块](#externalstypecommonjs)，你可以指定
-
-```javascript
-module.exports = {
-  //...
+```js title="rspack.config.mjs"
+export default {
   externals: {
-    jquery: 'commonjs jquery',
+    subtract: ['./math', 'subtract'],
+  },
+};
+```
+
+`subtract: ['./math', 'subtract']` 允许你选择一个模块的一部分，其中 `./math` 是模块名，你的打包只需要包含 `subtract` 变量下的子集。
+
+当 `externalsType` 为 `commonjs` 时，这个例子会编译为 `require('./math').subtract`；当 `externalsType` 为 `window` 时，这个例子会编译为 `window["./math"]["subtract"]`。
+
+与[字符串语法](#字符串)类似，你可以在数组的第一个元素中使用 `${externalsType} ${libraryName}` 语法指定外部库类型，例如：
+
+```js title="rspack.config.mjs"
+export default {
+  externals: {
+    subtract: ['commonjs ./math', 'subtract'],
   },
 };
 ```
 
 ### 对象
 
-<ApiMeta addedVersion={'0.3.5'} />
+:::warning
+带有 `{ root, commonjs, commonjs2, amd, ... }` 的对象将外部类型映射到对应的目标。[`library.type: 'umd'`](/config/output#outputlibrarytype) 要求提供 `root`、`commonjs`、`commonjs2` 和 `amd`，其他外部类型使用与其类型匹配的字段。
+:::
 
-带有 `{ root, amd, commonjs, ... }` 的对象只允许用于 [`libraryTarget: 'umd'`](/config/output#outputlibrarytarget) 和 [`externalsType: 'umd'`](#externalstype)。其他库的 target 不允许这样做。
-
-```javascript
-module.exports = {
-  //...
+```js title="rspack.config.mjs"
+export default {
   externals: {
-    react: 'react',
-  },
-
-  // 或者
-
-  externals: {
+    // 在 `library.type: 'umd'` 和 `externalsType: 'umd'` 时，需严格遵循以下格式：
     lodash: {
-      commonjs: 'lodash',
-      amd: 'lodash',
       root: '_', // 指向全局变量
+      commonjs: 'lodash',
+      commonjs2: 'lodash',
+      amd: 'lodash',
     },
   },
 };
 ```
 
-此语法用于描述外部 library 所有可用的访问方式。这里 `lodash` 这个外部 library 可以在 AMD 和 CommonJS 模块系统中通过 `lodash` 访问，但在全局变量形式下用 `_` 访问。`subtract` 可以通过全局 `math` 对象下的属性 `subtract` 访问（例如 `window['math']['subtract']`）。
+此语法用于描述外部 library 所有可用的访问方式。这里 `lodash` 这个外部库可以在 AMD 和 CommonJS 模块系统中通过 `lodash` 访问，但在全局变量形式下用 `_` 访问。`subtract` 可以通过全局 `math` 对象下的属性 `subtract` 访问（例如 `window['math']['subtract']`）。
+
+#### interop
+
+**类型：** `'default' | 'esModule'`
+
+对于 `commonjs`、`amd`、`umd` 等非 ESM 外部模块，默认导入通常取决于导入方：严格 ES 模块（`.mjs` 或声明了 `"type": "module"` 的包）会将整个 exports 对象作为默认导入，其他模块则通过运行时的 `__esModule` 检查决定是否读取 `.default`。
+
+对象形式的 external 可以通过可选的 `interop` 字段覆盖此行为，不受导入方影响：
+
+- `'esModule'`：将外部模块视为 ES 模块命名空间，默认导入读取 `.default`。
+- `'default'`：将外部模块视为 CommonJS，默认导入取得整个 exports 对象，同时仍可使用具名导入。
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'commonjs',
+  externals: {
+    dep: { commonjs: 'dep', interop: 'esModule' },
+  },
+};
+```
+
+省略 `interop` 时保留默认行为。externals 函数返回的对象同样支持此字段。
+
+`interop` 只对直接引用整个外部模块的配置生效。如果配置为 `commonjs: ['dep', 'named']`，读取的是 `require('dep').named` 这个属性，此时 Rspack 会忽略 `interop`，继续按上文的默认规则处理导入。
+
+对于 `umd` 和 `umd2`，`root`、`commonjs`、`commonjs2`、`amd` 描述同一个外部模块在不同环境中的加载方式，共用一个 `interop` 设置。例如：
+
+```js title="rspack.config.mjs"
+export default {
+  output: { library: { type: 'umd' } },
+  externalsType: 'umd',
+  externals: {
+    dep: {
+      root: 'dep',
+      commonjs: 'dep',
+      commonjs2: ['dep', 'nested'], // 读取 require('dep').nested
+      amd: 'dep',
+      interop: 'esModule', // 因 commonjs2 读取了 nested 属性，此设置会被忽略
+    },
+  },
+};
+```
+
+这里虽然只有 `commonjs2` 读取了属性，但整个 `dep` 的 `interop` 设置都会被忽略，其他三个分支也会使用默认导入规则。通过 CommonJS2 加载时，严格 ES 模块的默认导入会得到 `require('dep').nested`；其他导入方仍通过 `__esModule` 检查决定是否读取它的 `.default`。
+
+### 函数 \{#function}
+
+**类型：**
+
+```ts
+type ExternalFunction = (
+  data: ExternalItemFunctionData,
+  callback: (
+    error?: Error | null,
+    result?: ExternalItemValue,
+    externalsType?: ExternalsType,
+  ) => void,
+) => ExternalItemValue | void | Promise<ExternalItemValue | void>;
+```
+
+如果需要根据模块请求或其他模块信息决定是否将依赖外部化，可以使用函数。函数可以直接返回结果、返回 Promise，或调用回调。
+
+例如，下面的配置将 `react` 及其子路径保留为 ES 模块导入：
+
+```js title="rspack.config.mjs"
+export default {
+  output: {
+    module: true,
+  },
+  externalsType: 'module',
+  externals: ({ request }) => {
+    if (request === 'react' || request?.startsWith('react/')) {
+      return request;
+    }
+  },
+};
+```
+
+使用产物的环境需要能够解析这些导入，例如通过另一个打包工具或浏览器的 import map。
+
+同步返回结果时，函数应只声明一个参数，例如 `({ request }) => ...`。Rspack 通过函数的参数个数区分同步返回和回调用法。需要异步处理时，可以使用 `async` 函数或返回 Promise。
+
+#### 请求信息 \{#request-data}
+
+第一个参数包含依赖的相关信息：
+
+- `request`：源码中的模块请求，例如 `react` 或 `./utils.js`，此时尚未解析为文件路径。
+- `context`：解析请求时使用的起始目录。
+- `dependencyType`：依赖类别，例如 `esm` 或 `commonjs`。
+- `contextInfo.issuer`：发起请求的模块路径。
+- `contextInfo.issuerLayer`：发起请求的模块所属的层（如果已设置）。
+- `getResolve`：使用当前解析选项创建解析函数，详见[解析请求](#resolving-requests)。
+
+#### 返回结果 \{#results}
+
+直接返回的值、Promise 的结果和回调的结果具有相同含义：
+
+- **字符串、字符串数组或对象**：按对应的值格式将请求外部化，详见[字符串](#字符串)、[字符串数组](#字符串数组)和[对象](#对象)。
+- **`true`**：使用原始请求名称和 [`externalsType`](#externalstype) 将请求外部化。
+- **`false`**：停止检查当前 `externals` 配置的剩余规则，不将请求外部化。其他 `ExternalsPlugin` 实例仍可能将其外部化。
+- **`undefined`**：继续检查下一条规则。使用回调时，调用 `callback()`。
+
+如果没有规则将请求外部化，Rspack 会继续正常的模块处理流程。若要为单个结果覆盖 `externalsType`，可以添加 `'window _'` 这样的类型前缀，或通过回调的第三个参数指定类型。
+
+#### 回调用法 \{#callback-usage}
+
+第二个参数是回调函数。失败时调用 `callback(error)`，提供结果时调用 `callback(null, result, externalsType?)`，继续检查其他规则则调用 `callback()`。使用这种形式时，每个分支都应调用回调，而不是直接返回结果。
+
+上面的 ESM 示例也可以改用回调：
+
+```js title="rspack.config.mjs"
+export default {
+  output: {
+    module: true,
+  },
+  externalsType: 'module',
+  externals: ({ request }, callback) => {
+    if (request === 'react' || request?.startsWith('react/')) {
+      callback(null, request);
+      return;
+    }
+    callback();
+  },
+};
+```
+
+#### 解析请求 \{#resolving-requests}
+
+如果需要根据解析后的路径或包元数据决定是否将依赖外部化，可以使用 `getResolve()`。例如，在接收 `{ context, request, getResolve }` 的异步外部依赖函数中：
+
+```js
+const resolve = getResolve();
+const resolvedPath = await resolve(context, request);
+```
+
+可以向 `getResolve(options)` 传入[解析选项](/config/resolve)，定制解析函数。返回的函数也支持回调：`resolve(context, request, (error, resolvedPath, resolveData) => { ... })`。
+
+解析成功时会返回路径。如果请求被忽略，例如其别名被设为 `false`，Promise 的结果为 `undefined`，回调的第二个参数为 `false`。解析失败时，Promise 会被拒绝，或通过回调的第一个参数传递错误。
+
+使用回调时，可选的第三个参数包含解析详情。其中的 `descriptionFileData` 字段在有值时是解析后的 `package.json` 对象，可以直接读取 `name`、`version`、`type` 等字段，无需调用 `JSON.parse()`。
+
+### 正则表达式
+
+你也可以使用正则表达式来匹配需要外部化的模块。所有符合该正则的模块标识符，都会从打包产物中排除。
+
+```js title="rspack.config.mjs"
+export default {
+  externals: /react-dom/i,
+};
+```
+
+在上述配置中，所有匹配 `react-dom` 的模块标识符都会被 external，例如 `react-dom`、`react-dom/client` 等。
+
+### 复合语法
+
+有时你可能希望使用上述语法的组合。这可以通过以下方式完成：
+
+```js title="rspack.config.mjs"
+export default {
+  externals: [
+    {
+      // 字符串
+      react: 'react',
+      // 对象
+      lodash: {
+        commonjs: 'lodash',
+        amd: 'lodash',
+        root: '_', // indicates global variable
+      },
+      // 字符串数组
+      subtract: ['./math', 'subtract'],
+    },
+    // 函数
+    function ({ context, request }, callback) {
+      if (/^yourregex$/.test(request)) {
+        return callback(null, 'commonjs ' + request);
+      }
+      callback();
+    },
+    // 正则表达式
+    /^(jquery|\$)$/i,
+  ],
+};
+```
+
+:::warning
+如果没有指定类型，将使用[默认类型](#externalstype)，例如 `externals: { react: 'react' }` 而不是 `externals: { react: 'commonjs-module react' }`。
+:::
+
+### externals.byLayer
+
+在 externals 对象中使用 `byLayer`，可以根据导入模块所属的 [layer](/config/module-rules#ruleslayer) 选择外部依赖。匹配分支会与基础配置合并，分支中的值覆盖基础值。没有匹配分支时才使用 `byLayer.default`；显式声明的分支即使是空对象，也不会使用 `default`。
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'commonjs',
+  externals: {
+    fs: 'fs',
+    byLayer: {
+      server: { path: 'path' },
+      default: { crypto: 'crypto' },
+    },
+  },
+  module: {
+    rules: [{ test: /server\.js$/, layer: 'server' }],
+  },
+};
+```
+
+在这个例子中，`server` 层导入的 `fs` 和 `path` 都是外部依赖。其他层（包括没有设置 layer 的模块）导入的 `fs` 和 `crypto` 是外部依赖。在分支中把某个请求设为 `false`，可以取消基础配置对该请求的外部化。
+
+Rspack 也允许分支使用字符串、`RegExp` 或 externals 函数。这些形式会替代基础映射，并按顶层 `externals` 的相同规则匹配请求。
+
+`byLayer` 也可以是同步函数，接收导入模块所属的层（`string`，没有 layer 时为 `null`），返回与基础配置合并的 externals 对象，或返回其他 external 配置来替代基础映射；返回 `undefined` 则只使用基础配置。把 `byLayer` 本身设为 `undefined` 也会只保留基础配置：
+
+```js
+externals: {
+  fs: 'commonjs fs',
+  byLayer: (layer) =>
+    layer === 'server' ? { path: 'commonjs path' } : undefined,
+},
+```
+
+:::warning 懒编译与库输出
+同时启用懒编译和 `umd`、`umd2`、`amd`、`amd-require` 或 `system` 库输出时，Rspack 会在初始库 wrapper 中预留可以枚举的 external。预留范围包括懒模块自身的层，以及模块规则中声明的所有层，让同步后代切换 layer 后也能使用 external。
+
+这些 external 可能在懒模块激活前加载，包括来自从未命中可达模块的规则的 external，因此必须在库加载时就可用。用于匹配请求的 externals 函数和 `RegExp` 分支无法枚举，不能提前预留；函数形式的 `byLayer` 选择器返回对象或字符串时可以枚举。
+:::
 
 ## externalsType
 
 - **类型：** `string`
-- **默认值：** `var`
 
-指定 externals 的默认类型。当 external 被设置为 `amd`，`umd`，`system` 以及 `jsonp` 时，[`output.libraryTarget`](/config/output#outputlibrarytarget) 的值也应相同。例如，你只能在 `amd` 库中使用 `amd` 的 externals。
+`externalsType` 决定 Rspack 默认如何加载 external 依赖。使用 `'amd'`、`'umd'`、`'system'` 或 `'jsonp'` 类型时，[`output.library.type`](/config/output#outputlibrarytype) 必须设置为相同的值。例如，只有 `'amd'` 库才能使用 `'amd'` 类型的 external。
+
+如果 external 依赖需要使用与推导结果不同的加载格式，请显式设置 `externalsType`。
+
+### 默认值
+
+默认值按以下顺序推导：
+
+- 如果配置了 [`output.library`](/config/output#outputlibrary)，且其类型不是 `'modern-module'`，则 `externalsType` 默认为 [`output.library.type`](/config/output#outputlibrarytype)。
+- 否则，如果 [`output.module`](/config/output#outputmodule) 为 `true`，则默认为 `'module-import'`。
+- 其他情况下默认为 `'var'`。
+
+出于向后兼容的考虑，[`output.library.type: 'modern-module'`](/config/output#outputlibrarytype) 目前会跳过第一条规则，继续按照 `output.module` 推导默认值。如需使用 modern module externals，请显式设置 `externalsType: 'modern-module'`。
+
+### 可选值
 
 支持的类型如下：
 
 - `'amd'`
 - `'amd-require'`
-- `'assign'` - same as `'var'`
+- `'assign'` - 同 `'var'`
 - [`'commonjs'`](#externalstypecommonjs)
+- `'commonjs2'`
 - `'commonjs-module'`
+- `'commonjs-static'`
 - [`'global'`](#externalstypeglobal)
-- `'import'` - uses `import()` to load a native ECMAScript module (async module)
+- [`'module'`](#externalstypemodule)
+- [`'import'`](#externalstypeimport) - 使用 `import()` 加载一个原生的 ECMAScript 模块（异步模块）
+- [`'module-import'`](#externalstypemodule-import)
+- [`'modern-module'`](#externalstypemodern-module)
+- [`'commonjs-import'`](#externalstypecommonjs-import)
 - `'jsonp'`
 - [`'node-commonjs'`](#externalstypenode-commonjs)
+- [`'promise'`](#externalstypepromise)
 - [`'self'`](#externalstypeself)
 - `'system'`
+- [`'script'`](#externalstypescript)
 - [`'this'`](#externalstypethis)
 - `'umd'`
 - `'umd2'`
 - [`'var'`](#externalstypevar)
 - [`'window'`](#externalstypewindow)
 
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'promise',
+};
+```
+
 ### externalsType.commonjs
 
-将外部的默认类型指定为“commonjs”。Webpack 将为模块中使用的外部生成类似 `const X = require('...')` 的代码。
+将 externals 的默认类型指定为 `'commonjs'`。Rspack 将为模块中使用的外部生成类似 `const X = require('...')` 的代码。
 
-```javascript
+**示例**
+
+```js
 import fs from 'fs-extra';
 ```
 
-**rspack.config.js**
-
-```javascript
-module.exports = {
-  // ...
+```js title="rspack.config.mjs"
+export default {
   externalsType: 'commonjs',
   externals: {
     'fs-extra': 'fs-extra',
@@ -160,7 +468,7 @@ module.exports = {
 
 将会转换为类似下面的代码：
 
-```javascript
+```js
 const fs = require('fs-extra');
 ```
 
@@ -168,18 +476,17 @@ const fs = require('fs-extra');
 
 ### externalsType.global
 
-将外部的默认类型指定为 `'global'`。Webpack 会将 external 作为全局变量读取到 [`globalObject`](/config/output#outputglobalobject)。
+将 externals 的默认类型指定为 `'global'`。Rspack 会将 external 视为 [`globalObject`](/config/output#outputglobalobject) 上的一个全局变量读取。
 
-```javascript
+**示例**
+
+```js
 import jq from 'jquery';
 jq('.my-element').animate(/* ... */);
 ```
 
-**rspack.config.js**
-
-```javascript
-module.exports = {
-  // ...
+```js title="rspack.config.mjs"
+export default {
   externalsType: 'global',
   externals: {
     jquery: '$',
@@ -192,24 +499,282 @@ module.exports = {
 
 将会转换为类似下面的代码：
 
-```javascript
+```js
 const jq = global['$'];
 jq('.my-element').animate(/* ... */);
 ```
 
-### externalsType.node-commonjs
+### externalsType.module
 
-将 externals 类型设置为 `'node-commonjs'`，webpack 将从 `module` 中导入 `createRequire` 来构造一个 require 函数，用于加载模块中使用的外部对象。
+将 externals 的默认类型指定为 `'module'`。Rspack 将为模块中使用的 externals 生成类似 `import * as X from '...'` 的代码。
 
-```javascript
+确保开启了 [`output.module`](/config/output#outputmodule)。
+
+**示例**
+
+```js
 import jq from 'jquery';
 jq('.my-element').animate(/* ... */);
 ```
 
-**rspack.config.js**
+```js title="rspack.config.mjs"
+export default {
+  output: {
+    module: true,
+  },
+  externalsType: 'module',
+  externals: {
+    jquery: 'jquery',
+  },
+};
+```
+
+将会转换为类似下面的代码：
 
 ```js
-module.export = {
+import * as __rspack_external_jquery from 'jquery';
+
+const jq = __rspack_external_jquery['default'];
+jq('.my-element').animate(/* ... */);
+```
+
+请注意，在输出产物中将有 `import` 语句。
+
+### externalsType.import
+
+将 externals 的默认类型指定为 `'import'`。Rspack 将为模块中使用的 externals 生成类似 `import('...')` 的代码。
+
+**示例**
+
+```js
+async function foo() {
+  const jq = await import('jquery');
+  jq('.my-element').animate(/* ... */);
+}
+```
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'import',
+  externals: {
+    jquery: 'jquery',
+  },
+};
+```
+
+将会转换为类似下面的代码：
+
+```js
+var __webpack_modules__ = {
+  jquery: (module) => {
+    module.exports = import('jquery');
+  },
+};
+
+// Rspack runtime...
+
+async function foo() {
+  const jq = await Promise.resolve(/* import() */).then(
+    __webpack_require__.bind(__webpack_require__, 'jquery'),
+  );
+  jq('.my-element').animate(/* ... */);
+}
+```
+
+请注意，在输出产物中将有 `import()` 语句。
+
+### externalsType['module-import']
+
+将 externals 的默认类型指定为 `'module-import'`。这将结合 [`'module'`](#externalstypemodule) 和 [`'import'`](#externalstypeimport)。Rspack 将自动检测导入语法的类型，对于静态导入设置为 `'module'`，对于动态导入设置为 `'import'`。
+
+**示例**
+
+```js
+import { attempt } from 'lodash';
+
+async function foo() {
+  const jq = await import('jquery');
+  attempt(() => jq('.my-element').animate(/* ... */));
+}
+```
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'module-import',
+  externals: {
+    jquery: 'jquery',
+  },
+};
+```
+
+将会转换为类似下面的代码：
+
+```js
+import * as __rspack_external_lodash from 'lodash';
+const lodash = __rspack_external_jquery;
+
+var __webpack_modules__ = {
+  jquery: (module) => {
+    module.exports = import('jquery');
+  },
+};
+
+// Rspack runtime...
+
+async function foo() {
+  const jq = await Promise.resolve(/* import() */).then(
+    __webpack_require__.bind(__webpack_require__, 'jquery'),
+  );
+  (0, lodash.attempt)(() => jq('.my-element').animate(/* ... */));
+}
+```
+
+请注意，在输出产物中将有 `import` 或 `import()` 语句。
+
+当一个模块没有通过 `import` 或 `import()` 导入时，Rspack 将使用 `"module"` externals type 作为回退。如果你想使用不同类型的 externals 作为回退，你可以在 `externals` 选项中指定一个函数。例如：
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'module-import',
+  externals: [
+    function ({ request, dependencyType }, callback) {
+      if (dependencyType === 'commonjs') {
+        return callback(null, `node-commonjs ${request}`);
+      }
+      callback();
+    },
+  ],
+};
+```
+
+### externalsType['modern-module']
+
+将 externals 的默认类型指定为 `'modern-module'`。
+
+出于兼容性考虑，Rspack 暂时不会在 [`output.library.type`](/config/output#outputlibrarytype) 为 `'modern-module'` 时自动启用它。请显式配置 `externalsType: 'modern-module'` 来开启。下一个 major 版本中，它会成为 `modern-module` library 的默认值。
+
+对于静态 ESM import，Rspack 会像 [`'module'`](#externalstypemodule) 一样渲染 external，生成静态 `import` 语句。对于动态 `import()`，Rspack 会像 [`'module-import'`](#externalstypemodule-import) 一样渲染 external，生成 `import()`。
+
+对于 CommonJS `require()`，Rspack 会根据 target 选择 CommonJS external 变体。Node-like target 会像 [`'node-commonjs'`](#externalstypenode-commonjs) 一样渲染 external，在生成的 ESM 产物中通过 `createRequire` 构造 `require` 函数。其他 target 会像 [`'commonjs'`](#externalstypecommonjs) 一样渲染 external，保留裸 `require()` 调用。
+
+**示例**
+
+```js title="src/index.js"
+import { readFile } from 'node:fs/promises';
+
+const path = require('node:path');
+
+export async function loadConfig(file) {
+  const os = await import('node:os');
+  const content = await readFile(file, 'utf-8');
+  return {
+    content,
+    dirname: path.dirname(file),
+    platform: os.platform(),
+  };
+}
+```
+
+```js title="rspack.config.mjs"
+export default {
+  target: 'node',
+  output: {
+    library: {
+      type: 'modern-module',
+    },
+  },
+  externalsType: 'modern-module',
+  externals: ['node:fs/promises', 'node:path', 'node:os'],
+};
+```
+
+因为这个示例的 target 是 Node.js，生成的 ESM 产物会保留静态 import 为 `import` 语句，保留动态 import 为 `import()`，并通过 `createRequire` 渲染 `require()` external：
+
+```js
+import { createRequire as __rspack_createRequire } from 'node:module';
+import { readFile } from 'node:fs/promises';
+
+const __rspack_createRequire_require = __rspack_createRequire(import.meta.url);
+const path = __rspack_createRequire_require('node:path');
+
+async function loadConfig(file) {
+  const os = await import('node:os');
+  // ...
+}
+
+export { loadConfig };
+```
+
+### externalsType['commonjs-import']
+
+将 externals 的默认类型指定为 `'commonjs-import'`。这将结合 [`'commonjs'`](#externalstypecommonjs) 和 [`'import'`](#externalstypeimport)。Rspack 将自动检测导入语法的类型，对于动态导入设置为 `'import'`，其他的导入设置为 `'commonjs'`。
+
+这在构建一个 Node.js 应用程序时非常有用，当目标 Node.js 版本高于 `13.2.0`，同时支持 [`import()` 表达式](https://nodejs.org/api/esm.html#import-expressions) 和 `require()`。
+
+:::note
+`commonjs-import` 类型仅在 Rspack 中可用，webpack 并不支持此类型。
+:::
+
+**示例**
+
+```js
+import { attempt } from 'lodash';
+
+async function foo() {
+  const jq = await import('jquery');
+  attempt(() => jq('.my-element').animate(/* ... */));
+}
+```
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'commonjs-import',
+  externals: {
+    lodash: 'lodash',
+    jquery: 'jquery',
+  },
+};
+```
+
+将会转换为类似下面的代码：
+
+```js
+var __webpack_modules__ = {
+  lodash: function (module) {
+    module.exports = require('lodash');
+  },
+  jquery: function (module) {
+    module.exports = import('jquery');
+  },
+};
+
+// Rspack runtime...
+
+async function foo() {
+  const jq = await Promise.resolve(/* import() */).then(
+    __webpack_require__.bind(__webpack_require__, 'jquery'),
+  );
+  (0, lodash__rspack_import_0__.attempt)(() =>
+    jq('.my-element').animate(/* ... */),
+  );
+}
+```
+
+请注意，在输出产物中将有 `import()` 语句。
+
+### externalsType['node-commonjs']
+
+将 externals 类型设置为 `'node-commonjs'`，Rspack 将从 `module` 中导入 [`createRequire`](https://nodejs.org/api/module.html#module_module_createrequire_filename) 来构造一个 require 函数，用于加载模块中使用的外部对象。
+
+**示例**
+
+```js
+import jq from 'jquery';
+jq('.my-element').animate(/* ... */);
+```
+
+```js title="rspack.config.mjs"
+export default {
   externalsType: 'node-commonjs',
   externals: {
     jquery: 'jquery',
@@ -219,29 +784,53 @@ module.export = {
 
 将会转换为类似下面的代码：
 
-```javascript
-import { createRequire } from 'module';
+```js
+import { createRequire } from 'node:module';
 
 const jq = createRequire(import.meta.url)('jquery');
 jq('.my-element').animate(/* ... */);
 ```
 
-请注意，输出包中会有一个 `import` 语句。
+请注意，在输出产物中会有 `import` 语句。
 
-### externalsType.self
+### externalsType.promise
 
-将外部的默认类型指定为 `'self'`。 Webpack 会将 external 作为 `self` 对象上的全局变量读取。
+将 externals 的默认类型指定为 `'promise'`，Rspack 会将 external 视为全局变量（类似于 [`'var'`](#externalstypepromise)）并 await 它。
 
-```javascript
+**例子**
+
+```js
 import jq from 'jquery';
 jq('.my-element').animate(/* ... */);
 ```
 
-**rspack.config.js**
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'promise',
+  externals: {
+    jquery: '$',
+  },
+};
+```
 
-```javascript
-module.exports = {
-  // ...
+将会转换为类似下面的代码：
+
+```js
+const jq = await $;
+jq('.my-element').animate(/* ... */);
+```
+
+### externalsType.self
+
+将外部的默认类型指定为 `'self'`。 Rspack 会将 external 作为 `self` 对象上的全局变量读取。
+
+```js
+import jq from 'jquery';
+jq('.my-element').animate(/* ... */);
+```
+
+```js title="rspack.config.mjs"
+export default {
   externalsType: 'self',
   externals: {
     jquery: '$',
@@ -251,27 +840,104 @@ module.exports = {
 
 将会转换为类似下面的代码：
 
-```javascript
+```js
 const jq = self['$'];
 jq('.my-element').animate(/* ... */);
 ```
 
+### externalsType.script
+
+将 external 的默认类型指定为 `'script'`。Rspack 会使用 HTML `<script>` 标签加载外部资源，暴露预定义的全局变量。脚本加载完成后，`<script>` 标签将被移除。
+
+**语法**
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'script',
+  externals: {
+    packageName: [
+      'http://example.com/script.js',
+      'global',
+      'property',
+      'property',
+    ], // 属性是可选的
+  },
+};
+```
+
+如果不打算指定任何属性也可以使用快捷语法：
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'script',
+  externals: {
+    packageName: 'global@http://example.com/script.js', // 这里没有属性
+  },
+};
+```
+
+请注意，[output.publicPath](/config/output#outputpublicpath) 不会被添加到提供的 URL 中。
+
+**示例**
+
+让我们从 CDN 加载一个 `lodash`：
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'script',
+  externals: {
+    lodash: ['https://cdn.jsdelivr.net/npm/lodash@4.17.19/lodash.min.js', '_'],
+  },
+};
+```
+
+然后在代码中使用：
+
+```js
+import _ from 'lodash';
+console.log(_.head([1, 2, 3]));
+```
+
+下面是我们如何为上述示例指定属性的方法：
+
+```js title="rspack.config.mjs"
+export default {
+  externalsType: 'script',
+  externals: {
+    lodash: [
+      'https://cdn.jsdelivr.net/npm/lodash@4.17.19/lodash.min.js',
+      '_',
+      'head',
+    ],
+  },
+};
+```
+
+局部变量 `head` 和全局 `window._` 在导入 `lodash` 时都将被暴露出来。
+
+```js
+import head from 'lodash';
+console.log(head([1, 2, 3])); // logs 1 here
+console.log(window._.head(['a', 'b'])); // logs a here
+```
+
+:::tip
+当使用 HTML `<script>` 标签加载代码时，Rspack 运行时会尝试查找与 `src` 属性匹配或具有特定 `data-rspack` 属性的现有 `<script>` 标签。对于 chunk 加载，`data-rspack` 属性的值将是 `'[output.uniqueName]:chunk-[chunkId]'`，而外部脚本的值将是 `'[output.uniqueName]:[global]'`。
+:::
+
 ### externalsType.this
 
-将 external 的默认类型指定为 `'this'`。Webpack 会将 external 作为 `this` 对象上的全局变量读取。
+将 external 的默认类型指定为 `'this'`。Rspack 会将 external 作为 `this` 对象上的全局变量读取。
 
-示例
+**示例**
 
-```javascript
+```js
 import jq from 'jquery';
 jq('.my-element').animate(/* ... */);
 ```
 
-**rspack.config.js**
-
-```javascript
-module.exports = {
-  // ...
+```js title="rspack.config.mjs"
+export default {
   externalsType: 'this',
   externals: {
     jquery: '$',
@@ -281,27 +947,24 @@ module.exports = {
 
 将会转换为类似下面的代码：
 
-```javascript
+```js
 const jq = this['$'];
 jq('.my-element').animate(/* ... */);
 ```
 
 ### externalsType.var
 
-将 external 的默认类型指定为 `'var'`。Webpack 会将 external 作为全局变量读取。
+将 external 的默认类型指定为 `'var'`。Rspack 会将 external 作为全局变量读取。
 
-示例
+**示例**
 
-```javascript
+```js
 import jq from 'jquery';
 jq('.my-element').animate(/* ... */);
 ```
 
-**rspack.config.js**
-
-```javascript
-module.exports = {
-  // ...
+```js title="rspack.config.mjs"
+export default {
   externalsType: 'var',
   externals: {
     jquery: '$',
@@ -311,27 +974,24 @@ module.exports = {
 
 将会转换为类似下面的代码：
 
-```javascript
+```js
 const jq = $;
 jq('.my-element').animate(/* ... */);
 ```
 
 ### externalsType.window
 
-将 external 的默认类型指定为 `'window'`。Webpack 会将 external 作为 `window` 对象上的全局变量读取。
+将 external 的默认类型指定为 `'window'`。Rspack 会将 external 作为 `window` 对象上的全局变量读取。
 
-示例
+**示例**
 
-```javascript
+```js
 import jq from 'jquery';
 jq('.my-element').animate(/* ... */);
 ```
 
-**rspack.config.js**
-
-```javascript
-module.exports = {
-  // ...
+```js title="rspack.config.mjs"
+export default {
   externalsType: 'window',
   externals: {
     jquery: '$',
@@ -341,41 +1001,77 @@ module.exports = {
 
 将会转换为类似下面的代码：
 
-```javascript
+```js
 const jq = window['$'];
 jq('.my-element').animate(/* ... */);
 ```
 
 ## externalsPresets
 
+- **类型：** `object`
+
 为特定的目标环境启用外部模块的预设值。
 
-### node
+### externalsPresets.electron
 
-将 node.js 的内置模块（如 `fs`、`path` 或 `vm`）视为外部模块，并在使用时通过 `require()` 加载它们。
-
-### web
-
-将对 `http(s)://...` 和 `std:...` 引入的模块视为外部模块，并在使用时通过 `import` (`externalType: "module"`) 来加载它们（请注意，这会改变执行顺序，因为外部模块的代码会在 Chunk 中的任何其他模块的代码之前执行）。
-
-### webAsync
-
-<ApiMeta addedVersion="0.3.5" />
-
-将对 `http(s)://...` 和 `std:...` 引入的模块视为外部模块，并在使用时通过 `import()` (`externalType: "import"`) 来加载它们（请注意，此 external 类型为 async 模块，它对执行会产生各种副作用）。
-
-### electron
+**类型：**`boolean`
 
 将 Electron 主进程和预加载脚本中常见的 Electron 内置模块如 `electron`、`ipc` 或 `shell` 视为外部模块，并在使用时通过 `require()` 加载它们。
 
-### electronMain
+### externalsPresets.electronMain
+
+**类型：**`boolean`
 
 将 Electron 主进程中常见的 Electron 内置模块如 `app`、`ipc-main` 或 `shell` 视为外部模块，并在使用时通过 `require()` 加载它们。
 
-### electronRenderer
+### externalsPresets.electronPreload
+
+**类型：**`boolean`
+
+将 Electron 预加载脚本中常见的 Electron 内置模块如 `web-frame`、`ipc-renderer` 或 `shell` 视为外部模块，并在使用时通过 `require()` 加载它们。
+
+### externalsPresets.electronRenderer
+
+**类型：**`boolean`
 
 将 Electron 渲染进程中常见的 Electron 内置模块如 `web-frame`、`ipc-renderer` 或 `shell` 视为外部模块，并在使用时通过 `require()` 加载它们。
 
-### electronPreload
+### externalsPresets.node
 
-将 Electron 预加载脚本中常见的 Electron 内置模块如 `web-frame`、`ipc-renderer` 或 `shell` 视为外部模块，并在使用时通过 `require()` 加载它们。
+**类型：**`boolean`
+
+将 node.js 的内置模块（如 `fs`、`path` 或 `vm`）视为外部模块，并在使用时通过 `require()` 加载它们。
+
+### externalsPresets.nwjs
+
+**类型：**`boolean`
+
+将 NW.js 旧版 `nw.gui` 模块视为外部模块，并在使用时通过 `require()` 加载它。
+
+### externalsPresets.web
+
+**类型：**`boolean`
+
+将对 `http(s)://...` 和 `std:...` 引入的模块视为外部模块，并在使用时通过 `import` (`externalType: "module"`) 来加载它们 **（请注意，这会改变执行顺序，因为外部模块的代码会在 chunk 中的任何其他模块的代码之前执行）**。
+
+### externalsPresets.webAsync
+
+**类型：**`boolean`
+
+将对 `http(s)://...` 和 `std:...` 引入的模块视为外部模块，并在使用时通过 `async import()` 来加载它们 **（注意，外部模块的类型是 `async` 模块，对执行有各种影响）**。
+
+请注意，如果你打算输出 ES 模块并使用这些 node.js 相关的预设值，Rspack 将会将默认的 `externalsType` 设置为 [`node-commonjs`](#externalstypenode-commonjs)，这将使用 `createRequire` 来构造一个 require 函数，而不是使用 `require()`。
+
+**示例**
+
+使用 `node` 预设将不会打包内置模块，并将它们视为外部模块，当使用时通过 `require()` 加载它们。
+
+```js title="rspack.config.mjs"
+export default {
+  externalsPresets: {
+    node: true,
+  },
+};
+```
+
+<Attribution url="https://webpack.docschina.org/configuration/externals/" />

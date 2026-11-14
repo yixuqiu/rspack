@@ -1,123 +1,144 @@
-import type { RawCssExtractPluginOption } from "@rspack/binding";
-import { Compiler } from "../..";
-import { MODULE_TYPE } from "./loader";
+import { join } from 'node:path';
+import {
+  BuiltinPluginName,
+  type RawCssExtractPluginOption,
+} from '@rspack/binding';
+import type { Compilation, Compiler, LiteralUnion } from '../..';
+import { MODULE_TYPE } from './loader';
+import {
+  type CssExtractPluginContext,
+  PLUGIN_NAME,
+  pluginSymbol,
+} from './utils';
 
-export * from "./loader";
+export * from './loader';
 
-const DEFAULT_FILENAME = "[name].css";
-const LOADER_PATH = require.resolve("./loader");
+const DEFAULT_FILENAME = '[name].css';
+const LOADER_PATH = join(import.meta.dirname, 'cssExtractLoader.js');
 
-export interface PluginOptions {
-	filename?: string;
-	chunkFilename?: string;
-	ignoreOrder?: boolean;
-	insert?: string | ((linkTag: HTMLLinkElement) => void);
-	attributes?: Record<string, string>;
-	linkType?: string | "text/css" | false;
-	runtime?: boolean;
+export type { CssExtractRspackLoaderOptions } from './loader';
 
-	// workaround for pathinto, deprecate this when rspack supports pathinfo
-	pathinfo?: boolean;
+export interface CssExtractRspackPluginOptions {
+  filename?: RawCssExtractPluginOption['filename'];
+  chunkFilename?: RawCssExtractPluginOption['chunkFilename'];
+  ignoreOrder?: boolean;
+  insert?: string | ((linkTag: HTMLLinkElement) => void);
+  attributes?: Record<string, string>;
+  linkType?: LiteralUnion<'text/css', string> | false;
+  runtime?: boolean;
+
+  // workaround for pathinto, deprecate this when rspack supports pathinfo
+  pathinfo?: boolean;
+  // when using relativePath, add './' prefix, e.g:  url('static/img/foo.png') => url('./static/img/foo.png')
+  enforceRelative?: boolean;
 }
 
 export class CssExtractRspackPlugin {
-	static pluginName: string = "css-extract-rspack-plugin";
-	static loader: string = LOADER_PATH;
+  static pluginName = PLUGIN_NAME;
+  static loader: string = LOADER_PATH;
 
-	options: PluginOptions;
+  options: CssExtractRspackPluginOptions;
 
-	constructor(options?: PluginOptions) {
-		this.options = options || {};
-	}
+  constructor(options?: CssExtractRspackPluginOptions) {
+    this.options = options || {};
+  }
 
-	apply(compiler: Compiler) {
-		const { splitChunks } = compiler.options.optimization;
+  apply(compiler: Compiler) {
+    compiler.hooks.thisCompilation.tap(PLUGIN_NAME, (compilation) => {
+      // Share options without copying them into every JS loader context.
+      (compilation as Compilation & CssExtractPluginContext)[pluginSymbol] = {
+        runtime: this.options.runtime !== false,
+      };
+    });
 
-		if (splitChunks) {
-			if (
-				/** @type {string[]} */ splitChunks.defaultSizeTypes!.includes("...")
-			) {
-				/** @type {string[]} */
-				splitChunks.defaultSizeTypes!.push(MODULE_TYPE);
-			}
-		}
+    const { splitChunks } = compiler.options.optimization;
 
-		if (
-			compiler.options.output.pathinfo &&
-			this.options.pathinfo === undefined
-		) {
-			this.options.pathinfo = true;
-		}
+    if (splitChunks) {
+      if (
+        /** @type {string[]} */ splitChunks.defaultSizeTypes!.includes('...')
+      ) {
+        /** @type {string[]} */
+        splitChunks.defaultSizeTypes!.push(MODULE_TYPE);
+      }
+    }
 
-		compiler.__internal__registerBuiltinPlugin({
-			// @ts-expect-error CssExtractRspackPlugin is a constant value of BuiltinPlugin
-			name: "CssExtractRspackPlugin",
-			options: this.normalizeOptions(this.options)
-		});
-	}
+    if (
+      compiler.options.output.pathinfo &&
+      this.options.pathinfo === undefined
+    ) {
+      this.options.pathinfo = true;
+    }
 
-	normalizeOptions(options: PluginOptions): RawCssExtractPluginOption {
-		let chunkFilename = options.chunkFilename;
+    compiler.__internal__registerBuiltinPlugin({
+      name: BuiltinPluginName.CssExtractRspackPlugin,
+      options: this.normalizeOptions(this.options),
+    });
+  }
 
-		if (!chunkFilename) {
-			const filename = options.filename || DEFAULT_FILENAME;
+  normalizeOptions(
+    options: CssExtractRspackPluginOptions,
+  ): RawCssExtractPluginOption {
+    let chunkFilename = options.chunkFilename;
 
-			if (typeof filename !== "function") {
-				const hasName = /** @type {string} */ filename.includes("[name]");
-				const hasId = /** @type {string} */ filename.includes("[id]");
-				const hasChunkHash =
-					/** @type {string} */
-					filename.includes("[chunkhash]");
-				const hasContentHash =
-					/** @type {string} */
-					filename.includes("[contenthash]");
+    if (!chunkFilename) {
+      const filename = options.filename || DEFAULT_FILENAME;
 
-				// Anything changing depending on chunk is fine
-				if (hasChunkHash || hasContentHash || hasName || hasId) {
-					chunkFilename = filename;
-				} else {
-					// Otherwise prefix "[id]." in front of the basename to make it changing
-					chunkFilename =
-						/** @type {string} */
-						filename.replace(/(^|\/)([^/]*(?:\?|$))/, "$1[id].$2");
-				}
-			} else {
-				chunkFilename = "[id].css";
-			}
-		}
+      if (typeof filename !== 'function') {
+        const hasName = /** @type {string} */ filename.includes('[name]');
+        const hasId = /** @type {string} */ filename.includes('[id]');
+        const hasChunkHash =
+          /** @type {string} */
+          filename.includes('[chunkhash]');
+        const hasContentHash =
+          /** @type {string} */
+          filename.includes('[contenthash]');
 
-		const normalzedOptions: RawCssExtractPluginOption = {
-			filename: options.filename || DEFAULT_FILENAME,
-			chunkFilename: chunkFilename!,
-			ignoreOrder: options.ignoreOrder ?? false,
-			runtime: options.runtime ?? true,
-			insert:
-				typeof options.insert === "function"
-					? options.insert.toString()
-					: JSON.stringify(options.insert),
-			linkType:
-				typeof options.linkType === "undefined"
-					? JSON.stringify("text/css")
-					: options.linkType === false
-						? undefined
-						: JSON.stringify(options.linkType),
-			attributes: options.attributes
-				? (Reflect.ownKeys(options.attributes)
-						.map(k => [
-							JSON.stringify(k),
-							JSON.stringify(options.attributes![k as string])
-						])
-						.reduce((obj, [k, v]) => {
-							// @ts-expect-error
-							obj[k] = v;
-							return obj;
-						}, {}) as Record<string, string>)
-				: {},
-			pathinfo: options.pathinfo ?? false
-		};
+        // Anything changing depending on chunk is fine
+        if (hasChunkHash || hasContentHash || hasName || hasId) {
+          chunkFilename = filename;
+        } else {
+          // Otherwise prefix "[id]." in front of the basename to make it changing
+          chunkFilename =
+            /** @type {string} */
+            filename.replace(/(^|\/)([^/]*(?:\?|$))/, '$1[id].$2');
+        }
+      } else {
+        chunkFilename = '[id].css';
+      }
+    }
 
-		return normalzedOptions;
-	}
+    const normalzedOptions: RawCssExtractPluginOption = {
+      filename: options.filename || DEFAULT_FILENAME,
+      chunkFilename: chunkFilename,
+      ignoreOrder: options.ignoreOrder ?? false,
+      runtime: options.runtime ?? true,
+      insert:
+        typeof options.insert === 'function'
+          ? options.insert.toString()
+          : JSON.stringify(options.insert),
+      linkType:
+        typeof options.linkType === 'undefined'
+          ? JSON.stringify('text/css')
+          : options.linkType === false
+            ? undefined
+            : JSON.stringify(options.linkType),
+      attributes: options.attributes
+        ? Reflect.ownKeys(options.attributes)
+            .map((k) => [
+              JSON.stringify(k),
+              JSON.stringify(options.attributes![k as string]),
+            ])
+            .reduce((obj: Record<string, string>, [k, v]) => {
+              obj[k] = v;
+              return obj;
+            }, {})
+        : {},
+      pathinfo: options.pathinfo ?? false,
+      enforceRelative: options.enforceRelative ?? false,
+    };
+
+    return normalzedOptions;
+  }
 }
 
 export default CssExtractRspackPlugin;

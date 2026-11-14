@@ -1,0 +1,49 @@
+<%- var("cssLoadingUniqueName") %> = "<%- _unique_name %>";
+<%- var("loadingAttribute") %> = "data-rspack-loading";
+<%- var("cssLoadStylesheet") %> = <%- basicFunction("chunkId, url, done, hmr, fetchPriority") %> {
+	var link,
+		needAttach,
+		key = "chunk-" + chunkId;
+	if (!hmr) {
+		var links = document.getElementsByTagName("link");
+		for (var i = 0; i < links.length; i++) {
+			var l = links[i];
+			var href = l.getAttribute("href") || l.href;
+			if (href && !href.startsWith(<%- PUBLIC_PATH %>)) {
+				href =
+					<%- PUBLIC_PATH %> + (href.startsWith("/") ? href.slice(1) : href);
+			}
+			if (
+				l.rel == "stylesheet" &&
+				((href && href.startsWith(url)) ||
+					l.getAttribute("data-rspack") == cssLoadingUniqueName + ":" + key)
+			) {
+				link = l;
+				break;
+			}
+		}
+		if (!done) return link;
+	}
+	if (!link) {
+		needAttach = true;
+		<%- _create_link %>
+	}
+	var onLinkComplete = <%- basicFunction("prev, event") %> {
+		link.onerror = link.onload = null;
+		link.removeAttribute(loadingAttribute);
+		clearTimeout(timeout);
+		if (event && event.type != "load" && link.parentNode) link.parentNode.removeChild(link);
+		done(event);
+		if (prev) return prev(event);
+	};
+	if (link.getAttribute(loadingAttribute)) {
+		var timeout = setTimeout(
+			onLinkComplete.bind(null, undefined, { type: "timeout", target: link }),
+			<%- _chunk_load_timeout %> 
+		);
+		link.onerror = onLinkComplete.bind(null, link.onerror);
+		link.onload = onLinkComplete.bind(null, link.onload);
+	} else onLinkComplete(undefined, { type: "load", target: link });
+	hmr ? document.head.insertBefore(link, hmr) : needAttach && document.head.appendChild(link);
+	return link;
+};

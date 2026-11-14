@@ -1,0 +1,179 @@
+//! # EmbedFederationRuntimeModule
+//!
+//! Runtime module that wraps the startup function to ensure federation runtime dependencies
+//! execute before other modules. Generates a "prevStartup wrapper" pattern with defensive
+//! checks that intercepts and modifies the startup execution order.
+
+use std::sync::LazyLock;
+
+use rspack_cacheable::cacheable;
+use rspack_core::{
+  Compilation, DependencyId, RuntimeGlobals, RuntimeModule, RuntimeModuleGenerateContext,
+  RuntimeModuleStage, RuntimeTemplate, impl_runtime_module,
+};
+use rspack_error::Result;
+use rspack_plugin_runtime::extract_runtime_module_variables_from_ejs;
+
+use super::module_federation_runtime_plugin::ModuleFederationRuntimeExperimentsOptions;
+
+static EMBED_FEDERATION_RUNTIME_ASYNC_TEMPLATE: &str =
+  include_str!("./embed_federation_runtime_async.ejs");
+static EMBED_FEDERATION_RUNTIME_SYNC_TEMPLATE: &str =
+  include_str!("./embed_federation_runtime_sync.ejs");
+static RUNTIME_MODULE_VARIABLES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+  extract_runtime_module_variables_from_ejs(&[
+    EMBED_FEDERATION_RUNTIME_ASYNC_TEMPLATE,
+    EMBED_FEDERATION_RUNTIME_SYNC_TEMPLATE,
+  ])
+});
+
+#[cacheable]
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct EmbedFederationRuntimeModuleOptions {
+  pub collected_dependency_ids: Vec<DependencyId>,
+  pub experiments: ModuleFederationRuntimeExperimentsOptions,
+}
+
+#[impl_runtime_module]
+#[derive(Debug)]
+pub struct EmbedFederationRuntimeModule {
+  options: EmbedFederationRuntimeModuleOptions,
+}
+
+impl EmbedFederationRuntimeModule {
+  pub fn new(
+    runtime_template: &RuntimeTemplate,
+    options: EmbedFederationRuntimeModuleOptions,
+  ) -> Self {
+    Self::with_name(runtime_template, "embed_federation_runtime", options)
+  }
+}
+
+enum TemplateId {
+  Async,
+  Sync,
+}
+
+impl EmbedFederationRuntimeModule {
+  fn template_id(&self, template_id: TemplateId) -> String {
+    match template_id {
+      TemplateId::Async => format!("{}_async", self.id()),
+      TemplateId::Sync => format!("{}_sync", self.id()),
+    }
+  }
+}
+
+#[async_trait::async_trait]
+impl RuntimeModule for EmbedFederationRuntimeModule {
+  fn runtime_module_variables() -> &'static [&'static str] {
+    RUNTIME_MODULE_VARIABLES.as_slice()
+  }
+
+  fn runtime_requirements(
+    &self,
+    _compilation: &Compilation,
+  ) -> rspack_core::RuntimeModuleRuntimeRequirements {
+    let mut define = RuntimeGlobals::STARTUP;
+    if self.options.experiments.async_startup {
+      define.insert(RuntimeGlobals::STARTUP_ENTRYPOINT);
+    }
+    rspack_core::RuntimeModuleRuntimeRequirements {
+      define,
+      force_context: RuntimeGlobals::ENSURE_CHUNK_HANDLERS | RuntimeGlobals::HAS_OWN_PROPERTY,
+      ..Default::default()
+    }
+  }
+
+  fn template(&self) -> Vec<(String, String)> {
+    vec![
+      (
+        self.template_id(TemplateId::Async),
+        EMBED_FEDERATION_RUNTIME_ASYNC_TEMPLATE.to_string(),
+      ),
+      (
+        self.template_id(TemplateId::Sync),
+        EMBED_FEDERATION_RUNTIME_SYNC_TEMPLATE.to_string(),
+      ),
+    ]
+  }
+
+  async fn generate(&self, context: &RuntimeModuleGenerateContext<'_>) -> Result<String> {
+    let compilation = context.compilation;
+    let chunk_ukey = self
+      .chunk()
+      .expect("Chunk should be attached to RuntimeModule");
+
+    let collected_deps = &self.options.collected_dependency_ids;
+
+    let module_graph = compilation.get_module_graph();
+    let mut federation_runtime_modules = Vec::new();
+
+    // Find federation runtime dependencies in this chunk
+    if !collected_deps.is_empty() {
+      for dep_id in collected_deps.iter() {
+        if let Some(module_dyn) = module_graph.get_module_by_dependency_id(dep_id) {
+          let is_in_chunk = compilation
+            .build_chunk_graph_artifact
+            .chunk_graph
+            .is_module_in_chunk(&module_dyn.identifier(), chunk_ukey);
+          if is_in_chunk {
+            federation_runtime_modules.push(*dep_id);
+          }
+        }
+      }
+    }
+
+    // Generate module execution code for each federation runtime dependency
+    let mut module_executions = String::with_capacity(federation_runtime_modules.len() * 64);
+    let mut runtime_template = compilation.runtime_template.create_module_code_template();
+
+    for dep_id in federation_runtime_modules {
+      let module_str = runtime_template.module_raw(compilation, &dep_id, "", false);
+      module_executions.push_str("\t\t");
+      module_executions.push_str(&module_str);
+      module_executions.push('\n');
+    }
+
+    if self.options.experiments.async_startup {
+      let entry_chunk_ids = compilation
+        .build_chunk_graph_artifact
+        .chunk_by_ukey
+        .expect_get(&chunk_ukey)
+        .get_all_initial_chunks(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey)
+        .into_iter()
+        .map(|chunk_ukey| {
+          compilation
+            .build_chunk_graph_artifact
+            .chunk_by_ukey
+            .expect_get(&chunk_ukey)
+            .expect_id()
+            .clone()
+        })
+        .collect::<Vec<_>>();
+      let entry_chunk_ids_literal =
+        simd_json::to_string(&entry_chunk_ids).expect("Invalid json to string");
+      Ok(context.runtime_template.render(
+        &self.template_id(TemplateId::Async),
+        Some(serde_json::json!({
+          "_module_executions": module_executions,
+          "_entry_chunk_ids": entry_chunk_ids_literal,
+        })),
+      )?)
+    } else {
+      if module_executions.is_empty() {
+        return Ok("// Federation runtime entry modules not found in this chunk.".into());
+      }
+      // Sync startup: keep the legacy prevStartup wrapper for minimal surface area.
+      Ok(context.runtime_template.render(
+        &self.template_id(TemplateId::Sync),
+        Some(serde_json::json!({
+          "_module_executions": module_executions,
+        })),
+      )?)
+    }
+  }
+
+  fn stage(&self) -> RuntimeModuleStage {
+    RuntimeModuleStage::Trigger // Run after RemoteRuntimeModule and StartupChunkDependenciesRuntimeModule
+  }
+}

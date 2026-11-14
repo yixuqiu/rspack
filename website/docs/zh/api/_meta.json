@@ -1,20 +1,27 @@
 [
+  {
+    "type": "section-header",
+    "label": "介绍"
+  },
   "index",
   "cli",
   {
-    "type": "dir",
-    "name": "modules",
-    "label": "模块"
+    "type": "dir-section-header",
+    "name": "runtime-api",
+    "label": "Rspack 运行时 API"
   },
-  "node-api",
-  "hmr",
   {
-    "type": "dir",
+    "type": "dir-section-header",
+    "name": "javascript-api",
+    "label": "JavaScript API"
+  },
+  {
+    "type": "dir-section-header",
     "name": "loader-api",
     "label": "Loader API"
   },
   {
-    "type": "dir",
+    "type": "dir-section-header",
     "name": "plugin-api",
     "label": "插件 API"
   }

@@ -1,45 +1,48 @@
-use std::borrow::Cow;
-use std::hash::Hash;
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
-use rspack_error::{impl_empty_diagnosable_trait, Diagnostic, Result};
-use rspack_hash::RspackHash;
-use rspack_identifier::{Identifiable, Identifier};
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_collections::{Identifiable, Identifier};
+use rspack_error::{Result, impl_empty_diagnosable_trait};
+use rspack_hash::RspackHashDigest;
 use rspack_macros::impl_source_map_config;
-use rspack_sources::Source;
+use rspack_sources::BoxSource;
 use rspack_util::source_map::SourceMapKind;
 
 use crate::{
-  impl_module_meta_info, AsyncDependenciesBlockIdentifier, BuildContext, BuildInfo, BuildMeta,
-  BuildResult, ChunkUkey, CodeGenerationResult, Compilation, ConcatenationScope, Context,
-  DependenciesBlock, DependencyId, FactoryMeta, LibIdentOptions, Module, ModuleIdentifier,
-  ModuleType, RuntimeSpec, SourceType,
+  BoxModule, BuildContext, BuildInfo, BuildMeta, ChunkUkey, CodeGenerationResultBuilder,
+  Compilation, Context, DependenciesBlock, DependenciesBlockData, FactoryMetaStore, FreezeLock,
+  LibIdentOptions, Module, ModuleCodeGenerationContext, ModuleGraph, ModuleIdentifier, ModuleType,
+  RuntimeSpec, SourceType, impl_module_meta_info,
 };
 
 #[impl_source_map_config]
+#[cacheable]
 #[derive(Debug)]
 pub struct SelfModule {
   identifier: ModuleIdentifier,
   readable_identifier: String,
-  blocks: Vec<AsyncDependenciesBlockIdentifier>,
-  dependencies: Vec<DependencyId>,
-  factory_meta: Option<FactoryMeta>,
-  build_info: Option<BuildInfo>,
-  build_meta: Option<BuildMeta>,
+  dependencies_block: DependenciesBlockData,
+  factory_meta: FactoryMetaStore,
+  build_info: FreezeLock<BuildInfo>,
+  build_meta: FreezeLock<BuildMeta>,
 }
 
 impl SelfModule {
   pub fn new(module_identifier: ModuleIdentifier) -> Self {
-    let identifier = format!("self {}", module_identifier);
+    let identifier = format!("self {module_identifier}");
     Self {
       identifier: ModuleIdentifier::from(identifier.as_str()),
       readable_identifier: identifier,
-      blocks: Default::default(),
-      dependencies: Default::default(),
-      factory_meta: None,
-      build_info: None,
-      build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      dependencies_block: Default::default(),
+      factory_meta: Default::default(),
+      build_info: BuildInfo {
+        strict: true,
+        ..Default::default()
+      }
+      .into(),
+      build_meta: Default::default(),
+      source_map_kind: SourceMapKind::empty(),
     }
   }
 }
@@ -51,32 +54,21 @@ impl Identifiable for SelfModule {
 }
 
 impl DependenciesBlock for SelfModule {
-  fn add_block_id(&mut self, block: AsyncDependenciesBlockIdentifier) {
-    self.blocks.push(block)
+  fn dependencies_block(&self) -> &DependenciesBlockData {
+    &self.dependencies_block
   }
 
-  fn get_blocks(&self) -> &[AsyncDependenciesBlockIdentifier] {
-    &self.blocks
-  }
-
-  fn add_dependency_id(&mut self, dependency: DependencyId) {
-    self.dependencies.push(dependency)
-  }
-
-  fn get_dependencies(&self) -> &[DependencyId] {
-    &self.dependencies
+  fn dependencies_block_mut(&mut self) -> &mut DependenciesBlockData {
+    &mut self.dependencies_block
   }
 }
 
+#[cacheable_dyn]
 #[async_trait]
 impl Module for SelfModule {
   impl_module_meta_info!();
 
-  fn get_diagnostics(&self) -> Vec<Diagnostic> {
-    vec![]
-  }
-
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>) -> f64 {
     self.identifier.len() as f64
   }
 
@@ -84,19 +76,19 @@ impl Module for SelfModule {
     &ModuleType::Fallback
   }
 
-  fn source_types(&self) -> &[SourceType] {
+  fn source_types(&self, _module_graph: &ModuleGraph) -> &[SourceType] {
     &[SourceType::JavaScript]
   }
 
-  fn original_source(&self) -> Option<&dyn Source> {
+  fn source(&self) -> Option<&BoxSource> {
     None
   }
 
-  fn readable_identifier(&self, _context: &Context) -> Cow<str> {
+  fn readable_identifier(&self, _context: &Context) -> Cow<'_, str> {
     self.readable_identifier.as_str().into()
   }
 
-  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<str>> {
+  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<'_, str>> {
     None
   }
 
@@ -104,54 +96,33 @@ impl Module for SelfModule {
     None
   }
 
-  async fn build(
-    &mut self,
-    build_context: BuildContext<'_>,
-    _: Option<&Compilation>,
-  ) -> Result<BuildResult> {
-    let mut hasher = RspackHash::from(&build_context.compiler_options.output);
-    self.update_hash(&mut hasher);
-
-    let build_info = BuildInfo {
-      strict: true,
-      hash: Some(hasher.digest(&build_context.compiler_options.output.hash_digest)),
-      ..Default::default()
-    };
-
-    Ok(BuildResult {
-      build_info,
-      build_meta: Default::default(),
-      dependencies: Vec::new(),
-      blocks: Vec::new(),
-      analyze_result: Default::default(),
-      optimization_bailouts: vec![],
-    })
+  // #[tracing::instrument("SelfModule::code_generation", skip_all, fields(identifier = ?self.identifier()))]
+  async fn code_generation(
+    &self,
+    _code_generation_context: &mut ModuleCodeGenerationContext,
+  ) -> Result<CodeGenerationResultBuilder> {
+    Ok(CodeGenerationResultBuilder::default())
   }
 
-  #[allow(clippy::unwrap_in_result)]
-  fn code_generation(
+  async fn get_runtime_hash(
     &self,
-    _compilation: &Compilation,
+    compilation: &Compilation,
     _runtime: Option<&RuntimeSpec>,
-    _: Option<ConcatenationScope>,
-  ) -> Result<CodeGenerationResult> {
-    Ok(CodeGenerationResult::default())
+  ) -> Result<RspackHashDigest> {
+    // do nothing, since this is self reference, the module itself (parent module of this self module) should take effects
+    Ok(RspackHashDigest::new(
+      &[],
+      &compilation.options.output.hash_digest,
+    ))
+  }
+
+  async fn build(
+    self: Box<Self>,
+    _build_context: Arc<BuildContext>,
+    _compilation: Option<&Compilation>,
+  ) -> Result<BoxModule> {
+    Ok(BoxModule::new(self))
   }
 }
 
 impl_empty_diagnosable_trait!(SelfModule);
-
-impl Hash for SelfModule {
-  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    "__rspack_internal__SelfModule".hash(state);
-    self.identifier().hash(state);
-  }
-}
-
-impl PartialEq for SelfModule {
-  fn eq(&self, other: &Self) -> bool {
-    self.identifier() == other.identifier()
-  }
-}
-
-impl Eq for SelfModule {}

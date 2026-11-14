@@ -1,25 +1,32 @@
-#![feature(let_chains)]
+use std::sync::LazyLock;
 
-use async_trait::async_trait;
 use rspack_core::{
-  ApplyContext, BoxDependency, Compilation, CompilationParams, CompilerCompilation, CompilerMake,
-  CompilerOptions, Context, DependencyType, EntryDependency, EntryOptions, MakeParam, Plugin,
-  PluginContext,
+  Compilation, CompilationParams, CompilerCompilation, CompilerMake, Context, DependencyRef,
+  DependencyType, EntryDependency, EntryOptions, Plugin,
 };
 use rspack_error::Result;
 use rspack_hook::{plugin, plugin_hook};
 
+type LazyDependency = LazyLock<DependencyRef, Box<dyn FnOnce() -> DependencyRef + Send>>;
+
 #[plugin]
 #[derive(Debug)]
 pub struct EntryPlugin {
+  // Need "cache" the dependency to tell incremental that this entry dependency is not changed
+  // so it can be reused and skip the module make
+  dependency: LazyDependency,
   options: EntryOptions,
-  entry_request: String,
-  context: Context,
 }
 
 impl EntryPlugin {
   pub fn new(context: Context, entry_request: String, options: EntryOptions) -> Self {
-    Self::new_inner(options, entry_request, context)
+    let layer = options.layer.clone();
+    let name = options.name.is_none();
+    let dependency: LazyDependency = LazyLock::new(Box::new(move || {
+      DependencyRef::new(EntryDependency::new(entry_request, context, layer, name))
+    }));
+
+    Self::new_inner(dependency, options)
   }
 }
 
@@ -34,39 +41,18 @@ async fn compilation(
 }
 
 #[plugin_hook(CompilerMake for EntryPlugin)]
-async fn make(&self, compilation: &mut Compilation, params: &mut Vec<MakeParam>) -> Result<()> {
-  if let Some(state) = compilation.options.get_incremental_rebuild_make_state()
-    && !state.is_first()
-  {
-    return Ok(());
-  }
+async fn make(&self, compilation: &mut Compilation) -> Result<()> {
   let this = &self.inner;
-  let dependency: BoxDependency = Box::new(EntryDependency::new(
-    this.entry_request.clone(),
-    this.context.clone(),
-  ));
-  let dependency_id = *dependency.id();
   compilation
-    .add_entry(dependency, this.options.clone())
+    .add_entry(this.dependency.clone(), this.options.clone())
     .await?;
-
-  params.push(MakeParam::new_force_build_dep_param(dependency_id, None));
   Ok(())
 }
 
-#[async_trait]
 impl Plugin for EntryPlugin {
-  fn apply(
-    &self,
-    ctx: PluginContext<&mut ApplyContext>,
-    _options: &mut CompilerOptions,
-  ) -> Result<()> {
-    ctx
-      .context
-      .compiler_hooks
-      .compilation
-      .tap(compilation::new(self));
-    ctx.context.compiler_hooks.make.tap(make::new(self));
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compiler_hooks.compilation.tap(compilation::new(self));
+    ctx.compiler_hooks.make.tap(make::new(self));
     Ok(())
   }
 }

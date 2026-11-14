@@ -1,0 +1,342 @@
+use std::sync::Arc;
+
+use rspack_error::BatchErrors;
+use rspack_util::source_map::SourceMapKind;
+use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
+pub use swc_core::base::BoolOrDataConfig;
+use swc_core::{
+  atoms::Atom,
+  base::{
+    BoolOr,
+    config::{IsModule, JsMinifyCommentOption, JsMinifyFormatOptions, SourceMapsConfig},
+  },
+  common::{
+    BytePos, FileName, Mark,
+    comments::{Comment, CommentKind, Comments, SingleThreadedComments},
+    errors::HANDLER,
+  },
+  ecma::{
+    ast::Ident,
+    parser::{EsSyntax, Syntax},
+    transforms::base::{
+      fixer::{fixer, paren_remover},
+      hygiene::hygiene,
+      resolver,
+    },
+    visit::{Visit, VisitMutWith, noop_visit_type},
+  },
+};
+pub use swc_ecma_minifier::option::{
+  MangleOptions, MinifyOptions, TopLevelOptions,
+  terser::{TerserCompressorOptions, TerserEcmaVersion},
+};
+
+use super::{
+  JavaScriptCompiler, TransformOutput,
+  stringify::{PrintOptions, SourceMapConfig},
+};
+use crate::error::with_rspack_error_handler;
+
+/**
+ * Some code is modified based on
+ * https://github.com/swc-project/swc/blob/e6fc5327b1a309eae840fe1ec3a2367adab37430/crates/swc_compiler_base/src/lib.rs#L342
+ * Apache-2.0 licensed
+ * Author Donny/강동윤
+ * Copyright (c)
+ */
+pub(super) fn minify_file_comments(
+  comments: &SingleThreadedComments,
+  preserve_comments: &BoolOr<JsMinifyCommentOption>,
+  preserve_annotations: bool,
+) {
+  match preserve_comments {
+    BoolOr::Bool(true) | BoolOr::Data(JsMinifyCommentOption::PreserveAllComments) => {}
+
+    BoolOr::Data(JsMinifyCommentOption::PreserveSomeComments) => {
+      let preserve_excl = |_: &BytePos, vc: &mut std::vec::Vec<Comment>| -> bool {
+        // Preserve license comments.
+        //
+        // See https://github.com/terser/terser/blob/798135e04baddd94fea403cfaab4ba8b22b1b524/lib/output.js#L175-L181
+        vc.retain(|c: &Comment| {
+          c.text.contains("@lic")
+            || c.text.contains("@preserve")
+            || c.text.contains("@copyright")
+            || c.text.contains("@cc_on")
+            || (preserve_annotations
+              && (c.text.contains("__PURE__")
+                || c.text.contains("__INLINE__")
+                || c.text.contains("__NOINLINE__")
+                || c.text.contains("@vite-ignore")))
+            || (c.kind == CommentKind::Block && c.text.starts_with('!'))
+        });
+        !vc.is_empty()
+      };
+      let (mut l, mut t) = comments.borrow_all_mut();
+
+      l.retain(preserve_excl);
+      t.retain(preserve_excl);
+    }
+
+    BoolOr::Bool(false) => {
+      let (mut l, mut t) = comments.borrow_all_mut();
+      l.clear();
+      t.clear();
+    }
+    BoolOr::Data(JsMinifyCommentOption::PreserveRegexComments { regex }) => {
+      let preserve_excl = |_: &BytePos, vc: &mut std::vec::Vec<Comment>| -> bool {
+        // Preserve comments that match the regex
+        //
+        // See https://github.com/terser/terser/blob/798135e04baddd94fea403cfaab4ba8b22b1b524/lib/output.js#L286
+        vc.retain(|c: &Comment| regex.find(&c.text).is_some());
+        !vc.is_empty()
+      };
+      let (mut l, mut t) = comments.borrow_all_mut();
+      l.retain(preserve_excl);
+      t.retain(preserve_excl);
+    }
+  }
+}
+
+impl JavaScriptCompiler {
+  /// Minifies the given JavaScript source code.
+  ///
+  /// This method takes a filename, the source code to minify, minification options, and an optional function to operate on comments.
+  /// It returns a `TransformOutput` containing the minified code and an optional source map.
+  ///
+  /// # Parameters
+  ///
+  /// - `filename`: The name of the file being minified.
+  /// - `source`: The source code to minify.
+  /// - `opts`: The options for minification.
+  /// - `comments_op`: An optional function to operate on the comments in the source code.
+  ///
+  /// # Returns
+  ///
+  /// A `Result` containing a `TransformOutput` if the minification is successful, or a `BatchErrors` if an error occurs.
+  pub fn minify<S: Into<String>, F>(
+    &self,
+    filename: FileName,
+    source: S,
+    opts: JsMinifyOptions,
+    comments_op: Option<F>,
+  ) -> Result<TransformOutput, BatchErrors>
+  where
+    F: for<'a> FnOnce(&'a SingleThreadedComments),
+  {
+    self.run(|| -> Result<TransformOutput, BatchErrors> {
+      with_rspack_error_handler("Minify Error".to_string(), self.cm.clone(), |handler| {
+        let fm = self.cm.new_source_file(Arc::new(filename), source.into());
+
+        let source_map = opts
+          .source_map
+          .as_ref()
+          .map(|_| SourceMapsConfig::Bool(true))
+          .unwrap_as_option(|v| {
+            Some(match v {
+              Some(true) => SourceMapsConfig::Bool(true),
+              _ => SourceMapsConfig::Bool(false),
+            })
+          })
+          .expect("should have source map config");
+        let source_map_kind = SourceMapKind::from_enabled(source_map.enabled())
+          .with_sources_content(opts.inline_sources_content);
+
+        let mut min_opts = MinifyOptions {
+          compress: opts
+            .compress
+            .clone()
+            .unwrap_as_option(|default| match default {
+              Some(true) | None => Some(Default::default()),
+              _ => None,
+            })
+            .map(|v| v.into_config(self.cm.clone())),
+          mangle: opts
+            .mangle
+            .clone()
+            .unwrap_as_option(|default| match default {
+              Some(true) | None => Some(Default::default()),
+              _ => None,
+            }),
+          ..Default::default()
+        };
+
+        // top_level defaults to true if module is true
+
+        // https://github.com/swc-project/swc/issues/2254
+        if opts.module.unwrap_or(false) {
+          if let Some(opts) = &mut min_opts.compress
+            && opts.top_level.is_none()
+          {
+            opts.top_level = Some(TopLevelOptions { functions: true });
+          }
+
+          if let Some(opts) = &mut min_opts.mangle {
+            opts.top_level = Some(true);
+          }
+        }
+
+        let comments = SingleThreadedComments::default();
+
+        let target = opts.ecma.clone().into();
+        let program = self.parse_js(
+          fm.clone(),
+          target,
+          Syntax::Es(EsSyntax {
+            jsx: true,
+            decorators: true,
+            decorators_before_export: true,
+            import_attributes: true,
+            ..Default::default()
+          }),
+          opts
+            .module
+            .map_or_else(|| IsModule::Unknown, IsModule::Bool),
+          Some(&comments),
+        )?;
+
+        let unresolved_mark = Mark::new();
+        let top_level_mark = Mark::new();
+
+        let is_mangler_enabled = min_opts.mangle.is_some();
+
+        let program = HANDLER.set(handler, || {
+          let program = program
+            .apply(&mut resolver(unresolved_mark, top_level_mark, false))
+            .apply(&mut paren_remover(Some(&comments as &dyn Comments)));
+          let mut program = swc_ecma_minifier::optimize(
+            program,
+            self.cm.clone(),
+            Some(&comments),
+            None,
+            &min_opts,
+            &swc_ecma_minifier::option::ExtraOptions {
+              unresolved_mark,
+              top_level_mark,
+              mangle_name_cache: None,
+            },
+          );
+
+          if !is_mangler_enabled {
+            program.visit_mut_with(&mut hygiene())
+          }
+          program.apply(&mut fixer(Some(&comments as &dyn Comments)))
+        });
+
+        if let Some(op) = comments_op {
+          op(&comments);
+        }
+
+        minify_file_comments(
+          &comments,
+          &opts
+            .format
+            .comments
+            .clone()
+            .into_inner()
+            .unwrap_or(BoolOr::Data(JsMinifyCommentOption::PreserveSomeComments)),
+          opts.format.preserve_annotations,
+        );
+
+        let print_options = PrintOptions {
+          source_len: fm.byte_length(),
+          source_map: self.cm.clone(),
+          target,
+          source_map_config: SourceMapConfig {
+            source_map_kind,
+            names: Default::default(),
+          },
+          input_source_map: None,
+          minify: opts.minify,
+          comments: Some(&comments),
+          preamble: &opts.format.preamble,
+          ascii_only: opts.format.ascii_only,
+          inline_script: opts.format.inline_script,
+        };
+
+        self.print(&program, print_options).map_err(|e| e.into())
+      })
+    })
+  }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Represents the options for minifying JavaScript code.
+pub struct JsMinifyOptions {
+  #[serde(default = "true_as_default")]
+  /// Indicates whether to minify the code.
+  pub minify: bool,
+
+  #[serde(default)]
+  /// Configuration for compressing the code.
+  pub compress: BoolOrDataConfig<TerserCompressorOptions>,
+
+  #[serde(default)]
+  /// Configuration for mangling names in the code.
+  pub mangle: BoolOrDataConfig<MangleOptions>,
+
+  #[serde(default)]
+  /// Options for formatting the minified code.
+  pub format: JsMinifyFormatOptions,
+
+  #[serde(default)]
+  /// The ECMAScript version to target.
+  pub ecma: TerserEcmaVersion,
+
+  #[serde(default, rename = "keep_classnames")]
+  /// Indicates whether to keep class names unchanged.
+  pub keep_class_names: bool,
+
+  #[serde(default, rename = "keep_fnames")]
+  /// Indicates whether to keep function names unchanged.
+  pub keep_fn_names: bool,
+
+  #[serde(default)]
+  /// Indicates whether to wrap the code in a module.
+  pub module: Option<bool>,
+
+  #[serde(default)]
+  /// Indicates whether to support Safari 10.
+  pub safari10: bool,
+
+  #[serde(default)]
+  /// Indicates whether to scope the top level to the global object.
+  pub toplevel: bool,
+
+  #[serde(default)]
+  /// Configuration for source maps.
+  pub source_map: BoolOrDataConfig<TerserSourceMapKind>,
+
+  #[serde(default)]
+  /// The path where the minified output will be written.
+  pub output_path: Option<String>,
+
+  #[serde(default = "true_as_default")]
+  /// Indicates whether to inline the source content in the source map.
+  pub inline_sources_content: bool,
+}
+
+const fn true_as_default() -> bool {
+  true
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TerserSourceMapKind {
+  pub filename: Option<String>,
+  pub url: Option<String>,
+  pub root: Option<String>,
+  pub content: Option<String>,
+}
+
+pub struct IdentCollector {
+  pub names: FxHashMap<BytePos, Atom>,
+}
+
+impl Visit for IdentCollector {
+  noop_visit_type!();
+
+  fn visit_ident(&mut self, ident: &Ident) {
+    self.names.insert(ident.span.lo, ident.sym.clone());
+  }
+}

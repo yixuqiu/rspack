@@ -1,0 +1,1886 @@
+use std::{
+  hash::BuildHasherDefault,
+  sync::atomic::{AtomicBool, Ordering},
+};
+
+use indexmap::IndexMap;
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  rkyv::with::{AtomicLoad, Relaxed},
+  with::{AsOption, AsPreset, AsVec},
+};
+use rspack_collections::{IdentifierMap, IdentifierSet};
+use rspack_core::{
+  AsContextDependency, ChunkGraph, ConditionalInitFragment, ConnectionState, Dependency,
+  DependencyCategory, DependencyCodeGeneration, DependencyCondition, DependencyConditionFn,
+  DependencyDiagnosticsContext, DependencyId, DependencyLocation, DependencyRange,
+  DependencyTemplate, DependencyTemplateType, DependencyType, DetermineExportAssignmentsKey,
+  ESMExportBinding, ESMExportInitFragment, ExportInfoData, ExportMode, ExportModeDynamicReexport,
+  ExportModeEmptyStar, ExportModeFakeNamespaceObject, ExportModeNormalReexport,
+  ExportModeReexportDynamicDefault, ExportModeReexportNamedDefault,
+  ExportModeReexportNamespaceObject, ExportModeReexportUndefined, ExportModeUnused,
+  ExportNameOrSpec, ExportPresenceMode, ExportProvided, ExportSpec, ExportsInfoArtifact,
+  ExportsOfExportsSpec, ExportsSpec, ExportsType, ForwardId, ImportAttributes, ImportPhase,
+  InitFragmentExt, InitFragmentKey, InitFragmentStage, JavascriptParserOptions, LazyUntil,
+  ModuleDependency, ModuleGraph, ModuleGraphCacheArtifact, ModuleIdentifier, NormalInitFragment,
+  NormalReexportItem, ReferencedExport, ResourceIdentifier, RuntimeCondition, RuntimeGlobals,
+  RuntimeSpec, SideEffectsStateArtifact, StarReexportsInfo, TemplateContext, TemplateReplaceSource,
+  UsageState, UsedName, collect_referenced_export_items, create_exports_object_referenced,
+  create_no_exports_referenced, filter_runtime, get_exports_type, get_runtime_key,
+  get_terminal_binding, property_access, property_name,
+  render_make_deferred_namespace_mode_from_exports_type, to_normal_comment,
+};
+use rspack_error::{Diagnostic, Error, Severity};
+use rspack_hash::{RspackHash, RspackHasher};
+use rspack_intern::IndexAtomSet;
+use rspack_util::json_stringify;
+use rustc_hash::{FxHashSet as HashSet, FxHasher};
+
+use super::{
+  esm_import_dependency::esm_import_dependency_get_linking_error, esm_import_dependency_apply,
+};
+use crate::{Atom, connection_active_inline_value_for_esm_export_imported_specifier};
+
+const DYNAMIC_REEXPORT_RUNTIME_THRESHOLD: usize = 16;
+
+// Create __rspack_context.d(__rspack_exports, {}).
+// case1: `import { a } from 'a'; export { a }`
+// case2: `export { a } from 'a';`
+// case3: `export * from 'a'`
+#[cacheable]
+#[derive(Debug)]
+pub struct ESMExportImportedSpecifierDependency {
+  pub id: DependencyId,
+  #[cacheable(with=AsVec<AsPreset>)]
+  ids: Vec<Atom>,
+  #[cacheable(with=AsOption<AsPreset>)]
+  pub name: Option<Atom>,
+  #[cacheable(with=AsPreset)]
+  pub request: Atom,
+  source_order: i32,
+  pub other_star_exports: Option<Vec<DependencyId>>,
+  range: DependencyRange,
+  phase: ImportPhase,
+  attributes: Option<ImportAttributes>,
+  resource_identifier: ResourceIdentifier,
+  export_presence_mode: ExportPresenceMode,
+  loc: Option<DependencyLocation>,
+  #[cacheable(with=AtomicLoad<Relaxed>)]
+  lazy_make: AtomicBool,
+}
+
+impl ESMExportImportedSpecifierDependency {
+  #[allow(clippy::too_many_arguments)]
+  pub fn new(
+    request: Atom,
+    source_order: i32,
+    ids: Vec<Atom>,
+    name: Option<Atom>,
+    other_star_exports: Option<Vec<DependencyId>>,
+    range: DependencyRange,
+    export_presence_mode: ExportPresenceMode,
+    phase: ImportPhase,
+    attributes: Option<ImportAttributes>,
+    resource_identifier: ResourceIdentifier,
+    loc: Option<DependencyLocation>,
+  ) -> Self {
+    Self {
+      id: DependencyId::new(),
+      source_order,
+      name,
+      request,
+      ids,
+      resource_identifier,
+      other_star_exports,
+      range,
+      export_presence_mode,
+      phase,
+      attributes,
+      loc,
+      lazy_make: AtomicBool::new(false),
+    }
+  }
+
+  // Because it is shared by multiply ESMExportImportedSpecifierDependency, so put it to `BuildInfo`
+  pub fn active_exports<'a>(
+    &self,
+    module_graph: &'a ModuleGraph,
+  ) -> rspack_core::FreezeReadGuard<'a, HashSet<Atom>> {
+    let build_info = module_graph
+      .get_parent_module(&self.id)
+      .and_then(|ident| module_graph.module_by_identifier(ident))
+      .expect("should have mgm")
+      .build_info();
+    build_info.map(|info| &info.esm_named_exports)
+  }
+
+  // Because it is shared by multiply ESMExportImportedSpecifierDependency, so put it to `BuildInfo`
+  pub fn all_star_exports<'a>(
+    &self,
+    module_graph: &'a ModuleGraph,
+  ) -> Option<(
+    ModuleIdentifier,
+    rspack_core::FreezeReadGuard<'a, Vec<DependencyId>>,
+  )> {
+    let module = module_graph
+      .get_parent_module(&self.id)
+      .and_then(|ident| module_graph.module_by_identifier(ident));
+
+    if let Some(module) = module {
+      let build_info = module.build_info();
+      Some((
+        module.identifier(),
+        build_info.map(|info| &info.all_star_exports),
+      ))
+    } else {
+      None
+    }
+  }
+
+  pub fn get_ids<'a>(&'a self, mg: &'a ModuleGraph) -> &'a [Atom] {
+    mg.get_dep_meta_if_existing(&self.id)
+      .map_or_else(|| self.ids.as_slice(), |meta| meta.ids.as_slice())
+  }
+
+  pub fn get_mode(
+    &self,
+    module_graph: &ModuleGraph,
+    runtime: Option<&RuntimeSpec>,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> ExportMode {
+    let key = (self.id, runtime.map(|r| get_runtime_key(r).clone()));
+    module_graph_cache.cached_get_mode(key, || {
+      self.get_mode_inner(
+        module_graph,
+        module_graph_cache,
+        exports_info_artifact,
+        runtime,
+      )
+    })
+  }
+
+  fn get_mode_inner(
+    &self,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+    runtime: Option<&RuntimeSpec>,
+  ) -> ExportMode {
+    let id = &self.id;
+    let name = self.name.clone();
+    let Some(imported_module_identifier) = module_graph.module_identifier_by_dependency_id(id)
+    else {
+      // if it's not exists in module graph and has the lazy mark, then it's never picked up to make the module
+      return if self.lazy_make.load(Ordering::Relaxed) {
+        ExportMode::LazyMake
+      } else {
+        ExportMode::Missing
+      };
+    };
+
+    let parent_module = module_graph
+      .get_parent_module(id)
+      .expect("should have parent module");
+
+    if let Some(name) = name {
+      let exports_info = exports_info_artifact.get_exports_info_data(parent_module);
+      if !exports_info
+        .get_read_only_export_info(&name)
+        .is_used(runtime)
+      {
+        return ExportMode::Unused(ExportModeUnused { name: "*".into() });
+      }
+
+      let imported_exports_type = get_exports_type(
+        module_graph,
+        module_graph_cache,
+        exports_info_artifact,
+        id,
+        parent_module,
+      );
+      let ids = self.get_ids(module_graph);
+
+      // Special handling for reexporting the default export
+      // from non-namespace modules
+      if ids.first().map(|item| item.as_ref()) == Some("default") {
+        match imported_exports_type {
+          ExportsType::Dynamic => {
+            return ExportMode::ReexportDynamicDefault(ExportModeReexportDynamicDefault { name });
+          }
+          ExportsType::DefaultOnly | ExportsType::DefaultWithNamed => {
+            return ExportMode::ReexportNamedDefault(ExportModeReexportNamedDefault {
+              partial_namespace_export_info: exports_info.get_read_only_export_info(&name).id(),
+              name,
+            });
+          }
+          _ => {}
+        }
+      }
+
+      // reexporting with a fixed name
+      let export_info = exports_info.get_read_only_export_info(&name).id();
+      let res = if ids.is_empty() {
+        // export * as name
+        match imported_exports_type {
+          ExportsType::DefaultOnly => {
+            ExportMode::ReexportFakeNamespaceObject(ExportModeFakeNamespaceObject {
+              name,
+              partial_namespace_export_info: export_info,
+              fake_type: 0,
+            })
+          }
+          ExportsType::DefaultWithNamed => {
+            ExportMode::ReexportFakeNamespaceObject(ExportModeFakeNamespaceObject {
+              name,
+              partial_namespace_export_info: export_info,
+              fake_type: 2,
+            })
+          }
+          _ => ExportMode::ReexportNamespaceObject(ExportModeReexportNamespaceObject {
+            name,
+            partial_namespace_export_info: export_info,
+          }),
+        }
+      } else {
+        // export { name as name }
+        match imported_exports_type {
+          ExportsType::DefaultOnly => {
+            ExportMode::ReexportUndefined(ExportModeReexportUndefined { name })
+          }
+          _ => ExportMode::NormalReexport(ExportModeNormalReexport {
+            items: vec![NormalReexportItem {
+              name,
+              ids: ids.to_vec(),
+              hidden: false,
+              checked: false,
+              export_info,
+            }],
+          }),
+        }
+      };
+      return res;
+    }
+
+    let exports_info = exports_info_artifact.get_exports_info_data(parent_module);
+    if !exports_info.is_used(runtime) {
+      return ExportMode::Unused(ExportModeUnused { name: "*".into() });
+    }
+
+    // export * from
+    let StarReexportsInfo {
+      exports,
+      checked,
+      ignored_exports,
+      hidden,
+    } = self.get_star_reexports(
+      module_graph,
+      module_graph_cache,
+      exports_info_artifact,
+      runtime,
+      parent_module,
+      imported_module_identifier,
+    );
+
+    let Some(exports) = exports else {
+      return ExportMode::DynamicReexport(Box::new(ExportModeDynamicReexport {
+        ignored: ignored_exports,
+        hidden,
+      }));
+    };
+
+    if exports.is_empty() {
+      return ExportMode::EmptyStar(ExportModeEmptyStar { hidden });
+    }
+
+    let mut items = exports
+      .iter()
+      .map(|export_name| NormalReexportItem {
+        name: export_name.clone(),
+        ids: vec![export_name.clone()],
+        hidden: false,
+        checked: checked
+          .as_ref()
+          .map(|c| c.contains(export_name))
+          .unwrap_or_default(),
+        export_info: exports_info.get_read_only_export_info(export_name).id(),
+      })
+      .collect::<Vec<_>>();
+
+    if let Some(hidden) = &hidden {
+      for export_name in hidden.iter() {
+        items.push(NormalReexportItem {
+          name: export_name.clone(),
+          ids: vec![export_name.clone()],
+          hidden: true,
+          checked: false,
+          export_info: exports_info.get_read_only_export_info(export_name).id(),
+        });
+      }
+    }
+
+    ExportMode::NormalReexport(ExportModeNormalReexport { items })
+  }
+
+  pub fn get_star_reexports(
+    &self,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+    runtime: Option<&RuntimeSpec>,
+    parent_module: &ModuleIdentifier,
+    imported_module_identifier: &ModuleIdentifier,
+  ) -> StarReexportsInfo {
+    let exports_info = exports_info_artifact.get_exports_info_data(parent_module);
+    let imported_exports_info =
+      exports_info_artifact.get_exports_info_data(imported_module_identifier);
+
+    let no_extra_exports = matches!(
+      imported_exports_info.other_exports_info().provided(),
+      Some(ExportProvided::NotProvided)
+    );
+    let no_extra_imports = matches!(
+      exports_info.other_exports_info().get_used(runtime),
+      UsageState::Unused
+    );
+
+    let ignored_exports: HashSet<Atom> = {
+      let mut e = self.active_exports(module_graph).clone();
+      e.insert("default".into());
+      e
+    };
+
+    let hidden_exports = self
+      .discover_active_exports_from_other_star_exports(
+        module_graph,
+        module_graph_cache,
+        exports_info_artifact,
+      )
+      .map(|other_star_exports| {
+        other_star_exports
+          .names
+          .into_iter()
+          .take(other_star_exports.names_slice)
+          .filter(|name| !ignored_exports.contains(name))
+          .collect::<HashSet<_>>()
+      });
+
+    if !no_extra_exports && !no_extra_imports {
+      return StarReexportsInfo {
+        ignored_exports,
+        hidden: hidden_exports,
+        ..Default::default()
+      };
+    }
+
+    let mut exports = HashSet::default();
+    let mut checked = HashSet::default();
+    let mut hidden = if hidden_exports.is_some() {
+      Some(HashSet::default())
+    } else {
+      None
+    };
+
+    if no_extra_imports {
+      for export_info in exports_info.exports().values() {
+        let export_name = export_info.name().expect("should have export name");
+        if ignored_exports.contains(export_name) || !export_info.is_used(runtime) {
+          continue;
+        }
+
+        let imported_export_info = imported_exports_info.get_read_only_export_info(export_name);
+        if matches!(
+          imported_export_info.provided(),
+          Some(ExportProvided::NotProvided)
+        ) {
+          continue;
+        }
+
+        if hidden_exports
+          .as_ref()
+          .is_some_and(|hidden_exports| hidden_exports.contains(export_name))
+        {
+          hidden.as_mut().expect("According previous condition if hidden_exports is `Some`, hidden must be `Some(HashSet)").insert(export_name.clone());
+          continue;
+        }
+
+        if is_star_reexport_back_to_parent(
+          module_graph,
+          exports_info_artifact,
+          imported_export_info,
+          parent_module,
+        ) {
+          continue;
+        }
+
+        exports.insert(export_name.clone());
+        if matches!(
+          imported_export_info.provided(),
+          Some(ExportProvided::Provided)
+        ) {
+          continue;
+        }
+        checked.insert(export_name.clone());
+      }
+    } else if no_extra_exports {
+      for imported_export_info in imported_exports_info.exports().values() {
+        let imported_export_info_name = imported_export_info
+          .name()
+          .expect("should have export name");
+        if ignored_exports.contains(imported_export_info_name)
+          || matches!(
+            imported_export_info.provided(),
+            Some(ExportProvided::NotProvided)
+          )
+        {
+          continue;
+        }
+        if !exports_info
+          .get_read_only_export_info(imported_export_info_name)
+          .is_used(runtime)
+        {
+          continue;
+        }
+        if let Some(hidden) = hidden.as_mut()
+          && hidden_exports
+            .as_ref()
+            .is_some_and(|hidden_exports| hidden_exports.contains(imported_export_info_name))
+        {
+          hidden.insert(imported_export_info_name.clone());
+          continue;
+        }
+
+        if is_star_reexport_back_to_parent(
+          module_graph,
+          exports_info_artifact,
+          imported_export_info,
+          parent_module,
+        ) {
+          continue;
+        }
+
+        exports.insert(imported_export_info_name.clone());
+        if matches!(
+          imported_export_info.provided(),
+          Some(ExportProvided::Provided)
+        ) {
+          continue;
+        }
+        checked.insert(imported_export_info_name.clone());
+      }
+    }
+
+    StarReexportsInfo {
+      ignored_exports,
+      exports: Some(exports),
+      checked: Some(checked),
+      hidden,
+    }
+  }
+
+  pub fn discover_active_exports_from_other_star_exports(
+    &self,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> Option<DiscoverActiveExportsFromOtherStarExportsRet> {
+    if let Some(other_star_exports) = &self.other_star_exports {
+      if other_star_exports.is_empty() {
+        return None;
+      }
+    } else {
+      return None;
+    }
+    let i = self.other_star_exports.as_ref()?.len();
+
+    if let Some((module_identifier, all_star_exports)) = self.all_star_exports(module_graph)
+      && !all_star_exports.is_empty()
+    {
+      let (names, dependency_indices) = module_graph_cache.cached_determine_export_assignments(
+        DetermineExportAssignmentsKey::All(module_identifier),
+        || {
+          determine_export_assignments(
+            module_graph,
+            exports_info_artifact,
+            &module_identifier,
+            &all_star_exports,
+            None,
+          )
+        },
+      );
+
+      return Some(DiscoverActiveExportsFromOtherStarExportsRet {
+        names,
+        names_slice: dependency_indices[i - 1],
+        dependency_indices,
+        dependency_index: i,
+      });
+    }
+
+    if let Some(other_star_exports) = &self.other_star_exports {
+      let (names, dependency_indices) = module_graph_cache.cached_determine_export_assignments(
+        DetermineExportAssignmentsKey::Other(self.id),
+        || {
+          determine_export_assignments(
+            module_graph,
+            exports_info_artifact,
+            module_graph
+              .get_parent_module(&self.id)
+              .expect("should have parent module"),
+            other_star_exports,
+            Some(self.id),
+          )
+        },
+      );
+      return Some(DiscoverActiveExportsFromOtherStarExportsRet {
+        names,
+        names_slice: dependency_indices[i - 1],
+        dependency_indices,
+        dependency_index: i,
+      });
+    }
+    None
+  }
+
+  pub fn add_export_fragments(&self, ctxt: &mut TemplateContext, mode: ExportMode) {
+    let module = ctxt.module;
+    let runtime = ctxt.runtime;
+    let compilation = ctxt.compilation;
+    let mg = &compilation.get_module_graph();
+    let mg_cache = &compilation.module_graph_cache_artifact;
+    let exports_info_artifact = &compilation.exports_info_artifact;
+    let module_identifier = module.identifier();
+    let target_module = mg.get_module_by_dependency_id(&self.id);
+    let import_var = compilation.get_import_var(
+      module_identifier,
+      target_module,
+      self.user_request(),
+      self.phase,
+      runtime,
+    );
+    match mode {
+      ExportMode::Missing | ExportMode::LazyMake | ExportMode::EmptyStar(_) => {
+        ctxt.init_fragments.push(
+          NormalInitFragment::new(
+            "/* empty/unused ESM star reexport */\n".to_string(),
+            InitFragmentStage::StageESMExports,
+            1,
+            InitFragmentKey::ESMEmptyReexport(import_var),
+            None,
+          )
+          .boxed(),
+        );
+      }
+      ExportMode::Unused(ExportModeUnused { name }) => ctxt.init_fragments.push(
+        NormalInitFragment::new(
+          to_normal_comment(&format!("unused reexport {name}")),
+          InitFragmentStage::StageESMExports,
+          1,
+          InitFragmentKey::ESMUnusedReexport(import_var),
+          None,
+        )
+        .boxed(),
+      ),
+      ExportMode::ReexportDynamicDefault(ExportModeReexportDynamicDefault { name }) => {
+        let exports_info = exports_info_artifact.get_exports_info_data(&module_identifier);
+        let used_name =
+          exports_info.get_used_name(exports_info_artifact, runtime, std::slice::from_ref(&name));
+        let key = render_used_name(used_name.as_ref());
+
+        let init_fragment = self
+          .get_reexport_fragment(
+            ctxt,
+            "reexport default from dynamic",
+            key,
+            &import_var,
+            ValueKey::Null,
+          )
+          .boxed();
+        ctxt.init_fragments.push(init_fragment);
+      }
+      ExportMode::ReexportNamedDefault(mode) => {
+        let exports_info = exports_info_artifact.get_exports_info_data(&module_identifier);
+        let used_name = exports_info.get_used_name(
+          exports_info_artifact,
+          runtime,
+          std::slice::from_ref(&mode.name),
+        );
+        let key = render_used_name(used_name.as_ref());
+        let init_fragment = self
+          .get_reexport_fragment(
+            ctxt,
+            "reexport default export from named module",
+            key,
+            &import_var,
+            ValueKey::Name,
+          )
+          .boxed();
+        ctxt.init_fragments.push(init_fragment);
+      }
+      ExportMode::ReexportNamespaceObject(mode) => {
+        let exports_info = exports_info_artifact.get_exports_info_data(&module_identifier);
+        let used_name = exports_info.get_used_name(
+          exports_info_artifact,
+          runtime,
+          std::slice::from_ref(&mode.name),
+        );
+        let key = render_used_name(used_name.as_ref());
+
+        if self.phase.is_defer()
+          && let Some(target_module) = target_module
+          && !target_module.build_meta().has_top_level_await()
+        {
+          let exports_type = target_module.get_exports_type(
+            mg,
+            mg_cache,
+            exports_info_artifact,
+            module.get_strict_esm_module(),
+          );
+          let (namespace_cache, namespace_expr) = self
+            .get_reexport_deferred_namespace_object_fragments(
+              ctxt,
+              key,
+              &import_var,
+              target_module.identifier(),
+              exports_type,
+            );
+          ctxt.init_fragments.push(namespace_cache.boxed());
+          ctxt.init_fragments.push(namespace_expr.boxed());
+          return;
+        }
+
+        let init_fragment = self
+          .get_reexport_fragment(
+            ctxt,
+            "reexport module object",
+            key,
+            &import_var,
+            ValueKey::Name,
+          )
+          .boxed();
+        ctxt.init_fragments.push(init_fragment);
+      }
+      ExportMode::ReexportFakeNamespaceObject(mode) => {
+        // TODO: reexport fake namespace object
+        let exports_info = exports_info_artifact.get_exports_info_data(&module_identifier);
+        let used_name = exports_info.get_used_name(
+          exports_info_artifact,
+          runtime,
+          std::slice::from_ref(&mode.name),
+        );
+        let key = render_used_name(used_name.as_ref());
+
+        if self.phase.is_defer()
+          && let Some(target_module) = target_module
+          && !target_module.build_meta().has_top_level_await()
+        {
+          let exports_type = target_module.get_exports_type(
+            mg,
+            mg_cache,
+            exports_info_artifact,
+            module.get_strict_esm_module(),
+          );
+          let (namespace_cache, namespace_expr) = self
+            .get_reexport_deferred_namespace_object_fragments(
+              ctxt,
+              key,
+              &import_var,
+              target_module.identifier(),
+              exports_type,
+            );
+          ctxt.init_fragments.push(namespace_cache.boxed());
+          ctxt.init_fragments.push(namespace_expr.boxed());
+          return;
+        }
+
+        let (namespace_cache, namespace_expr) =
+          self.get_reexport_fake_namespace_object_fragments(ctxt, key, &import_var, mode.fake_type);
+        ctxt.init_fragments.push(namespace_cache.boxed());
+        ctxt.init_fragments.push(namespace_expr.boxed());
+      }
+      ExportMode::ReexportUndefined(mode) => {
+        let exports_info = exports_info_artifact.get_exports_info_data(&module_identifier);
+        let used_name = exports_info.get_used_name(
+          exports_info_artifact,
+          runtime,
+          std::slice::from_ref(&mode.name),
+        );
+        let key = render_used_name(used_name.as_ref());
+
+        let init_fragment = self
+          .get_reexport_fragment(
+            ctxt,
+            "reexport non-default export from non-ESM",
+            key,
+            "undefined",
+            ValueKey::Name,
+          )
+          .boxed();
+        ctxt.init_fragments.push(init_fragment);
+      }
+      ExportMode::NormalReexport(mode) => {
+        let imported_module = mg
+          .module_identifier_by_dependency_id(&self.id)
+          .expect("should have imported module identifier");
+        let exports_info = exports_info_artifact.get_exports_info_data(&module_identifier);
+        for item in mode.items {
+          let NormalReexportItem {
+            name,
+            ids,
+            hidden,
+            checked,
+            export_info: _,
+          } = item;
+
+          if hidden {
+            continue;
+          }
+
+          let used_name =
+            exports_info.get_used_name(exports_info_artifact, runtime, std::slice::from_ref(&name));
+          let key = render_used_name(used_name.as_ref());
+
+          if checked {
+            let key = InitFragmentKey::ESMImport(format!("reexport (checked) {import_var} {name}"));
+            let runtime_condition = if self.weak() {
+              RuntimeCondition::Boolean(false)
+            } else if let Some(connection) = mg.connection_by_dependency_id(self.id()) {
+              filter_runtime(ctxt.runtime, |r| {
+                connection.is_target_active(
+                  mg,
+                  r,
+                  mg_cache,
+                  &ctxt
+                    .compilation
+                    .build_module_graph_artifact
+                    .side_effects_state_artifact,
+                  exports_info_artifact,
+                )
+              })
+            } else {
+              RuntimeCondition::Boolean(true)
+            };
+            let stmt = self.get_conditional_reexport_statement(
+              ctxt,
+              name,
+              &import_var,
+              ids[0].clone(),
+              ValueKey::UsedName(UsedName::Normal(ids)),
+            );
+            let is_async =
+              ModuleGraph::is_async(&compilation.async_modules_artifact, &module_identifier);
+            ctxt
+              .init_fragments
+              .push(Box::new(ConditionalInitFragment::new(
+                stmt,
+                if is_async {
+                  InitFragmentStage::StageAsyncESMImports
+                } else {
+                  InitFragmentStage::StageESMImports
+                },
+                self.source_order,
+                key,
+                None,
+                runtime_condition,
+              )));
+          } else {
+            let exports_info = exports_info_artifact.get_exports_info_data(imported_module);
+            let used_name = exports_info.get_used_name(exports_info_artifact, runtime, &ids);
+            let init_fragment = self
+              .get_reexport_fragment(ctxt, "reexport safe", key, &import_var, used_name.into())
+              .boxed();
+            ctxt.init_fragments.push(init_fragment);
+          }
+        }
+      }
+      ExportMode::DynamicReexport(mode) => {
+        let mut ignored = mode.ignored;
+        if let Some(hidden) = mode.hidden {
+          ignored.extend(hidden);
+        }
+
+        let use_runtime =
+          self.has_repeated_dynamic_reexports(mg, runtime, mg_cache, exports_info_artifact);
+        let exports_name = module.get_exports_argument();
+        let is_async =
+          ModuleGraph::is_async(&compilation.async_modules_artifact, &module.identifier());
+        let content = if use_runtime {
+          let reexport = ctxt
+            .runtime_template
+            .render_runtime_globals(&RuntimeGlobals::REEXPORT);
+          let exports = ctxt.runtime_template.render_exports_argument(exports_name);
+          let ignored = render_dynamic_reexport_excluded(&ignored);
+          format!("/* reexport */ {reexport}({exports}, {import_var}, {ignored});\n")
+        } else {
+          let environment = compilation.options.output.environment;
+          let supports_arrow_function = environment.supports_arrow_function();
+          let supports_const = environment.supports_const();
+          let mut content = format!(
+            r"
+/* reexport */ var __rspack_reexport = {{}};
+/* reexport */ for( {} __rspack_import_key in {import_var}) ",
+            if supports_const { "const" } else { "var" }
+          );
+
+          if ignored.len() > 1 {
+            content += &format!(
+              "if({}.indexOf(__rspack_import_key) < 0) ",
+              json_stringify(&ignored)
+            );
+          } else if let Some(item) = ignored.iter().next() {
+            content += &format!(
+              "if(__rspack_import_key !== {}) ",
+              rspack_util::json_stringify_str(item)
+            );
+          }
+          content += "__rspack_reexport[__rspack_import_key] =";
+          if supports_arrow_function && supports_const {
+            content += &format!("() => {import_var}[__rspack_import_key]");
+          } else {
+            content += &format!(
+              "function(key) {{ return {import_var}[key]; }}.bind(0, __rspack_import_key)"
+            );
+          }
+          content += &format!(
+            r#"
+/* reexport */ {}({}, __rspack_reexport);
+"#,
+            ctxt
+              .runtime_template
+              .render_runtime_globals(&RuntimeGlobals::DEFINE_PROPERTY_GETTERS),
+            ctxt.runtime_template.render_exports_argument(exports_name),
+          );
+          content
+        };
+        ctxt.init_fragments.push(
+          NormalInitFragment::new(
+            content,
+            if is_async {
+              InitFragmentStage::StageAsyncESMImports
+            } else {
+              InitFragmentStage::StageESMImports
+            },
+            self.source_order,
+            InitFragmentKey::ESMDynamicReexport(import_var),
+            None,
+          )
+          .boxed(),
+        );
+      }
+    }
+  }
+
+  fn has_repeated_dynamic_reexports(
+    &self,
+    module_graph: &ModuleGraph,
+    runtime: Option<&RuntimeSpec>,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> bool {
+    let Some((_, dependencies)) = self.all_star_exports(module_graph) else {
+      return false;
+    };
+    dependencies
+      .iter()
+      .filter_map(|dependency_id| {
+        module_graph
+          .dependency_by_id(dependency_id)
+          .downcast_ref::<Self>()
+      })
+      .filter(|dependency| {
+        matches!(
+          dependency.get_mode(
+            module_graph,
+            runtime,
+            module_graph_cache,
+            exports_info_artifact,
+          ),
+          ExportMode::DynamicReexport(_)
+        )
+      })
+      .take(DYNAMIC_REEXPORT_RUNTIME_THRESHOLD)
+      .count()
+      >= DYNAMIC_REEXPORT_RUNTIME_THRESHOLD
+  }
+
+  fn get_reexport_deferred_namespace_object_fragments(
+    &self,
+    ctxt: &mut TemplateContext,
+    key: String,
+    name: &str,
+    target_module: ModuleIdentifier,
+    exports_type: ExportsType,
+  ) -> (NormalInitFragment, ESMExportInitFragment) {
+    let TemplateContext {
+      module,
+      compilation,
+      runtime_template,
+      ..
+    } = ctxt;
+    let is_circular_module = compilation
+      .circular_modules
+      .is_circular_module(&module.identifier());
+    let module_id = ChunkGraph::get_module_id(&compilation.module_ids_artifact, target_module);
+    let mode = render_make_deferred_namespace_mode_from_exports_type(exports_type);
+    let value = format!(
+      "/* reexport deferred namespace object */ {name}_deferred_namespace_cache || ({name}_deferred_namespace_cache = {}({}, {}))",
+      runtime_template.render_runtime_globals(&RuntimeGlobals::MAKE_DEFERRED_NAMESPACE_OBJECT),
+      json_stringify(&module_id),
+      mode
+    );
+    let export_map = vec![(key.into(), ESMExportBinding::Getter(value.into()))];
+    let cache_var = format!("var {name}_deferred_namespace_cache;\n");
+
+    (
+      NormalInitFragment::new(
+        cache_var.clone(),
+        InitFragmentStage::StageConstants,
+        -1,
+        InitFragmentKey::ESMDeferImportNamespaceObjectFragment(cache_var),
+        None,
+      ),
+      ESMExportInitFragment::new(
+        module.get_exports_argument(),
+        export_map,
+        is_circular_module,
+      ),
+    )
+  }
+
+  fn get_reexport_fragment(
+    &self,
+    ctxt: &mut TemplateContext,
+    comment: &str,
+    key: String,
+    name: &str,
+    value_key: ValueKey,
+  ) -> ESMExportInitFragment {
+    let return_value = Self::get_return_value(name.to_owned(), value_key);
+    let is_circular_module = ctxt
+      .compilation
+      .circular_modules
+      .is_circular_module(&ctxt.module.identifier());
+    let export_map = vec![(
+      key.into(),
+      ESMExportBinding::Getter(format!("/* {comment} */ {return_value}").into()),
+    )];
+    ESMExportInitFragment::new(
+      ctxt.module.get_exports_argument(),
+      export_map,
+      is_circular_module,
+    )
+  }
+
+  fn get_reexport_fake_namespace_object_fragments(
+    &self,
+    ctxt: &mut TemplateContext,
+    key: String,
+    name: &str,
+    fake_type: u8,
+  ) -> (NormalInitFragment, ESMExportInitFragment) {
+    let TemplateContext {
+      module,
+      compilation,
+      runtime_template,
+      ..
+    } = ctxt;
+    let is_circular_module = compilation
+      .circular_modules
+      .is_circular_module(&module.identifier());
+    let value = format!(
+      r"/* reexport fake namespace object from non-ESM */ {name}_namespace_cache || ({name}_namespace_cache = {}({name}{}))",
+      runtime_template.render_runtime_globals(&RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT),
+      if fake_type == 0 {
+        String::new()
+      } else {
+        format!(", {fake_type}")
+      }
+    );
+    let export_map = vec![(key.into(), ESMExportBinding::Getter(value.into()))];
+    let cache_var = format!("var {name}_namespace_cache;\n");
+
+    (
+      NormalInitFragment::new(
+        cache_var.clone(),
+        InitFragmentStage::StageConstants,
+        -1,
+        InitFragmentKey::ESMFakeNamespaceObjectFragment(cache_var),
+        None,
+      ),
+      ESMExportInitFragment::new(
+        module.get_exports_argument(),
+        export_map,
+        is_circular_module,
+      ),
+    )
+  }
+
+  fn get_return_value(name: String, value_key: ValueKey) -> String {
+    match value_key {
+      ValueKey::False => "/* unused export */ undefined".to_string(),
+      ValueKey::Null => format!("{name}_default.a"),
+      ValueKey::Name => name,
+      ValueKey::UsedName(used) => match used {
+        UsedName::Normal(used) => format!("{}{}", name, property_access(used, 0)),
+        UsedName::Inlined(inlined) => {
+          inlined.render(&to_normal_comment(&format!("inlined export {name}",)))
+        }
+      },
+    }
+  }
+
+  fn get_conditional_reexport_statement(
+    &self,
+    ctxt: &mut TemplateContext<'_, '_>,
+    key: Atom,
+    name: &String,
+    first_value_key: Atom,
+    value_key: ValueKey,
+  ) -> String {
+    if matches!(value_key, ValueKey::False) {
+      return "/* unused export */\n".to_string();
+    }
+    let TemplateContext {
+      module,
+      runtime_template,
+      ..
+    } = ctxt;
+    let return_value = Self::get_return_value(name.clone(), value_key);
+    let exports_name = module.get_exports_argument();
+    format!(
+      "if({}({}, {})) {}({}, {{ {}: function() {{ return {}; }} }});\n",
+      runtime_template.render_runtime_globals(&RuntimeGlobals::HAS_OWN_PROPERTY),
+      name,
+      rspack_util::json_stringify_str(&first_value_key),
+      runtime_template.render_runtime_globals(&RuntimeGlobals::DEFINE_PROPERTY_GETTERS),
+      runtime_template.render_exports_argument(exports_name),
+      property_name(&key).expect("should have property_name"),
+      return_value
+    )
+  }
+
+  pub fn create_export_presence_mode(options: &JavascriptParserOptions) -> ExportPresenceMode {
+    options
+      .reexport_exports_presence
+      .or(options.exports_presence)
+      .unwrap_or(ExportPresenceMode::Error)
+  }
+
+  fn get_conflicting_star_exports_errors(
+    &self,
+    ids: &[Atom],
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+    should_error: bool,
+    diagnostics_context: &DependencyDiagnosticsContext,
+  ) -> Option<Vec<Diagnostic>> {
+    let create_error = |message: String| {
+      let (severity, title) = if should_error {
+        (Severity::Error, "ESModulesLinkingError")
+      } else {
+        (Severity::Warning, "ESModulesLinkingWarning")
+      };
+      let parent_module_identifier = module_graph
+        .get_parent_module(&self.id)
+        .expect("should have parent module for dependency");
+      let mut error = if let Some(span) = self.range()
+        && let Some(parent_module) = module_graph.module_by_identifier(parent_module_identifier)
+        && let Some(source) = diagnostics_context.module_source(parent_module.as_ref())
+      {
+        Error::from_shared_source(
+          Some(source),
+          span.start as usize,
+          span.end as usize,
+          title.to_string(),
+          message,
+        )
+      } else {
+        let mut error = rspack_error::error!(message);
+        error.code = Some(title.into());
+        error
+      };
+      error.severity = severity;
+      error.hide_stack = Some(true);
+      let mut diagnostic = Diagnostic::from(error);
+      diagnostic.module_identifier = Some(*parent_module_identifier);
+      diagnostic
+    };
+
+    if ids.is_empty()
+      && self.name.is_none()
+      && let Some(potential_conflicts) = self.discover_active_exports_from_other_star_exports(
+        module_graph,
+        module_graph_cache,
+        exports_info_artifact,
+      )
+      && potential_conflicts.names_slice > 0
+    {
+      let own_names = HashSet::from_iter(
+        &potential_conflicts.names[potential_conflicts.names_slice
+          ..potential_conflicts.dependency_indices[potential_conflicts.dependency_index]],
+      );
+      let imported_module = module_graph.get_module_by_dependency_id(&self.id)?;
+      let exports_info = exports_info_artifact.get_exports_info_data(&imported_module.identifier());
+      let mut conflicts: IndexMap<&str, Vec<&Atom>, BuildHasherDefault<FxHasher>> =
+        IndexMap::default();
+      for export_info in exports_info.exports().values() {
+        if !matches!(export_info.provided(), Some(ExportProvided::Provided)) {
+          continue;
+        }
+        let Some(name) = export_info.name() else {
+          continue;
+        };
+        if name == "default" {
+          continue;
+        }
+        if self.active_exports(module_graph).contains(name) {
+          continue;
+        }
+        if own_names.contains(&name) {
+          continue;
+        }
+
+        let dependencies = if let Some((_, all_star_exports)) = self.all_star_exports(module_graph)
+        {
+          all_star_exports
+            .iter()
+            .map(|id| module_graph.dependency_by_id(id))
+            .filter_map(|dep| dep.as_module_dependency())
+            .collect::<Vec<_>>()
+        } else {
+          Vec::new()
+        };
+        let Some(conflicting_dependency) = find_dependency_for_name(
+          potential_conflicts.names.iter().enumerate(),
+          potential_conflicts.dependency_indices.iter(),
+          name,
+          dependencies.iter().copied(),
+        ) else {
+          continue;
+        };
+        let Some(target) = get_terminal_binding(export_info, module_graph, exports_info_artifact)
+        else {
+          continue;
+        };
+        let Some(conflicting_module) =
+          module_graph.get_module_by_dependency_id(conflicting_dependency.id())
+        else {
+          continue;
+        };
+        if conflicting_module.identifier() == imported_module.identifier() {
+          continue;
+        }
+        let exports_info =
+          exports_info_artifact.get_exports_info_data(&conflicting_module.identifier());
+        let Some(conflicting_export_info) = exports_info.named_exports(name) else {
+          continue;
+        };
+        let Some(conflicting_target) =
+          get_terminal_binding(conflicting_export_info, module_graph, exports_info_artifact)
+        else {
+          continue;
+        };
+        if target == conflicting_target {
+          continue;
+        }
+        if let Some(list) = conflicts.get_mut(conflicting_dependency.request()) {
+          list.push(name);
+        } else {
+          conflicts.insert(conflicting_dependency.request(), vec![name]);
+        }
+      }
+      if !conflicts.is_empty() {
+        return Some(conflicts.iter().map(|(request, exports)| {
+          let msg = format!(
+            "The requested module '{}' contains conflicting star exports for the {} {} with the previous requested module '{request}'",
+            self.request(),
+            if exports.len() > 1 { "names" } else { "name" },
+            exports.iter().map(|e| format!("'{e}'")).collect::<Vec<_>>().join(", "),
+          );
+          create_error(msg)
+        }).collect());
+      }
+    }
+    None
+  }
+}
+
+#[derive(Debug)]
+pub struct DiscoverActiveExportsFromOtherStarExportsRet {
+  names: Vec<Atom>,
+  names_slice: usize,
+  pub dependency_indices: Vec<usize>,
+  pub dependency_index: usize,
+}
+
+#[cacheable_dyn]
+impl DependencyCodeGeneration for ESMExportImportedSpecifierDependency {
+  fn update_hash(
+    &self,
+    hasher: &mut RspackHasher,
+    compilation: &rspack_core::Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) {
+    // Case: `export { value } from "./file.js"` where `value` is an inlinable
+    // const export. The reexport template renders the imported module's
+    // get_used_name(...) result directly. When that result is inlined, the
+    // connection can be inactive and get_module_graph_hash may skip the imported
+    // module's exports_info, so hash the inline value here to invalidate stale
+    // generated reexport code when the target const changes.
+    let module_graph = compilation.get_module_graph();
+    let ExportMode::NormalReexport(mode) = self.get_mode(
+      module_graph,
+      runtime,
+      &compilation.module_graph_cache_artifact,
+      &compilation.exports_info_artifact,
+    ) else {
+      return;
+    };
+    let Some(imported_module) = module_graph.module_identifier_by_dependency_id(&self.id) else {
+      return;
+    };
+    let exports_info = compilation
+      .exports_info_artifact
+      .get_exports_info_data(imported_module);
+
+    for item in mode.items {
+      if item.hidden || item.checked {
+        continue;
+      }
+      if let Some(UsedName::Inlined(inlined)) =
+        exports_info.get_used_name(&compilation.exports_info_artifact, runtime, &item.ids)
+      {
+        item.name.hash(hasher);
+        item.ids.hash(hasher);
+        inlined.hash(hasher);
+      }
+    }
+  }
+
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(ESMExportImportedSpecifierDependencyTemplate::template_type())
+  }
+}
+
+#[cacheable_dyn]
+impl Dependency for ESMExportImportedSpecifierDependency {
+  fn id(&self) -> &DependencyId {
+    &self.id
+  }
+
+  fn loc(&self) -> Option<DependencyLocation> {
+    self.loc.clone()
+  }
+
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
+  }
+
+  fn category(&self) -> &DependencyCategory {
+    &DependencyCategory::Esm
+  }
+
+  fn dependency_type(&self) -> &DependencyType {
+    &DependencyType::EsmExportImportedSpecifier
+  }
+
+  fn get_phase(&self) -> ImportPhase {
+    self.phase
+  }
+
+  fn get_attributes(&self) -> Option<&ImportAttributes> {
+    self.attributes.as_ref()
+  }
+
+  fn get_exports(
+    &self,
+    mg: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> Option<ExportsSpec> {
+    let mode = self.get_mode(mg, None, module_graph_cache, exports_info_artifact);
+    match mode {
+      ExportMode::Missing | ExportMode::LazyMake => None,
+      ExportMode::Unused(_) => {
+        // https://github.com/webpack/webpack/blob/ac7e531436b0d47cd88451f497cdfd0dad41535d/lib/dependencies/HarmonyExportImportedSpecifierDependency.js#L630-L742
+        unreachable!()
+      }
+      ExportMode::EmptyStar(mode) => Some(ExportsSpec {
+        exports: ExportsOfExportsSpec::Names(vec![]),
+        hide_export: mode.hidden,
+        dependencies: Some(vec![
+          *mg
+            .module_identifier_by_dependency_id(self.id())
+            .expect("should have module"),
+        ]),
+        ..Default::default()
+      }),
+      ExportMode::ReexportDynamicDefault(mode) => {
+        let from = mg.connection_by_dependency_id(self.id());
+        Some(ExportsSpec {
+          exports: ExportsOfExportsSpec::Names(vec![ExportNameOrSpec::ExportSpec(ExportSpec {
+            name: mode.name,
+            export: Some(rspack_core::Nullable::Value(vec![Atom::from("default")])),
+            from: from.cloned(),
+            ..Default::default()
+          })]),
+          priority: Some(1),
+          dependencies: Some(vec![*from.expect("should have module").module_identifier()]),
+          ..Default::default()
+        })
+      }
+      ExportMode::ReexportNamedDefault(mode) => {
+        let from = mg.connection_by_dependency_id(self.id());
+        Some(ExportsSpec {
+          exports: ExportsOfExportsSpec::Names(vec![ExportNameOrSpec::ExportSpec(ExportSpec {
+            name: mode.name,
+            export: Some(rspack_core::Nullable::Value(vec![Atom::from("default")])),
+            from: from.cloned(),
+            ..Default::default()
+          })]),
+          priority: Some(1),
+          dependencies: Some(vec![*from.expect("should have module").module_identifier()]),
+          ..Default::default()
+        })
+      }
+      ExportMode::ReexportNamespaceObject(mode) => {
+        let from = mg.connection_by_dependency_id(self.id());
+        Some(ExportsSpec {
+          exports: ExportsOfExportsSpec::Names(vec![ExportNameOrSpec::ExportSpec(ExportSpec {
+            name: mode.name,
+            export: Some(rspack_core::Nullable::Null),
+            from: from.cloned(),
+            ..Default::default()
+          })]),
+          priority: Some(1),
+          dependencies: Some(vec![*from.expect("should have module").module_identifier()]),
+          ..Default::default()
+        })
+      }
+      ExportMode::ReexportFakeNamespaceObject(mode) => {
+        let from = mg.connection_by_dependency_id(self.id());
+        Some(ExportsSpec {
+          exports: ExportsOfExportsSpec::Names(vec![ExportNameOrSpec::ExportSpec(ExportSpec {
+            name: mode.name,
+            export: Some(rspack_core::Nullable::Null),
+            exports: Some(vec![ExportNameOrSpec::ExportSpec(ExportSpec {
+              name: "default".into(),
+              can_mangle: Some(false),
+              from: from.cloned(),
+              export: Some(rspack_core::Nullable::Null),
+              ..Default::default()
+            })]),
+            from: from.cloned(),
+            ..Default::default()
+          })]),
+          priority: Some(1),
+          dependencies: Some(vec![*from.expect("should have module").module_identifier()]),
+          ..Default::default()
+        })
+      }
+      ExportMode::ReexportUndefined(mode) => Some(ExportsSpec {
+        exports: ExportsOfExportsSpec::Names(vec![ExportNameOrSpec::String(mode.name)]),
+        dependencies: Some(vec![
+          *mg
+            .module_identifier_by_dependency_id(self.id())
+            .expect("should have module id"),
+        ]),
+        ..Default::default()
+      }),
+      ExportMode::NormalReexport(mode) => {
+        let from = mg.connection_by_dependency_id(self.id());
+        Some(ExportsSpec {
+          priority: Some(1),
+          exports: ExportsOfExportsSpec::Names(
+            mode
+              .items
+              .into_iter()
+              .map(|item| {
+                ExportNameOrSpec::ExportSpec(ExportSpec {
+                  name: item.name,
+                  from: from.cloned(),
+                  export: Some(rspack_core::Nullable::Value(item.ids)),
+                  hidden: Some(item.hidden),
+                  ..Default::default()
+                })
+              })
+              .collect::<Vec<_>>(),
+          ),
+          dependencies: Some(vec![*from.expect("should have module").module_identifier()]),
+          ..Default::default()
+        })
+      }
+      ExportMode::DynamicReexport(mode) => {
+        let from = mg.connection_by_dependency_id(self.id());
+        Some(ExportsSpec {
+          exports: ExportsOfExportsSpec::UnknownExports,
+          from: from.cloned(),
+          can_mangle: Some(false),
+          hide_export: mode.hidden.clone(),
+          exclude_exports: {
+            let mut exclude_exports = mode.ignored;
+            if let Some(hidden) = mode.hidden {
+              exclude_exports.extend(hidden);
+            }
+            Some(exclude_exports)
+          },
+          dependencies: Some(vec![*from.expect("should have module").module_identifier()]),
+          ..Default::default()
+        })
+      }
+    }
+  }
+
+  fn get_module_evaluation_side_effects_state(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _side_effects_state_artifact: &SideEffectsStateArtifact,
+    _module_chain: &mut IdentifierSet,
+    _connection_state_cache: &mut IdentifierMap<ConnectionState>,
+  ) -> ConnectionState {
+    ConnectionState::Active(false)
+  }
+
+  fn resource_identifier(&self) -> Option<&str> {
+    Some(&self.resource_identifier)
+  }
+
+  fn source_order(&self) -> Option<i32> {
+    Some(self.source_order)
+  }
+
+  // #[tracing::instrument(skip_all)]
+  fn get_diagnostics(
+    &self,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> Option<Vec<Diagnostic>> {
+    self.get_diagnostics_with_context(
+      module_graph,
+      module_graph_cache,
+      exports_info_artifact,
+      &DependencyDiagnosticsContext::default(),
+    )
+  }
+
+  fn get_diagnostics_with_context(
+    &self,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+    diagnostics_context: &DependencyDiagnosticsContext,
+  ) -> Option<Vec<Diagnostic>> {
+    let module = module_graph.get_parent_module(&self.id)?;
+    let module = module_graph.module_by_identifier(module)?;
+    let ids = self.get_ids(module_graph);
+    if let Some(should_error) = self
+      .export_presence_mode
+      .get_effective_export_presence(module.as_ref())
+    {
+      let mut diagnostics = Vec::new();
+      // don't need to check the import specifier is existed or not when name is None (export *)
+      if let Some(name) = &self.name
+        && let Some(error) = esm_import_dependency_get_linking_error(
+          self,
+          ids,
+          module_graph,
+          module_graph_cache,
+          exports_info_artifact,
+          name,
+          true,
+          should_error,
+          diagnostics_context,
+        )
+      {
+        diagnostics.push(error);
+      }
+      if let Some(errors) = self.get_conflicting_star_exports_errors(
+        ids,
+        module_graph,
+        module_graph_cache,
+        exports_info_artifact,
+        should_error,
+        diagnostics_context,
+      ) {
+        diagnostics.extend(errors);
+      }
+      return Some(diagnostics);
+    }
+    None
+  }
+
+  fn get_referenced_exports(
+    &self,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Vec<ReferencedExport> {
+    let mode = self.get_mode(
+      module_graph,
+      runtime,
+      module_graph_cache,
+      exports_info_artifact,
+    );
+    match mode {
+      ExportMode::Missing
+      | ExportMode::LazyMake
+      | ExportMode::Unused(_)
+      | ExportMode::EmptyStar(_)
+      | ExportMode::ReexportUndefined(_) => create_no_exports_referenced(),
+      ExportMode::ReexportDynamicDefault(_) | ExportMode::DynamicReexport(_) => {
+        create_exports_object_referenced()
+      }
+      ExportMode::ReexportNamedDefault(ExportModeReexportNamedDefault {
+        ref partial_namespace_export_info,
+        ..
+      })
+      | ExportMode::ReexportNamespaceObject(ExportModeReexportNamespaceObject {
+        ref partial_namespace_export_info,
+        ..
+      })
+      | ExportMode::ReexportFakeNamespaceObject(ExportModeFakeNamespaceObject {
+        ref partial_namespace_export_info,
+        ..
+      }) => {
+        let mut referenced_exports = vec![];
+        collect_referenced_export_items(
+          exports_info_artifact,
+          runtime,
+          &mut referenced_exports,
+          vec![],
+          Some(partial_namespace_export_info.as_data(exports_info_artifact)),
+          matches!(mode, ExportMode::ReexportFakeNamespaceObject(_)),
+          &mut Default::default(),
+        );
+        referenced_exports
+          .into_iter()
+          .map(ReferencedExport::from)
+          .collect::<Vec<_>>()
+      }
+      ExportMode::NormalReexport(mode) => {
+        let mut referenced_exports = vec![];
+        for item in &mode.items {
+          if item.hidden {
+            continue;
+          }
+          collect_referenced_export_items(
+            exports_info_artifact,
+            runtime,
+            &mut referenced_exports,
+            item.ids.iter().collect(),
+            Some(item.export_info.as_data(exports_info_artifact)),
+            false,
+            &mut Default::default(),
+          );
+        }
+        referenced_exports
+          .into_iter()
+          .map(ReferencedExport::from)
+          .collect::<Vec<_>>()
+      }
+    }
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::Transitive
+  }
+
+  fn forward_id(&self) -> ForwardId {
+    let is_star_export = self.name.is_none();
+    if is_star_export {
+      ForwardId::All
+    } else if let Some(id) = self.ids.first() {
+      ForwardId::Id(id.clone())
+    } else {
+      ForwardId::All
+    }
+  }
+
+  fn lazy(&self) -> Option<LazyUntil> {
+    self.lazy_make.load(Ordering::Relaxed).then(|| {
+      if let Some(name) = &self.name {
+        LazyUntil::Id(name.clone())
+      } else {
+        LazyUntil::Fallback
+      }
+    })
+  }
+
+  fn set_lazy(&self) {
+    self.lazy_make.store(true, Ordering::Relaxed);
+  }
+
+  fn unset_lazy(&self) -> bool {
+    self.lazy_make.swap(false, Ordering::Relaxed)
+  }
+}
+
+#[cacheable_dyn]
+impl ModuleDependency for ESMExportImportedSpecifierDependency {
+  fn request(&self) -> &str {
+    &self.request
+  }
+
+  fn user_request(&self) -> &str {
+    &self.request
+  }
+
+  fn get_condition(&self) -> Option<DependencyCondition> {
+    Some(DependencyCondition::new(
+      ESMExportImportedSpecifierDependencyCondition,
+    ))
+  }
+}
+
+enum ValueKey {
+  False,
+  Null,
+  Name,
+  UsedName(UsedName),
+}
+
+impl From<Option<UsedName>> for ValueKey {
+  fn from(value: Option<UsedName>) -> Self {
+    match value {
+      None => Self::False,
+      Some(used) => Self::UsedName(used),
+    }
+  }
+}
+
+impl AsContextDependency for ESMExportImportedSpecifierDependency {}
+
+/// A star branch that resolves back to the same (module, name) cannot supply that
+/// binding. Leave the name available for a sibling star export.
+fn is_star_reexport_back_to_parent(
+  module_graph: &ModuleGraph,
+  exports_info_artifact: &ExportsInfoArtifact,
+  export_info: &ExportInfoData,
+  parent_module: &ModuleIdentifier,
+) -> bool {
+  let mut current = export_info;
+  let mut visited = HashSet::default();
+  while current.target_is_set() {
+    // Follow one hop at a time, as in webpack's isStarReexportBackToParent.
+    let targets = current.get_max_target();
+    let Some(target) = targets.values().next() else {
+      break;
+    };
+    let Some(module) = target
+      .dependency
+      .as_ref()
+      .and_then(|dep| module_graph.module_identifier_by_dependency_id(dep))
+    else {
+      break;
+    };
+    let Some([name, rest @ ..]) = target.export.as_deref() else {
+      break;
+    };
+    if module == parent_module && rest.is_empty() && Some(name) == export_info.name() {
+      return true;
+    }
+    current = exports_info_artifact
+      .get_exports_info_data(module)
+      .get_read_only_export_info(name);
+    if !current.target_is_set() || !visited.insert(current.id()) {
+      break;
+    }
+  }
+  false
+}
+
+/// return (names, dependency_indices)
+fn determine_export_assignments(
+  module_graph: &ModuleGraph,
+  exports_info_artifact: &ExportsInfoArtifact,
+  parent_module: &ModuleIdentifier,
+  dependencies: &[DependencyId],
+  additional_dependency: Option<DependencyId>,
+) -> (Vec<Atom>, Vec<usize>) {
+  // https://github.com/webpack/webpack/blob/ac7e531436b0d47cd88451f497cdfd0dad41535d/lib/dependencies/HarmonyExportImportedSpecifierDependency.js#L109
+  // JS `Set` keeps insertion order, so use `IndexAtomSet` to match its behavior.
+  let total_deps = dependencies.len() + usize::from(additional_dependency.is_some());
+
+  // Pre-compute capacity: sum up export counts across all dependencies to avoid rehashing
+  let estimated_capacity: usize = dependencies
+    .iter()
+    .chain(additional_dependency.iter())
+    .filter_map(|dep| module_graph.module_identifier_by_dependency_id(dep))
+    .map(|mid| {
+      exports_info_artifact
+        .get_exports_info_data(mid)
+        .exports()
+        .len()
+    })
+    .sum();
+
+  let mut names = IndexAtomSet::with_capacity(estimated_capacity);
+  let mut dependency_indices = Vec::with_capacity(total_deps);
+
+  for dependency in dependencies.iter().chain(additional_dependency.iter()) {
+    if let Some(module_identifier) = module_graph.module_identifier_by_dependency_id(dependency) {
+      let exports_info = exports_info_artifact.get_exports_info_data(module_identifier);
+
+      for export_info in exports_info.exports().values() {
+        // SAFETY: This is safe because a real export can't export empty string
+        let export_info_name = export_info.name().expect("export name is empty");
+        if matches!(export_info.provided(), Some(ExportProvided::Provided))
+          && export_info_name != "default"
+          && !names.contains(export_info_name)
+          && !is_star_reexport_back_to_parent(
+            module_graph,
+            exports_info_artifact,
+            export_info,
+            parent_module,
+          )
+        {
+          names.insert(export_info_name.clone());
+        }
+      }
+    }
+    dependency_indices.push(names.len());
+  }
+
+  (names.into_iter().collect(), dependency_indices)
+}
+
+fn find_dependency_for_name<'a>(
+  names: impl Iterator<Item = (usize, &'a Atom)>,
+  mut dependency_indices: impl Iterator<Item = &'a usize>,
+  name: &Atom,
+  mut dependencies: impl Iterator<Item = &'a dyn ModuleDependency>,
+) -> Option<&'a dyn ModuleDependency> {
+  let mut idx = *dependency_indices.next()?;
+  let mut dependency = dependencies.next();
+  for (i, n) in names {
+    while i >= idx {
+      dependency = dependencies.next();
+      idx = *dependency_indices.next()?;
+    }
+    if n == name {
+      return dependency;
+    }
+  }
+  None
+}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct ESMExportImportedSpecifierDependencyTemplate;
+
+impl ESMExportImportedSpecifierDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::EsmExportImportedSpecifier)
+  }
+}
+
+impl DependencyTemplate for ESMExportImportedSpecifierDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    _source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<ESMExportImportedSpecifierDependency>()
+      .expect("ESMExportImportedSpecifierDependencyTemplate should only be used for ESMExportImportedSpecifierDependency");
+    let TemplateContext {
+      compilation,
+      runtime,
+      concatenation_scope,
+      ..
+    } = code_generatable_context;
+
+    let module_graph = compilation.get_module_graph();
+    let module_graph_cache = &compilation.module_graph_cache_artifact;
+    let exports_info_artifact = &compilation.exports_info_artifact;
+    let mode = dep.get_mode(
+      module_graph,
+      *runtime,
+      module_graph_cache,
+      exports_info_artifact,
+    );
+
+    if let Some(scope) = concatenation_scope {
+      if let ExportMode::ReexportUndefined(mode) = mode {
+        scope.register_raw_export(
+          mode.name,
+          String::from("/* reexport non-default export from non-ESM */ undefined"),
+        );
+      };
+
+      return;
+    }
+
+    if !matches!(
+      mode,
+      ExportMode::LazyMake | ExportMode::Unused(_) | ExportMode::EmptyStar(_)
+    ) {
+      esm_import_dependency_apply(dep, dep.source_order, dep.phase, code_generatable_context);
+      dep.add_export_fragments(code_generatable_context, mode);
+    }
+  }
+}
+
+fn render_used_name(used: Option<&UsedName>) -> String {
+  match used {
+    None => "/* unused export */ undefined".to_string(),
+    Some(UsedName::Normal(value_key)) if value_key.len() == 1 => value_key[0].to_string(),
+    _ => unreachable!("export should only have one name"),
+  }
+}
+
+fn render_dynamic_reexport_excluded(values: &HashSet<Atom>) -> String {
+  match values.len() {
+    0 => "0".to_string(),
+    1 => rspack_util::json_stringify_str(
+      values
+        .iter()
+        .next()
+        .expect("single excluded reexport should exist"),
+    ),
+    _ => json_stringify(values),
+  }
+}
+
+struct ESMExportImportedSpecifierDependencyCondition;
+
+impl DependencyConditionFn for ESMExportImportedSpecifierDependencyCondition {
+  fn get_connection_state(
+    &self,
+    connection: &rspack_core::ModuleGraphConnection,
+    runtime: Option<&RuntimeSpec>,
+    module_graph: &ModuleGraph,
+    module_graph_cache: &ModuleGraphCacheArtifact,
+    _side_effects_state_artifact: &SideEffectsStateArtifact,
+    exports_info_artifact: &ExportsInfoArtifact,
+  ) -> ConnectionState {
+    let dependency = module_graph.dependency_by_id(&connection.dependency_id);
+    let dependency = dependency
+      .downcast_ref::<ESMExportImportedSpecifierDependency>()
+      .expect("should be ESMExportImportedSpecifierDependency");
+    let mode = dependency.get_mode(
+      module_graph,
+      runtime,
+      module_graph_cache,
+      exports_info_artifact,
+    );
+    let used = !matches!(mode, ExportMode::Unused(_) | ExportMode::EmptyStar(_));
+    ConnectionState::Active(
+      used
+        && connection_active_inline_value_for_esm_export_imported_specifier(
+          dependency,
+          &mode,
+          connection,
+          runtime,
+          module_graph,
+          exports_info_artifact,
+        ),
+    )
+  }
+}

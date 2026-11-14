@@ -1,234 +1,323 @@
-use std::borrow::Cow;
+use rspack_util::{
+  SpanExt,
+  swc::{AstSubRangeExt, PropertyKeyValue, classify_property_key},
+};
+use swc_next_ecma_ast::*;
 
-use rustc_hash::FxHashSet;
-use swc_core::ecma::ast::FnDecl;
-use swc_core::ecma::ast::{AssignExpr, BlockStmt, CatchClause, Decl, DoWhileStmt};
-use swc_core::ecma::ast::{ForInStmt, ForOfStmt, ForStmt, IfStmt, LabeledStmt, WithStmt};
-use swc_core::ecma::ast::{ModuleDecl, ModuleItem, ObjectPat, ObjectPatProp, Stmt, WhileStmt};
-use swc_core::ecma::ast::{SwitchCase, SwitchStmt, TryStmt, VarDecl, VarDeclKind, VarDeclarator};
+use super::{DestructuringAssignmentProperty, JavascriptParser, PatRef};
+use crate::{
+  Atom, parser_plugin::JavascriptParserPlugin, utils::eval::BasicEvaluatedExpression,
+  visitors::DestructuringAssignmentProperties,
+};
 
-use super::JavascriptParser;
-use crate::parser_plugin::JavascriptParserPlugin;
-use crate::utils::eval;
-
-impl<'parser> JavascriptParser<'parser> {
-  pub fn pre_walk_module_declarations(&mut self, statements: &Vec<ModuleItem>) {
-    for statement in statements {
-      self.pre_walk_module_declaration(statement);
+fn eval_property_key<'parser>(
+  parser: &mut JavascriptParser<'parser>,
+  key: PropertyKey,
+) -> BasicEvaluatedExpression<'parser> {
+  let ast = parser.ast.ast;
+  let span = key.span(ast);
+  let mut evaluated = BasicEvaluatedExpression::with_range(span.real_lo(), span.real_hi());
+  match classify_property_key(ast, key) {
+    PropertyKeyValue::StringLiteral(string) => {
+      evaluated.set_string(ast.get_wtf8(string.value(ast)).to_string_lossy());
     }
-  }
-
-  pub fn pre_walk_statements(&mut self, statements: &Vec<Stmt>) {
-    for statement in statements {
-      self.pre_walk_statement(statement)
-    }
-  }
-
-  fn pre_walk_module_declaration(&mut self, statement: &ModuleItem) {
-    match statement {
-      ModuleItem::ModuleDecl(decl) => {
-        if self
-          .plugin_drive
-          .clone()
-          .pre_module_declaration(self, decl)
-          .unwrap_or_default()
-        {
-          return;
-        }
-        match decl {
-          ModuleDecl::TsImportEquals(_)
-          | ModuleDecl::TsExportAssignment(_)
-          | ModuleDecl::TsNamespaceExport(_) => unreachable!(),
-          _ => {
-            self.is_esm = true;
-          }
-        }
+    PropertyKeyValue::NumericLiteral(number) => evaluated.set_number(number.value(ast)),
+    PropertyKeyValue::BigIntLiteral(bigint) => {
+      if let Some(value) = bigint.value(ast) {
+        evaluated.set_bigint(value);
       }
-      ModuleItem::Stmt(stmt) => self.pre_walk_statement(stmt),
+    }
+    PropertyKeyValue::IdentifierName(identifier) => {
+      evaluated.set_string(ast.get_utf8(identifier.name(ast)));
+    }
+    PropertyKeyValue::PrivateIdentifier(identifier) => {
+      evaluated.set_string(ast.get_utf8(identifier.name(ast)));
+    }
+    PropertyKeyValue::OtherExpr(expression) => return parser.evaluate_expression(expression),
+  }
+  evaluated
+}
+
+impl JavascriptParser<'_> {
+  pub fn pre_walk_module_items(&mut self, statements: SubRange<Stmt>) {
+    let ast = self.ast.ast;
+    for statement in ast.nodes(statements) {
+      self.pre_walk_module_item(statement);
     }
   }
 
-  pub fn pre_walk_statement(&mut self, statement: &Stmt) {
-    if self
-      .plugin_drive
-      .clone()
-      .pre_statement(self, statement)
-      .unwrap_or_default()
-    {
-      return;
+  pub fn pre_walk_statements(&mut self, statements: SubRange<Stmt>) {
+    let ast = self.ast.ast;
+    for statement in ast.nodes(statements) {
+      self.pre_walk_statement(statement);
     }
+  }
 
-    match statement {
-      Stmt::Block(stmt) => self.pre_walk_block_statement(stmt),
-      Stmt::DoWhile(stmt) => self.pre_walk_do_while_statement(stmt),
-      Stmt::ForIn(stmt) => self.pre_walk_for_in_statement(stmt),
-      Stmt::ForOf(stmt) => self.pre_walk_for_of_statement(stmt),
-      Stmt::For(stmt) => self.pre_walk_for_statement(stmt),
-      Stmt::Decl(decl) => match decl {
-        Decl::Fn(decl) => self.pre_walk_function_declaration(decl),
-        Decl::Var(decl) => self.pre_walk_variable_declaration(decl),
-        Decl::Class(_) | Decl::Using(_) => (),
-        Decl::TsInterface(_) | Decl::TsTypeAlias(_) | Decl::TsEnum(_) | Decl::TsModule(_) => {
-          unreachable!()
+  fn pre_walk_module_item(&mut self, statement: Stmt) {
+    match self.ast.ast.stmt_data(statement) {
+      StmtData::ImportDeclaration(_)
+      | StmtData::ExportNamedDeclaration(_)
+      | StmtData::ExportDefaultDeclaration(_)
+      | StmtData::ExportAllDeclaration(_) => self.is_esm = true,
+      _ => self.pre_walk_statement(statement),
+    }
+  }
+
+  pub fn pre_walk_statement(&mut self, statement: Stmt) {
+    let drive = self.plugin_drive();
+    self.enter_statement(
+      statement.span(self.ast.ast),
+      statement,
+      |parser, node| {
+        // Lexical block functions belong to the block pass. Hoisting hooks
+        // would otherwise register them in the enclosing scope.
+        if let NodeKindData::Function(function) = parser.ast.ast.kind_data(node.node_id())
+          && parser.is_block_scoped_function(function)
+        {
+          return true;
         }
+        drive.pre_statement(parser, node).unwrap_or_default()
       },
-      Stmt::If(stmt) => self.pre_walk_if_statement(stmt),
-      Stmt::Labeled(stmt) => self.pre_walk_labeled_statement(stmt),
-      Stmt::Switch(stmt) => self.pre_walk_switch_statement(stmt),
-      Stmt::Try(stmt) => self.pre_walk_try_statement(stmt),
-      Stmt::While(stmt) => self.pre_walk_while_statement(stmt),
-      Stmt::With(stmt) => self.pre_walk_with_statement(stmt),
-      _ => (),
+      |parser, node| match parser.ast.ast.kind_data(node.node_id()) {
+        NodeKindData::BlockStatement(stmt) => parser.pre_walk_block_statement(stmt),
+        NodeKindData::DoWhileStatement(stmt) => parser.pre_walk_do_while_statement(stmt),
+        NodeKindData::ForInStatement(stmt) => parser.pre_walk_for_in_statement(stmt),
+        NodeKindData::ForOfStatement(stmt) => parser.pre_walk_for_of_statement(stmt),
+        NodeKindData::ForStatement(stmt) => parser.pre_walk_for_statement(stmt),
+        NodeKindData::VariableDeclaration(stmt) => parser.pre_walk_variable_declaration(stmt),
+        NodeKindData::IfStatement(stmt) => parser.pre_walk_if_statement(stmt),
+        NodeKindData::LabeledStatement(stmt) => parser.pre_walk_labeled_statement(stmt),
+        NodeKindData::SwitchStatement(stmt) => parser.pre_walk_switch_statement(stmt),
+        NodeKindData::TryStatement(stmt) => parser.pre_walk_try_statement(stmt),
+        NodeKindData::WhileStatement(stmt) => parser.pre_walk_while_statement(stmt),
+        NodeKindData::WithStatement(stmt) => parser.pre_walk_with_statement(stmt),
+        _ => (),
+      },
+    );
+  }
+
+  pub(super) fn is_block_scoped_function(&self, function: Function) -> bool {
+    let ast = self.ast.ast;
+    let Some(identifier) = function.id(ast) else {
+      return false;
+    };
+    let semantic = self.ast.semantic;
+    let Some(symbol) = semantic.symbol_of(identifier.node_id()) else {
+      return false;
+    };
+    let scope_id = semantic.scope_of_symbol(symbol);
+    let scope = semantic.scope(scope_id);
+    let hoist_target = scope.hoist_target;
+    if scope_id == hoist_target {
+      return false;
+    }
+    // These functions cannot have an Annex B companion binding.
+    if scope.flags.strict || function.r#async(ast) || function.generator(ast) {
+      return true;
+    }
+    // SWC records an eligible Annex B function's companion var declaration
+    // at the same identifier node, separately from its lexical block symbol.
+    let name = ast.get_utf8(identifier.name(ast));
+    !semantic
+      .binding(hoist_target, name.as_bytes())
+      .is_some_and(|symbol| {
+        semantic.declarations(symbol).any(|declaration| {
+          declaration.scope == hoist_target && declaration.node == identifier.node_id()
+        })
+      })
+  }
+
+  fn pre_walk_with_statement(&mut self, stmt: WithStatement) {
+    self.pre_walk_statement(stmt.body(self.ast.ast));
+  }
+
+  fn pre_walk_while_statement(&mut self, stmt: WhileStatement) {
+    self.pre_walk_statement(stmt.body(self.ast.ast));
+  }
+
+  fn pre_walk_catch_clause(&mut self, clause: CatchClause) {
+    self.pre_walk_statement(Stmt::BlockStatement(clause.body(self.ast.ast)));
+  }
+
+  fn pre_walk_try_statement(&mut self, stmt: TryStatement) {
+    let ast = self.ast.ast;
+    self.pre_walk_statement(Stmt::BlockStatement(stmt.block(ast)));
+    if let Some(handler) = stmt.handler(ast) {
+      self.pre_walk_catch_clause(handler);
+    }
+    if let Some(finalizer) = stmt.finalizer(ast) {
+      self.pre_walk_statement(Stmt::BlockStatement(finalizer));
     }
   }
 
-  fn pre_walk_with_statement(&mut self, stmt: &WithStmt) {
-    self.pre_walk_statement(&stmt.body)
-  }
-
-  fn pre_walk_while_statement(&mut self, stmt: &WhileStmt) {
-    self.pre_walk_statement(&stmt.body)
-  }
-
-  fn pre_walk_catch_clause(&mut self, cache_clause: &CatchClause) {
-    // FIXME: webpack use `pre_walk_statement` here
-    self.pre_walk_block_statement(&cache_clause.body);
-  }
-
-  fn pre_walk_try_statement(&mut self, stmt: &TryStmt) {
-    // FIXME: webpack use `pre_walk_statement` here
-    self.pre_walk_block_statement(&stmt.block);
-    if let Some(handler) = &stmt.handler {
-      self.pre_walk_catch_clause(handler)
-    }
-    if let Some(finalizer) = &stmt.finalizer {
-      // FIXME: webpack use `pre_walk_statement` here
-      self.pre_walk_block_statement(finalizer)
+  fn pre_walk_switch_statement(&mut self, stmt: SwitchStatement) {
+    let ast = self.ast.ast;
+    for case in ast.nodes(stmt.cases(ast)) {
+      self.pre_walk_statements(case.consequent(ast));
     }
   }
 
-  fn pre_walk_switch_cases(&mut self, switch_cases: &Vec<SwitchCase>) {
-    for switch_case in switch_cases {
-      self.pre_walk_statements(&switch_case.cons)
+  fn pre_walk_labeled_statement(&mut self, stmt: LabeledStatement) {
+    self.pre_walk_statement(stmt.body(self.ast.ast));
+  }
+
+  fn pre_walk_if_statement(&mut self, stmt: IfStatement) {
+    let ast = self.ast.ast;
+    self.pre_walk_statement(stmt.consequent(ast));
+    if let Some(alternate) = stmt.alternate(ast) {
+      self.pre_walk_statement(alternate);
     }
   }
 
-  fn pre_walk_switch_statement(&mut self, stmt: &SwitchStmt) {
-    self.pre_walk_switch_cases(&stmt.cases)
+  fn pre_walk_for_statement(&mut self, stmt: ForStatement) {
+    let ast = self.ast.ast;
+    if let Some(init) = stmt.init(ast)
+      && let ForStatementInitData::VariableDeclaration(declaration) =
+        ast.for_statement_init_data(init)
+    {
+      self.pre_walk_statement(Stmt::Declaration(Decl::VariableDeclaration(declaration)));
+    }
+    self.pre_walk_statement(stmt.body(ast));
   }
 
-  fn pre_walk_labeled_statement(&mut self, stmt: &LabeledStmt) {
-    self.pre_walk_statement(&stmt.body);
-  }
-
-  fn pre_walk_if_statement(&mut self, stmt: &IfStmt) {
-    self.pre_walk_statement(&stmt.cons);
-    if let Some(alter) = &stmt.alt {
-      self.pre_walk_statement(alter);
+  fn pre_walk_for_head(&mut self, head: ForStatementLeft) {
+    if let ForStatementLeftData::VariableDeclaration(declaration) =
+      self.ast.ast.for_statement_left_data(head)
+    {
+      self.pre_walk_variable_declaration(declaration);
     }
   }
 
-  fn pre_walk_function_declaration(&mut self, decl: &FnDecl) {
-    self.define_variable(decl.ident.sym.to_string());
-  }
-
-  fn pre_walk_for_statement(&mut self, stmt: &ForStmt) {
-    if let Some(decl) = stmt.init.as_ref().and_then(|init| init.as_var_decl()) {
-      // FIXME: webpack use `pre_walk_statement` here
-      self.pre_walk_variable_declaration(decl)
+  fn pre_walk_for_of_statement(&mut self, stmt: ForOfStatement) {
+    let ast = self.ast.ast;
+    if stmt.r#await(ast) && self.is_top_level_scope() {
+      self.plugin_drive().top_level_for_of_await_stmt(self, stmt);
     }
-    self.pre_walk_statement(&stmt.body);
+    self.pre_walk_for_head(stmt.left(ast));
+    self.pre_walk_statement(stmt.body(ast));
   }
 
-  fn pre_walk_for_of_statement(&mut self, stmt: &ForOfStmt) {
-    if stmt.is_await && matches!(self.top_level_scope, super::TopLevelScope::Top) {
-      self
-        .plugin_drive
-        .clone()
-        .top_level_for_of_await_stmt(self, stmt);
-    }
-    if let Some(left) = stmt.left.as_var_decl() {
-      self.pre_walk_variable_declaration(left)
-    }
-    self.pre_walk_statement(&stmt.body)
+  pub(super) fn pre_walk_block_statement(&mut self, stmt: BlockStatement) {
+    let ast = self.ast.ast;
+    self.pre_walk_statements(stmt.body(ast));
   }
 
-  pub(super) fn pre_walk_block_statement(&mut self, stmt: &BlockStmt) {
-    self.pre_walk_statements(&stmt.stmts);
+  fn pre_walk_do_while_statement(&mut self, stmt: DoWhileStatement) {
+    self.pre_walk_statement(stmt.body(self.ast.ast));
   }
 
-  fn pre_walk_do_while_statement(&mut self, stmt: &DoWhileStmt) {
-    self.pre_walk_statement(&stmt.body);
+  fn pre_walk_for_in_statement(&mut self, stmt: ForInStatement) {
+    let ast = self.ast.ast;
+    self.pre_walk_for_head(stmt.left(ast));
+    self.pre_walk_statement(stmt.body(ast));
   }
 
-  fn pre_walk_for_in_statement(&mut self, stmt: &ForInStmt) {
-    if let Some(decl) = stmt.left.as_var_decl() {
-      self.pre_walk_variable_declaration(decl);
-    }
-    self.pre_walk_statement(&stmt.body);
-  }
-
-  fn pre_walk_variable_declaration(&mut self, decl: &VarDecl) {
-    if decl.kind == VarDeclKind::Var {
-      self._pre_walk_variable_declaration(decl)
+  fn pre_walk_variable_declaration(&mut self, decl: VariableDeclaration) {
+    if decl.kind(self.ast.ast) == VariableKind::Var {
+      self._pre_walk_variable_declaration(decl);
     }
   }
 
-  pub(super) fn _pre_walk_variable_declaration(&mut self, decl: &VarDecl) {
-    for declarator in &decl.decls {
+  pub(super) fn _pre_walk_variable_declaration(&mut self, decl: VariableDeclaration) {
+    let drive = self.plugin_drive();
+    let ast = self.ast.ast;
+    for declarator in ast.nodes(decl.declarators(ast)) {
       self.pre_walk_variable_declarator(declarator);
-      // TODO: hooks.pre_declarator
-      self.enter_pattern(Cow::Borrowed(&declarator.name), |this, ident| {
-        this.define_variable(ident.sym.to_string());
-      });
+      if !drive
+        .pre_declarator(self, declarator, decl)
+        .unwrap_or_default()
+      {
+        self.enter_pattern(PatRef::Borrowed(declarator.id(ast)), |_, _, _| {});
+      }
     }
   }
 
-  fn _pre_walk_object_pattern(&mut self, obj_pat: &ObjectPat) -> Option<FxHashSet<String>> {
-    let mut keys = FxHashSet::default();
-    for prop in &obj_pat.props {
-      match prop {
-        ObjectPatProp::KeyValue(prop) => {
-          let name = eval::eval_prop_name(&prop.key);
-          if let Some(id) = name.and_then(|id| id.as_string()) {
-            keys.insert(id);
-          }
-        }
-        ObjectPatProp::Assign(prop) => {
-          keys.insert(prop.key.sym.to_string());
-        }
-        ObjectPatProp::Rest(_) => return None,
+  pub(crate) fn collect_destructuring_assignment_properties(
+    &mut self,
+    pattern: BindingPattern,
+  ) -> Option<DestructuringAssignmentProperties> {
+    let ast = self.ast.ast;
+    if let Some(object) = pattern.as_object_pattern(ast) {
+      return self.collect_destructuring_assignment_properties_from_object_pattern(object);
+    }
+    if let Some(array) = pattern.as_array_pattern(ast) {
+      return self.collect_destructuring_assignment_properties_from_array_pattern(array);
+    }
+    None
+  }
+
+  pub(crate) fn collect_destructuring_assignment_properties_from_object_pattern(
+    &mut self,
+    object: ObjectPattern,
+  ) -> Option<DestructuringAssignmentProperties> {
+    let ast = self.ast.ast;
+    if object.rest(ast).is_some() {
+      return None;
+    }
+    let mut keys = DestructuringAssignmentProperties::default();
+    for property in ast.nodes(object.properties(ast)) {
+      let key = property.key(ast);
+      let value = property.value(ast);
+      let (id, shorthand) = if property.shorthand(ast) {
+        let identifier = value.as_binding_identifier(ast).or_else(|| {
+          value
+            .as_assignment_pattern(ast)
+            .and_then(|assignment| assignment.left(ast).as_binding_identifier(ast))
+        })?;
+        (Atom::from(ast.get_utf8(identifier.name(ast))), true)
+      } else {
+        let evaluated = eval_property_key(self, key);
+        (Atom::from(evaluated.as_string()?), false)
       };
+      keys.insert(DestructuringAssignmentProperty {
+        id,
+        range: key.span(ast).into(),
+        pattern: self.collect_destructuring_assignment_properties(value),
+        shorthand,
+      });
     }
     Some(keys)
   }
 
-  fn pre_walk_variable_declarator(&mut self, declarator: &VarDeclarator) {
-    let Some(init) = declarator.init.as_ref() else {
-      return;
-    };
-    let Some(obj_pat) = declarator.name.as_object() else {
-      return;
-    };
-    let keys = self._pre_walk_object_pattern(obj_pat);
-    if keys.is_none() {
-      return;
+  pub(crate) fn collect_destructuring_assignment_properties_from_array_pattern(
+    &mut self,
+    array: ArrayPattern,
+  ) -> Option<DestructuringAssignmentProperties> {
+    let ast = self.ast.ast;
+    if array.rest(ast).is_some() {
+      return None;
     }
-    if let Some(assign) = init.as_assign() {
-      self.pre_walk_assignment_expression(assign);
+    let mut keys = DestructuringAssignmentProperties::default();
+    let mut buffer = rspack_util::itoa::Buffer::new();
+    for (index, element) in ast.nodes(array.elements(ast)).enumerate() {
+      let Some(element) = element else {
+        continue;
+      };
+      keys.insert(DestructuringAssignmentProperty {
+        id: buffer.format(index).into(),
+        range: element.span(ast).into(),
+        pattern: self.collect_destructuring_assignment_properties(element),
+        shorthand: false,
+      });
     }
+    Some(keys)
   }
 
-  pub(super) fn pre_walk_assignment_expression(&mut self, assign: &AssignExpr) {
-    let Some(left) = assign.left.as_pat().and_then(|pat| pat.as_object()) else {
+  fn pre_walk_variable_declarator(&mut self, declarator: VariableDeclarator) {
+    let ast = self.ast.ast;
+    let Some(init) = declarator.init(ast) else {
       return;
     };
-    let keys = self._pre_walk_object_pattern(left);
-    if keys.is_none() {
+    let Some(object) = declarator.id(ast).as_object_pattern(ast) else {
       return;
-    }
-    if let Some(right) = assign.right.as_assign() {
-      self.pre_walk_assignment_expression(right)
+    };
+    self.enter_destructuring_assignment(object, init);
+  }
+
+  pub(crate) fn pre_walk_assignment_expression(&mut self, assign: AssignmentExpression) {
+    let ast = self.ast.ast;
+    if let Some(object) = assign.left(ast).as_object_assignment_target(ast) {
+      self.enter_destructuring_assignment(object, assign.right(ast));
     }
   }
 }

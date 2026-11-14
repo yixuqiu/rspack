@@ -1,56 +1,87 @@
-use rspack_core::{AsContextDependency, AsModuleDependency, Dependency};
-use rspack_core::{DependencyId, DependencyLocation};
-use rspack_core::{DependencyTemplate, RuntimeGlobals, TemplateContext};
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_core::{
+  AsContextDependency, AsModuleDependency, Dependency, DependencyCodeGeneration, DependencyId,
+  DependencyLocation, DependencyRange, DependencyTemplate, DependencyTemplateType, RuntimeGlobals,
+  TemplateContext, TemplateReplaceSource,
+};
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct RequireHeaderDependency {
   id: DependencyId,
-  loc: DependencyLocation,
+  range: DependencyRange,
+  loc: Option<DependencyLocation>,
 }
 
 impl RequireHeaderDependency {
-  pub fn new(start: u32, end: u32) -> Self {
-    let loc = DependencyLocation::new(start, end);
+  pub fn new(range: DependencyRange, loc: Option<DependencyLocation>) -> Self {
     Self {
       id: DependencyId::new(),
+      range,
       loc,
     }
   }
+
+  pub fn range(&self) -> DependencyRange {
+    self.range
+  }
 }
 
+#[cacheable_dyn]
 impl Dependency for RequireHeaderDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "RequireHeaderDependency"
-  }
-
   fn id(&self) -> &DependencyId {
     &self.id
+  }
+
+  fn loc(&self) -> Option<DependencyLocation> {
+    self.loc.clone()
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::False
   }
 }
 
 impl AsModuleDependency for RequireHeaderDependency {}
 impl AsContextDependency for RequireHeaderDependency {}
 
-impl DependencyTemplate for RequireHeaderDependency {
-  fn apply(
+#[cacheable_dyn]
+impl DependencyCodeGeneration for RequireHeaderDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(RequireHeaderDependencyTemplate::template_type())
+  }
+}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct RequireHeaderDependencyTemplate;
+
+impl RequireHeaderDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Custom("RequireHeaderDependency")
+  }
+}
+
+impl DependencyTemplate for RequireHeaderDependencyTemplate {
+  fn render(
     &self,
-    source: &mut rspack_core::TemplateReplaceSource,
-    code_generatable_context: &mut rspack_core::TemplateContext,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
   ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<RequireHeaderDependency>()
+      .expect("RequireHeaderDependencyTemplate should only be used for RequireHeaderDependency");
+
     let TemplateContext {
-      runtime_requirements,
-      ..
+      runtime_template, ..
     } = code_generatable_context;
-    runtime_requirements.insert(RuntimeGlobals::REQUIRE);
     source.replace(
-      self.loc.start(),
-      self.loc.end() - 1,
-      RuntimeGlobals::REQUIRE.name(),
+      dep.range.start,
+      dep.range.end,
+      runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE),
       None,
     );
-  }
-
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
   }
 }

@@ -1,98 +1,99 @@
-import WebpackLicense from '@components/webpack-license';
-import { ApiMeta, Stability } from '../../../components/ApiMeta';
+---
+description: 'Rspack entry configuration reference covering single and multiple entries, dynamic entry functions, and entry description options.'
+---
 
-<WebpackLicense from="https://webpack.js.org/configuration/entry-context/#entry" />
+import Attribution from '@components/Attribution';
+import PropertyType from '@components/PropertyType';
 
 # Entry
 
-The `entry` configuration is used to set the entry module for Rspack builds.
-
 - **Type:**
 
-  ```ts
-  type EntryDescription = {
-    import: EntryItem;
-    runtime?: EntryRuntime;
-    chunkLoading?: ChunkLoading;
-    asyncChunks?: boolean;
-    publicPath?: PublicPath;
-    baseUri?: string;
-    filename?: EntryFilename;
-  };
+```ts
+type EntryStatic =
+  string | string[] | Record<string, string | string[] | EntryDescription>;
 
-  type EntryObject = {
-    [k: string]: EntryItem | EntryDescription;
-  };
+type Entry = EntryStatic | (() => EntryStatic | Promise<EntryStatic>);
+```
 
-  type Config = {
-    entry: EntryItem | EntryObject;
-  };
-  ```
+- **Default:** `'./src/index.js'`
 
-- **Default:** `./src/index.js`
+The `entry` configuration is used to set the entry module for Rspack builds.
 
-## Single Entry
+## Single entry
 
 If you are building a single page application or a library, you will usually only need to set up a single entry point.
 
 To set up a single entry, simply pass the path to the entry module as a string to the `entry` configuration.
 
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: './src/index.js',
 };
 ```
 
 The above writing method will automatically set the name of the entry module to `main`, which is equivalent to the following writing method:
 
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: {
     main: './src/index.js',
   },
 };
 ```
 
-### Path Type
+### Path type
 
 The path of the entry module can be a relative path or an absolute path.
 
-If `entry` is set as a relative path, Rspack will use the value set by [context configuration](/config/context.html) as the base path, which by default is the current working directory of the Node.js process, namely `process.cwd ()`.
+If `entry` is set as a relative path, Rspack will use the value set by [context configuration](/config/context) as the base path, which by default is the current working directory of the Node.js process, namely `process.cwd()`.
 
 You can also use the [path module](https://nodejs.org/api/path.html) in Node.js to generate an absolute path and pass it to the `entry` configuration:
 
-```ts title="rspack.config.js"
-const path = require('path');
+```js title="rspack.config.mjs"
+import path from 'node:path';
 
-module.exports = {
-  entry: path.join(__dirname, './src/index.js'),
+export default {
+  entry: path.join(import.meta.dirname, './src/index.js'),
 };
 ```
 
-### Entry Array
+### Entry array
 
 When setting the value of an entry, in addition to setting it to `string`, you can also pass in a `string[]`, meaning that the entry contains multiple entry modules.
 
 For example, the following example will build `pre.js` and `post.js` into the output of `page`.
 
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: {
     page: ['./src/pre.js', './src/post.js'],
   },
 };
 ```
 
-Multiple modules will be executed sequentially according to the order defined by the array, so the code in `pre.js` will be executed before the code in `post.js`.
+When an array is used for an entry, Rspack still creates a single chunk for that entry. Modules in the array are loaded in declaration order and merged into the same dependency graph, so `pre.js` runs before `post.js`.
 
-## Multiple Entries
+This pattern is commonly used to inject extra code before the main application entry, such as polyfills or development-only tooling, without adding manual imports in application source files.
+
+**Example: Injecting a polyfill**
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    main: ['./src/polyfill.js', './src/index.js'],
+  },
+};
+```
+
+## Multiple entries
 
 If you need to build multiple entries at once, you should set `entry` to an object, and each key of the object corresponds to an entry name.
 
 For example, the following example will build `page1` and `page2` as two entries:
 
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: {
     page1: './src/page1/index.js',
     page2: './src/page2/index.js',
@@ -100,38 +101,54 @@ module.exports = {
 };
 ```
 
-### Entry Description Object
+### Entry description object
 
 When you set `entry` to an object, you can set the value of the entry to a description object. A description object can contain the following properties:
 
 #### EntryDescription.import
 
-- **Type:**
+<PropertyType
+  type="string[] | string"
+  defaultValueList={[{ defaultValue: "'./src/index.js'" }]}
+/>
 
-  ```ts
-  type EntryItem = string[] | string;
-  ```
+The path or paths to the entry modules.
 
-- **Default:** `'./src/index.js'`
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    foo: {
+      import: './src/foo.js',
+    },
+  },
+};
+```
 
-The path to the entry module.
+Multiple paths can be set in the `import` property:
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    foo: {
+      import: ['./src/foo.js', './src/bar.js'],
+    },
+  },
+};
+```
 
 #### EntryDescription.runtime
 
-- **Type:**
+<PropertyType
+  type="false | string"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
-  ```ts
-  type EntryRuntime = false | string;
-  ```
+Sets the name of the Rspack runtime chunk. Setting `runtime` creates a separate chunk for this code. Set it to `false` to keep the code in the entry chunk.
 
-- **Default:** `undefined`
+For example, name the Rspack runtime chunk used by the `main` entry `'foo'`:
 
-The name of the runtime chunk. When `runtime` is set, a new runtime chunk will be created. You can also set it to `false` to avoid a new runtime chunk.
-
-The `runtime` property is used to set the name of the runtime chunk, for example to set the name of the `main` entry chunk to `'foo'`:
-
-```ts title="rspack.config.js"
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry: {
     main: {
       import: './src/index.js',
@@ -143,94 +160,178 @@ module.exports = {
 
 #### EntryDescription.chunkLoading
 
-<ApiMeta addedVersion={'0.2.6'} />
+<PropertyType
+  type="false | string | 'jsonp' | 'import-scripts' | 'require' | 'async-node' | 'import'"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
-- **Type:**
-
-  ```ts
-  type ChunkLoading = false | ChunkLoadingType;
-  type ChunkLoadingType =
-    | ('jsonp' | 'import-scripts' | 'require' | 'async-node' | 'import')
-    | string;
-  ```
-
-- **Default:** `undefined`
-
-How this entry load other chunks.
+How this entry load other chunks. Methods included by default are `'jsonp'` (web), `'import'` (ESM), `'import-scripts'` (WebWorker), `'require'` (sync node.js), `'async-node'` (async node.js), but others might be added by plugins.
 
 #### EntryDescription.asyncChunks
 
-<ApiMeta addedVersion={'0.2.6'} />
-
-- **Type:** `boolean`
-- **Default:** `true`
+<PropertyType type="boolean" defaultValueList={[{ defaultValue: 'true' }]} />
 
 Whether to create a load-on-demand asynchronous chunk for this entry.
 
 #### EntryDescription.publicPath
 
-<ApiMeta addedVersion={'0.2.6'} />
-
-- **Type:**
-
-  ```ts
-  type PublicPath = 'auto' | string;
-  ```
-
-- **Default:** `undefined`
+<PropertyType
+  type="'auto' | string | ((pathData: PathData, assetInfo?: AssetInfo) => string)"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
 The publicPath of the resource referenced by this entry.
 
 #### EntryDescription.baseUri
 
-<ApiMeta addedVersion={'0.2.6'} />
+<PropertyType
+  type="string"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
-- **Type:** `string`
-- **Default:** `undefined`
-
-The baseURI of the resource referenced by this entry.
+Sets the initial base URI used to resolve relative asset and Worker URLs for this entry. If omitted, Rspack uses its default base URI. See [Base URI](/guide/features/asset-base-path#base-uri) for default values and usage examples.
 
 #### EntryDescription.filename
 
-<ApiMeta addedVersion={'0.2.6'} />
-
-- **Type:** `string`
-- **Default:** `undefined`
+<PropertyType
+  type="string | ((pathData: PathData, assetInfo?: AssetInfo) => string)"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
 
 The filename of the entry chunk.
 
 #### EntryDescription.library
 
-<ApiMeta addedVersion={'0.3.12'} />
+- **Type:** `LibraryOptions`
+- **Default:** `undefined`
 
 The format of the chunk generated by this entry as a library, for detailed configuration, see [output.library](/config/output#outputlibrary).
+
+#### EntryDescription.dependOn
+
+<PropertyType
+  type="string[] | string"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+Declares the entries that the current entry depends on. Accepts an **entry name** or an array of entry names.
+
+Use `dependOn` when multiple entries on the same page have an explicit dependency relationship, such as an editor and a preview that depend on a common application shell. Rspack will:
+
+- Reuse modules from the dependency entries instead of including them again in the current entry chunk.
+- Use the [Rspack runtime](/misc/glossary#rspack-runtime) from the dependency entries. These entries share a module cache, so shared modules are initialized only once.
+- Wait until the required chunks are available before starting the current entry.
+
+For example, make the `editor` and `preview` entries depend on `shell`:
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    shell: './src/shell.js',
+    editor: {
+      import: './src/editor.js',
+      dependOn: 'shell',
+    },
+    preview: {
+      import: './src/preview.js',
+      dependOn: 'shell',
+    },
+  },
+};
+```
+
+```js title="src/shell.js"
+export const documentState = { title: 'Untitled' };
+
+console.log('Shell initialized');
+```
+
+```js title="src/editor.js"
+import { documentState } from './shell.js';
+
+documentState.title = 'Draft';
+```
+
+```js title="src/preview.js"
+import { documentState } from './shell.js';
+
+console.log(documentState.title);
+```
+
+The build produces `shell.js`, `editor.js`, and `preview.js`. The shell module is bundled only in `shell.js`, and all three entries use the same Rspack runtime and module cache. Assuming the output directory is served at `/dist/`, load the files in this order:
+
+```html
+<script defer src="/dist/shell.js"></script>
+<script defer src="/dist/editor.js"></script>
+<script defer src="/dist/preview.js"></script>
+```
+
+The page logs `Shell initialized` once, followed by `Draft`: the preview reads the same object that the editor updated. Source code still needs to import the modules it uses; `dependOn` does not expose their exports as global variables.
+
+`dependOn` controls chunk dependencies, but does not wait for asynchronous application initialization, such as a request started by `shell`. Coordinate that work explicitly in your application code. Entry dependencies must not form a cycle, and an entry with `dependOn` must not also specify `runtime`.
+
+If you only need to extract shared modules automatically, prefer [SplitChunksPlugin](/plugins/split-chunks-plugin). It splits modules according to configurable rules without declaring dependencies between entries or unifying their Rspack runtime instances. If multiple entries on the same page also need to share module instances, combine it with [`optimization.runtimeChunk: 'single'`](/config/optimization#optimizationruntimechunk). Use `dependOn` when you need explicit entry dependencies; it can also be combined with `splitChunks`.
+
+#### EntryDescription.wasmLoading
+
+<PropertyType
+  type="false | 'fetch' | 'async-node' | 'universal'"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+Option to set the method of loading WebAssembly Modules for this entry. When omitted, the value of [`output.wasmLoading`](/config/output#outputwasmloading) is used.
+
+The default value of [`output.wasmLoading`](/config/output#outputwasmloading) can be affected by different [target](/config/target):
+
+- Defaults to `'fetch'` if target is set to `'web'`, `'webworker'`, `'electron-renderer'` or `'node-webkit'`.
+- Defaults to `'async-node'` if target is set to `'node'`, `'async-node'`, `'electron-main'` or `'electron-preload'`.
+
+#### EntryDescription.layer
+
+<PropertyType
+  type="string | null | undefined"
+  defaultValueList={[{ defaultValue: 'undefined' }]}
+/>
+
+Specifies the layer in which modules of this entrypoint are placed. Make the corresponding configuration take effect through layer matching in split chunks, [rules](/config/module-rules#rulesissuerlayer), stats, and externals.
+
+For more information about layers, see the [Module layers guide](/guide/advanced/layer).
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    index: {
+      import: './src/index.js',
+      layer: 'layer-name',
+    },
+  },
+};
+```
 
 ## Dynamic entry
 
 If a function is passed then it will be invoked on every [make](/api/plugin-api/compiler-hooks#make) event.
 
-> Note that the `make` event triggers when webpack starts and for every invalidation when [watching for file changes](/config/watch).
+> Note that the `make` event triggers when Rspack starts and for every invalidation when [watching for file changes](/config/watch).
 
-```js title=rspack.config.js
-module.exports = {
-  //...
+```js title="rspack.config.mjs"
+export default {
   entry: () => './demo',
 };
 ```
 
-or
+Or:
 
-```js title=rspack.config.js
-module.exports = {
-  //...
-  entry: () => new Promise(resolve => resolve(['./demo', './demo2'])),
+```js title="rspack.config.mjs"
+export default {
+  entry: () => new Promise((resolve) => resolve(['./demo', './demo2'])),
 };
 ```
 
 For example: you can use dynamic entries to get the actual entries from an external source (remote server, file system content or database):
 
-```js title=rspack.config.js
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   entry() {
     return fetchPathsFromSomeExternalSource(); // returns a promise that will be resolved with something like ['src/main-layout.js', 'src/admin-layout.js']
   },
@@ -238,3 +339,5 @@ module.exports = {
 ```
 
 When combining with the [output.library](/config/output#outputlibrary) option: If an array is passed only the last item is exported.
+
+<Attribution url="https://webpack.js.org/configuration/entry-context/#entry" />

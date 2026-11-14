@@ -1,23 +1,44 @@
-import WebpackLicense from '@components/webpack-license';
+---
+description: 'The context configuration is used to set the base directory for Rspack builds'
+---
 
-<WebpackLicense from="https://webpack.js.org/configuration/entry-context/#context" />
+import Attribution from '@components/Attribution';
+import PropertyType from '@components/PropertyType';
+import { Tabs, Tab } from '@theme';
 
 # Context
 
+<PropertyType
+  type="string"
+  defaultValueList={[{ defaultValue: 'process.cwd()' }]}
+/>
+
 The `context` configuration is used to set the base directory for Rspack builds.
 
-- **Type:** `string`
-- **Default:** `process.cwd()`
-
-`context` is an absolute path that is used as the base path for relative paths in Rspack configurations such as [entry](config/entry) and [output](config/output).
+`context` is an absolute path that is used as the base path for relative paths in Rspack configurations such as [entry](/config/entry) and [output](/config/output).
 
 By default, Rspack uses the current working directory of the Node.js process as the base directory. In most cases, it is recommended to set a base directory manually, rather than relying on the current working directory of Node.js.
 
 ## Example
 
-For example, you can use `__dirname` as the base directory:
+For example, you can use the configuration file's directory as the base directory:
 
-```ts title="rspack.config.js"
+<Tabs>
+  <Tab label="ESM">
+
+```js title="rspack.config.mjs"
+export default {
+  context: import.meta.dirname,
+  entry: {
+    main: './src/index.js',
+  },
+};
+```
+
+  </Tab>
+  <Tab label="CJS">
+
+```js title="rspack.config.cjs"
 module.exports = {
   context: __dirname,
   entry: {
@@ -26,4 +47,9 @@ module.exports = {
 };
 ```
 
-In the above example, the `main` entry will be resolved based on the `path.join(__dirname, './src/index.js')` path.
+  </Tab>
+</Tabs>
+
+In the above example, the `main` entry resolves to `src/index.js` relative to the configuration file's directory.
+
+<Attribution url="https://webpack.js.org/configuration/entry-context/#context" />

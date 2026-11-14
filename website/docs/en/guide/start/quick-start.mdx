@@ -1,149 +1,176 @@
-import { Tabs, Tab, PackageManagerTabs } from '@theme';
+---
+description: 'Use Rsbuild for web applications, Rslib for JavaScript libraries, or Rspack CLI for custom build workflows. Learn about environment requirements and manual installation.'
+---
+
+import { PackageManagerTabs } from '@theme';
 
 # Quick start
 
 Get up to speed quickly with a new Rspack based project.
 
-## Creating project using scaffolding
+- [Create a new project](#create-a-new-project): Choose the right tool to create a new project powered by Rspack.
+- [Migrating from existing projects](#migrating-from-existing-projects): Migrate from a webpack-based project to Rspack.
 
-### Using Rsbuild
+## Ecosystem
 
-Rsbuild is a new generation build tool based on Rspack and developed by the Rspack team. It provides out-of-the-box build capabilities that can significantly improve the development experience and lower the barrier to get started.
+As a low-level bundler, Rspack has a rich ecosystem that includes various frameworks, tools, and solutions. These ecosystem projects cover different aspects from frameworks to development tools, meeting diverse development needs across scenarios and providing an out-of-the-box experience.
 
-We recommend using [Rsbuild](https://rsbuild.dev/) to create new projects, simply run the following command:
+See the [Ecosystem](/guide/start/ecosystem) page to explore these ecosystem projects.
+
+## Environment preparation
+
+Rspack supports using [Node.js](https://nodejs.org/), [Deno](https://deno.com/), or [Bun](https://bun.sh/) as the JavaScript runtime.
+
+You can refer to the following installation guides and choose one runtime:
+
+- [Install Node.js](https://nodejs.org/en/download)
+- [Install Bun](https://bun.com/docs/installation)
+- [Install Deno](https://docs.deno.com/runtime/getting_started/installation/)
+
+:::tip Version requirements
+
+- Rspack v2 requires Node.js version 20.19+, 22.12+.
+- Rspack v1 requires Node.js 18.12.0 or higher.
+
+:::
+
+:::details For unsupported platforms
+
+If you are using a niche platform, Rspack may not provide native support for it. In this case, please manually install `@rspack/binding-wasm32-wasi` as a fallback. The Wasm build is compatible with most platforms.
+
+Currently supported platforms:
+
+- `darwin-arm64`
+- `darwin-x64`
+- `linux-arm64-gnu`
+- `linux-arm64-musl`
+- `linux-riscv64-gnu`
+- `linux-riscv64-musl`
+- `linux-ppc64-gnu`
+- `linux-s390x-gnu`
+- `linux-x64-gnu`
+- `linux-x64-musl`
+- `win32-arm64-msvc`
+- `win32-ia32-msvc`
+- `win32-x64-msvc`
+
+:::
+
+## Create a new project
+
+### Web applications
+
+For web applications, we recommend [Rsbuild](https://rsbuild.rs/). It builds on Rspack with defaults for common build tasks, a dev server, and integrations for frameworks such as React and Vue to help you start developing quickly. You can customize the build through configuration and plugins, or adjust the underlying Rspack configuration.
+
+Run the following command and follow the prompts:
 
 <PackageManagerTabs command="create rsbuild@latest" />
 
-> For more information, refer to [Rsbuild - Quick Start](https://rsbuild.dev/guide/start/quick-start).
+:::tip Non-interactive mode
 
-### Using the Rspack CLI
+To skip interactive prompts, specify a directory and template, for example: `npx -y create-rsbuild --dir my-app --template react`.
 
-Rspack CLI is a tool comparable to Webpack CLI, offering the basic `serve` and `build` commands.
+:::
 
-Run the following command to create an Rspack CLI project:
+> See [Rsbuild - Quick start](https://rsbuild.rs/guide/start/quick-start) to learn more.
+
+### JavaScript libraries
+
+For JavaScript libraries that other projects consume, such as utility packages and component libraries, we recommend [Rslib](https://rslib.rs/). It builds on Rsbuild with defaults for library development and supports generating ESM and CommonJS output and TypeScript declarations, so you can publish your library to npm or share it across projects.
+
+Run the following command and follow the prompts:
+
+<PackageManagerTabs command="create rslib@latest" />
+
+:::tip Non-interactive mode
+
+To skip interactive prompts, specify a directory and template, for example: `npx -y create-rslib --dir my-lib --template node-js`.
+
+:::
+
+> See [Rslib - Quick start](https://rslib.rs/guide/start/quick-start) to learn more.
+
+### Using Rspack CLI directly
+
+If you want to set up your own build workflow and manage the Rspack configuration directly, you can use Rspack CLI. It provides development, build, and preview commands, while you choose and configure loaders, plugins, and other build capabilities yourself.
+
+#### Using a scaffold
+
+Run the following command and follow the prompts to create a project from a template:
 
 <PackageManagerTabs command="create rspack@latest" />
 
-Then follow the prompts in your terminal.
+:::tip Non-interactive mode
 
-## Online examples
+To skip interactive prompts, specify a directory and template, for example: `npx -y create-rspack --dir my-app --template react`.
 
-We provide an online example based on Rsbuild. The example gives an intuitive feel for the build performance of Rspack and the development experience of Rsbuild:
+:::
 
-- [Rsbuild codesandbox example](https://codesandbox.io/p/github/rspack-contrib/rsbuild-codesandbox-example)
+#### Manual installation
+
+You can also install Rspack CLI and create a configuration file manually. Start by creating a project directory and generating an npm `package.json` file:
+
+```bash
+mkdir rspack-demo
+cd rspack-demo
+npm init -y
+```
+
+Then install [@rspack/core](https://www.npmjs.com/package/@rspack/core) and [@rspack/cli](https://www.npmjs.com/package/@rspack/cli) as dev dependencies:
+
+<PackageManagerTabs command="add @rspack/core @rspack/cli -D" />
+
+Update your build scripts to use Rspack CLI:
+
+```js title="package.json"
+{
+  "scripts": {
+    "dev": "rspack dev",
+    "build": "rspack build",
+    "preview": "rspack preview"
+  }
+}
+```
+
+Next, see [Configure Rspack](/config/) to learn about how to configure Rspack.
 
 ## Migrating from existing projects
 
-If you need to migrate from an existing project to Rspack or Rsbuild, you can refer to the following guides:
+If you need to migrate from an existing project to Rspack, you can refer to the following guides:
 
-- [Migrating from Webpack to Rspack](/guide/migration/webpack)
-- [Migrating from Webpack to Rsbuild](https://rsbuild.dev/guide/migration/webpack)
-- [Migrating from Vue CLI to Rsbuild](https://rsbuild.dev/guide/migration/vue-cli)
-- [Migrating from Create React App to Rsbuild](https://rsbuild.dev/guide/migration/cra)
+- [Migrating from webpack to Rspack](/guide/migration/webpack)
+- [Migrating from webpack to Rsbuild](https://rsbuild.rs/guide/migration/webpack)
+- [Migrating from Create React App to Rsbuild](https://rsbuild.rs/guide/migration/cra)
+- [Migrating from Vue CLI to Rsbuild](https://rsbuild.rs/guide/migration/vue-cli)
+- [Migrating from Vite to Rsbuild](https://rsbuild.rs/guide/migration/vite)
+- [Migrating from Tsup to Rslib](https://rslib.rs/guide/migration/tsup)
 - [Migrating from Storybook](/guide/migration/storybook)
 
-## Community toolchain
+## Install canary version
 
-There are already some Rspack-based toolchains in the community:
+When you need to test or verify the features of Rspack that are not yet released to the stable version, you may need to use the canary version.
 
-- If you want to build a static site, you can try [Rspress](https://rspress.dev).
-- If you want to analyze the build process and build artifacts, you can try [Rsdoctor](https://rsdoctor.dev).
-- If you're looking for a full-stack React framework, you can try [Modern.js](https://modernjs.dev/en/).
-- If you want a fast and production-ready setup that works in a monorepo, you can try [Nx](https://nx.dev).
+The canary version of Rspack has a `-canary` suffix in the package scope. For example, the canary package name of `@rspack/core` is `@rspack-canary/core`. To use these versions, you can configure the overrides of the package manager (npm/yarn/pnpm/bun).
 
-### Rspress
+Here is an example of using pnpm overrides:
 
-Rspress is a static site generator based on Rspack. It provides a complete solution for building static sites and includes the following features:
-
-- 🚀 Fast Startup: Based on Rust-based build tool and markdown/mdx compiler, the build speed is extremely fast, bringing you the ultimate development experience.
-- 📚 MDX Support: MDX is a powerful way to write content, allowing you to use React components in Markdown.
-- 📦 Built-in Full Text Search: Automatically generates a full-text search index for you during building process, providing out-of-the-box full-text search capabilities.
-- 🌈 Static Site Generation: In production, it automatically builds into static HTML files, which can be easily deployed anywhere.
-- 🔌 Providing Plugin System: Providing a plugin system, you can customize the build process and theme according to your needs.
-
-Learn more about Rspress in the [official documentation](https://rspress.dev).
-
-### Modern.js
-
-[Modern.js Framework](https://modernjs.dev/en/) is a Rspack-based progressive React framework that provides a complete solution for building web applications. It supports nested routes, server-side rendering, and provides out-of-the-box CSS solutions such as styled components and Tailwind CSS.
-
-Learn more about Modern.js in the [official documentation](https://modernjs.dev/en/guides/get-started/introduction).
-
-### Using Nx
-
-The fastest way to get up to speed quickly and leverage Rspack and React in a production-ready setting is to use the dedicated [Rspack Nx plugin](https://www.npmjs.com/package/@nx/rspack). This gives you a pre-configured setup, integrating Rspack with React, TypeScript, ESLint, Jest, and Cypress for e2e testing.
-
-Run the following command to set up a new Nx workspace with React and Rspack:
-
-<Tabs values={[{ label: 'npm' }, { label: 'yarn' }, { label: 'pnpm' }]}>
-  <Tab>
-
-```sh
-npx create-nx-workspace myrspackapp --preset=@nx/rspack
+```json title="package.json"
+{
+  "pnpm": {
+    "overrides": {
+      "@rspack/core": "npm:@rspack-canary/core@latest"
+    },
+    "peerDependencyRules": {
+      "allowAny": ["@rspack/*"]
+    }
+  }
+}
 ```
 
-  </Tab>
+Rspack community also provides [install-rspack](https://github.com/rstackjs/install-rspack) tool to easily install canary version:
 
-  <Tab>
-
-```sh
-yarn create nx-workspace myrspackapp --preset=@nx/rspack --pm=yarn
+```shell
+npx install-rspack --version latest # Install the latest version
+npx install-rspack --version canary # Install the canary version
+npx install-rspack --version 1.0.0-canary-d614005-20250101082730 # Install the specified canary version
 ```
-
-  </Tab>
-
-  <Tab>
-
-```sh
-pnpm create nx-workspace myrspackapp --preset=@nx/rspack  --pm=pnpm
-```
-
-  </Tab>
-</Tabs>
-
-The pre-configured setup is already ready to work with Rspack, TypeScript, TSX and React. In addition it also comes with Jest and Cypress for testing and ESLint for linting.
-
-Once created you can simply `npm start` (or `pnpm start` or `yarn start`) to start the development server. You can also run `npm run build` (or `pnpm run build` or `yarn run build`) to build the application for production and similarly run `npm run test` (or `pnpm run test` or `yarn run test`) to run the unit tests.
-
-You can learn more about Nx at [https://nx.dev](https://nx.dev).
-
-## Manual installation
-
-### Installation
-
-We'll start by creating a project directory, generating an NPM `package.json`, and then installing `@rspack/cli` locally:
-
-<Tabs values={[{ label: 'npm' }, { label: 'yarn' }, { label: 'pnpm' }]}>
-  <Tab>
-
-```sh
-mkdir rspack-demo
-cd rspack-demo
-npm init -y
-npm install -D @rspack/cli
-```
-
-  </Tab>
-
-  <Tab>
-
-```sh
-mkdir rspack-demo
-cd rspack-demo
-npm init -y
-yarn add -D @rspack/cli
-```
-
-  </Tab>
-
-  <Tab>
-
-```sh
-mkdir rspack-demo
-cd rspack-demo
-npm init -y
-pnpm install -D @rspack/cli
-```
-
-  </Tab>
-</Tabs>

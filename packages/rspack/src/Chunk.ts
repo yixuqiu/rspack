@@ -1,128 +1,97 @@
-import {
-	__chunk_group_inner_get_chunk_group,
-	__chunk_inner_can_be_initial,
-	__chunk_inner_get_all_async_chunks,
-	__chunk_inner_get_all_initial_chunks,
-	__chunk_inner_get_all_referenced_chunks,
-	__chunk_inner_has_runtime,
-	__chunk_inner_is_only_initial,
-	type JsChunk,
-	type JsCompilation
-} from "@rspack/binding";
-import { ChunkGroup } from "./ChunkGroup";
-import { compareChunkGroupsByIndex } from "./util/comparators";
-import { Compilation } from ".";
+import util from 'node:util';
+import { Chunk, type ChunkGroup } from '@rspack/binding';
 
-export class Chunk {
-	#inner: JsChunk;
-	#inner_compilation: JsCompilation;
+Object.defineProperty(Chunk.prototype, 'files', {
+  enumerable: true,
+  configurable: true,
+  get(this: Chunk) {
+    return new Set(this._files);
+  },
+});
 
-	name?: string;
-	id?: string;
-	ids: Array<string>;
-	idNameHints: Array<string>;
-	filenameTemplate?: string;
-	cssFilenameTemplate?: string;
-	files: Array<string>;
-	runtime: Array<string>;
-	hash?: string;
-	contentHash: Record<string, string>;
-	renderedHash?: string;
-	chunkReasons: Array<string>;
-	auxiliaryFiles: Array<string>;
+Object.defineProperty(Chunk.prototype, 'runtime', {
+  enumerable: true,
+  configurable: true,
+  get(this: Chunk) {
+    return new Set(this._runtime);
+  },
+});
 
-	static __from_binding(chunk: JsChunk, compilation: Compilation): Chunk;
-	static __from_binding(chunk: JsChunk, compilation: JsCompilation): Chunk;
-	static __from_binding(
-		chunk: JsChunk,
-		compilation: Compilation | JsCompilation
-	) {
-		if (compilation instanceof Compilation) {
-			return new Chunk(chunk, compilation.__internal_getInner());
-		}
-		return new Chunk(chunk, compilation);
-	}
+Object.defineProperty(Chunk.prototype, 'auxiliaryFiles', {
+  enumerable: true,
+  configurable: true,
+  get(this: Chunk) {
+    return new Set(this._auxiliaryFiles);
+  },
+});
 
-	constructor(chunk: JsChunk, compilation: JsCompilation) {
-		this.#inner = chunk;
-		this.#inner_compilation = compilation;
+Object.defineProperty(Chunk.prototype, 'groupsIterable', {
+  enumerable: true,
+  configurable: true,
+  get(this: Chunk) {
+    return new Set(this._groupsIterable);
+  },
+});
 
-		this.name = chunk.name;
-		this.id = chunk.id;
-		this.ids = chunk.ids;
-		this.idNameHints = chunk.idNameHints;
-		this.filenameTemplate = chunk.filenameTemplate;
-		this.cssFilenameTemplate = chunk.cssFilenameTemplate;
-		this.files = chunk.files;
-		this.runtime = chunk.runtime;
-		this.hash = chunk.hash;
-		this.contentHash = chunk.contentHash;
-		this.renderedHash = chunk.renderedHash;
-		this.chunkReasons = chunk.chunkReasons;
-		this.auxiliaryFiles = chunk.auxiliaryFiles;
-	}
-
-	isOnlyInitial() {
-		return __chunk_inner_is_only_initial(
-			this.#inner.__inner_ukey,
-			this.#inner_compilation
-		);
-	}
-
-	canBeInitial() {
-		return __chunk_inner_can_be_initial(
-			this.#inner.__inner_ukey,
-			this.#inner_compilation
-		);
-	}
-
-	hasRuntime() {
-		return __chunk_inner_has_runtime(
-			this.#inner.__inner_ukey,
-			this.#inner_compilation
-		);
-	}
-
-	get groupsIterable(): Iterable<ChunkGroup> {
-		const chunk_groups = this.#inner.__inner_groups.map(ukey => {
-			const cg = __chunk_group_inner_get_chunk_group(
-				ukey as number,
-				this.#inner_compilation
-			);
-			return ChunkGroup.__from_binding(cg, this.#inner_compilation);
-		});
-		chunk_groups.sort(compareChunkGroupsByIndex);
-		return new Set(chunk_groups);
-	}
-
-	getAllAsyncChunks(): Iterable<Chunk> {
-		return new Set(
-			__chunk_inner_get_all_async_chunks(
-				this.#inner.__inner_ukey,
-				this.#inner_compilation
-			).map(c => Chunk.__from_binding(c, this.#inner_compilation))
-		);
-	}
-
-	getAllInitialChunks(): Iterable<Chunk> {
-		return new Set(
-			__chunk_inner_get_all_initial_chunks(
-				this.#inner.__inner_ukey,
-				this.#inner_compilation
-			).map(c => Chunk.__from_binding(c, this.#inner_compilation))
-		);
-	}
-
-	getAllReferencedChunks(): Iterable<Chunk> {
-		return new Set(
-			__chunk_inner_get_all_referenced_chunks(
-				this.#inner.__inner_ukey,
-				this.#inner_compilation
-			).map(c => Chunk.__from_binding(c, this.#inner_compilation))
-		);
-	}
-
-	__internal_inner_ukey() {
-		return this.#inner.__inner_ukey;
-	}
+interface ChunkMaps {
+  hash: Record<string | number, string>;
+  contentHash: Record<string | number, Record<string, string>>;
+  name: Record<string | number, string>;
 }
+
+Object.defineProperty(Chunk.prototype, 'getChunkMaps', {
+  enumerable: true,
+  configurable: true,
+  value(this: Chunk, realHash: boolean): ChunkMaps {
+    const chunkHashMap: Record<string | number, string> = {};
+    const chunkContentHashMap: Record<
+      string | number,
+      Record<string, string>
+    > = {};
+    const chunkNameMap: Record<string | number, string> = {};
+
+    for (const chunk of this.getAllAsyncChunks()) {
+      const id = chunk.id;
+      if (id === undefined) continue;
+      const chunkHash = realHash ? chunk.hash : chunk.renderedHash;
+      if (chunkHash) {
+        chunkHashMap[id] = chunkHash;
+      }
+      for (const key of Object.keys(chunk.contentHash)) {
+        if (!chunkContentHashMap[key]) {
+          chunkContentHashMap[key] = {};
+        }
+        chunkContentHashMap[key][id] = chunk.contentHash[key];
+      }
+      if (chunk.name) {
+        chunkNameMap[id] = chunk.name;
+      }
+    }
+
+    return {
+      hash: chunkHashMap,
+      contentHash: chunkContentHashMap,
+      name: chunkNameMap,
+    };
+  },
+});
+
+Object.defineProperty(Chunk.prototype, util.inspect.custom, {
+  enumerable: true,
+  configurable: true,
+  value(this: Chunk): any {
+    return { ...this };
+  },
+});
+
+declare module '@rspack/binding' {
+  interface Chunk {
+    readonly files: ReadonlySet<string>;
+    readonly runtime: ReadonlySet<string>;
+    readonly auxiliaryFiles: ReadonlySet<string>;
+    readonly groupsIterable: ReadonlySet<ChunkGroup>;
+    getChunkMaps(realHash: boolean): ChunkMaps;
+  }
+}
+
+export { Chunk } from '@rspack/binding';

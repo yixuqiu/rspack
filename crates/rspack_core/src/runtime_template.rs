@@ -1,0 +1,2002 @@
+use std::{
+  borrow::Cow,
+  fmt::{Debug, Write},
+  sync::{Arc, LazyLock, Mutex},
+};
+
+use cow_utils::CowUtils;
+use heck::ToSnakeCase;
+use itertools::Itertools;
+use memchr::memmem;
+use rspack_collections::{Identifier, IdentifierSet};
+use rspack_dojang::{Context, Dojang, FunctionContainer, Operand};
+use rspack_error::{Error, Result, ToStringResultToRspackResultExt, error};
+use rspack_intern::Atom;
+use rspack_util::{fx_hash::FxIndexSet, json_stringify, placeholder::PlaceholderFinder};
+use rustc_hash::{FxHashMap, FxHashSet as HashSet};
+use serde_json::{Value, json};
+
+use crate::{
+  AsyncDependenciesBlockIdentifier, ChunkGraph, Compilation, CompilerOptions, DependenciesBlock,
+  DependencyId, DependencyType, ExportsArgument, ExportsInfoArtifact, ExportsType,
+  FakeNamespaceObjectMode, ImportPhase, InitFragment, InitFragmentExt, InitFragmentKey,
+  InitFragmentStage, Module, ModuleArgument, ModuleGraph, ModuleGraphCacheArtifact, ModuleId,
+  ModuleIdentifier, NormalInitFragment, PathInfo, RuntimeCondition, RuntimeGlobals, RuntimeSpec,
+  UsedName, compile_boolean_matcher_from_lists, contextify, property_access,
+  runtime_globals::{
+    RuntimeVariable, rspack_export_runtime_variable_name, rspack_runtime_variable_name,
+    runtime_globals_to_string, runtime_variable_name,
+  },
+  runtime_mode::RuntimeMode,
+  to_comment, to_normal_comment,
+};
+
+pub struct RuntimeTemplate {
+  compiler_options: Arc<CompilerOptions>,
+  render_mode: RuntimeTemplateRenderMode,
+  dojang: Arc<Dojang>,
+}
+
+static RUNTIME_GLOBALS_PLACEHOLDER: LazyLock<PlaceholderFinder> =
+  LazyLock::new(|| PlaceholderFinder::new("$$RUNTIME_GLOBAL_"));
+
+static WEBPACK_RUNTIME_GLOBALS: LazyLock<Arc<RuntimeGlobalsRenderMap>> = LazyLock::new(|| {
+  Arc::new(runtime_globals_to_render_map(
+    RuntimeGlobalsRenderMode::Webpack,
+  ))
+});
+
+static RSPACK_CONTEXT_RUNTIME_GLOBALS: LazyLock<Arc<RuntimeGlobalsRenderMap>> =
+  LazyLock::new(|| {
+    Arc::new(runtime_globals_to_render_map(
+      RuntimeGlobalsRenderMode::RspackContext,
+    ))
+  });
+
+static RSPACK_LEXICAL_RUNTIME_GLOBALS: LazyLock<Arc<RuntimeGlobalsRenderMap>> =
+  LazyLock::new(|| {
+    Arc::new(runtime_globals_to_render_map(
+      RuntimeGlobalsRenderMode::RspackLexical,
+    ))
+  });
+
+static RSPACK_EXPORT_RUNTIME_GLOBALS: LazyLock<Arc<RuntimeGlobalsRenderMap>> =
+  LazyLock::new(|| {
+    Arc::new(runtime_globals_to_render_map(
+      RuntimeGlobalsRenderMode::RspackExport,
+    ))
+  });
+
+/// Controls how a single runtime global is rendered into its final JavaScript identifier.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum RuntimeGlobalsRenderMode {
+  /// Renders webpack-compatible identifiers such as `__webpack_require__.d`.
+  #[default]
+  Webpack,
+  /// Renders runtime globals as properties on `__rspack_context`.
+  RspackContext,
+  /// Renders runtime globals as lexical variables such as `definePropertyGetters`.
+  RspackLexical,
+  /// Renders runtime globals as exported lexical variables such as
+  /// `definePropertyGetters`.
+  RspackExport,
+}
+
+impl RuntimeGlobalsRenderMode {
+  /// Returns whether runtime globals use webpack-compatible identifiers.
+  pub fn is_legacy(self) -> bool {
+    matches!(self, Self::Webpack)
+  }
+
+  fn render_runtime_variable(self, runtime_variable: &RuntimeVariable) -> &'static str {
+    match self {
+      Self::Webpack => runtime_variable_name(runtime_variable),
+      Self::RspackContext | Self::RspackLexical => rspack_runtime_variable_name(runtime_variable),
+      Self::RspackExport => rspack_export_runtime_variable_name(runtime_variable),
+    }
+  }
+}
+
+/// Selects the runtime-global representation used by each code-template scenario.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum RuntimeTemplateRenderMode {
+  /// Uses webpack-compatible runtime globals in every code-template scenario.
+  #[default]
+  Webpack,
+  /// Uses context references in modules and chunks, and lexical bindings in runtime modules.
+  Rspack,
+  /// Uses exported lexical bindings in modules, runtime modules, and chunks.
+  RspackExport,
+}
+
+impl RuntimeTemplateRenderMode {
+  fn from_options(compiler_options: &CompilerOptions) -> Self {
+    match compiler_options.experiments.runtime_mode {
+      RuntimeMode::Webpack => Self::Webpack,
+      RuntimeMode::Rspack
+        if compiler_options.output.module
+          && compiler_options
+            .output
+            .enabled_library_types
+            .as_ref()
+            .is_some_and(|types| types.iter().any(|ty| ty == "modern-module")) =>
+      {
+        Self::RspackExport
+      }
+      RuntimeMode::Rspack => Self::Rspack,
+    }
+  }
+
+  fn for_module_execution(compiler_options: &CompilerOptions) -> Self {
+    match compiler_options.experiments.runtime_mode {
+      RuntimeMode::Webpack => Self::Webpack,
+      RuntimeMode::Rspack => Self::Rspack,
+    }
+  }
+
+  /// Returns whether all runtime globals use webpack-compatible identifiers.
+  pub fn is_legacy(self) -> bool {
+    matches!(self, Self::Webpack)
+  }
+
+  /// Returns the runtime-global render mode for ordinary module code generation.
+  pub fn module_render_mode(self) -> RuntimeGlobalsRenderMode {
+    match self {
+      Self::Webpack => RuntimeGlobalsRenderMode::Webpack,
+      Self::Rspack => RuntimeGlobalsRenderMode::RspackContext,
+      Self::RspackExport => RuntimeGlobalsRenderMode::RspackExport,
+    }
+  }
+
+  /// Returns the runtime-global render mode used to generate runtime modules.
+  pub fn runtime_module_render_mode(self) -> RuntimeGlobalsRenderMode {
+    match self {
+      Self::Webpack => RuntimeGlobalsRenderMode::Webpack,
+      Self::Rspack => RuntimeGlobalsRenderMode::RspackLexical,
+      Self::RspackExport => RuntimeGlobalsRenderMode::RspackExport,
+    }
+  }
+
+  /// Returns the runtime-global render mode used while assembling final chunks.
+  pub fn chunk_render_mode(self) -> RuntimeGlobalsRenderMode {
+    match self {
+      Self::Webpack => RuntimeGlobalsRenderMode::Webpack,
+      Self::Rspack => RuntimeGlobalsRenderMode::RspackContext,
+      Self::RspackExport => RuntimeGlobalsRenderMode::RspackExport,
+    }
+  }
+}
+
+#[derive(Debug)]
+struct RuntimeGlobalsRenderMap {
+  runtime_values: FxHashMap<RuntimeGlobals, Arc<str>>,
+}
+
+impl RuntimeGlobalsRenderMap {
+  fn render(&self, runtime_globals: &RuntimeGlobals) -> Arc<str> {
+    self
+      .runtime_values
+      .get(runtime_globals)
+      .expect("runtime global should be a single known flag")
+      .clone()
+  }
+
+  fn render_template_placeholder(&self, name: &str) -> Arc<str> {
+    let runtime_globals =
+      RuntimeGlobals::from_name(name).expect("runtime global name should be known");
+    self.render(&runtime_globals)
+  }
+}
+
+fn replace_runtime_globals<'a>(
+  template: &'a str,
+  runtime_globals: &RuntimeGlobalsRenderMap,
+) -> Cow<'a, str> {
+  let mut matches = RUNTIME_GLOBALS_PLACEHOLDER
+    .find_all(template, |rest| {
+      let end = memmem::find(rest.as_bytes(), b"$$")?;
+      let name = &rest[..end];
+      (!name.contains('\n')).then_some((end + 2, name))
+    })
+    .peekable();
+  if matches.peek().is_none() {
+    return Cow::Borrowed(template);
+  }
+
+  let mut result = String::with_capacity(template.len());
+  let mut end = 0;
+  for (range, name) in matches {
+    result.push_str(&template[end..range.start]);
+    result.push_str(&runtime_globals.render_template_placeholder(name));
+    end = range.end;
+  }
+  result.push_str(&template[end..]);
+  Cow::Owned(result)
+}
+
+impl Debug for RuntimeTemplate {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("runtime_template").finish()
+  }
+}
+
+impl RuntimeTemplate {
+  pub fn new(compiler_options: Arc<CompilerOptions>) -> Self {
+    let render_mode = RuntimeTemplateRenderMode::from_options(&compiler_options);
+    Self::with_render_mode(compiler_options, render_mode)
+  }
+
+  pub(crate) fn for_module_execution(compiler_options: Arc<CompilerOptions>) -> Self {
+    let render_mode = RuntimeTemplateRenderMode::for_module_execution(&compiler_options);
+    Self::with_render_mode(compiler_options, render_mode)
+  }
+
+  fn with_render_mode(
+    compiler_options: Arc<CompilerOptions>,
+    render_mode: RuntimeTemplateRenderMode,
+  ) -> Self {
+    let runtime_globals = get_runtime_globals_render_map(render_mode.runtime_module_render_mode());
+    let mut dojang = Dojang::new();
+    register_runtime_module_declaration_functions(&mut dojang);
+
+    let runtime_globals_cloned = runtime_globals.clone();
+    let compiler_options_cloned = compiler_options.clone();
+    dojang.functions.insert(
+      "basicFunction".into(),
+      FunctionContainer::F1(Box::new(move |args: Operand| {
+        dojang_basic_function(args, &runtime_globals_cloned, &compiler_options_cloned)
+      })),
+    );
+
+    let runtime_globals_cloned = runtime_globals.clone();
+    let compiler_options_cloned = compiler_options.clone();
+    dojang.functions.insert(
+      "returningFunction".into(),
+      FunctionContainer::F2(Box::new(move |args: Operand, return_value: Operand| {
+        dojang_returning_function(
+          args,
+          return_value,
+          &runtime_globals_cloned,
+          &compiler_options_cloned,
+        )
+      })),
+    );
+
+    let runtime_globals_cloned = runtime_globals.clone();
+    let compiler_options_cloned = compiler_options.clone();
+    dojang.functions.insert(
+      "expressionFunction".into(),
+      FunctionContainer::F2(Box::new(move |args: Operand, expression: Operand| {
+        dojang_expression_function(
+          args,
+          expression,
+          &runtime_globals_cloned,
+          &compiler_options_cloned,
+        )
+      })),
+    );
+
+    let compiler_options_cloned = compiler_options.clone();
+    dojang.functions.insert(
+      "emptyFunction".into(),
+      FunctionContainer::F0(Box::new(move || {
+        dojang_empty_function(&compiler_options_cloned)
+      })),
+    );
+
+    let runtime_globals_cloned = runtime_globals.clone();
+    let compiler_options_cloned = compiler_options.clone();
+    dojang.functions.insert(
+      "destructureArray".into(),
+      FunctionContainer::F2(Box::new(move |items: Operand, value: Operand| {
+        dojang_array_destructure(
+          items,
+          value,
+          &runtime_globals_cloned,
+          &compiler_options_cloned,
+        )
+      })),
+    );
+
+    let runtime_globals_cloned = runtime_globals.clone();
+    let runtime_globals_render_mode = render_mode.runtime_module_render_mode();
+    dojang.functions.insert(
+      "define".into(),
+      FunctionContainer::F1(Box::new(move |runtime_global: Operand| {
+        dojang_define(
+          runtime_global,
+          &runtime_globals_cloned,
+          runtime_globals_render_mode,
+        )
+      })),
+    );
+
+    let runtime_globals_cloned = runtime_globals;
+    dojang.functions.insert(
+      "weak".into(),
+      FunctionContainer::F1(Box::new(move |runtime_global: Operand| {
+        dojang_weak(runtime_global, &runtime_globals_cloned)
+      })),
+    );
+
+    Self {
+      compiler_options,
+      render_mode,
+      dojang: Arc::new(dojang),
+    }
+  }
+
+  pub fn add_templates(&mut self, templates: Vec<(String, String)>) {
+    for (key, template) in templates {
+      let dojang = Arc::get_mut(&mut self.dojang)
+        .expect("runtime templates cannot be added while a code template is alive");
+      if !dojang.templates.contains_key(&key) {
+        dojang
+          .add_with_option(key.clone(), template)
+          .unwrap_or_else(|_| panic!("failed to add template {key}"));
+      }
+    }
+  }
+
+  /// Returns the render-mode combination selected for this compilation.
+  pub fn render_mode(&self) -> RuntimeTemplateRenderMode {
+    self.render_mode
+  }
+
+  pub fn create_runtime_module_identifier(&self, name: &str) -> Identifier {
+    let module_name = if let Some(name) = name.strip_suffix("RuntimeModule") {
+      name
+    } else {
+      name
+    };
+    self.create_custom_runtime_module_identifier(&module_name.to_snake_case())
+  }
+
+  pub fn create_custom_runtime_module_identifier(&self, custom: &str) -> Identifier {
+    let prefix = if self.render_mode.is_legacy() {
+      "webpack/runtime/"
+    } else {
+      "rspack/runtime/"
+    };
+    Identifier::from(format!("{prefix}{custom}"))
+  }
+
+  /// Creates the template used to render runtime globals referenced by ordinary modules.
+  pub fn create_module_code_template(&self) -> ModuleCodeTemplate {
+    ModuleCodeTemplate::new(
+      self.compiler_options.clone(),
+      self.render_mode.module_render_mode(),
+    )
+  }
+
+  /// Creates the template used by `RuntimeModule::generate` in every generation phase.
+  pub fn create_runtime_module_code_template(&self) -> RuntimeCodeTemplate {
+    RuntimeCodeTemplate::new(
+      self.compiler_options.clone(),
+      self.render_mode.runtime_module_render_mode(),
+      Some(self.dojang.clone()),
+    )
+  }
+
+  /// Creates the template used to render runtime globals while assembling a chunk.
+  pub fn create_chunk_code_template(&self) -> RuntimeCodeTemplate {
+    RuntimeCodeTemplate::new(
+      self.compiler_options.clone(),
+      self.render_mode.chunk_render_mode(),
+      None,
+    )
+  }
+}
+
+fn get_runtime_globals_render_map(
+  render_mode: RuntimeGlobalsRenderMode,
+) -> Arc<RuntimeGlobalsRenderMap> {
+  match render_mode {
+    RuntimeGlobalsRenderMode::Webpack => WEBPACK_RUNTIME_GLOBALS.clone(),
+    RuntimeGlobalsRenderMode::RspackContext => RSPACK_CONTEXT_RUNTIME_GLOBALS.clone(),
+    RuntimeGlobalsRenderMode::RspackLexical => RSPACK_LEXICAL_RUNTIME_GLOBALS.clone(),
+    RuntimeGlobalsRenderMode::RspackExport => RSPACK_EXPORT_RUNTIME_GLOBALS.clone(),
+  }
+}
+
+fn hmr_runtime_state_prefix(
+  render_mode: RuntimeGlobalsRenderMode,
+  runtime_globals: &RuntimeGlobalsRenderMap,
+) -> String {
+  match render_mode {
+    RuntimeGlobalsRenderMode::RspackLexical => RuntimeGlobals::HMR_RUNTIME_STATE_PREFIX
+      .property_name()
+      .expect("hmr runtime state prefix should have property name")
+      .to_string(),
+    RuntimeGlobalsRenderMode::RspackExport => "__rspack_hmr_s".to_string(),
+    RuntimeGlobalsRenderMode::Webpack | RuntimeGlobalsRenderMode::RspackContext => runtime_globals
+      .render(&RuntimeGlobals::HMR_RUNTIME_STATE_PREFIX)
+      .to_string(),
+  }
+}
+
+fn runtime_globals_to_render_map(render_mode: RuntimeGlobalsRenderMode) -> RuntimeGlobalsRenderMap {
+  let mut runtime_values = FxHashMap::default();
+
+  for (_, runtime_globals) in RuntimeGlobals::all().iter_names() {
+    let rendered = match render_mode {
+      RuntimeGlobalsRenderMode::Webpack => {
+        if runtime_globals == RuntimeGlobals::REQUIRE_SCOPE {
+          runtime_variable_name(&RuntimeVariable::Require).to_string()
+        } else {
+          runtime_globals_to_string(&runtime_globals)
+        }
+      }
+      RuntimeGlobalsRenderMode::RspackContext => {
+        if runtime_globals == RuntimeGlobals::REQUIRE_SCOPE {
+          runtime_variable_name(&RuntimeVariable::Context).to_string()
+        } else if runtime_globals == RuntimeGlobals::REQUIRE {
+          format!("{}.r", runtime_variable_name(&RuntimeVariable::Context))
+        } else if runtime_globals == RuntimeGlobals::EXPORTS {
+          rspack_runtime_variable_name(&RuntimeVariable::Exports).to_string()
+        } else if runtime_globals.renderable_require_scope() == runtime_globals {
+          if let Some(name) = runtime_globals.rspack_context_property_name() {
+            format!(
+              "{}{}",
+              runtime_variable_name(&RuntimeVariable::Context),
+              property_access([name], 0)
+            )
+          } else {
+            runtime_globals_to_string(&runtime_globals)
+          }
+        } else {
+          runtime_globals_to_string(&runtime_globals)
+        }
+      }
+      RuntimeGlobalsRenderMode::RspackLexical => {
+        if runtime_globals == RuntimeGlobals::REQUIRE_SCOPE {
+          runtime_variable_name(&RuntimeVariable::Context).to_string()
+        } else if runtime_globals == RuntimeGlobals::REQUIRE {
+          rspack_runtime_variable_name(&RuntimeVariable::Require).to_string()
+        } else if runtime_globals == RuntimeGlobals::EXPORTS {
+          rspack_runtime_variable_name(&RuntimeVariable::Exports).to_string()
+        } else if runtime_globals == RuntimeGlobals::MODULE {
+          rspack_runtime_variable_name(&RuntimeVariable::Module).to_string()
+        } else if runtime_globals.renderable_require_scope() == runtime_globals {
+          runtime_globals.to_lexical_name().map_or_else(
+            || runtime_globals_to_string(&runtime_globals),
+            str::to_string,
+          )
+        } else {
+          runtime_globals_to_string(&runtime_globals)
+        }
+      }
+      RuntimeGlobalsRenderMode::RspackExport => {
+        if runtime_globals == RuntimeGlobals::REQUIRE_SCOPE
+          || runtime_globals == RuntimeGlobals::REQUIRE
+        {
+          rspack_export_runtime_variable_name(&RuntimeVariable::Require).to_string()
+        } else if runtime_globals == RuntimeGlobals::EXPORTS {
+          rspack_export_runtime_variable_name(&RuntimeVariable::Exports).to_string()
+        } else if runtime_globals == RuntimeGlobals::MODULE {
+          rspack_export_runtime_variable_name(&RuntimeVariable::Module).to_string()
+        } else if runtime_globals.renderable_require_scope() == runtime_globals {
+          runtime_globals.to_lexical_name().map_or_else(
+            || runtime_globals_to_string(&runtime_globals),
+            str::to_string,
+          )
+        } else {
+          runtime_globals_to_string(&runtime_globals)
+        }
+      }
+    };
+
+    runtime_values.insert(runtime_globals, rendered.into());
+  }
+
+  runtime_values.shrink_to_fit();
+
+  RuntimeGlobalsRenderMap { runtime_values }
+}
+
+fn to_cow<'a>(val: &'a Operand, runtime_globals: &RuntimeGlobalsRenderMap) -> Cow<'a, str> {
+  match val {
+    Operand::Value(val) => {
+      replace_runtime_globals(val.as_str().unwrap_or_default(), runtime_globals)
+    }
+    _ => Cow::Borrowed(""),
+  }
+}
+
+fn join_to_cow<'a>(
+  val: &'a Operand,
+  sep: &str,
+  runtime_globals: &RuntimeGlobalsRenderMap,
+) -> Cow<'a, str> {
+  match val {
+    Operand::Array(items) => Cow::Owned(
+      items
+        .iter()
+        .map(|item| to_cow(item, runtime_globals))
+        .join(sep),
+    ),
+    _ => to_cow(val, runtime_globals),
+  }
+}
+
+fn dojang_basic_function(
+  args: Operand,
+  runtime_globals: &RuntimeGlobalsRenderMap,
+  compiler_options: &Arc<CompilerOptions>,
+) -> Operand {
+  if compiler_options
+    .output
+    .environment
+    .supports_arrow_function()
+  {
+    Operand::Value(Value::from(format!(
+      r#"({}) =>"#,
+      join_to_cow(&args, ", ", runtime_globals)
+    )))
+  } else {
+    Operand::Value(Value::from(format!(
+      r#"function({})"#,
+      join_to_cow(&args, ", ", runtime_globals)
+    )))
+  }
+}
+
+fn dojang_returning_function(
+  return_value: Operand,
+  args: Operand,
+  runtime_globals: &RuntimeGlobalsRenderMap,
+  compiler_options: &Arc<CompilerOptions>,
+) -> Operand {
+  if compiler_options
+    .output
+    .environment
+    .supports_arrow_function()
+  {
+    Operand::Value(Value::from(format!(
+      "({}) => ({})",
+      join_to_cow(&args, ", ", runtime_globals),
+      to_cow(&return_value, runtime_globals)
+    )))
+  } else {
+    Operand::Value(Value::from(format!(
+      "function({}) {{ return {}; }}",
+      join_to_cow(&args, ", ", runtime_globals),
+      to_cow(&return_value, runtime_globals)
+    )))
+  }
+}
+
+fn dojang_expression_function(
+  expression: Operand,
+  args: Operand,
+  runtime_globals: &RuntimeGlobalsRenderMap,
+  compiler_options: &Arc<CompilerOptions>,
+) -> Operand {
+  if compiler_options
+    .output
+    .environment
+    .supports_arrow_function()
+  {
+    Operand::Value(Value::from(format!(
+      "({}) => ({})",
+      join_to_cow(&args, ", ", runtime_globals),
+      to_cow(&expression, runtime_globals)
+    )))
+  } else {
+    Operand::Value(Value::from(format!(
+      "function({}) {{ {}; }}",
+      join_to_cow(&args, ", ", runtime_globals),
+      to_cow(&expression, runtime_globals)
+    )))
+  }
+}
+
+fn dojang_empty_function(compiler_options: &Arc<CompilerOptions>) -> Operand {
+  if compiler_options
+    .output
+    .environment
+    .supports_arrow_function()
+  {
+    Operand::Value(Value::from("() => {}"))
+  } else {
+    Operand::Value(Value::from("function() {}"))
+  }
+}
+
+fn register_runtime_module_declaration_functions(dojang: &mut Dojang) {
+  dojang.functions.insert(
+    "var".into(),
+    FunctionContainer::F1(Box::new(|name: Operand| {
+      Operand::Value(Value::from(format!("var {}", String::from(name))))
+    })),
+  );
+  dojang.functions.insert(
+    "fn".into(),
+    FunctionContainer::F1(Box::new(|name: Operand| {
+      Operand::Value(Value::from(format!("function {}", String::from(name))))
+    })),
+  );
+}
+
+fn dojang_array_destructure(
+  items: Operand,
+  value: Operand,
+  runtime_globals: &RuntimeGlobalsRenderMap,
+  compiler_options: &Arc<CompilerOptions>,
+) -> Operand {
+  if compiler_options.output.environment.supports_destructuring() {
+    Operand::Value(Value::from(format!(
+      "var [{}] = {};",
+      join_to_cow(&items, ", ", runtime_globals),
+      to_cow(&value, runtime_globals)
+    )))
+  } else {
+    let value_name = to_cow(&value, runtime_globals).into_owned();
+    let items = match items {
+      Operand::Array(items) => items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+          let item_name = to_cow(item, runtime_globals);
+          if item_name.is_empty() {
+            String::default()
+          } else {
+            format!("var {item_name} = {value_name}[{idx}];")
+          }
+        })
+        .join("\n"),
+      Operand::Value(val) => val
+        .as_str()
+        .unwrap_or_default()
+        .split(",")
+        .enumerate()
+        .map(|(idx, item)| {
+          let item_name = item.trim().to_string();
+          if item_name.is_empty() {
+            String::default()
+          } else {
+            format!("var {item_name} = {value_name}[{idx}];")
+          }
+        })
+        .join("\n"),
+      _ => String::default(),
+    };
+    Operand::Value(Value::from(items))
+  }
+}
+
+fn dojang_define(
+  runtime_global: Operand,
+  runtime_globals: &RuntimeGlobalsRenderMap,
+  render_mode: RuntimeGlobalsRenderMode,
+) -> Operand {
+  // `define(...)` marks a runtime global assignment; the EJS extractor records it in `define`.
+  match render_mode {
+    RuntimeGlobalsRenderMode::RspackLexical | RuntimeGlobalsRenderMode::RspackExport => {
+      Operand::Value(Value::from(format!(
+        "var {}",
+        to_cow(&runtime_global, runtime_globals)
+      )))
+    }
+    RuntimeGlobalsRenderMode::Webpack | RuntimeGlobalsRenderMode::RspackContext => Operand::Value(
+      Value::from(to_cow(&runtime_global, runtime_globals).into_owned()),
+    ),
+  }
+}
+
+fn dojang_weak(runtime_global: Operand, runtime_globals: &RuntimeGlobalsRenderMap) -> Operand {
+  // `weak(...)` marks an optional runtime global read; the extractor records it in `weak`.
+  Operand::Value(Value::from(
+    to_cow(&runtime_global, runtime_globals).into_owned(),
+  ))
+}
+
+// information content of the comment
+#[derive(Default)]
+struct CommentOptions<'a> {
+  // request string used originally
+  request: Option<&'a str>,
+  // name of the chunk referenced
+  chunk_name: Option<&'a str>,
+  // additional message
+  message: Option<&'a str>,
+}
+
+fn subtract_runtime(a: Option<&RuntimeSpec>, b: Option<&RuntimeSpec>) -> Option<RuntimeSpec> {
+  match (a, b) {
+    (Some(a), None) => Some(a.clone()),
+    (None, None) => None,
+    (None, Some(b)) => Some(b.clone()),
+    (Some(a), Some(b)) => Some(a.subtract(b)),
+  }
+}
+
+pub fn for_each_runtime<F>(runtime: Option<&RuntimeSpec>, mut f: F, deterministic_order: bool)
+where
+  F: FnMut(Option<&ustr::Ustr>),
+{
+  match runtime {
+    None => f(None),
+    Some(runtime) => {
+      if deterministic_order {
+        for r in runtime.iter().sorted() {
+          f(Some(r));
+        }
+      } else {
+        for r in runtime.iter() {
+          f(Some(r));
+        }
+      }
+    }
+  }
+}
+
+pub fn render_make_deferred_namespace_mode_from_exports_type(exports_type: ExportsType) -> String {
+  match exports_type {
+    ExportsType::Namespace => "8".to_string(),
+    ExportsType::DefaultOnly => "0".to_string(),
+    ExportsType::DefaultWithNamed => "2".to_string(),
+    ExportsType::Dynamic => "6".to_string(),
+  }
+}
+
+pub fn get_exports_type(
+  module_graph: &ModuleGraph,
+  module_graph_cache: &ModuleGraphCacheArtifact,
+  exports_info_artifact: &ExportsInfoArtifact,
+  id: &DependencyId,
+  parent_module: &ModuleIdentifier,
+) -> ExportsType {
+  let strict = module_graph
+    .module_by_identifier(parent_module)
+    .expect("should have mgm")
+    .get_strict_esm_module();
+  get_exports_type_with_strict(
+    module_graph,
+    module_graph_cache,
+    exports_info_artifact,
+    id,
+    strict,
+  )
+}
+
+pub fn get_exports_type_with_strict(
+  module_graph: &ModuleGraph,
+  module_graph_cache: &ModuleGraphCacheArtifact,
+  exports_info_artifact: &ExportsInfoArtifact,
+  id: &DependencyId,
+  strict: bool,
+) -> ExportsType {
+  let module = module_graph
+    .module_identifier_by_dependency_id(id)
+    .expect("should have module");
+  module_graph
+    .module_by_identifier(module)
+    .expect("should have module")
+    .get_exports_type(
+      module_graph,
+      module_graph_cache,
+      exports_info_artifact,
+      strict,
+    )
+}
+
+pub fn get_outgoing_async_modules(
+  compilation: &Compilation,
+  module: &dyn Module,
+) -> FxIndexSet<ModuleId> {
+  fn helper(
+    compilation: &Compilation,
+    mg: &ModuleGraph,
+    module: &dyn Module,
+    set: &mut FxIndexSet<ModuleId>,
+    visited: &mut IdentifierSet,
+  ) {
+    let module_identifier = module.identifier();
+    if !ModuleGraph::is_async(&compilation.async_modules_artifact, &module_identifier) {
+      return;
+    }
+    if !visited.insert(module_identifier) {
+      return;
+    }
+    if module.build_meta().has_top_level_await() {
+      set.insert(
+        ChunkGraph::get_module_id(&compilation.module_ids_artifact, module_identifier)
+          .expect("should have module_id")
+          .clone(),
+      );
+    } else {
+      for (module, connections) in mg.get_outcoming_connections_by_module(&module_identifier) {
+        let is_esm = connections.iter().any(|connection| {
+          let dep = mg.dependency_by_id(&connection.dependency_id);
+          matches!(
+            dep.dependency_type(),
+            DependencyType::EsmImport
+              | DependencyType::EsmExportImport
+              | DependencyType::EsmExportImportedSpecifier
+              | DependencyType::Provided
+          )
+        });
+        if is_esm {
+          helper(
+            compilation,
+            mg,
+            mg.module_by_identifier(&module)
+              .expect("should have module")
+              .as_ref(),
+            set,
+            visited,
+          );
+        }
+      }
+    }
+  }
+
+  let mut set = FxIndexSet::default();
+  let mut visited = IdentifierSet::default();
+  helper(
+    compilation,
+    compilation.get_module_graph(),
+    module,
+    &mut set,
+    &mut visited,
+  );
+  set
+}
+
+#[derive(Debug)]
+pub struct ModuleCodeTemplate {
+  compiler_options: Arc<CompilerOptions>,
+  runtime_globals_render_mode: RuntimeGlobalsRenderMode,
+  runtime_globals: Arc<RuntimeGlobalsRenderMap>,
+  runtime_requirements: RuntimeGlobals,
+}
+
+impl ModuleCodeTemplate {
+  fn new(
+    compiler_options: Arc<CompilerOptions>,
+    runtime_globals_render_mode: RuntimeGlobalsRenderMode,
+  ) -> Self {
+    Self {
+      compiler_options,
+      runtime_globals_render_mode,
+      runtime_globals: get_runtime_globals_render_map(runtime_globals_render_mode),
+      runtime_requirements: RuntimeGlobals::default(),
+    }
+  }
+
+  pub fn runtime_requirements_mut(&mut self) -> &mut RuntimeGlobals {
+    &mut self.runtime_requirements
+  }
+
+  pub fn runtime_requirements(&self) -> &RuntimeGlobals {
+    &self.runtime_requirements
+  }
+
+  pub fn render_runtime_globals(&mut self, runtime_globals: &RuntimeGlobals) -> String {
+    self.runtime_requirements.insert(*runtime_globals);
+    self.runtime_globals.render(runtime_globals).to_string()
+  }
+
+  pub fn render_runtime_globals_without_adding(
+    &self,
+    runtime_globals: &RuntimeGlobals,
+  ) -> Arc<str> {
+    self.runtime_globals.render(runtime_globals)
+  }
+
+  pub fn render_runtime_scope(&self) -> Arc<str> {
+    match self.runtime_globals_render_mode {
+      RuntimeGlobalsRenderMode::Webpack => {
+        WEBPACK_RUNTIME_GLOBALS.render(&RuntimeGlobals::REQUIRE_SCOPE)
+      }
+      RuntimeGlobalsRenderMode::RspackExport => {
+        self.runtime_globals.render(&RuntimeGlobals::REQUIRE)
+      }
+      RuntimeGlobalsRenderMode::RspackContext | RuntimeGlobalsRenderMode::RspackLexical => {
+        RSPACK_CONTEXT_RUNTIME_GLOBALS.render(&RuntimeGlobals::REQUIRE_SCOPE)
+      }
+    }
+  }
+
+  pub fn define_es_module_flag_statement(&mut self, exports_argument: ExportsArgument) -> String {
+    format!(
+      "{}({});\n",
+      self.render_runtime_globals(&RuntimeGlobals::MAKE_NAMESPACE_OBJECT),
+      self.render_exports_argument(exports_argument)
+    )
+  }
+
+  pub fn render_exports_argument(&mut self, exports_argument: ExportsArgument) -> String {
+    self.runtime_requirements.insert(RuntimeGlobals::EXPORTS);
+    match exports_argument {
+      ExportsArgument::Exports => "exports".to_string(),
+      ExportsArgument::RspackExports => self
+        .render_runtime_variable(&RuntimeVariable::Exports)
+        .to_string(),
+    }
+  }
+
+  pub fn render_module_argument(&mut self, module_argument: ModuleArgument) -> String {
+    self.runtime_requirements.insert(RuntimeGlobals::MODULE);
+    match module_argument {
+      ModuleArgument::Module => "module".to_string(),
+      ModuleArgument::RspackModule => self
+        .render_runtime_variable(&RuntimeVariable::Module)
+        .to_string(),
+    }
+  }
+
+  pub fn render_this_exports(&mut self) -> String {
+    self
+      .runtime_requirements
+      .insert(RuntimeGlobals::THIS_AS_EXPORTS);
+    "this".to_string()
+  }
+
+  pub fn render_runtime_variable(&self, runtime_variable: &RuntimeVariable) -> &'static str {
+    self
+      .runtime_globals_render_mode
+      .render_runtime_variable(runtime_variable)
+  }
+
+  /// Returns the final runtime-global representation used by this module template.
+  pub fn render_mode(&self) -> RuntimeGlobalsRenderMode {
+    self.runtime_globals_render_mode
+  }
+
+  pub fn returning_function(&self, return_value: &str, args: &str) -> String {
+    if self
+      .compiler_options
+      .output
+      .environment
+      .supports_arrow_function()
+    {
+      format!("({args}) => ({return_value})")
+    } else {
+      format!("function({args}) {{ return {return_value}; }}")
+    }
+  }
+
+  pub fn basic_function(&self, args: &str, body: &str) -> String {
+    if self
+      .compiler_options
+      .output
+      .environment
+      .supports_arrow_function()
+    {
+      format!(
+        r#"({args}) => {{
+{body}
+}}"#
+      )
+    } else {
+      format!(
+        r#"function({args}) {{
+{body}
+}}"#
+      )
+    }
+  }
+
+  pub fn get_optimized_deferred_module(
+    &mut self,
+    exports_type: ExportsType,
+    module_id_expr: &str,
+    async_deps: FxIndexSet<ModuleId>,
+  ) -> String {
+    self
+      .runtime_requirements
+      .insert(RuntimeGlobals::MAKE_OPTIMIZED_DEFERRED_NAMESPACE_OBJECT);
+    let mode = render_make_deferred_namespace_mode_from_exports_type(exports_type);
+    let mut content = format!(
+      "{}({}, {}",
+      self.render_runtime_globals(&RuntimeGlobals::MAKE_OPTIMIZED_DEFERRED_NAMESPACE_OBJECT),
+      module_id_expr,
+      mode
+    );
+    if !async_deps.is_empty() {
+      content += ", ";
+      content += &json_stringify(&async_deps);
+    }
+    content += ")";
+    content
+  }
+
+  pub fn runtime_condition_expression(
+    &mut self,
+    chunk_graph: &ChunkGraph,
+    runtime_condition: Option<&RuntimeCondition>,
+    runtime: Option<&RuntimeSpec>,
+  ) -> String {
+    let Some(runtime_condition) = runtime_condition else {
+      return "true".to_string();
+    };
+
+    let runtime_condition = match runtime_condition {
+      RuntimeCondition::Boolean(v) => return v.to_string(),
+      RuntimeCondition::Spec(spec) => spec,
+    };
+
+    let mut positive_runtime_ids = HashSet::default();
+    for_each_runtime(
+      Some(runtime_condition),
+      |runtime| {
+        if let Some(runtime_id) =
+          runtime.and_then(|runtime| chunk_graph.get_runtime_id(runtime.as_str()))
+        {
+          positive_runtime_ids.insert(runtime_id);
+        }
+      },
+      false,
+    );
+
+    let mut negative_runtime_ids = HashSet::default();
+    for_each_runtime(
+      subtract_runtime(runtime, Some(runtime_condition)).as_ref(),
+      |runtime| {
+        if let Some(runtime_id) =
+          runtime.and_then(|runtime| chunk_graph.get_runtime_id(runtime.as_str()))
+        {
+          negative_runtime_ids.insert(runtime_id);
+        }
+      },
+      false,
+    );
+
+    compile_boolean_matcher_from_lists(
+      positive_runtime_ids.into_iter().collect::<Vec<_>>(),
+      negative_runtime_ids.into_iter().collect::<Vec<_>>(),
+    )
+    .render(
+      self
+        .render_runtime_globals(&RuntimeGlobals::RUNTIME_ID)
+        .as_str(),
+    )
+  }
+
+  pub fn throw_missing_module_error_block(&self, request: &str) -> String {
+    let e = format!("Cannot find module '{request}'");
+    format!(
+      "var e = new Error({}); e.code = 'MODULE_NOT_FOUND'; throw e;",
+      json!(e)
+    )
+  }
+
+  pub fn block_promise(
+    &mut self,
+    block: Option<&AsyncDependenciesBlockIdentifier>,
+    compilation: &Compilation,
+    message: &str,
+  ) -> String {
+    let Some(block) = block else {
+      let comment = self.comment(CommentOptions {
+        request: None,
+        chunk_name: None,
+        message: Some(message),
+      });
+      return format!("Promise.resolve({})", comment.trim());
+    };
+    let chunk_group = compilation
+      .build_chunk_graph_artifact
+      .chunk_graph
+      .get_block_chunk_group(
+        block,
+        &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
+      );
+    let Some(chunk_group) = chunk_group else {
+      let comment = self.comment(CommentOptions {
+        request: None,
+        chunk_name: None,
+        message: Some(message),
+      });
+      return format!("Promise.resolve({})", comment.trim());
+    };
+    if chunk_group.chunks.is_empty() {
+      let comment = self.comment(CommentOptions {
+        request: None,
+        chunk_name: None,
+        message: Some(message),
+      });
+      return format!("Promise.resolve({})", comment.trim());
+    }
+    let mg = compilation.get_module_graph();
+    let block = mg.block_by_id_expect(block);
+    let comment = self.comment(CommentOptions {
+      request: None,
+      chunk_name: block.get_group_options().and_then(|o| o.name()),
+      message: Some(message),
+    });
+    let chunks = if compilation.hot
+      && let Some(chunk) = chunk_group.get_hmr_loading_chunk(compilation)
+    {
+      vec![chunk]
+    } else {
+      chunk_group
+        .get_loading_chunks(compilation)
+        .collect::<Vec<_>>()
+    };
+
+    if chunks.len() == 1 {
+      let chunk_id = simd_json::to_string(chunks[0].id().expect("should have chunk.id"))
+        .expect("should able to json stringify");
+
+      let fetch_priority = chunk_group
+        .kind
+        .get_normal_options()
+        .and_then(|x| x.fetch_priority);
+
+      if fetch_priority.is_some() {
+        self
+          .runtime_requirements
+          .insert(RuntimeGlobals::HAS_FETCH_PRIORITY);
+      }
+
+      format!(
+        "{}({comment}{chunk_id}{})",
+        self.render_runtime_globals(&RuntimeGlobals::ENSURE_CHUNK),
+        fetch_priority
+          .map(|x| format!(r#", "{x}""#))
+          .unwrap_or_default()
+      )
+    } else if !chunks.is_empty() {
+      let fetch_priority = chunk_group
+        .kind
+        .get_normal_options()
+        .and_then(|x| x.fetch_priority);
+
+      if fetch_priority.is_some() {
+        self
+          .runtime_requirements
+          .insert(RuntimeGlobals::HAS_FETCH_PRIORITY);
+      }
+
+      format!(
+        "Promise.all({comment}[{}])",
+        chunks
+          .iter()
+          .map(|c| format!(
+            "{}({}{})",
+            self.render_runtime_globals(&RuntimeGlobals::ENSURE_CHUNK),
+            simd_json::to_string(c.id().expect("should have chunk.id"))
+              .expect("should able to json stringify"),
+            fetch_priority
+              .map(|x| format!(r#", "{x}""#))
+              .unwrap_or_default()
+          ))
+          .collect::<Vec<_>>()
+          .join(", ")
+      )
+    } else {
+      format!("Promise.resolve({})", comment.trim())
+    }
+  }
+
+  // add a comment
+  fn comment(&self, comment_options: CommentOptions) -> String {
+    let used_pathinfo = matches!(
+      self.compiler_options.output.pathinfo,
+      PathInfo::Bool(true) | PathInfo::String(_)
+    );
+    let content = if used_pathinfo {
+      vec![
+        comment_options.message,
+        comment_options.request,
+        comment_options.chunk_name,
+      ]
+    } else {
+      vec![comment_options.message, comment_options.chunk_name]
+    }
+    .iter()
+    .filter_map(|&item| item)
+    .map(|item| contextify(self.compiler_options.context.as_path(), item))
+    .collect::<Vec<_>>()
+    .join(" | ");
+
+    if content.is_empty() {
+      return String::new();
+    }
+
+    if used_pathinfo {
+      format!("{} ", to_comment(&content))
+    } else {
+      format!("{} ", to_normal_comment(&content))
+    }
+  }
+
+  pub fn module_raw(
+    &mut self,
+    compilation: &Compilation,
+    id: &DependencyId,
+    request: &str,
+    weak: bool,
+  ) -> String {
+    if let Some(module_identifier) = compilation
+      .get_module_graph()
+      .module_identifier_by_dependency_id(id)
+      && let Some(module_id) =
+        ChunkGraph::get_module_id(&compilation.module_ids_artifact, *module_identifier)
+    {
+      format!(
+        "{}({})",
+        self.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+        self.module_id_expr(request, module_id)
+      )
+    } else if weak {
+      self.weak_error_expression(request)
+    } else {
+      self.missing_module(request)
+    }
+  }
+
+  pub fn module_id_expr(&self, request: &str, module_id: &ModuleId) -> String {
+    format!(
+      "{}{}",
+      self.comment(CommentOptions {
+        request: Some(request),
+        ..Default::default()
+      }),
+      json_stringify(module_id)
+    )
+  }
+
+  pub fn weak_error(&self, request: &str) -> String {
+    format!(
+      "var e = new Error('Module is not available (weak dependency), request is {request}'); e.code = 'MODULE_NOT_FOUND'; throw e;"
+    )
+  }
+
+  // Weak errors are embedded as statements, expressions, or promises depending on the
+  // runtime template position, aligned with webpack RuntimeTemplate.weakError:
+  // https://github.com/webpack/webpack/blob/2944286213cf1b3697a1c8dd41ffd3f8ada99448/lib/RuntimeTemplate.js#L461-L486
+  pub fn weak_error_expression(&self, request: &str) -> String {
+    format!("Object({}())", self.weak_error_function(request))
+  }
+
+  pub fn weak_error_promise(&self, request: &str) -> String {
+    format!(
+      "Promise.resolve().then({})",
+      self.weak_error_function(request)
+    )
+  }
+
+  pub fn weak_error_function(&self, request: &str) -> String {
+    format!(
+      "function __rspack_weak_module_error__() {{ {} }}",
+      self.weak_error(request)
+    )
+  }
+
+  pub fn missing_module(&self, request: &str) -> String {
+    format!(
+      "Object({}())",
+      self.throw_missing_module_error_function(request)
+    )
+  }
+
+  pub fn missing_module_promise(&self, request: &str) -> String {
+    format!(
+      "Promise.resolve().then({})",
+      self.throw_missing_module_error_function(request)
+    )
+  }
+
+  pub fn missing_module_statement(&self, request: &str) -> String {
+    format!("{};\n", self.missing_module(request))
+  }
+
+  pub fn throw_missing_module_error_function(&self, request: &str) -> String {
+    format!(
+      "function __rspack_missing_module() {{ {} }}",
+      self.throw_missing_module_error_block(request)
+    )
+  }
+
+  pub fn module_id(
+    &self,
+    compilation: &Compilation,
+    id: &DependencyId,
+    request: &str,
+    weak: bool,
+  ) -> String {
+    if let Some(module_identifier) = compilation
+      .get_module_graph()
+      .module_identifier_by_dependency_id(id)
+      && let Some(module_id) =
+        ChunkGraph::get_module_id(&compilation.module_ids_artifact, *module_identifier)
+    {
+      self.module_id_expr(request, module_id)
+    } else if weak {
+      "null /* weak dependency, without id */".to_string()
+    } else {
+      self.missing_module(request)
+    }
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  pub fn import_statement(
+    &mut self,
+    module: &dyn Module,
+    compilation: &Compilation,
+    id: &DependencyId,
+    import_var: &str,
+    request: &str,
+    phase: ImportPhase,
+    update: bool, // whether a new variable should be created or the existing one updated
+  ) -> (String, String) {
+    let mg = compilation.get_module_graph();
+    let Some(target_module) = mg.get_module_by_dependency_id(id) else {
+      return (self.missing_module_statement(request), String::new());
+    };
+
+    let module_id_expr = self.module_id(compilation, id, request, false);
+
+    let opt_declaration = if update { "" } else { "var " };
+
+    let exports_type = target_module.get_exports_type(
+      mg,
+      &compilation.module_graph_cache_artifact,
+      &compilation.exports_info_artifact,
+      module.get_strict_esm_module(),
+    );
+
+    if phase.is_defer() && !target_module.build_meta().has_top_level_await() {
+      let async_deps = get_outgoing_async_modules(compilation, target_module.as_ref());
+      let import_content = format!(
+        "/* deferred import */{opt_declaration}{import_var} = {};\n",
+        self.get_optimized_deferred_module(exports_type, &module_id_expr, async_deps)
+      );
+      return (import_content, String::new());
+    }
+
+    let import_content = format!(
+      "/* import */ {opt_declaration}{import_var} = {}({module_id_expr});\n",
+      self.render_runtime_globals(&RuntimeGlobals::REQUIRE)
+    );
+    if matches!(exports_type, ExportsType::Dynamic) {
+      return (
+        import_content,
+        format!(
+          "/* import */ {opt_declaration}{import_var}_default = /*#__PURE__*/{}({import_var});\n",
+          self.render_runtime_globals(&RuntimeGlobals::COMPAT_GET_DEFAULT_EXPORT),
+        ),
+      );
+    }
+    (import_content, String::new())
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  pub fn export_from_import(
+    &mut self,
+    compilation: &Compilation,
+    init_fragments: &mut Vec<Box<dyn InitFragment>>,
+    origin_module: &dyn Module,
+    runtime: Option<&RuntimeSpec>,
+    default_interop: bool,
+    request: &str,
+    import_var: &str,
+    export_name: &[Atom],
+    id: &DependencyId,
+    is_call: bool,
+    call_context: bool,
+    asi_safe: Option<bool>,
+    phase: ImportPhase,
+  ) -> String {
+    let mg = compilation.get_module_graph();
+    let Some(target_module) = mg.get_module_by_dependency_id(id) else {
+      return self.missing_module(request);
+    };
+
+    let exports_type = target_module.get_exports_type(
+      mg,
+      &compilation.module_graph_cache_artifact,
+      &compilation.exports_info_artifact,
+      origin_module.get_strict_esm_module(),
+    );
+
+    let target_module_identifier = target_module.identifier();
+
+    let is_deferred = phase.is_defer() && !target_module.build_meta().has_top_level_await();
+
+    let mut exclude_default_export_name = None;
+    if default_interop {
+      if !export_name.is_empty()
+        && let Some(first_export_name) = export_name.first()
+        && first_export_name == "default"
+      {
+        if is_deferred && !matches!(exports_type, ExportsType::Namespace) {
+          let name = &export_name[1..];
+          let exports_info = compilation
+            .exports_info_artifact
+            .get_exports_info_data(&target_module_identifier);
+          let Some(used) =
+            exports_info.get_used_name(&compilation.exports_info_artifact, runtime, name)
+          else {
+            return to_normal_comment(&format!(
+              "unused export {}",
+              property_access(export_name, 0)
+            )) + "undefined";
+          };
+          let UsedName::Normal(used) = used else {
+            unreachable!("can't inline the exports of defer imported module")
+          };
+          let access = format!("{import_var}.a{}", property_access(used, 0));
+          if is_call {
+            return access;
+          }
+          let Some(asi_safe) = asi_safe else {
+            return access;
+          };
+          return if asi_safe {
+            format!("({access})")
+          } else {
+            format!(";({access})")
+          };
+        }
+        match exports_type {
+          ExportsType::Dynamic => {
+            if is_call {
+              return format!("{import_var}_default(){}", property_access(export_name, 1));
+            } else {
+              return if let Some(asi_safe) = asi_safe {
+                match asi_safe {
+                  true => format!(
+                    "({import_var}_default(){})",
+                    property_access(export_name, 1)
+                  ),
+                  false => format!(
+                    ";({import_var}_default(){})",
+                    property_access(export_name, 1)
+                  ),
+                }
+              } else {
+                format!("{import_var}_default.a{}", property_access(export_name, 1))
+              };
+            }
+          }
+          ExportsType::DefaultOnly | ExportsType::DefaultWithNamed => {
+            exclude_default_export_name = Some(export_name[1..].to_vec());
+          }
+          _ => {}
+        }
+      } else if !export_name.is_empty() {
+        if matches!(exports_type, ExportsType::DefaultOnly) {
+          return format!(
+            "/* non-default import from non-esm module */undefined\n{}",
+            property_access(export_name, 1)
+          );
+        } else if !matches!(exports_type, ExportsType::Namespace)
+          && let Some(first_export_name) = export_name.first()
+          && first_export_name == "__esModule"
+        {
+          return "/* __esModule */true".to_string();
+        }
+      } else if is_deferred {
+        // now exportName.length is 0
+        // fall through to the end of this function, create the namespace there.
+      } else if matches!(
+        exports_type,
+        ExportsType::DefaultOnly | ExportsType::DefaultWithNamed
+      ) {
+        let name = format!("var {import_var}_namespace_cache;\n");
+        init_fragments.push(
+          NormalInitFragment::new(
+            name.clone(),
+            InitFragmentStage::StageESMExports,
+            -1,
+            InitFragmentKey::ESMFakeNamespaceObjectFragment(name),
+            None,
+          )
+          .boxed(),
+        );
+        let prefix = if let Some(asi_safe) = asi_safe {
+          match asi_safe {
+            true => "",
+            false => ";",
+          }
+        } else {
+          "Object"
+        };
+        return format!(
+          "/*#__PURE__*/ {prefix}({import_var}_namespace_cache || ({import_var}_namespace_cache = {}({import_var}{})))",
+          self.render_runtime_globals(&RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT),
+          if matches!(exports_type, ExportsType::DefaultOnly) {
+            ""
+          } else {
+            ", 2"
+          }
+        );
+      }
+    }
+
+    let export_name = exclude_default_export_name
+      .as_deref()
+      .unwrap_or(export_name);
+    if !export_name.is_empty() {
+      let exports_info = compilation
+        .exports_info_artifact
+        .get_exports_info_data(&target_module_identifier);
+      let used_name = match exports_info.get_used_name(
+        &compilation.exports_info_artifact,
+        runtime,
+        export_name,
+      ) {
+        Some(UsedName::Normal(used_name)) => used_name,
+        Some(UsedName::Inlined(inlined)) => {
+          assert!(
+            !is_deferred,
+            "can't inline the exports of defer imported module"
+          );
+          return inlined.render(&to_normal_comment(&format!(
+            "inlined export {}",
+            property_access(export_name, 0)
+          )));
+        }
+        None => {
+          let mut result = to_normal_comment(&format!(
+            "unused export {}",
+            property_access(export_name, 0)
+          ));
+          result.push_str(" undefined");
+          return result;
+        }
+      };
+      let comment = if used_name != export_name {
+        to_normal_comment(&property_access(export_name, 0))
+      } else {
+        String::new()
+      };
+      let property = property_access(used_name, 0);
+      let access = format!(
+        "{import_var}{}{comment}{property}",
+        if is_deferred { ".a" } else { "" }
+      );
+      if is_call && !call_context {
+        if let Some(asi_safe) = asi_safe {
+          match asi_safe {
+            true => format!("(0,{access})"),
+            false => format!(";(0,{access})"),
+          }
+        } else {
+          format!("Object({access})")
+        }
+      } else {
+        access
+      }
+    } else if is_deferred {
+      let cache_var = format!("var {import_var}_deferred_namespace_cache;\n");
+      init_fragments.push(
+        NormalInitFragment::new(
+          cache_var.clone(),
+          InitFragmentStage::StageConstants,
+          -1,
+          InitFragmentKey::ESMDeferImportNamespaceObjectFragment(cache_var),
+          None,
+        )
+        .boxed(),
+      );
+      let module_id =
+        ChunkGraph::get_module_id(&compilation.module_ids_artifact, target_module_identifier);
+      let mode = render_make_deferred_namespace_mode_from_exports_type(exports_type);
+      format!(
+        "/*#__PURE__*/ {}({import_var}_deferred_namespace_cache || ({import_var}_deferred_namespace_cache = {}({}, {})))",
+        match asi_safe {
+          Some(true) => "",
+          Some(false) => ";",
+          None => "Object",
+        },
+        self.render_runtime_globals(&RuntimeGlobals::MAKE_DEFERRED_NAMESPACE_OBJECT),
+        json_stringify(&module_id),
+        mode,
+      )
+    } else {
+      import_var.to_string()
+    }
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  pub fn module_namespace_promise(
+    &mut self,
+    compilation: &Compilation,
+    module_id: Identifier,
+    dep_id: &DependencyId,
+    block: Option<&AsyncDependenciesBlockIdentifier>,
+    request: &str,
+    message: &str,
+    weak: bool,
+    phase: ImportPhase,
+  ) -> String {
+    let mg = compilation.get_module_graph();
+    let Some(target_module) = mg.get_module_by_dependency_id(dep_id) else {
+      return self.missing_module_promise(request);
+    };
+    // Match webpack's weak module without-id path in moduleNamespacePromise:
+    // https://github.com/webpack/webpack/blob/2944286213cf1b3697a1c8dd41ffd3f8ada99448/lib/RuntimeTemplate.js#L682-L692
+    if weak
+      && ChunkGraph::get_module_id(&compilation.module_ids_artifact, target_module.identifier())
+        .is_none()
+    {
+      return self.weak_error_promise(request);
+    }
+
+    let promise = self.block_promise(block, compilation, message);
+    let strict = mg
+      .module_by_identifier(&module_id)
+      .expect("should have mgm")
+      .get_strict_esm_module();
+    let exports_type = target_module.get_exports_type(
+      mg,
+      &compilation.module_graph_cache_artifact,
+      &compilation.exports_info_artifact,
+      strict,
+    );
+    let module_id_expr = self.module_id(compilation, dep_id, request, weak);
+
+    let header = if weak {
+      Some(format!(
+        r#"if(!{}[{module_id_expr}]) {{
+ {} 
+}}"#,
+        self.render_runtime_globals(&RuntimeGlobals::MODULE_FACTORIES),
+        self.weak_error(request)
+      ))
+    } else {
+      None
+    };
+
+    let mut appending;
+
+    if phase.is_defer() && !target_module.build_meta().has_top_level_await() {
+      let mode = format!(
+        "{} | 16",
+        render_make_deferred_namespace_mode_from_exports_type(exports_type)
+      );
+      let async_deps = get_outgoing_async_modules(compilation, target_module.as_ref());
+      if !async_deps.is_empty() {
+        if let Some(header) = header {
+          let rendered_async_deps_fn = self.render_runtime_globals(
+            &RuntimeGlobals::DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES,
+          );
+          appending = format!(
+            ".then({})",
+            self.basic_function(
+              "",
+              &format!(
+                "{header}\nreturn {}({})",
+                &rendered_async_deps_fn,
+                json_stringify(&async_deps)
+              )
+            )
+          );
+        } else {
+          let rendered_async_deps_fn = self.render_runtime_globals(
+            &RuntimeGlobals::DEFERRED_MODULES_ASYNC_TRANSITIVE_DEPENDENCIES,
+          );
+          appending = format!(
+            ".then({})",
+            self.returning_function(
+              &format!(
+                "{}({})",
+                &rendered_async_deps_fn,
+                json_stringify(&async_deps)
+              ),
+              ""
+            )
+          );
+        }
+        write!(
+          appending,
+          ".then({}.bind({}, {module_id_expr}, {mode}))",
+          self.render_runtime_globals(&RuntimeGlobals::MAKE_DEFERRED_NAMESPACE_OBJECT),
+          self.render_runtime_globals(&RuntimeGlobals::REQUIRE)
+        )
+        .expect("infallible write to String");
+      } else if let Some(header) = header {
+        let rendered_async_deps_fn =
+          self.render_runtime_globals(&RuntimeGlobals::MAKE_DEFERRED_NAMESPACE_OBJECT);
+        appending = format!(
+          ".then({})",
+          self.basic_function(
+            "",
+            &format!(
+              "{header}\nreturn {}({module_id_expr}, {mode});",
+              &rendered_async_deps_fn
+            )
+          )
+        );
+      } else {
+        appending = format!(
+          ".then({}.bind({}, {module_id_expr}, {mode}))",
+          self.render_runtime_globals(&RuntimeGlobals::MAKE_DEFERRED_NAMESPACE_OBJECT),
+          self.render_runtime_globals(&RuntimeGlobals::REQUIRE)
+        );
+      }
+      return format!("{promise}{appending}");
+    }
+
+    let mut fake_type = FakeNamespaceObjectMode::PROMISE_LIKE;
+    match exports_type {
+      ExportsType::Namespace => {
+        if let Some(header) = header {
+          appending = format!(
+            ".then(function() {{ {header}\nreturn {}}})",
+            self.module_raw(compilation, dep_id, request, weak)
+          )
+        } else {
+          appending = format!(
+            ".then({}.bind({}, {module_id_expr}))",
+            self.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+            self.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+          );
+        }
+      }
+      _ => {
+        if matches!(exports_type, ExportsType::Dynamic) {
+          fake_type |= FakeNamespaceObjectMode::RETURN_VALUE;
+        }
+        if matches!(
+          exports_type,
+          ExportsType::DefaultWithNamed | ExportsType::Dynamic
+        ) {
+          fake_type |= FakeNamespaceObjectMode::MERGE_PROPERTIES;
+        }
+        if ModuleGraph::is_async(
+          &compilation.async_modules_artifact,
+          &target_module.identifier(),
+        ) {
+          if let Some(header) = header {
+            appending = format!(
+              r#".then(function() {{
+ {header}
+return {}
+}})"#,
+              self.module_raw(compilation, dep_id, request, weak)
+            )
+          } else {
+            appending = format!(
+              ".then({}.bind({}, {module_id_expr}))",
+              self.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+              self.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+            );
+          }
+          appending.push_str(
+            format!(
+              r#".then(function(m){{
+ return {}(m, {fake_type}) 
+}})"#,
+              self.render_runtime_globals(&RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT)
+            )
+            .as_str(),
+          );
+        } else {
+          fake_type |= FakeNamespaceObjectMode::MODULE_ID;
+          if let Some(header) = header {
+            let create_fake_namespace_object =
+              self.render_runtime_globals(&RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT);
+            let expr = if self.render_mode() == RuntimeGlobalsRenderMode::RspackExport {
+              let require = self.render_runtime_globals(&RuntimeGlobals::REQUIRE);
+              format!(
+                "{create_fake_namespace_object}.call({require}, {module_id_expr}, {fake_type})"
+              )
+            } else {
+              format!("{create_fake_namespace_object}({module_id_expr}, {fake_type})")
+            };
+            appending = format!(
+              r#".then(function() {{
+ {header} return {expr};
+}})"#
+            );
+          } else {
+            appending = format!(
+              ".then({}.bind({}, {module_id_expr}, {fake_type}))",
+              self.render_runtime_globals(&RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT),
+              self.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+            );
+          }
+        }
+      }
+    }
+
+    format!("{promise}{appending}")
+  }
+
+  pub fn sync_module_factory(
+    &mut self,
+    dep: &DependencyId,
+    request: &str,
+    compilation: &Compilation,
+  ) -> String {
+    let return_value = self.module_raw(compilation, dep, request, false);
+    let factory = self.returning_function(&return_value, "");
+    self.returning_function(&factory, "")
+  }
+
+  pub fn async_module_factory(
+    &mut self,
+    block_id: &AsyncDependenciesBlockIdentifier,
+    request: &str,
+    compilation: &Compilation,
+  ) -> String {
+    let module_graph = compilation.get_module_graph();
+    let block = module_graph
+      .block_by_id(block_id)
+      .expect("should have block");
+    let dep = block
+      .get_dependency_ids()
+      .next()
+      .expect("should have dependency");
+    let ensure_chunk = self.block_promise(Some(block_id), compilation, "");
+    let return_value = self.module_raw(compilation, dep, request, false);
+    let factory = self.returning_function(&return_value, "");
+    self.returning_function(
+      &if ensure_chunk.starts_with("Promise.resolve(") {
+        factory
+      } else {
+        format!(
+          "{ensure_chunk}.then({})",
+          self.returning_function(&factory, "")
+        )
+      },
+      "",
+    )
+  }
+}
+
+/// Renders runtime globals for both runtime-module generation and chunk assembly.
+pub struct RuntimeCodeTemplate {
+  compiler_options: Arc<CompilerOptions>,
+  render_mode: RuntimeGlobalsRenderMode,
+  runtime_globals: Arc<RuntimeGlobalsRenderMap>,
+  dojang: Option<Arc<Dojang>>,
+}
+
+impl Debug for RuntimeCodeTemplate {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("RuntimeCodeTemplate")
+      .field("render_mode", &self.render_mode)
+      .finish_non_exhaustive()
+  }
+}
+
+impl RuntimeCodeTemplate {
+  fn new(
+    compiler_options: Arc<CompilerOptions>,
+    render_mode: RuntimeGlobalsRenderMode,
+    dojang: Option<Arc<Dojang>>,
+  ) -> Self {
+    Self {
+      compiler_options,
+      render_mode,
+      runtime_globals: get_runtime_globals_render_map(render_mode),
+      dojang,
+    }
+  }
+
+  pub fn render_runtime_global_definition(&self, runtime_globals: &RuntimeGlobals) -> String {
+    let runtime_global = self.runtime_globals.render(runtime_globals);
+    match self.render_mode {
+      RuntimeGlobalsRenderMode::RspackLexical | RuntimeGlobalsRenderMode::RspackExport => {
+        format!("var {runtime_global}")
+      }
+      RuntimeGlobalsRenderMode::Webpack | RuntimeGlobalsRenderMode::RspackContext => {
+        runtime_global.to_string()
+      }
+    }
+  }
+
+  /// Returns the final runtime-global representation selected by the creating factory.
+  pub fn render_mode(&self) -> RuntimeGlobalsRenderMode {
+    self.render_mode
+  }
+
+  pub fn render_runtime_globals(&self, runtime_globals: &RuntimeGlobals) -> String {
+    self.runtime_globals.render(runtime_globals).to_string()
+  }
+
+  pub fn render_hmr_runtime_state_expression(&self, key: &str) -> String {
+    let state_prefix = hmr_runtime_state_prefix(self.render_mode, &self.runtime_globals);
+    format!("{state_prefix}_{key}")
+  }
+
+  pub fn render_runtime_variable(&self, runtime_variable: &RuntimeVariable) -> String {
+    self
+      .render_mode
+      .render_runtime_variable(runtime_variable)
+      .to_string()
+  }
+
+  pub fn render_runtime_argument(&self) -> String {
+    match self.render_mode {
+      RuntimeGlobalsRenderMode::Webpack | RuntimeGlobalsRenderMode::RspackExport => {
+        self.render_runtime_globals(&RuntimeGlobals::REQUIRE)
+      }
+      RuntimeGlobalsRenderMode::RspackContext | RuntimeGlobalsRenderMode::RspackLexical => {
+        self.render_runtime_variable(&RuntimeVariable::Context)
+      }
+    }
+  }
+
+  pub fn render_exports_argument(&self, exports_argument: ExportsArgument) -> String {
+    match exports_argument {
+      ExportsArgument::Exports => "exports".to_string(),
+      ExportsArgument::RspackExports => self.render_runtime_variable(&RuntimeVariable::Exports),
+    }
+  }
+
+  pub fn render_module_argument(&self, module_argument: ModuleArgument) -> String {
+    match module_argument {
+      ModuleArgument::Module => "module".to_string(),
+      ModuleArgument::RspackModule => self.render_runtime_variable(&RuntimeVariable::Module),
+    }
+  }
+
+  pub fn basic_function(&self, args: &str, body: &str) -> String {
+    if self
+      .compiler_options
+      .output
+      .environment
+      .supports_arrow_function()
+    {
+      format!(
+        r#"({args}) => {{
+{body}
+}}"#
+      )
+    } else {
+      format!(
+        r#"function({args}) {{
+{body}
+}}"#
+      )
+    }
+  }
+  pub fn render(&self, key: &str, params: Option<serde_json::Value>) -> Result<String, Error> {
+    let mut render_params = Value::Object(Default::default());
+
+    render_params
+      .as_object_mut()
+      .unwrap_or_else(|| unreachable!())
+      .extend(RuntimeGlobals::all().iter_names().map(|(name, value)| {
+        (
+          name.to_string(),
+          Value::String(self.runtime_globals.render(&value).to_string()),
+        )
+      }));
+
+    if let Some(params) = params {
+      match params {
+        Value::Object(params) => {
+          for (k, v) in params {
+            render_params
+              .as_object_mut()
+              .unwrap_or_else(|| unreachable!())
+              .insert(k, v);
+          }
+        }
+        _ => panic!("Should receive a map value"),
+      }
+    }
+
+    let dojang = self
+      .dojang
+      .as_ref()
+      .expect("chunk code templates cannot render runtime module templates");
+    if let Some((executer, file_content)) = dojang.templates.get(key) {
+      executer
+        .render(
+          &mut Context::new(render_params),
+          &dojang.templates,
+          &dojang.functions,
+          file_content,
+          &mut Mutex::new(FxHashMap::default()),
+        )
+        // Replace Windows-style line endings (\r\n) with Unix-style (\n) to ensure consistent runtime templates across platforms
+        .map(|render| render.cow_replace("\r\n", "\n").to_string())
+        .to_rspack_result_with_message(|e| {
+          format!("Runtime module: failed to render template {key} from: {e}")
+        })
+    } else {
+      Err(error!("Runtime module: Template {key} is not found"))
+    }
+  }
+}

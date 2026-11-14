@@ -1,0 +1,137 @@
+Array [
+  .style_modules_css-class {
+	color: red;
+	background: red;
+}
+
+
+.style_modules_css-class {background: red}
+
+.style_modules_css-class {
+	color: red;
+	color: red;
+	color: red;
+	color: red;
+}
+
+
+.style_modules_css-class {
+	color: red;
+}
+
+
+.style_modules_css-class {
+	color: red;
+}
+
+/* TODO fix me */
+/*:import("reexport.modules.css") {
+	primary-color: _my_color;
+}
+
+.class {color: primary-color}*/
+
+
+.style_modules_css-class {
+	color:    red, red, func()   ;
+}
+
+.style_modules_css-nest {
+
+	:export {
+		unknown: unknown;
+	}
+
+	unknown: unknown;
+},
+  .style_modules_css-class {
+	color: red;
+	background: red;
+}
+
+
+.style_modules_css-class {background: red}
+
+.style_modules_css-class {
+	color: red;
+	color: red;
+	color: red;
+	color: red;
+}
+
+
+.style_modules_css-class {
+	color: red;
+}
+
+
+.style_modules_css-class {
+	color: red;
+}
+
+/* TODO fix me */
+/*:import("reexport.modules.css") {
+	primary-color: _my_color;
+}
+
+.class {color: primary-color}*/
+
+
+.style_modules_css-class {
+	color:    red, red, func()   ;
+}
+
+.style_modules_css-nest {
+
+	:export {
+		unknown: unknown;
+	}
+
+	unknown: unknown;
+},
+  .style_modules_css-class {
+	color: red;
+	background: red;
+}
+
+
+.style_modules_css-class {background: red}
+
+.style_modules_css-class {
+	color: red;
+	color: red;
+	color: red;
+	color: red;
+}
+
+
+.style_modules_css-class {
+	color: red;
+}
+
+
+.style_modules_css-class {
+	color: red;
+}
+
+/* TODO fix me */
+/*:import("reexport.modules.css") {
+	primary-color: _my_color;
+}
+
+.class {color: primary-color}*/
+
+
+.style_modules_css-class {
+	color:    red, red, func()   ;
+}
+
+.style_modules_css-nest {
+
+	:export {
+		unknown: unknown;
+	}
+
+	unknown: unknown;
+},
+]

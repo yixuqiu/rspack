@@ -1,0 +1,324 @@
+use std::sync::Arc;
+
+use rspack_collections::{IdentifierMap, IdentifierSet};
+use rspack_core::{
+  BuildModuleGraphArtifact, Compilation, DependenciesBlock, Dependency, DependencyId,
+  DependencyTemplate, ExportsInfoArtifact, ExternalModule, ImportPhase, InitFragmentExt,
+  InitFragmentKey, InitFragmentStage, NormalInitFragment,
+};
+use rspack_plugin_javascript::dependency::{
+  ESMExportImportedSpecifierDependency, ESMImportSideEffectDependency, ImportDependency,
+};
+use rustc_hash::FxHashSet;
+
+pub fn cutout_star_re_export_externals(
+  compilation: &Compilation,
+  build_module_graph_artifact: &mut BuildModuleGraphArtifact,
+  exports_info_artifact: &mut ExportsInfoArtifact,
+) {
+  let mg = build_module_graph_artifact.get_module_graph();
+  let mut connections_to_disable = FxHashSet::default();
+
+  let entry_modules = build_module_graph_artifact
+    .entry_dependencies
+    .iter()
+    .filter_map(|dep_id| mg.module_identifier_by_dependency_id(dep_id))
+    .copied()
+    .collect::<IdentifierSet>();
+
+  for module_id in &entry_modules {
+    let module = mg
+      .module_by_identifier(module_id)
+      .expect("should have entry module");
+    let mut side_effects_deps_by_module = IdentifierMap::<Vec<DependencyId>>::default();
+    let mut star_export_deps_by_module = IdentifierMap::default();
+
+    for dep in module.get_dependencies() {
+      let dep_id = dep.id();
+      let Some(module) = mg.get_module_by_dependency_id(dep_id) else {
+        continue;
+      };
+
+      let Some(external_module) = module.as_external_module() else {
+        continue;
+      };
+      if external_module.resolve_external_type() != "module" {
+        continue;
+      }
+
+      if dep.as_any().is::<ESMImportSideEffectDependency>() {
+        side_effects_deps_by_module
+          .entry(external_module.id)
+          .or_default()
+          .push(*dep_id);
+      } else if let Some(esm_export_dep) = dep
+        .as_any()
+        .downcast_ref::<ESMExportImportedSpecifierDependency>()
+        && esm_export_dep.name.is_none()
+        && esm_export_dep.other_star_exports.is_some()
+      {
+        *star_export_deps_by_module
+          .entry(external_module.id)
+          .or_insert(0) += 1;
+
+        connections_to_disable.insert(*dep_id);
+      }
+    }
+
+    for (module_id, side_effect_deps) in side_effects_deps_by_module {
+      let star_count = star_export_deps_by_module.get(&module_id).unwrap_or(&0);
+      if side_effect_deps.len() == *star_count {
+        connections_to_disable.extend(side_effect_deps);
+      }
+    }
+  }
+
+  let mg = build_module_graph_artifact.get_module_graph_mut();
+  for dep_id in &connections_to_disable {
+    let conn = mg
+      .connection_by_dependency_id_mut(dep_id)
+      .expect("definitely has connection");
+    conn.force_inactive();
+  }
+
+  // correct exports info
+  for module_id in entry_modules {
+    let module = mg
+      .module_by_identifier(&module_id)
+      .expect("should have entry module");
+
+    if !module.build_meta().esm() {
+      continue;
+    }
+
+    let exports_info = exports_info_artifact.get_exports_info_data(&module_id);
+
+    // re check
+    if matches!(
+      exports_info.other_exports_info().provided(),
+      Some(rspack_core::ExportProvided::Unknown)
+    ) {
+      let has_unknown_exports = module.get_dependencies().iter().any(|dep| {
+        if connections_to_disable.contains(dep.id()) {
+          return false;
+        }
+
+        let Some(exports) = dep.get_exports(
+          mg,
+          &compilation.module_graph_cache_artifact,
+          exports_info_artifact,
+        ) else {
+          return false;
+        };
+
+        match &exports.exports {
+          rspack_core::ExportsOfExportsSpec::UnknownExports => true,
+          rspack_core::ExportsOfExportsSpec::NoExports => false,
+          rspack_core::ExportsOfExportsSpec::Names(_) => false,
+        }
+      });
+
+      if !has_unknown_exports {
+        let exports_info = exports_info_artifact.get_exports_info_data_mut(&module_id);
+        exports_info
+          .other_exports_info_mut()
+          .set_provided(Some(rspack_core::ExportProvided::NotProvided));
+      }
+    }
+  }
+}
+
+pub fn cutout_dyn_import_externals(
+  cutout_all_externals: bool,
+  output_module: bool,
+  build_module_graph_artifact: &mut BuildModuleGraphArtifact,
+) {
+  let mg = build_module_graph_artifact.get_module_graph();
+  let mut connections_to_disable = Vec::new();
+  for (_, module) in mg.modules() {
+    let mut blocks = module.get_blocks().to_vec();
+    while let Some(block_id) = blocks.pop() {
+      let Some(block) = mg.block_by_id(&block_id) else {
+        continue;
+      };
+      blocks.extend_from_slice(block.get_blocks());
+      for block_dep in block.get_dependencies() {
+        let block_dep_id = block_dep.id();
+        if block_dep.as_any().is::<ImportDependency>() {
+          let import_dep_connection = mg.connection_by_dependency_id(block_dep_id);
+          if let Some(import_dep_connection) = import_dep_connection {
+            // Try find the connection with a import dependency pointing to an external module.
+            // If found, record the dependency so its connection can be disabled (forced inactive) and handled by external dyn-import rendering.
+            let import_module_id = import_dep_connection.module_identifier();
+            let Some(import_module) = mg.module_by_identifier(import_module_id) else {
+              continue;
+            };
+
+            if import_module.as_external_module().is_some_and(|external| {
+              if cutout_all_externals {
+                return true;
+              }
+              if !output_module {
+                return true;
+              }
+              matches!(
+                external.resolve_external_type(),
+                "import"
+                  | "module"
+                  | "commonjs"
+                  | "commonjs2"
+                  | "commonjs-module"
+                  | "commonjs-static"
+                  | "node-commonjs"
+              )
+            }) {
+              // remove connection of dyn-import external module
+              connections_to_disable.push(*block_dep_id);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  let mg = build_module_graph_artifact.get_module_graph_mut();
+  for dep_id in connections_to_disable {
+    let conn = mg
+      .connection_by_dependency_id_mut(&dep_id)
+      .expect("definitely has connection");
+    conn.force_inactive();
+  }
+}
+
+pub fn render_dyn_import_external_module(
+  import_dep: &ImportDependency,
+  external_module: &ExternalModule,
+  source: &mut rspack_core::TemplateReplaceSource,
+) {
+  let request = external_module.get_request();
+  let attributes_str = if let Some(attributes) = import_dep.get_attributes() {
+    format!(
+      ", {{ with: {} }}",
+      simd_json::to_string(attributes).expect("invalid json to_string")
+    )
+  } else {
+    String::new()
+  };
+  let comments_str = {
+    let mut comments_string = String::new();
+
+    for (line_comment, comment) in import_dep.comments.iter() {
+      if *line_comment {
+        comments_string.push_str(&format!("//{comment}\n"));
+      } else {
+        comments_string.push_str(&format!("/*{comment}*/ "));
+      }
+    }
+
+    comments_string
+  };
+
+  let callee = match import_dep.get_phase() {
+    ImportPhase::Evaluation => "import",
+    ImportPhase::Source => "import.source",
+    ImportPhase::Defer => "import.defer",
+  };
+
+  source.replace(
+    import_dep.range.start,
+    import_dep.range.end,
+    format!(
+      "{callee}({}{}{})",
+      comments_str,
+      rspack_util::json_stringify_str(&request.primary),
+      attributes_str
+    ),
+    None,
+  );
+}
+
+#[derive(Debug)]
+pub(crate) struct ImportDependencyTemplate {
+  pub(crate) template: Option<Arc<dyn DependencyTemplate>>,
+}
+
+impl DependencyTemplate for ImportDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn rspack_core::DependencyCodeGeneration,
+    source: &mut rspack_core::rspack_sources::ReplaceSource,
+    code_generatable_context: &mut rspack_core::TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<ImportDependency>()
+      .expect("should be import dependency");
+    let mg = code_generatable_context.compilation.get_module_graph();
+    let ref_module = mg.get_module_by_dependency_id(&dep.id);
+    if let Some(external) = ref_module.and_then(|m| m.as_external_module()) {
+      render_dyn_import_external_module(dep, external, source);
+      return;
+    }
+
+    if let Some(template) = &self.template {
+      template.render(dep, source, code_generatable_context);
+    }
+  }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExportImportedDependencyTemplate {
+  pub(crate) template: Option<Arc<dyn DependencyTemplate>>,
+}
+
+impl DependencyTemplate for ExportImportedDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn rspack_core::DependencyCodeGeneration,
+    source: &mut rspack_core::rspack_sources::ReplaceSource,
+    code_generatable_context: &mut rspack_core::TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<ESMExportImportedSpecifierDependency>()
+      .expect("should be export imported dependency");
+    let mg = code_generatable_context.compilation.get_module_graph();
+    let module = mg.module_identifier_by_dependency_id(&dep.id);
+
+    if dep.name.is_none()
+      && dep.other_star_exports.is_some()
+      && let Some(module) = module
+        .and_then(|mid| mg.module_by_identifier(mid))
+        .and_then(|m| {
+          m.as_external_module()
+            .filter(|&m| m.resolve_external_type() == "module")
+        })
+      // TODO: should cache calculate results for this
+      && code_generatable_context
+        .compilation
+        .entry_modules()
+        .contains(&code_generatable_context.module.identifier())
+    {
+      let request = module.get_request();
+      let chunk_init_fragments = code_generatable_context.chunk_init_fragments();
+      chunk_init_fragments.push(
+        NormalInitFragment::new(
+          format!(
+            "export * from {};\n",
+            rspack_util::json_stringify_str(request.primary())
+          ),
+          InitFragmentStage::StageESMImports,
+          0,
+          InitFragmentKey::Const(format!("esm_module_reexport_star_{}", dep.request)),
+          None,
+        )
+        .boxed(),
+      );
+      return;
+    }
+
+    if let Some(template) = &self.template {
+      template.render(dep, source, code_generatable_context);
+    }
+  }
+}

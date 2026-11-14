@@ -1,24 +1,30 @@
-#![feature(let_chains)]
-#![feature(round_char_boundary)]
+#![feature(string_from_utf8_lossy_owned)]
 
+mod cache;
+mod chain;
+mod code_filter;
 mod content;
+mod context;
+mod filter;
 mod loader;
 mod plugin;
 mod runner;
 mod scheme;
 
-pub use content::Content;
-pub use loader::{DisplayWithSuffix, Loader};
+pub use code_filter::CodeFilter;
+pub use content::{
+  AdditionalData, Content, DescriptionData, ParseMeta, ParseMetaValue, ResourceData,
+};
+pub use context::{LoaderContext, LoaderDependencies, State};
+pub use filter::LoaderFilter;
+pub use loader::{
+  DisplayWithSuffix, Loader, LoaderExecutionKind, LoaderItem, ResourceParsedData, parse_resource,
+};
 pub use plugin::LoaderRunnerPlugin;
-pub use rspack_identifier::{Identifiable, Identifier};
-pub use runner::{run_loaders, AdditionalData, DescriptionData, LoaderContext, ResourceData};
-pub use scheme::{get_scheme, Scheme};
+pub use rspack_collections::{Identifiable, Identifier};
+pub use runner::{LoaderFilters, LoaderResult, run_loaders};
+pub use scheme::{Scheme, get_scheme};
 
 pub const BUILTIN_LOADER_PREFIX: &str = "builtin:";
-
-#[doc(hidden)]
-pub mod __private {
-  pub mod loader {
-    pub use crate::loader::{LoaderItem, LoaderItemList};
-  }
-}
+pub use cache::LoaderRunnerOptions;
+pub use chain::LoaderChain;

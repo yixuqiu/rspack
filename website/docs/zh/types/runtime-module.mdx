@@ -1,0 +1,24 @@
+<>
+
+```ts
+declare class RuntimeModule {
+  fullHash: boolean;
+  dependentHash: boolean;
+
+  attach(compilation: Compilation, chunk: Chunk, chunkGraph: ChunkGraph): void;
+  readonly source:
+    | {
+        source: string | Buffer;
+        map?: string;
+      }
+    | undefined;
+  readonly stage: RuntimeModuleStage;
+  readonly name: string;
+  identifier(): string;
+  readableIdentifier(): string;
+  shouldIsolate(): boolean;
+  generate(): string;
+}
+```
+
+</>

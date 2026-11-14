@@ -1,35 +1,70 @@
 // @ts-nocheck
 
-const path = require("path");
+import path from 'node:path';
+import * as workerThreads from 'node:worker_threads';
 
-module.exports = ({ outputDirectory }) =>
-	class Worker {
-		constructor(url, options = {}) {
-			expect(url).toBeInstanceOf(URL);
-			expect(url.origin).toBe("https://test.cases");
-			expect(url.pathname.startsWith("/path/")).toBe(true);
-			this.url = url;
-			const file = url.pathname.slice(6);
-			const workerBootstrap = `
+export const createFakeWorker = (env, { outputDirectory }) =>
+  class Worker {
+    constructor(resource, options = {}) {
+      const isFileURL = /^file:/i.test(resource);
+      const isBlobURL = /^blob:/i.test(resource);
+
+      if (!isFileURL && !isBlobURL) {
+        env.expect(resource.origin).toBe('https://test.cases');
+        env.expect(resource.pathname.startsWith('/path/')).toBe(true);
+      }
+
+      this.url = resource;
+      const file = isFileURL
+        ? resource
+        : path.resolve(
+            outputDirectory,
+            isBlobURL
+              ? options.originalURL.pathname.slice(6)
+              : resource.pathname.slice(6),
+          );
+
+      const workerBootstrap = `
 const { parentPort } = require("worker_threads");
-const { URL } = require("url");
+const { URL, fileURLToPath } = require("url");
 const path = require("path");
 const fs = require("fs");
 global.self = global;
 self.URL = URL;
-self.location = new URL(${JSON.stringify(url.toString())});
+self.location = new URL(${JSON.stringify(
+        isBlobURL
+          ? resource.toString().replace('nodedata:', 'https://test.cases/path/')
+          : resource.toString(),
+      )});
 const urlToPath = url => {
-	if(url.startsWith("https://test.cases/path/")) url = url.slice(24);
+  if (/^file:/i.test(url)) return fileURLToPath(url);
+	if (url.startsWith("https://test.cases/path/")) url = url.slice(24);
 	return path.resolve(${JSON.stringify(outputDirectory)}, \`./\${url}\`);
 };
 self.importScripts = url => {
 	${
-		options.type === "module"
-			? `throw new Error("importScripts is not supported in module workers")`
-			: `require(urlToPath(url))`
-	};
+    options.type === 'module'
+      ? 'throw new Error("importScripts is not supported in module workers")'
+      : 'require(urlToPath(url))'
+  };
 };
 self.fetch = async url => {
+	if (typeof url === "string" ? url.endsWith(".wasm") : url.toString().endsWith(".wasm")) {
+		return new Promise((resolve, reject) => {
+			fs.readFile(require("node:url").fileURLToPath(url), (err, data) => {
+				if (err) {
+					reject(err);
+					return;
+				}
+				return resolve(
+					new Response(data, {
+						headers: { "Content-Type": "application/wasm" }
+					})
+				);
+			});
+		});
+	}
+
 	try {
 		const buffer = await new Promise((resolve, reject) =>
 			fs.readFile(urlToPath(url), (err, b) =>
@@ -37,8 +72,12 @@ self.fetch = async url => {
 			)
 		);
 		return {
+		  headers: { get(name) {
+				if (name.toLowerCase() === "content-type") {}
+			} },
 			status: 200,
 			ok: true,
+			arrayBuffer() { return buffer; },
 			json: async () => JSON.parse(buffer.toString("utf-8"))
 		};
 	} catch(err) {
@@ -51,41 +90,52 @@ self.fetch = async url => {
 		throw err;
 	}
 };
-parentPort.on("message", data => {
-	if(self.onmessage) self.onmessage({
-		data
-	});
-});
+
 self.postMessage = data => {
 	parentPort.postMessage(data);
 };
-require(${JSON.stringify(path.resolve(outputDirectory, file))});
-`;
-			// eslint-disable-next-line n/no-unsupported-features/node-builtins
-			this.worker = new (require("worker_threads").Worker)(workerBootstrap, {
-				eval: true
+if (${options.type === 'module'}) {
+	import(${JSON.stringify(file)}).then(() => {
+		parentPort.on("message", data => {
+			if(self.onmessage) self.onmessage({
+				data
 			});
+		});
+	});
+} else {
+	parentPort.on("message", data => {
+		if(self.onmessage) self.onmessage({
+			data
+		});
+	});
+	require(${JSON.stringify(file)});
+}
+`;
+      this.worker = new workerThreads.Worker(workerBootstrap, {
+        eval: true,
+      });
 
-			this._onmessage = undefined;
-		}
+      this._onmessage = undefined;
+    }
 
-		set onmessage(value) {
-			if (this._onmessage) this.worker.off("message", this._onmessage);
-			this.worker.on(
-				"message",
-				(this._onmessage = data => {
-					value({
-						data
-					});
-				})
-			);
-		}
+    // eslint-disable-next-line accessor-pairs
+    set onmessage(value) {
+      if (this._onmessage) this.worker.off('message', this._onmessage);
+      this.worker.on(
+        'message',
+        (this._onmessage = (data) => {
+          value({
+            data,
+          });
+        }),
+      );
+    }
 
-		postMessage(data) {
-			this.worker.postMessage(data);
-		}
+    postMessage(data) {
+      this.worker.postMessage(data);
+    }
 
-		terminate() {
-			return this.worker.terminate();
-		}
-	};
+    terminate() {
+      return this.worker.terminate();
+    }
+  };

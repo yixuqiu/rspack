@@ -1,0 +1,12 @@
+ERROR in ./index.js
+  × Module parse failed:
+  ╰─▶   × JavaScript parse error: 'package' is reserved in strict mode and cannot be used as a binding identifier
+         ╭─[3:14]
+       1 │ "use strict";
+       2 │
+       3 │ var { nested: package } = foo;
+         ·               ───────
+         ╰────
+      
+  help: 
+        You may need an appropriate loader to handle this file type.

@@ -1,0 +1,113 @@
+use itertools::Itertools;
+use rspack_core::{
+  Chunk, ChunkByUkey, ChunkNamedIdArtifact, CompilationChunkIds, Plugin,
+  incremental::IncrementalPasses,
+};
+use rspack_error::{Diagnostic, Result};
+use rspack_hook::{plugin, plugin_hook};
+use rustc_hash::FxHashMap as HashMap;
+
+use crate::id_helpers::{
+  NaturalChunkCompareCache, assign_ascending_chunk_ids, compare_chunks_natural,
+};
+
+#[derive(Debug)]
+pub struct OccurrenceChunkIdsPluginOptions {
+  pub prioritise_initial: bool,
+}
+
+#[plugin]
+#[derive(Debug, Default)]
+pub struct OccurrenceChunkIdsPlugin {
+  prioritise_initial: bool,
+}
+
+impl OccurrenceChunkIdsPlugin {
+  pub fn new(option: OccurrenceChunkIdsPluginOptions) -> Self {
+    Self::new_inner(option.prioritise_initial)
+  }
+}
+
+#[plugin_hook(CompilationChunkIds for OccurrenceChunkIdsPlugin)]
+async fn chunk_ids(
+  &self,
+  compilation: &rspack_core::Compilation,
+  chunk_by_ukey: &mut ChunkByUkey,
+  _named_chunk_ids_artifact: &mut ChunkNamedIdArtifact,
+  diagnostics: &mut Vec<Diagnostic>,
+) -> Result<()> {
+  if let Some(diagnostic) = compilation.incremental.disable_passes(
+    IncrementalPasses::CHUNK_IDS | IncrementalPasses::MODULES_HASHES,
+    "OccurrenceChunkIdsPlugin (optimization.chunkIds = \"size\")",
+    "it requires calculating the id of all the chunks, which is a global effect",
+  ) && let Some(diagnostic) = diagnostic
+  {
+    diagnostics.push(diagnostic);
+  }
+
+  let chunk_graph = &compilation.build_chunk_graph_artifact.chunk_graph;
+  let chunk_group_by_ukey = &compilation.build_chunk_graph_artifact.chunk_group_by_ukey;
+  let mut occurs_in_initial_chunks_map = HashMap::default();
+
+  for chunk in chunk_by_ukey.values() {
+    let mut occurs = 0;
+    for chunk_group_ukey in chunk.groups() {
+      if let Some(chunk_group) = chunk_group_by_ukey.get(chunk_group_ukey) {
+        for parent_ukey in &chunk_group.parents {
+          if let Some(parent) = chunk_group_by_ukey.get(parent_ukey)
+            && parent.is_initial()
+          {
+            occurs += 1;
+          }
+        }
+      }
+    }
+    occurs_in_initial_chunks_map.insert(chunk.ukey(), occurs);
+  }
+
+  let mut chunk_compare_cache = NaturalChunkCompareCache::default();
+  let chunks = chunk_by_ukey
+    .values()
+    .map(|chunk| chunk as &Chunk)
+    .sorted_unstable_by(|a, b| {
+      if self.prioritise_initial {
+        let a_entry_occurs = occurs_in_initial_chunks_map.get(&a.ukey()).unwrap_or(&0);
+        let b_entry_occurs = occurs_in_initial_chunks_map.get(&b.ukey()).unwrap_or(&0);
+        if a_entry_occurs != b_entry_occurs {
+          return b_entry_occurs.cmp(a_entry_occurs);
+        }
+      }
+
+      let a_occurs = a.get_number_of_groups();
+      let b_occurs = b.get_number_of_groups();
+      if a_occurs != b_occurs {
+        return b_occurs.cmp(&a_occurs);
+      }
+
+      compare_chunks_natural(
+        chunk_graph,
+        &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
+        &compilation.module_ids_artifact,
+        a,
+        b,
+        &mut chunk_compare_cache,
+      )
+    })
+    .map(|chunk| chunk.ukey())
+    .collect::<Vec<_>>();
+
+  assign_ascending_chunk_ids(&chunks, chunk_by_ukey);
+
+  Ok(())
+}
+
+impl Plugin for OccurrenceChunkIdsPlugin {
+  fn name(&self) -> &'static str {
+    "rspack.OccurrenceChunkIdsPlugin"
+  }
+
+  fn apply(&self, ctx: &mut rspack_core::ApplyContext<'_>) -> Result<()> {
+    ctx.compilation_hooks.chunk_ids.tap(chunk_ids::new(self));
+    Ok(())
+  }
+}

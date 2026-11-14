@@ -1,33 +1,45 @@
+use rspack_cacheable::{cacheable, cacheable_dyn};
 use rspack_core::{
-  AsContextDependency, AsDependencyTemplate, Dependency, DependencyCategory, DependencyId,
-  DependencyType, ModuleDependency,
+  AsContextDependency, AsDependencyCodeGeneration, Dependency, DependencyCategory, DependencyId,
+  DependencyType, ModuleDependency, ResourceIdentifier,
 };
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct ContainerExposedDependency {
   id: DependencyId,
   request: String,
   pub exposed_name: String,
-  resource_identifier: String,
+  resource_identifier: ResourceIdentifier,
+  dependency_type: DependencyType,
 }
 
 impl ContainerExposedDependency {
   pub fn new(exposed_name: String, request: String) -> Self {
-    let resource_identifier = format!("exposed dependency {}={}", exposed_name, request);
+    let resource_identifier = format!("exposed dependency {exposed_name}={request}").into();
     Self {
       id: DependencyId::new(),
       request,
       exposed_name,
       resource_identifier,
+      dependency_type: DependencyType::ContainerExposed,
+    }
+  }
+
+  pub fn new_shared_fallback(request: String) -> Self {
+    let resource_identifier = format!("share-container-fallback:{request}").into();
+    Self {
+      id: DependencyId::new(),
+      request,
+      exposed_name: String::new(),
+      resource_identifier,
+      dependency_type: DependencyType::ShareContainerFallback,
     }
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for ContainerExposedDependency {
-  fn dependency_debug_name(&self) -> &'static str {
-    "ContainerExposedDependency"
-  }
-
   fn id(&self) -> &DependencyId {
     &self.id
   }
@@ -37,14 +49,19 @@ impl Dependency for ContainerExposedDependency {
   }
 
   fn dependency_type(&self) -> &DependencyType {
-    &DependencyType::ContainerExposed
+    &self.dependency_type
   }
 
   fn resource_identifier(&self) -> Option<&str> {
     Some(&self.resource_identifier)
   }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
+  }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for ContainerExposedDependency {
   fn request(&self) -> &str {
     &self.request
@@ -53,9 +70,7 @@ impl ModuleDependency for ContainerExposedDependency {
   fn user_request(&self) -> &str {
     &self.request
   }
-
-  fn set_request(&mut self, _request: String) {}
 }
 
 impl AsContextDependency for ContainerExposedDependency {}
-impl AsDependencyTemplate for ContainerExposedDependency {}
+impl AsDependencyCodeGeneration for ContainerExposedDependency {}

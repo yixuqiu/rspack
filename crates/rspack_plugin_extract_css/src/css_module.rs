@@ -1,122 +1,135 @@
-use std::hash::Hash;
-use std::path::PathBuf;
+use std::sync::Arc;
 
-use once_cell::sync::Lazy;
-use rspack_core::rspack_sources::Source;
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_collections::{Identifiable, Identifier};
 use rspack_core::{
-  impl_module_meta_info, impl_source_map_config, AsyncDependenciesBlockIdentifier, BuildContext,
-  BuildInfo, BuildMeta, BuildResult, CodeGenerationResult, Compilation, CompilerOptions,
-  ConcatenationScope, DependenciesBlock, DependencyId, DependencyType, FactoryMeta, Module,
-  ModuleFactory, ModuleFactoryCreateData, ModuleFactoryResult, RuntimeSpec, SourceType,
+  BoxModule, BuildContext, BuildInfo, BuildMeta, CodeGenerationResultBuilder, Compilation,
+  CompilerOptions, DependenciesBlock, DependenciesBlockData, FactoryMetaStore, FreezeLock, Module,
+  ModuleCodeGenerationContext, ModuleExt, ModuleFactory, ModuleFactoryCreateData,
+  ModuleFactoryResult, ModuleGraph, ModuleLayer, RuntimeSpec, SourceType, impl_module_meta_info,
+  impl_source_map_config, module_update_hash, rspack_sources::BoxSource,
 };
-use rspack_error::Result;
-use rspack_error::{impl_empty_diagnosable_trait, Diagnostic};
-use rspack_hash::{RspackHash, RspackHashDigest};
-use rspack_identifier::{Identifiable, Identifier};
-use rustc_hash::FxHashSet;
+use rspack_error::{Result, impl_empty_diagnosable_trait};
+use rspack_hash::{RspackHash, RspackHashDigest, RspackHasher};
+use rspack_util::{identifier::split_at_query_mark, itoa};
 
-use crate::css_dependency::CssDependency;
-use crate::plugin::{MODULE_TYPE, SOURCE_TYPE};
-
-pub(crate) static DEPENDENCY_TYPE: Lazy<DependencyType> =
-  Lazy::new(|| DependencyType::Custom("mini-extract-dep".into()));
+use crate::{
+  css_dependency::CssDependency,
+  plugin::{MODULE_TYPE, SOURCE_TYPE},
+};
 
 #[impl_source_map_config]
+#[cacheable]
 #[derive(Debug)]
 pub(crate) struct CssModule {
   pub(crate) identifier: String,
   pub(crate) content: String,
   pub(crate) _context: String,
-  pub(crate) media: String,
-  pub(crate) supports: String,
-  pub(crate) source_map: String,
+  pub(crate) module_layer: Option<ModuleLayer>,
+  pub(crate) media: Option<String>,
+  pub(crate) supports: Option<String>,
+  pub(crate) source_map: Option<String>,
+  pub(crate) css_layer: Option<String>,
   pub(crate) identifier_index: u32,
 
-  factory_meta: Option<FactoryMeta>,
-  build_info: Option<BuildInfo>,
-  build_meta: Option<BuildMeta>,
+  factory_meta: FactoryMetaStore,
+  build_info: FreezeLock<BuildInfo>,
+  build_meta: FreezeLock<BuildMeta>,
 
-  blocks: Vec<AsyncDependenciesBlockIdentifier>,
-  dependencies: Vec<DependencyId>,
+  dependencies_block: DependenciesBlockData,
 
   identifier__: Identifier,
-  filepath: PathBuf,
 }
-
-impl Hash for CssModule {
-  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    self.identifier.hash(state);
-  }
-}
-
-impl PartialEq for CssModule {
-  fn eq(&self, other: &Self) -> bool {
-    self.identifier == other.identifier
-  }
-}
-
-impl Eq for CssModule {}
 
 impl CssModule {
-  pub fn new(dep: CssDependency) -> Self {
+  pub fn new(dep: &CssDependency) -> Self {
+    let mut identifier_index_buffer = itoa::Buffer::new();
+    let identifier_index_str = identifier_index_buffer.format(dep.identifier_index);
     let identifier__ = format!(
-      "css|{}|{}|{}|{}}}",
-      dep.identifier, dep.identifier_index, dep.supports, dep.media,
+      "css|{}|{}|{}|{}|{}}}",
+      dep.identifier,
+      identifier_index_str,
+      dep.css_layer.as_deref().unwrap_or_default(),
+      dep.supports.as_deref().unwrap_or_default(),
+      dep.media.as_deref().unwrap_or_default(),
     )
     .into();
 
     Self {
-      identifier: dep.identifier,
-      content: dep.content,
-      _context: dep.context,
-      media: dep.media,
-      supports: dep.supports,
-      source_map: dep.source_map,
+      identifier: dep.identifier.clone(),
+      content: dep.content.clone(),
+      module_layer: dep.module_layer.clone(),
+      css_layer: dep.css_layer.clone(),
+      _context: dep.context.clone(),
+      media: dep.media.clone(),
+      supports: dep.supports.clone(),
+      source_map: dep.source_map.clone(),
       identifier_index: dep.identifier_index,
-      blocks: vec![],
-      dependencies: vec![],
-      factory_meta: None,
-      build_info: None,
-      build_meta: None,
-      source_map_kind: rspack_util::source_map::SourceMapKind::None,
+      dependencies_block: Default::default(),
+      factory_meta: Default::default(),
+      build_info: BuildInfo {
+        cacheable: dep.cacheable,
+        strict: true,
+        dependencies: dep.dependencies.clone(),
+        ..Default::default()
+      }
+      .into(),
+      build_meta: Default::default(),
+      source_map_kind: rspack_util::source_map::SourceMapKind::empty(),
       identifier__,
-      filepath: dep.filepath,
     }
   }
 
   fn compute_hash(&self, options: &CompilerOptions) -> RspackHashDigest {
-    let mut hasher = RspackHash::from(&options.output);
+    let mut hasher = RspackHasher::from(&options.output);
 
     self.content.hash(&mut hasher);
+    if let Some(layer) = &self.css_layer {
+      layer.hash(&mut hasher);
+    }
     self.supports.hash(&mut hasher);
     self.media.hash(&mut hasher);
+    self.source_map.hash(&mut hasher);
 
     hasher.digest(&options.output.hash_digest)
   }
 }
 
+#[cacheable_dyn]
 #[async_trait::async_trait]
 impl Module for CssModule {
   impl_module_meta_info!();
 
-  fn readable_identifier(&self, context: &rspack_core::Context) -> std::borrow::Cow<str> {
+  fn readable_identifier(&self, context: &rspack_core::Context) -> std::borrow::Cow<'_, str> {
+    let index_suffix = if self.identifier_index > 0 {
+      let mut index_buffer = itoa::Buffer::new();
+      let index_str = index_buffer.format(self.identifier_index);
+      format!("({index_str})")
+    } else {
+      String::new()
+    };
     std::borrow::Cow::Owned(format!(
-      "css {}{}{}{}",
+      "css {}{}{}{}{}",
       context.shorten(&self.identifier),
-      if self.identifier_index > 0 {
-        format!("({})", self.identifier_index)
+      index_suffix,
+      if let Some(layer) = &self.css_layer {
+        format!(" (layer {layer})")
       } else {
-        "".into()
+        String::new()
       },
-      if self.supports.is_empty() {
-        "".into()
+      if let Some(supports) = &self.supports
+        && !supports.is_empty()
+      {
+        format!(" (supports {supports})")
       } else {
-        format!(" (supports {})", self.supports)
+        String::new()
       },
-      if self.media.is_empty() {
-        "".into()
+      if let Some(media) = &self.media
+        && !media.is_empty()
+      {
+        format!(" (media {media})")
       } else {
-        format!(" (media {})", self.media)
+        String::new()
       }
     ))
   }
@@ -125,15 +138,15 @@ impl Module for CssModule {
     self
       .identifier
       .split('!')
-      .last()
-      .map(|resource| resource.split('?').next().unwrap_or(resource).into())
+      .next_back()
+      .map(|resource| split_at_query_mark(resource).0.into())
   }
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>) -> f64 {
     self.content.len() as f64
   }
 
-  fn original_source(&self) -> Option<&dyn Source> {
+  fn source(&self) -> Option<&BoxSource> {
     None
   }
 
@@ -141,63 +154,60 @@ impl Module for CssModule {
     &MODULE_TYPE
   }
 
-  fn source_types(&self) -> &[SourceType] {
+  fn source_types(&self, _module_graph: &ModuleGraph) -> &[SourceType] {
     &*SOURCE_TYPE
   }
 
+  fn need_id(&self) -> bool {
+    false
+  }
+
   async fn build(
-    &mut self,
-    build_context: BuildContext<'_>,
+    mut self: Box<Self>,
+    build_context: Arc<BuildContext>,
     _compilation: Option<&Compilation>,
-  ) -> Result<BuildResult> {
-    let mut file_deps = FxHashSet::default();
-    file_deps.insert(self.filepath.clone());
-
-    Ok(BuildResult {
-      build_info: BuildInfo {
-        hash: Some(self.compute_hash(build_context.compiler_options)),
-        file_dependencies: file_deps,
-        ..Default::default()
-      },
-      ..Default::default()
-    })
+  ) -> Result<BoxModule> {
+    self.build_info.get_mut().hash = Some(self.compute_hash(&build_context.compiler_options));
+    Ok(BoxModule::new(self))
   }
 
-  fn code_generation(
+  // #[tracing::instrument("ExtractCssModule::code_generation", skip_all, fields(identifier = ?self.identifier()))]
+  async fn code_generation(
     &self,
-    _compilation: &Compilation,
-    _runtime: Option<&RuntimeSpec>,
-    _concatenation_scope: Option<ConcatenationScope>,
-  ) -> Result<CodeGenerationResult> {
-    Ok(CodeGenerationResult::default())
+    _code_generation_context: &mut ModuleCodeGenerationContext,
+  ) -> Result<CodeGenerationResultBuilder> {
+    Ok(CodeGenerationResultBuilder::default())
   }
 
-  fn get_diagnostics(&self) -> Vec<Diagnostic> {
-    vec![]
+  async fn get_runtime_hash(
+    &self,
+    compilation: &Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    let mut hasher = RspackHasher::from(&compilation.options.output);
+    module_update_hash(self, &mut hasher, compilation, runtime);
+    self.build_info.read().hash.hash(&mut hasher);
+    Ok(hasher.digest(&compilation.options.output.hash_digest))
+  }
+
+  fn get_layer(&self) -> Option<&ModuleLayer> {
+    self.module_layer.as_ref()
   }
 }
 
 impl Identifiable for CssModule {
-  fn identifier(&self) -> rspack_identifier::Identifier {
+  fn identifier(&self) -> rspack_collections::Identifier {
     self.identifier__
   }
 }
 
 impl DependenciesBlock for CssModule {
-  fn add_block_id(&mut self, block: AsyncDependenciesBlockIdentifier) {
-    self.blocks.push(block)
+  fn dependencies_block(&self) -> &DependenciesBlockData {
+    &self.dependencies_block
   }
 
-  fn get_blocks(&self) -> &[AsyncDependenciesBlockIdentifier] {
-    &self.blocks
-  }
-
-  fn add_dependency_id(&mut self, dependency: DependencyId) {
-    self.dependencies.push(dependency)
-  }
-
-  fn get_dependencies(&self) -> &[DependencyId] {
-    &self.dependencies
+  fn dependencies_block_mut(&mut self) -> &mut DependenciesBlockData {
+    &mut self.dependencies_block
   }
 }
 
@@ -207,14 +217,13 @@ pub(crate) struct CssModuleFactory;
 #[async_trait::async_trait]
 impl ModuleFactory for CssModuleFactory {
   async fn create(&self, data: &mut ModuleFactoryCreateData) -> Result<ModuleFactoryResult> {
-    let css_dep = data
-      .dependency
+    let css_dep = data.dependencies[0]
       .downcast_ref::<CssDependency>()
       .expect("unreachable");
 
-    Ok(ModuleFactoryResult::new_with_module(Box::new(
-      CssModule::new(css_dep.clone()),
-    )))
+    Ok(ModuleFactoryResult::new_with_module(
+      CssModule::new(css_dep).boxed(),
+    ))
   }
 }
 

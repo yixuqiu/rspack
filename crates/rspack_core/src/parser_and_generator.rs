@@ -1,39 +1,92 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::{any::Any, borrow::Cow, ops::Deref};
 
-use derivative::Derivative;
-use rkyv::AlignedVec;
+use derive_more::with_trait::Debug;
+use rspack_cacheable::{
+  cacheable, cacheable_dyn,
+  with::{AsMap, AsPreset, AsVec},
+};
 use rspack_error::{Result, TWithDiagnosticArray};
-use rspack_loader_runner::{AdditionalData, ResourceData};
+use rspack_hash::RspackHashDigest;
+use rspack_intern::Atom;
+use rspack_loader_runner::{AdditionalData, ParseMeta, ParseMetaValue, ResourceData};
 use rspack_sources::BoxSource;
-use rspack_util::source_map::SourceMapKind;
-use swc_core::common::Span;
+use rspack_util::{ext::AsAny, source_map::SourceMapKind};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-  tree_shaking::visitor::OptimizeAnalyzeResult, AsyncDependenciesBlock, BoxDependency, BoxLoader,
-  BuildExtraDataType, BuildInfo, BuildMeta, CodeGenerationData, Compilation, CompilerOptions,
-  DependencyTemplate, GeneratorOptions, Module, ModuleDependency, ModuleIdentifier, ModuleType,
-  ParserOptions, RuntimeGlobals, RuntimeSpec, SourceType,
+  AsyncDependenciesBlock, BoxDependency, BoxLoader, BuildInfo, BuildMeta, ChunkGraph,
+  CodeGenerationData, Compilation, CompilerOptions, ConcatenationScope, Context,
+  DependencyCodeGenerationRef, DependencyId, DependencyLocation, DependencyRange,
+  EvaluatedInlinableValue, FactoryMeta, GeneratorOptions, Module, ModuleCodeTemplate, ModuleGraph,
+  ModuleIdentifier, ModuleLayer, ModuleType, NormalModule, ParserOptions, RuntimeSpec, SourceType,
+  ValueCacheVersions,
 };
-use crate::{ChunkGraph, ConcatenationScope, Context, ModuleGraph};
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct ParseContext<'a> {
   pub source: BoxSource,
   pub module_context: &'a Context,
   pub module_identifier: ModuleIdentifier,
   pub module_type: &'a ModuleType,
+  pub module_layer: Option<&'a ModuleLayer>,
   pub module_user_request: &'a str,
   pub module_parser_options: Option<&'a ParserOptions>,
+  pub module_generator_options: Option<&'a GeneratorOptions>,
   pub module_source_map_kind: SourceMapKind,
-  #[derivative(Debug = "ignore")]
+  pub module_match_resource: Option<&'a ResourceData>,
+  #[debug(skip)]
   pub loaders: &'a [BoxLoader],
   pub resource_data: &'a ResourceData,
   pub compiler_options: &'a CompilerOptions,
-  pub additional_data: AdditionalData,
-  pub code_generation_dependencies: &'a mut Vec<Box<dyn ModuleDependency>>,
+  pub value_cache_versions: &'a ValueCacheVersions,
+  pub additional_data: Option<AdditionalData>,
+  pub factory_meta: Option<&'a FactoryMeta>,
+  pub parse_meta: ParseMeta,
   pub build_info: &'a mut BuildInfo,
   pub build_meta: &'a mut BuildMeta,
+  pub runtime_template: &'a ModuleCodeTemplate,
+}
+
+#[cacheable]
+#[derive(Debug, Default, Clone)]
+pub struct CollectedTypeScriptInfo {
+  #[cacheable(with=AsVec<AsPreset>)]
+  pub type_exports: FxHashSet<Atom>,
+  #[cacheable(with=AsMap<AsPreset>)]
+  pub exported_enums: FxHashMap<Atom, TSEnumValue>,
+}
+
+#[cacheable_dyn]
+impl ParseMetaValue for CollectedTypeScriptInfo {
+  fn clone_parse_meta(&self) -> Box<dyn ParseMetaValue> {
+    Box::new(self.clone())
+  }
+
+  fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
+    self
+  }
+}
+
+pub const COLLECTED_TYPESCRIPT_INFO_PARSE_META_KEY: &str = "rspack-collected-ts-info";
+
+#[cacheable]
+#[derive(Debug, Default, Clone)]
+pub struct TSEnumValue(
+  #[cacheable(with=AsMap<AsPreset>)] FxHashMap<Atom, Option<EvaluatedInlinableValue>>,
+);
+
+impl TSEnumValue {
+  pub fn new(value: FxHashMap<Atom, Option<EvaluatedInlinableValue>>) -> Self {
+    Self(value)
+  }
+}
+
+impl Deref for TSEnumValue {
+  type Target = FxHashMap<Atom, Option<EvaluatedInlinableValue>>;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
 }
 
 #[derive(Debug)]
@@ -43,69 +96,98 @@ pub struct SideEffectsBailoutItem {
   pub ty: String,
 }
 
-impl SideEffectsBailoutItem {
-  pub fn new(msg: String, ty: String) -> Self {
-    Self { msg, ty }
-  }
-}
+impl SideEffectsBailoutItem {}
 
 #[derive(Debug)]
 pub struct SideEffectsBailoutItemWithSpan {
-  pub span: Span,
+  pub range: DependencyRange,
+  pub loc: Option<DependencyLocation>,
   /// The type of AstNode
   pub ty: String,
 }
 
 impl SideEffectsBailoutItemWithSpan {
-  pub fn new(span: Span, ty: String) -> Self {
-    Self { span, ty }
+  pub fn new(range: DependencyRange, loc: Option<DependencyLocation>, ty: String) -> Self {
+    Self { range, loc, ty }
   }
 }
 
 #[derive(Debug)]
 pub struct ParseResult {
   pub dependencies: Vec<BoxDependency>,
-  pub blocks: Vec<AsyncDependenciesBlock>,
-  pub presentational_dependencies: Vec<Box<dyn DependencyTemplate>>,
+  pub blocks: Vec<Box<AsyncDependenciesBlock>>,
+  pub presentational_dependencies: Vec<DependencyCodeGenerationRef>,
+  pub code_generation_dependencies: Vec<DependencyId>,
   pub source: BoxSource,
-  pub analyze_result: OptimizeAnalyzeResult,
   pub side_effects_bailout: Option<SideEffectsBailoutItem>,
 }
 
 #[derive(Debug)]
 pub struct GenerateContext<'a> {
   pub compilation: &'a Compilation,
-  pub module_generator_options: Option<&'a GeneratorOptions>,
-  pub runtime_requirements: &'a mut RuntimeGlobals,
+  pub runtime_template: &'a mut ModuleCodeTemplate,
   pub data: &'a mut CodeGenerationData,
   pub requested_source_type: SourceType,
+  pub module_parser_options: Option<&'a ParserOptions>,
+  pub module_generator_options: Option<&'a GeneratorOptions>,
   pub runtime: Option<&'a RuntimeSpec>,
   pub concatenation_scope: Option<&'a mut ConcatenationScope>,
 }
 
-pub trait ParserAndGenerator: Send + Sync + Debug {
+#[cacheable_dyn]
+#[async_trait::async_trait]
+pub trait ParserAndGenerator: Send + Sync + Debug + AsAny {
   /// The source types that the generator can generate (the source types you can make requests for)
-  fn source_types(&self) -> &[SourceType];
+  fn source_types(&self, module: &dyn Module, module_graph: &ModuleGraph) -> &[SourceType];
   /// Parse the source and return the dependencies and the ast or source
-  fn parse(&mut self, parse_context: ParseContext) -> Result<TWithDiagnosticArray<ParseResult>>;
+  async fn parse<'a>(
+    &mut self,
+    parse_context: ParseContext<'a>,
+  ) -> Result<TWithDiagnosticArray<ParseResult>>;
   /// Size of the original source
-  fn size(&self, module: &dyn Module, source_type: &SourceType) -> f64;
+  fn size(&self, module: &dyn Module, source_type: Option<&SourceType>) -> f64;
   /// Generate source or AST based on the built source or AST
-  fn generate(
+  async fn generate(
     &self,
     source: &BoxSource,
     module: &dyn Module,
     generate_context: &mut GenerateContext,
   ) -> Result<BoxSource>;
-  /// Store parser&generator data to cache
-  fn store(&self, _extra_data: &mut HashMap<BuildExtraDataType, AlignedVec>) {}
-  /// Resume parser&generator data from cache
-  fn resume(&mut self, _extra_data: &HashMap<BuildExtraDataType, AlignedVec>) {}
 
   fn get_concatenation_bailout_reason(
     &self,
     _module: &dyn Module,
     _mg: &ModuleGraph,
     _cg: &ChunkGraph,
-  ) -> Option<String>;
+  ) -> Option<Cow<'static, str>>;
+
+  async fn get_runtime_hash(
+    &self,
+    _module: &NormalModule,
+    compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    Ok(RspackHashDigest::new(
+      &[],
+      &compilation.options.output.hash_digest,
+    ))
+  }
+
+  fn has_runtime_hash(&self) -> bool {
+    false
+  }
+}
+
+impl dyn ParserAndGenerator + '_ {
+  pub fn downcast_ref<D: Any>(&self) -> Option<&D> {
+    self.as_any().downcast_ref::<D>()
+  }
+
+  pub fn downcast_mut<D: Any>(&mut self) -> Option<&mut D> {
+    self.as_any_mut().downcast_mut::<D>()
+  }
+
+  pub fn is<D: Any>(&self) -> bool {
+    self.downcast_ref::<D>().is_some()
+  }
 }

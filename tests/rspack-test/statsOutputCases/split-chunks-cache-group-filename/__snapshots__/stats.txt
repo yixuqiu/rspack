@@ -1,0 +1,4 @@
+Entrypoint main xx bytes = main.js
+chunk (runtime: main) main.js (main) xx bytes [entry] [rendered]
+  ./index.js xx bytes [built] [code generated]
+Rspack x.x.x compiled successfully in X s

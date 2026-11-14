@@ -1,27 +1,105 @@
-import Theme from 'rspress/theme';
+import { NoSSR, useLang, usePage } from '@rspress/core/runtime';
+import {
+  Layout as BaseLayout,
+  DocLayout as BasicDocLayout,
+  Link,
+  type DocLayoutProps,
+} from '@rspress/core/theme-original';
+import {
+  Search as PluginAlgoliaSearch,
+  ZH_LOCALES,
+} from '@rspress/plugin-algolia/runtime';
+import { Announcement } from '@rstackjs/doc-ui/announcement';
+import { ConfigProvider } from '@rstackjs/doc-ui/antd';
+import { BlogBackButton } from '@rstackjs/doc-ui/blog-back-button';
+import { NavIcon } from '@rstackjs/doc-ui/nav-icon';
+import '@rstackjs/doc-ui/theme.css';
 import { HomeLayout } from './pages';
-import { RsfamilyNavIcon } from 'rsfamily-nav-icon';
-import 'rsfamily-nav-icon/dist/index.css';
-// enable this when we need a new announcement
-// import { Announcement } from './components/Announcement';
-// import { NoSSR } from 'rspress/runtime';
 
-const Layout = () => (
-  <Theme.Layout
-    beforeNavTitle={<RsfamilyNavIcon />}
-    // beforeNav={
-    //   <NoSSR>
-    //     <Announcement />
-    //   </NoSSR>
-    // }
-  />
-);
+// Enable this when we need a new announcement
+const ANNOUNCEMENT_URL = '';
 
-// eslint-disable-next-line import/export
-export * from 'rspress/theme';
+const DocLayout = (props: DocLayoutProps) => {
+  const { page } = usePage();
+  const lang = useLang();
 
-export default {
-  ...Theme,
-  Layout,
-  HomeLayout,
+  return (
+    <BasicDocLayout
+      {...props}
+      beforeDocContent={
+        <>
+          <BlogBackButton
+            pathname={page.routePath}
+            lang={lang}
+            LinkComp={Link}
+          />
+          {props.beforeDocContent}
+        </>
+      }
+    />
+  );
 };
+
+const Layout = () => {
+  const { page } = usePage();
+  const lang = useLang();
+  return (
+    <ConfigProvider
+      theme={{
+        // Update tokens for Collapse in dark mode
+        token: {
+          colorBorder: 'var(--rp-c-divider)',
+        },
+        components: {
+          Collapse: {
+            contentBg: 'transparent',
+          },
+        },
+      }}
+    >
+      <BaseLayout
+        beforeNavTitle={<NavIcon />}
+        beforeNav={
+          ANNOUNCEMENT_URL && (
+            <NoSSR>
+              <Announcement
+                href={
+                  lang === 'en'
+                    ? ANNOUNCEMENT_URL
+                    : `/${lang}${ANNOUNCEMENT_URL}`
+                }
+                message={
+                  lang === 'en'
+                    ? 'Rspack 2.0 has been released!'
+                    : 'Rspack 2.0 正式发布！'
+                }
+                localStorageKey="rspack-v2-announcement-closed"
+                display={page.pageType === 'home'}
+              />
+            </NoSSR>
+          )
+        }
+      />
+    </ConfigProvider>
+  );
+};
+
+const Search = () => {
+  const lang = useLang();
+  return (
+    <PluginAlgoliaSearch
+      docSearchProps={{
+        appId: 'TQOGCXPBUD', // cspell:disable-line
+        apiKey: '8c30f9d1f12e786a132af15ea30cf997', // cspell:disable-line
+        indexName: 'rspack',
+        searchParameters: {
+          facetFilters: [`lang:${lang}`],
+        },
+      }}
+      locales={ZH_LOCALES}
+    />
+  );
+};
+
+export * from '@rspress/core/theme-original';
+export { DocLayout, HomeLayout, Layout, Search };

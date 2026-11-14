@@ -1,15 +1,26 @@
-#[cfg(not(target_os = "linux"))]
 #[global_allocator]
-static GLOBAL: mimalloc_rust::GlobalMiMalloc = mimalloc_rust::GlobalMiMalloc;
+#[cfg(not(any(miri, target_family = "wasm")))]
+#[cfg(not(any(
+  feature = "sftrace-setup",
+  feature = "system-allocator",
+  feature = "tracy-client"
+)))]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(all(target_os = "linux", target_env = "musl"))]
 #[global_allocator]
-static GLOBAL: mimalloc_rust::GlobalMiMalloc = mimalloc_rust::GlobalMiMalloc;
+#[cfg(not(any(miri, target_family = "wasm")))]
+#[cfg(all(feature = "sftrace-setup", not(feature = "system-allocator")))]
+static GLOBAL: sftrace_setup::SftraceAllocator<mimalloc::MiMalloc> =
+  sftrace_setup::SftraceAllocator(mimalloc::MiMalloc);
 
-#[cfg(all(
-  target_os = "linux",
-  target_env = "gnu",
-  any(target_arch = "x86_64", target_arch = "aarch64")
-))]
 #[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+#[cfg(not(any(miri, target_family = "wasm")))]
+#[cfg(all(feature = "sftrace-setup", feature = "system-allocator"))]
+static GLOBAL: sftrace_setup::SftraceAllocator<std::alloc::System> =
+  sftrace_setup::SftraceAllocator(std::alloc::System);
+
+#[global_allocator]
+#[cfg(not(any(miri, target_family = "wasm")))]
+#[cfg(all(feature = "tracy-client", not(feature = "sftrace-setup")))]
+static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
+  tracy_client::ProfiledAllocator::new(std::alloc::System, 10); // adjust callstack_depth if needed with performance cost

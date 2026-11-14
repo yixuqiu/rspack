@@ -1,44 +1,73 @@
-use rspack_core::{AsModuleDependency, ContextDependency};
-use rspack_core::{ContextOptions, Dependency, TemplateReplaceSource};
-use rspack_core::{DependencyCategory, DependencyId, DependencyTemplate};
-use rspack_core::{DependencyType, ErrorSpan, TemplateContext};
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_core::{
+  AsModuleDependency, Context, ContextDependency, ContextOptions, Dependency, DependencyCategory,
+  DependencyCodeGeneration, DependencyId, DependencyLocation, DependencyRange, DependencyTemplate,
+  DependencyTemplateType, DependencyType, ExportsInfoArtifact, ModuleGraph,
+  ModuleGraphCacheArtifact, ReferencedSpecifier, ResourceIdentifier, TemplateContext,
+  TemplateReplaceSource,
+};
+use rspack_error::Diagnostic;
 
 use super::{
   context_dependency_template_as_require_call, create_resource_identifier_for_context_dependency,
 };
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct CommonJsRequireContextDependency {
-  callee_start: u32,
-  callee_end: u32,
-  args_end: u32,
   id: DependencyId,
+  loc: DependencyLocation,
+  range: DependencyRange,
+  value_range: Option<DependencyRange>,
+  context: Option<Context>,
+  resource_identifier: ResourceIdentifier,
   options: ContextOptions,
-  span: Option<ErrorSpan>,
-  resource_identifier: String,
+  optional: bool,
+  critical: rspack_core::DependencyCriticalState,
 }
 
 impl CommonJsRequireContextDependency {
   pub fn new(
-    callee_start: u32,
-    callee_end: u32,
-    args_end: u32,
     options: ContextOptions,
-    span: Option<ErrorSpan>,
+    loc: DependencyLocation,
+    range: DependencyRange,
+    value_range: Option<DependencyRange>,
+    optional: bool,
+    context: Option<Context>,
   ) -> Self {
-    let resource_identifier = create_resource_identifier_for_context_dependency(None, &options);
+    let resource_identifier = create_resource_identifier_for_context_dependency(
+      context.as_ref().map(|c| c.as_str()),
+      &options,
+    );
     Self {
-      callee_start,
-      callee_end,
-      args_end,
+      loc,
+      range,
+      value_range,
+      context,
       options,
-      span,
-      id: DependencyId::new(),
       resource_identifier,
+      optional,
+      id: DependencyId::new(),
+      critical: Default::default(),
     }
+  }
+
+  pub fn set_referenced_specifiers(&mut self, referenced_specifiers: Vec<ReferencedSpecifier>) {
+    if referenced_specifiers.is_empty() {
+      // If the referenced specifiers are empty, keep it as default (None), since this dependency can't eliminate by side effects optimization,
+      // so if we set it to Some(vec![]), and the dependency still executes, it will cause runtime error because the exports are all tree shaken.
+      // see test case `tests/rspack-test/configCases/cjs-tree-shaking/side-effects-free`
+      return;
+    }
+    self.options.referenced_specifiers = Some(referenced_specifiers);
+    self.resource_identifier = create_resource_identifier_for_context_dependency(
+      self.context.as_ref().map(|c| c.as_str()),
+      &self.options,
+    );
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for CommonJsRequireContextDependency {
   fn id(&self) -> &DependencyId {
     &self.id
@@ -52,12 +81,32 @@ impl Dependency for CommonJsRequireContextDependency {
     &DependencyType::CommonJSRequireContext
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    self.span
+  fn get_context(&self) -> Option<&Context> {
+    self.context.as_ref()
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "CommonJsRequireContextDependency"
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
+  }
+
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
+  }
+
+  fn get_diagnostics(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
+  ) -> Option<Vec<Diagnostic>> {
+    if let Some(critical) = self.critical() {
+      return Some(vec![critical]);
+    }
+    None
+  }
+
+  fn loc(&self) -> Option<DependencyLocation> {
+    Some(self.loc.clone())
   }
 }
 
@@ -71,37 +120,67 @@ impl ContextDependency for CommonJsRequireContextDependency {
   }
 
   fn get_context(&self) -> Option<&str> {
-    None
+    self.context.as_ref().map(|c| c.as_str())
   }
 
   fn resource_identifier(&self) -> &str {
     &self.resource_identifier
   }
 
-  fn set_request(&mut self, request: String) {
-    self.options.request = request;
+  fn get_optional(&self) -> bool {
+    self.optional
+  }
+
+  fn type_prefix(&self) -> rspack_core::ContextTypePrefix {
+    rspack_core::ContextTypePrefix::Normal
+  }
+
+  fn critical(&self) -> Option<Diagnostic> {
+    self.critical.get()
+  }
+
+  fn set_critical(&self, critical: Option<Diagnostic>) {
+    self.critical.set(critical);
   }
 }
 
-impl DependencyTemplate for CommonJsRequireContextDependency {
-  fn apply(
-    &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
-  ) {
-    context_dependency_template_as_require_call(
-      self,
-      source,
-      code_generatable_context,
-      self.callee_start,
-      self.callee_end,
-      self.args_end,
-    );
-  }
-
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+#[cacheable_dyn]
+impl DependencyCodeGeneration for CommonJsRequireContextDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(CommonJsRequireContextDependencyTemplate::template_type())
   }
 }
 
 impl AsModuleDependency for CommonJsRequireContextDependency {}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct CommonJsRequireContextDependencyTemplate;
+
+impl CommonJsRequireContextDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::CommonJSRequireContext)
+  }
+}
+
+impl DependencyTemplate for CommonJsRequireContextDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<CommonJsRequireContextDependency>()
+      .expect("CommonJsRequireContextDependencyTemplate should be used for CommonJsRequireContextDependency");
+
+    context_dependency_template_as_require_call(
+      dep,
+      source,
+      code_generatable_context,
+      &dep.range,
+      dep.value_range.as_ref(),
+    );
+  }
+}

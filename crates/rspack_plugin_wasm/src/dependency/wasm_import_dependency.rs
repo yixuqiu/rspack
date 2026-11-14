@@ -1,39 +1,40 @@
+use rspack_cacheable::{cacheable, cacheable_dyn, with::AsPreset};
 use rspack_core::{
-  AsContextDependency, AsDependencyTemplate, Dependency, DependencyCategory, DependencyId,
-  DependencyType, ErrorSpan, ExtendedReferencedExport, ModuleDependency, ModuleGraph, RuntimeSpec,
+  AsContextDependency, AsDependencyCodeGeneration, Dependency, DependencyCategory, DependencyId,
+  DependencyRange, DependencyType, ExportsInfoArtifact, ModuleDependency, ModuleGraph,
+  ModuleGraphCacheArtifact, ReferencedExport, RuntimeSpec,
 };
-use swc_core::ecma::atoms::Atom;
+use rspack_intern::Atom;
 
-use crate::WasmNode;
-
-#[derive(Debug, Clone)]
+#[allow(dead_code)]
+#[cacheable]
+#[derive(Debug)]
 pub struct WasmImportDependency {
   id: DependencyId,
+  #[cacheable(with=AsPreset)]
   name: Atom,
   request: String,
   // only_direct_import: bool,
-  /// the WASM AST node
-  pub desc: WasmNode,
-
-  span: Option<ErrorSpan>,
+  span: Option<DependencyRange>,
 }
 
 impl WasmImportDependency {
-  pub fn new(request: String, name: String, desc: WasmNode) -> Self {
+  pub fn new(request: String, name: String) -> Self {
     Self {
       id: DependencyId::new(),
       name: name.into(),
       request,
-      desc,
       // only_direct_import,
       span: None,
     }
   }
-  pub fn name(&self) -> &str {
+
+  pub fn name(&self) -> &Atom {
     &self.name
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for WasmImportDependency {
   fn id(&self) -> &DependencyId {
     &self.id
@@ -47,15 +48,22 @@ impl Dependency for WasmImportDependency {
     &DependencyType::WasmImport
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    self.span
+  fn get_referenced_exports(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
+    _runtime: Option<&RuntimeSpec>,
+  ) -> Vec<ReferencedExport> {
+    vec![ReferencedExport::from(&self.name)]
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "WasmImportDependency"
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
   }
 }
 
+#[cacheable_dyn]
 impl ModuleDependency for WasmImportDependency {
   fn request(&self) -> &str {
     &self.request
@@ -64,20 +72,8 @@ impl ModuleDependency for WasmImportDependency {
   fn user_request(&self) -> &str {
     &self.request
   }
-
-  fn set_request(&mut self, request: String) {
-    self.request = request;
-  }
-
-  fn get_referenced_exports(
-    &self,
-    _module_graph: &ModuleGraph,
-    _runtime: Option<&RuntimeSpec>,
-  ) -> Vec<ExtendedReferencedExport> {
-    vec![ExtendedReferencedExport::Array(vec![self.name.clone()])]
-  }
 }
 
-impl AsDependencyTemplate for WasmImportDependency {}
+impl AsDependencyCodeGeneration for WasmImportDependency {}
 
 impl AsContextDependency for WasmImportDependency {}

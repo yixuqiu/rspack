@@ -1,3 +1,5 @@
+use crate::itoa;
+
 /*
   MIT License http://www.opensource.org/licenses/mit-license.php
   Author Tobias Koppers @sokra
@@ -5,35 +7,96 @@
 
 // Port from https://github.com/webpack/webpack/blob/4b4ca3bb53f36a5b8fc6bc1bd976ed7af161bd80/lib/util/numberHash.js
 
-const SAFE_LIMIT: usize = 0x80000000usize;
-const SAFE_PART: usize = SAFE_LIMIT - 1;
-const COUNT: usize = 4;
+const FNV_64_THRESHOLD: usize = 1 << 24;
 
-pub fn get_number_hash(str: &str, range: usize) -> usize {
-  let mut arr = [0usize; COUNT];
-  let primes = [3usize, 7usize, 17usize, 19usize];
+const FNV_OFFSET_32: u32 = 2_166_136_261;
 
-  for i in 0..str.len() {
-    let c = str.as_bytes()[i] as usize;
-    arr[0] = (arr[0] + c * primes[0] + arr[3]) & SAFE_PART;
-    arr[1] = (arr[1] + c * primes[1] + arr[0]) & SAFE_PART;
-    arr[2] = (arr[2] + c * primes[2] + arr[1]) & SAFE_PART;
-    arr[3] = (arr[3] + c * primes[3] + arr[2]) & SAFE_PART;
+const FNV_PRIME_32: u32 = 16_777_619;
 
-    arr[0] ^= arr[arr[0] % COUNT] >> 1;
-    arr[1] ^= arr[arr[1] % COUNT] >> 1;
-    arr[2] ^= arr[arr[2] % COUNT] >> 1;
-    arr[3] ^= arr[arr[3] % COUNT] >> 1;
+const MASK_31: u32 = 0x7fff_ffff;
+
+const FNV_OFFSET_64: u64 = 0xCBF2_9CE4_8422_2325;
+
+const FNV_PRIME_64: u64 = 0x0100_0000_01B3;
+
+#[derive(Debug, Clone, Copy)]
+pub struct NumberHashState {
+  inner: NumberHashStateInner,
+  range: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NumberHashStateInner {
+  Fnv32(u32),
+  Fnv64(u64),
+}
+
+fn fnv1a32(s: &str) -> u32 {
+  fnv1a32_update(FNV_OFFSET_32, s) & MASK_31
+}
+
+fn fnv1a32_update(mut hash: u32, s: &str) -> u32 {
+  for code_unit in s.encode_utf16() {
+    hash ^= code_unit as u32;
+    hash = hash.wrapping_mul(FNV_PRIME_32);
   }
 
-  if range <= SAFE_PART {
-    (arr[0] + arr[1] + arr[2] + arr[3]) % range
+  hash
+}
+
+fn fnv1a64(s: &str) -> u64 {
+  let mut hash = FNV_OFFSET_64;
+
+  for code_unit in s.encode_utf16() {
+    hash ^= code_unit as u64;
+    hash = hash.wrapping_mul(FNV_PRIME_64);
+  }
+
+  hash
+}
+
+fn fnv1a64_update(mut hash: u64, s: &str) -> u64 {
+  for code_unit in s.encode_utf16() {
+    hash ^= code_unit as u64;
+    hash = hash.wrapping_mul(FNV_PRIME_64);
+  }
+
+  hash
+}
+
+pub fn get_number_hash(s: &str, range: usize) -> usize {
+  if range < FNV_64_THRESHOLD {
+    (fnv1a32(s) as usize) % range
   } else {
-    let range_ext = range / SAFE_LIMIT;
-    let sum1 = (arr[0] + arr[2]) & SAFE_PART;
-    let sum2 = (arr[0] + arr[2]) % range_ext;
-    (sum2 * SAFE_LIMIT + sum1) % range
+    (fnv1a64(s) % (range as u64)) as usize
   }
+}
+
+pub fn get_number_hash_state(prefix: &str, range: usize) -> NumberHashState {
+  let inner = if range < FNV_64_THRESHOLD {
+    NumberHashStateInner::Fnv32(fnv1a32_update(FNV_OFFSET_32, prefix))
+  } else {
+    NumberHashStateInner::Fnv64(fnv1a64_update(FNV_OFFSET_64, prefix))
+  };
+  NumberHashState { inner, range }
+}
+
+pub fn get_number_hash_combined_from_state(state: NumberHashState, suffix: u64) -> usize {
+  let mut suffix_buffer = itoa::Buffer::new();
+  let suffix = suffix_buffer.format(suffix);
+
+  match state.inner {
+    NumberHashStateInner::Fnv32(hash) => {
+      ((fnv1a32_update(hash, suffix) & MASK_31) as usize) % state.range
+    }
+    NumberHashStateInner::Fnv64(hash) => {
+      (fnv1a64_update(hash, suffix) % (state.range as u64)) as usize
+    }
+  }
+}
+
+pub fn get_number_hash_combined(prefix: &str, suffix: u64, range: usize) -> usize {
+  get_number_hash_combined_from_state(get_number_hash_state(prefix, range), suffix)
 }
 
 #[test]
@@ -47,5 +110,63 @@ fn test_number_hash() {
       }
     }
     assert_eq!(set.len(), (*n - 1));
+  }
+
+  let test_cases = [
+    // range = 100
+    ("Hello, world!", 100usize, 16usize),
+    (
+      "You are right, but Rspack is a next-generation super fast bundler developed by the WebInfra team. Written in Rust, it make your build fly like rocket. With perfect support for Webpack ecosystem, it not only fast, but also friendly. Using Rspack, you can build faster and go home earlier.",
+      100usize,
+      73usize,
+    ),
+    ("我能吞下玻璃而不伤身体", 100usize, 97usize),
+    ("君が笑ってると、僕もうれしくなるんだ。", 100usize, 1usize),
+    ("🤣👉🤡", 100usize, 53usize),
+    // range = 10 * (1 << 24)
+    ("Hello, world!", 167_772_160_usize, 77_102_068_usize),
+    (
+      "You are right, but Rspack is a next-generation super fast bundler developed by the WebInfra team. Written in Rust, it make your build fly like rocket. With perfect support for Webpack ecosystem, it not only fast, but also friendly. Using Rspack, you can build faster and go home earlier.",
+      167_772_160_usize,
+      42_705_789_usize,
+    ),
+    (
+      "我能吞下玻璃而不伤身体",
+      167_772_160_usize,
+      63_515_641_usize,
+    ),
+    (
+      "君が笑ってると、僕もうれしくなるんだ。",
+      167_772_160_usize,
+      111_837_237_usize,
+    ),
+    ("🤣👉🤡", 167_772_160_usize, 93_616_649_usize),
+  ];
+
+  for (s, range, hash) in test_cases.iter() {
+    assert_eq!(get_number_hash(s, *range), *hash);
+  }
+}
+
+#[test]
+fn test_number_hash_combined_matches_concatenated_input() {
+  let test_cases = [
+    ("module/a.js", 0, 100usize),
+    ("module/a.js", 7, 100usize),
+    ("我能吞下玻璃而不伤身体", 42, 100usize),
+    ("vendor/react/index.js", 12345, 100usize),
+    ("chunk~main", 9, 167_772_160_usize),
+    (
+      "君が笑ってると、僕もうれしくなるんだ。",
+      314_159,
+      167_772_160_usize,
+    ),
+  ];
+
+  for (prefix, suffix, range) in test_cases {
+    assert_eq!(
+      get_number_hash_combined(prefix, suffix, range),
+      get_number_hash(&format!("{prefix}{suffix}"), range)
+    );
   }
 }

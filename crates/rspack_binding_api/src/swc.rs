@@ -1,0 +1,125 @@
+use std::{rc::Rc, sync::Arc};
+
+use napi::{Env, bindgen_prelude::PromiseRaw};
+use rspack_javascript_compiler::{
+  JavaScriptCompiler, TransformOutput as CompilerTransformOutput, minify::JsMinifyOptions,
+  transform::SwcOptions,
+};
+use rspack_util::source_map::SourceMapKind;
+use swc_core::{
+  base::config::SourceMapsConfig, common::comments::SingleThreadedComments, ecma::ast::noop_pass,
+};
+
+#[napi(object)]
+pub struct TransformOutput {
+  pub code: String,
+  pub map: Option<String>,
+  pub diagnostics: Vec<String>,
+}
+
+impl From<CompilerTransformOutput> for TransformOutput {
+  fn from(value: CompilerTransformOutput) -> Self {
+    Self {
+      code: value.code,
+      map: value.map.map(|v| v.to_json()),
+      diagnostics: value.diagnostics,
+    }
+  }
+}
+
+fn _to_source_map_kind(source_maps: Option<SourceMapsConfig>) -> SourceMapKind {
+  match source_maps {
+    Some(SourceMapsConfig::Str(s)) if s == "inline" => SourceMapKind::SourceMap,
+    Some(SourceMapsConfig::Str(s)) => {
+      // Explicitly handle non-"inline" string values for SourceMapsConfig::Str.
+      // Currently, only "inline" is supported; other values are treated as empty.
+      // Consider updating this match arm if additional string values are supported in the future.
+      SourceMapKind::empty()
+    }
+    Some(SourceMapsConfig::Bool(true)) => SourceMapKind::SourceMap,
+    Some(SourceMapsConfig::Bool(false)) => SourceMapKind::empty(),
+    _ => SourceMapKind::empty(),
+  }
+}
+
+fn _transform(source: String, options: String) -> napi::Result<TransformOutput> {
+  #[cfg_attr(not(feature = "plugin"), allow(unused_mut))]
+  let mut options: SwcOptions = serde_json::from_str(&options)?;
+
+  #[cfg(feature = "plugin")]
+  {
+    options.runtime_options = options.runtime_options.plugin_runtime(std::sync::Arc::new(
+      rspack_util::swc::runtime::WasmtimeRuntime,
+    ));
+  }
+
+  let compiler = JavaScriptCompiler::new();
+  let comments = Rc::new(SingleThreadedComments::default());
+  let module_source_map_kind = _to_source_map_kind(options.source_maps.clone());
+
+  compiler
+    .transform(
+      source,
+      Some(Arc::new(swc_core::common::FileName::Real(
+        options.filename.clone().into(),
+      ))),
+      comments,
+      options,
+      Some(module_source_map_kind),
+      |_, _| {},
+      |_| noop_pass(),
+    )
+    .map(TransformOutput::from)
+    .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e}")))
+}
+
+#[napi]
+pub fn transform<'env>(
+  env: &'env Env,
+  source: String,
+  options: String,
+) -> napi::Result<PromiseRaw<'env, TransformOutput>> {
+  rspack_napi::runtime::promise_from_future(env, async move { _transform(source, options) })
+}
+
+#[napi]
+pub fn transform_sync(source: String, options: String) -> napi::Result<TransformOutput> {
+  rspack_napi::runtime::within_runtime_if_available(|| _transform(source, options))
+}
+
+fn _minify(source: String, options: String) -> napi::Result<TransformOutput> {
+  let options: JsMinifyOptions = serde_json::from_str(&options)?;
+  let compiler = JavaScriptCompiler::new();
+  compiler
+    .minify(
+      swc_core::common::FileName::Anon,
+      source,
+      options,
+      None::<&dyn Fn(&swc_core::common::comments::SingleThreadedComments)>,
+    )
+    .map(TransformOutput::from)
+    .map_err(|e| {
+      let v = e.into_inner();
+      let err = v
+        .into_iter()
+        .map(|e| format!("{e:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+      napi::Error::new(napi::Status::GenericFailure, err)
+    })
+}
+
+#[napi]
+pub fn minify<'env>(
+  env: &'env Env,
+  source: String,
+  options: String,
+) -> napi::Result<PromiseRaw<'env, TransformOutput>> {
+  rspack_napi::runtime::promise_from_future(env, async move { _minify(source, options) })
+}
+
+#[napi]
+pub fn minify_sync(source: String, options: String) -> napi::Result<TransformOutput> {
+  _minify(source, options)
+}

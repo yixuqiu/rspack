@@ -1,25 +1,20 @@
 use std::{
   borrow::Cow,
+  ops::Range,
   path::{Path, PathBuf},
+  sync::LazyLock,
 };
 
 use concat_string::concat_string;
-use once_cell::sync::Lazy;
+use cow_utils::CowUtils;
+use memchr::{memchr, memchr2_iter};
 use regex::Regex;
+#[cfg(windows)]
+use rspack_paths::dos_device_path_prefix_len;
+use smallvec::SmallVec;
 use sugar_path::SugarPath;
 
-static SEGMENTS_SPLIT_REGEXP: Lazy<Regex> = Lazy::new(|| Regex::new(r"([|!])").expect("TODO:"));
-static WINDOWS_ABS_PATH_REGEXP: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"^[a-zA-Z]:[/\\]").expect("TODO:"));
-static WINDOWS_PATH_SEPARATOR_REGEXP: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"[/\\]").expect("TODO:"));
-pub fn make_paths_relative(context: &str, identifier: &str) -> String {
-  SEGMENTS_SPLIT_REGEXP
-    .split(identifier)
-    .map(|s| absolute_to_request(context, s))
-    .collect::<Vec<_>>()
-    .join("")
-}
+static WINDOWS_PATH_SEPARATOR: &[char] = &['/', '\\'];
 
 /// # Example
 ///  ```ignore
@@ -28,11 +23,16 @@ pub fn make_paths_relative(context: &str, identifier: &str) -> String {
 ///   ("/hello", Some("?world=1"))
 /// )
 /// ```
-fn split_at_query_mark(path: &str) -> (&str, Option<&str>) {
+pub fn split_at_query_mark(path: &str) -> (&str, Option<&str>) {
+  #[cfg(windows)]
+  let query_mark_pos = {
+    let prefix_len = dos_device_path_prefix_len(path);
+    path[prefix_len..].find('?').map(|pos| prefix_len + pos)
+  };
+  #[cfg(not(windows))]
   let query_mark_pos = path.find('?');
-  query_mark_pos
-    .map(|pos| (&path[..pos], Some(&path[pos..])))
-    .unwrap_or((path, None))
+
+  query_mark_pos.map_or((path, None), |pos| (&path[..pos], Some(&path[pos..])))
 }
 
 // Port from https://github.com/webpack/webpack/blob/4b4ca3bb53f36a5b8fc6bc1bd976ed7af161bd80/lib/util/identifier.js#L30
@@ -46,44 +46,26 @@ pub fn absolute_to_request<'b>(context: &str, maybe_absolute_path: &'b str) -> C
     return Cow::Borrowed(maybe_absolute_path);
   }
 
-  let (maybe_absolute_resource, query_part) = split_at_query_mark(maybe_absolute_path);
-
-  let relative_resource = if maybe_absolute_path.starts_with('/') {
-    let tmp = Path::new(maybe_absolute_resource).relative(context);
-    let tmp_path = tmp.to_string_lossy();
-    relative_path_to_request(&tmp_path).into_owned()
-  } else if WINDOWS_ABS_PATH_REGEXP.is_match(maybe_absolute_path) {
-    let mut resource = maybe_absolute_resource
-      .as_path()
-      .relative(context)
-      .to_string_lossy()
-      .into_owned();
-
-    // In windows, A path that relative to a another path could still be absolute.
-    // ("d:/aaaa/cccc").relative("c:/aaaaa/") would get "d:/aaaa/cccc".
-    if !WINDOWS_ABS_PATH_REGEXP.is_match(&resource) {
-      resource =
-        relative_path_to_request(&WINDOWS_PATH_SEPARATOR_REGEXP.replace_all(&resource, "/"))
-          .into_owned();
-    }
-    resource
-  } else {
+  if !maybe_absolute_path.starts_with('/') && !is_windows_absolute_path(maybe_absolute_path) {
     // not an absolute path
     return Cow::Borrowed(maybe_absolute_path);
-  };
+  }
 
-  return if let Some(query_part) = query_part {
-    Cow::Owned(concat_string!(relative_resource, query_part))
-  } else {
-    Cow::Owned(relative_resource)
-  };
+  let mut result = String::with_capacity(
+    context
+      .len()
+      .saturating_add(maybe_absolute_path.len())
+      .saturating_add(2),
+  );
+  push_absolute_to_request(context, maybe_absolute_path, &mut result);
+  Cow::Owned(result)
 }
 
 /// # Context
 /// First introduced at https://github.com/webpack/webpack/commit/5563ee9e583602eb38ab21219a327d346cd16218#r120784061
 /// Introduced at https://github.com/webpack/webpack/commit/c76be4d7383f35b3260dafefbcd24cac245d9e42
 /// Fix https://github.com/webpack/webpack/issues/14014
-pub fn relative_path_to_request(rel: &str) -> Cow<str> {
+pub fn relative_path_to_request(rel: &str) -> Cow<'_, str> {
   if rel.is_empty() {
     Cow::Borrowed("./.")
   } else if rel == ".." {
@@ -95,21 +77,226 @@ pub fn relative_path_to_request(rel: &str) -> Cow<str> {
   }
 }
 
-fn request_to_absolute(context: &str, relative_path: &str) -> String {
-  if relative_path.starts_with("./") || relative_path.starts_with("../") {
-    Path::new(context)
-      .join(relative_path)
-      .to_string_lossy()
-      .to_string()
+#[inline]
+fn is_windows_absolute_path(path: &str) -> bool {
+  #[cfg(windows)]
+  if dos_device_path_prefix_len(path) != 0 {
+    return true;
+  }
+
+  let bytes = path.as_bytes();
+  bytes.len() >= 3
+    && bytes[0].is_ascii_alphabetic()
+    && bytes[1] == b':'
+    && matches!(bytes[2], b'/' | b'\\')
+}
+
+#[inline]
+fn push_relative_path_to_request(rel: &str, out: &mut String) {
+  if rel.is_empty() {
+    out.push_str("./.");
+  } else if rel == ".." {
+    out.push_str("../.");
+  } else if rel.starts_with("../") {
+    out.push_str(rel);
   } else {
-    PathBuf::from(relative_path).to_string_lossy().to_string()
+    out.push_str("./");
+    out.push_str(rel);
   }
 }
 
+/// Appends a request-form path for `maybe_absolute_path` into `out`.
+///
+/// This function appends to the provided output buffer and does not clear or
+/// overwrite existing contents in `out`.
+///
+/// Accepted inputs:
+/// - Absolute POSIX paths are converted to a request relative to `context`.
+/// - Absolute Windows paths are converted similarly when possible.
+/// - Query parts (for example `?foo`) are preserved and appended.
+/// - Non-absolute inputs are accepted and appended unchanged.
+pub fn push_absolute_to_request(context: &str, maybe_absolute_path: &str, out: &mut String) {
+  if maybe_absolute_path.starts_with('/')
+    && maybe_absolute_path.len() > 1
+    && maybe_absolute_path.ends_with('/')
+  {
+    out.push_str(maybe_absolute_path);
+    return;
+  }
+
+  if maybe_absolute_path.starts_with('/') {
+    let (maybe_absolute_resource, query_part) = split_at_query_mark(maybe_absolute_path);
+    let tmp = Path::new(maybe_absolute_resource).relative(context);
+    let tmp_path = tmp.to_string_lossy();
+    push_relative_path_to_request(&tmp_path, out);
+    if let Some(query_part) = query_part {
+      out.push_str(query_part);
+    }
+    return;
+  }
+
+  if is_windows_absolute_path(maybe_absolute_path) {
+    let (maybe_absolute_resource, query_part) = split_at_query_mark(maybe_absolute_path);
+    let relative_resource = maybe_absolute_resource.as_path().relative(context);
+    let resource = relative_resource.to_string_lossy();
+
+    // In windows, A path that relative to a another path could still be absolute.
+    // ("d:/aaaa/cccc").relative("c:/aaaaa/") would get "d:/aaaa/cccc".
+    if is_windows_absolute_path(resource.as_ref()) {
+      out.push_str(resource.as_ref());
+    } else {
+      let resource = resource.cow_replace(WINDOWS_PATH_SEPARATOR, "/");
+      push_relative_path_to_request(resource.as_ref(), out);
+    }
+
+    if let Some(query_part) = query_part {
+      out.push_str(query_part);
+    }
+    return;
+  }
+
+  out.push_str(maybe_absolute_path);
+}
+
+fn push_request_to_absolute(context: &str, relative_path: &str, out: &mut String) {
+  if relative_path.starts_with("./") || relative_path.starts_with("../") {
+    let relative_path = if relative_path.starts_with("./") {
+      relative_path
+        .strip_prefix("./")
+        .expect("should start with ./")
+    } else {
+      relative_path
+    };
+
+    let mut absolute_path = PathBuf::with_capacity(
+      context
+        .len()
+        .saturating_add(relative_path.len())
+        .saturating_add(1),
+    );
+    absolute_path.push(context);
+    absolute_path.push(relative_path);
+    out.push_str(&absolute_path.to_string_lossy());
+  } else {
+    out.push_str(relative_path);
+  }
+}
+
+fn identifier_segment_ranges(identifier: &str) -> SmallVec<[Range<u32>; 4]> {
+  let identifier_len =
+    u32::try_from(identifier.len()).expect("identifier length should fit into u32");
+  let mut ranges = SmallVec::new();
+  let mut last = 0;
+
+  for index in memchr2_iter(b'|', b'!', identifier.as_bytes()) {
+    ranges.push(last as u32..index as u32);
+    last = index + 1;
+  }
+  ranges.push(last as u32..identifier_len);
+  ranges
+}
+
 pub fn make_paths_absolute(context: &str, identifier: &str) -> String {
-  SEGMENTS_SPLIT_REGEXP
-    .split(identifier)
-    .map(|str| request_to_absolute(context, str))
-    .collect::<Vec<String>>()
-    .join("")
+  let ranges = identifier_segment_ranges(identifier);
+  let relative_segment_count = ranges
+    .iter()
+    .filter(|range| {
+      let segment = &identifier[range.start as usize..range.end as usize];
+      segment.starts_with("./") || segment.starts_with("../")
+    })
+    .count();
+  let result_capacity = context
+    .len()
+    .saturating_add(1)
+    .saturating_mul(relative_segment_count)
+    .saturating_add(identifier.len());
+  let mut result = String::with_capacity(result_capacity);
+
+  for range in ranges {
+    let start = range.start as usize;
+    let end = range.end as usize;
+    push_request_to_absolute(context, &identifier[start..end], &mut result);
+    if end < identifier.len() {
+      result.push(identifier.as_bytes()[end] as char);
+    }
+  }
+  result
+}
+
+pub fn make_paths_relative(context: &str, identifier: &str) -> String {
+  let ranges = identifier_segment_ranges(identifier);
+  let segment_capacity = context.len().saturating_mul(2).saturating_add(2);
+  let result_capacity = segment_capacity
+    .saturating_mul(ranges.len())
+    .saturating_add(identifier.len());
+  let mut result = String::with_capacity(result_capacity);
+
+  for range in ranges {
+    let start = range.start as usize;
+    let end = range.end as usize;
+    push_absolute_to_request(context, &identifier[start..end], &mut result);
+    if end < identifier.len() {
+      result.push(identifier.as_bytes()[end] as char);
+    }
+  }
+  result
+}
+
+pub fn strip_zero_width_space_for_fragment(s: &str) -> Cow<'_, str> {
+  s.cow_replace("\u{200b}#", "#")
+}
+
+pub fn insert_zero_width_space_for_fragment(s: &str) -> Cow<'_, str> {
+  // Most paths and queries have no `#`; skip the substring searcher for them.
+  if memchr(b'#', s.as_bytes()).is_none() {
+    return Cow::Borrowed(s);
+  }
+  s.cow_replace("#", "\u{200b}#")
+}
+
+/// Format a resolver result as a resource request, escaping literal fragment markers.
+pub fn format_resolved_resource(path: &str, query: &str, fragment: &str) -> String {
+  let mut resource = String::with_capacity(
+    path
+      .len()
+      .saturating_add(query.len())
+      .saturating_add(fragment.len()),
+  );
+  resource.push_str(&insert_zero_width_space_for_fragment(path));
+  resource.push_str(&insert_zero_width_space_for_fragment(query));
+  resource.push_str(fragment);
+  resource
+}
+
+static REQUEST_TO_ID_REGEX1: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"^(\.\.?/)+").expect("Failed to initialize REQUEST_TO_ID_REGEX1"));
+static REQUEST_TO_ID_REGEX2: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"(^[.-]|[^a-zA-Z0-9_-])+").expect("Failed to initialize REQUEST_TO_ID_REGEX2")
+});
+
+/// Convert a request string to a valid identifier by removing relative path prefixes
+/// and replacing illegal characters with underscores
+pub fn request_to_id(request: &str) -> String {
+  REQUEST_TO_ID_REGEX2
+    .replace_all(&REQUEST_TO_ID_REGEX1.replace(request, ""), "_")
+    .to_string()
+}
+
+#[test]
+fn test_push_absolute_to_request() {
+  let mut out = String::new();
+  push_absolute_to_request(
+    "/workspace/app",
+    "/workspace/app/src/index.js?foo=1",
+    &mut out,
+  );
+  assert_eq!(out, "./src/index.js?foo=1");
+
+  let mut out = String::new();
+  push_absolute_to_request("/workspace/app", "/regexp/", &mut out);
+  assert_eq!(out, "/regexp/");
+
+  let mut out = String::new();
+  push_absolute_to_request("/workspace/app", "loader", &mut out);
+  assert_eq!(out, "loader");
 }

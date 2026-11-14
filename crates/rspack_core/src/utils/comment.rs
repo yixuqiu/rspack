@@ -1,8 +1,4 @@
-use once_cell::sync::Lazy;
-use regex::Regex;
-
-static COMMENT_END_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r"\*\/").expect("should init regex"));
+use cow_utils::CowUtils;
 
 #[inline]
 pub fn to_comment(str: &str) -> String {
@@ -10,7 +6,16 @@ pub fn to_comment(str: &str) -> String {
     return String::new();
   }
 
-  let result = COMMENT_END_REGEX.replace_all(str, "* /");
+  let result = str.cow_replace("*/", "* /");
+  format!("/*! {result} */")
+}
 
-  format!("/*! {} */", result)
+#[inline]
+pub fn to_comment_with_nl(str: &str) -> String {
+  if str.is_empty() {
+    return String::new();
+  }
+
+  let result = str.cow_replace("*/", "* /");
+  format!("/*! {result} */\n")
 }

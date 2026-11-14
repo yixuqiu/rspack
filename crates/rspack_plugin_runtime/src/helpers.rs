@@ -1,18 +1,41 @@
-use std::hash::Hash;
+use std::sync::LazyLock;
 
+use itertools::Itertools;
+use regex::Regex;
+use rspack_collections::IdentifierLinkedMap;
 use rspack_core::{
-  get_chunk_from_ukey, get_chunk_group_from_ukey, get_js_chunk_filename_template,
-  rspack_sources::{BoxSource, RawSource, SourceExt},
-  Chunk, ChunkGroupByUkey, ChunkGroupUkey, ChunkUkey, Compilation, PathData, RuntimeGlobals,
+  Chunk, ChunkGraph, ChunkGroupByUkey, ChunkGroupUkey, ChunkLoading, ChunkLoadingType, ChunkUkey,
+  Compilation, PathData, RuntimeCodeTemplate, RuntimeGlobals, RuntimeModuleRuntimeRequirements,
+  RuntimeVariable, SourceType,
+  chunk_graph_chunk::ChunkIdSet,
+  get_js_chunk_filename_template,
+  rspack_sources::{BoxSource, RawStringSource, SourceExt},
 };
-use rspack_error::{error, Result};
-use rspack_hash::RspackHash;
-use rspack_identifier::IdentifierLinkedMap;
-use rspack_plugin_javascript::{runtime::stringify_chunks_to_array, RenderJsChunkArgs};
+use rspack_error::{Result, error};
+use rspack_hash::{RspackHash, RspackHasher};
+use rspack_plugin_javascript::runtime::stringify_chunks_to_array;
+use rspack_util::fx_hash::FxIndexSet;
 use rustc_hash::FxHashSet as HashSet;
 
+use crate::runtime_module::is_enabled_for_chunk;
+
+pub fn should_export_webpack_require_for_module_chunk_loading(
+  chunk_ukey: &ChunkUkey,
+  compilation: &Compilation,
+) -> bool {
+  let chunk_loading = ChunkLoading::Enable(ChunkLoadingType::Import);
+  is_enabled_for_chunk(chunk_ukey, &chunk_loading, compilation)
+    && compilation
+      .build_chunk_graph_artifact
+      .chunk_graph
+      .has_chunk_entry_dependent_chunks(
+        chunk_ukey,
+        &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
+      )
+}
+
 pub fn update_hash_for_entry_startup(
-  hasher: &mut RspackHash,
+  hasher: &mut RspackHasher,
   compilation: &Compilation,
   entries: &IdentifierLinkedMap<ChunkGroupUkey>,
   chunk: &ChunkUkey,
@@ -21,30 +44,31 @@ pub fn update_hash_for_entry_startup(
     if let Some(module_id) = compilation
       .get_module_graph()
       .module_graph_module_by_identifier(module)
-      .map(|module| {
-        match compilation
-          .chunk_graph
-          .get_module_id(module.module_identifier)
-        {
-          Some(id) => id.as_str(),
-          None => "null",
-        }
+      .and_then(|module| {
+        ChunkGraph::get_module_id(&compilation.module_ids_artifact, module.module_identifier)
       })
     {
       module_id.hash(hasher);
     }
 
-    if let Some(runtime_chunk) = get_chunk_group_from_ukey(entry, &compilation.chunk_group_by_ukey)
-      .map(|e| e.get_runtime_chunk(&compilation.chunk_group_by_ukey))
+    if let Some(runtime_chunk) = compilation
+      .build_chunk_graph_artifact
+      .chunk_group_by_ukey
+      .get(entry)
+      .map(|e| e.get_runtime_chunk(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey))
     {
       for chunk_ukey in get_all_chunks(
         entry,
         chunk,
         Some(&runtime_chunk),
-        &compilation.chunk_group_by_ukey,
+        &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
       ) {
-        if let Some(chunk) = get_chunk_from_ukey(&chunk_ukey, &compilation.chunk_by_ukey) {
-          chunk.id.hash(hasher);
+        if let Some(chunk) = compilation
+          .build_chunk_graph_artifact
+          .chunk_by_ukey
+          .get(&chunk_ukey)
+        {
+          chunk.id().hash(hasher);
         }
       }
     }
@@ -56,24 +80,24 @@ pub fn get_all_chunks(
   exclude_chunk1: &ChunkUkey,
   exclude_chunk2: Option<&ChunkUkey>,
   chunk_group_by_ukey: &ChunkGroupByUkey,
-) -> HashSet<ChunkUkey> {
+) -> FxIndexSet<ChunkUkey> {
   fn add_chunks(
     chunk_group_by_ukey: &ChunkGroupByUkey,
-    chunks: &mut HashSet<ChunkUkey>,
+    chunks: &mut FxIndexSet<ChunkUkey>,
     entrypoint_ukey: &ChunkGroupUkey,
     exclude_chunk1: &ChunkUkey,
     exclude_chunk2: Option<&ChunkUkey>,
-    visit_chunk_groups: &mut HashSet<ChunkGroupUkey>,
+    visit_chunk_groups: &mut FxIndexSet<ChunkGroupUkey>,
   ) {
-    if let Some(entrypoint) = get_chunk_group_from_ukey(entrypoint_ukey, chunk_group_by_ukey) {
+    if let Some(entrypoint) = chunk_group_by_ukey.get(entrypoint_ukey) {
       for chunk in &entrypoint.chunks {
         if chunk == exclude_chunk1 {
           continue;
         }
-        if let Some(exclude_chunk2) = exclude_chunk2 {
-          if chunk == exclude_chunk2 {
-            continue;
-          }
+        if let Some(exclude_chunk2) = exclude_chunk2
+          && chunk == exclude_chunk2
+        {
+          continue;
         }
         chunks.insert(*chunk);
       }
@@ -83,24 +107,24 @@ pub fn get_all_chunks(
           continue;
         }
         visit_chunk_groups.insert(*parent);
-        if let Some(chunk_group) = get_chunk_group_from_ukey(parent, chunk_group_by_ukey) {
-          if chunk_group.is_initial() {
-            add_chunks(
-              chunk_group_by_ukey,
-              chunks,
-              &chunk_group.ukey,
-              exclude_chunk1,
-              exclude_chunk2,
-              visit_chunk_groups,
-            );
-          }
+        if let Some(chunk_group) = chunk_group_by_ukey.get(parent)
+          && chunk_group.is_initial()
+        {
+          add_chunks(
+            chunk_group_by_ukey,
+            chunks,
+            &chunk_group.ukey,
+            exclude_chunk1,
+            exclude_chunk2,
+            visit_chunk_groups,
+          );
         }
       }
     }
   }
 
-  let mut chunks: HashSet<ChunkUkey> = HashSet::default();
-  let mut visit_chunk_groups = HashSet::default();
+  let mut chunks = FxIndexSet::default();
+  let mut visit_chunk_groups = FxIndexSet::default();
 
   add_chunks(
     chunk_group_by_ukey,
@@ -114,30 +138,86 @@ pub fn get_all_chunks(
   chunks
 }
 
-pub fn get_runtime_chunk_output_name(args: &RenderJsChunkArgs) -> Result<String> {
+pub async fn get_runtime_chunk_output_name(
+  compilation: &Compilation,
+  chunk_ukey: &ChunkUkey,
+) -> Result<String> {
   let entry_point = {
-    let entry_points = args
-      .compilation
+    let entry_points = compilation
+      .build_chunk_graph_artifact
       .chunk_graph
-      .get_chunk_entry_modules_with_chunk_group_iterable(args.chunk_ukey);
+      .get_chunk_entry_modules_with_chunk_group_iterable(chunk_ukey);
 
     let (_, entry_point_ukey) = entry_points
       .iter()
       .next()
       .ok_or_else(|| error!("should has entry point ukey"))?;
 
-    args
-      .compilation
+    compilation
+      .build_chunk_graph_artifact
       .chunk_group_by_ukey
       .expect_get(entry_point_ukey)
   };
 
-  let runtime_chunk = args
-    .compilation
+  let runtime_chunk = compilation
+    .build_chunk_graph_artifact
     .chunk_by_ukey
-    .expect_get(&entry_point.get_runtime_chunk(&args.compilation.chunk_group_by_ukey));
+    .expect_get(
+      &entry_point.get_runtime_chunk(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey),
+    );
 
-  get_chunk_output_name(runtime_chunk, args.compilation)
+  get_chunk_output_name(runtime_chunk, compilation).await
+}
+
+pub fn runtime_chunk_has_hash(compilation: &Compilation, chunk_ukey: &ChunkUkey) -> Result<bool> {
+  let entry_point = {
+    let entry_points = compilation
+      .build_chunk_graph_artifact
+      .chunk_graph
+      .get_chunk_entry_modules_with_chunk_group_iterable(chunk_ukey);
+
+    let (_, entry_point_ukey) = entry_points
+      .iter()
+      .next()
+      .ok_or_else(|| error!("should has entry point ukey"))?;
+
+    compilation
+      .build_chunk_graph_artifact
+      .chunk_group_by_ukey
+      .expect_get(entry_point_ukey)
+  };
+
+  let runtime_chunk_ukey =
+    entry_point.get_runtime_chunk(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey);
+  let runtime_chunk = compilation
+    .build_chunk_graph_artifact
+    .chunk_by_ukey
+    .expect_get(&runtime_chunk_ukey);
+
+  let filename = get_js_chunk_filename_template(
+    runtime_chunk,
+    &compilation.options.output,
+    &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
+  );
+
+  if filename.has_hash_placeholder() {
+    return Ok(true);
+  }
+
+  if filename.has_content_hash_placeholder()
+    && (compilation
+      .build_chunk_graph_artifact
+      .chunk_graph
+      .has_chunk_full_hash_modules(&runtime_chunk_ukey, &compilation.runtime_modules)
+      || compilation
+        .build_chunk_graph_artifact
+        .chunk_graph
+        .has_chunk_dependent_hash_modules(&runtime_chunk_ukey, &compilation.runtime_modules))
+  {
+    return Ok(true);
+  }
+
+  Ok(false)
 }
 
 pub fn generate_entry_startup(
@@ -145,43 +225,50 @@ pub fn generate_entry_startup(
   chunk: &ChunkUkey,
   entries: &IdentifierLinkedMap<ChunkGroupUkey>,
   passive: bool,
+  runtime_template: &RuntimeCodeTemplate,
 ) -> BoxSource {
   let mut module_id_exprs = vec![];
-  let mut chunks_ids = HashSet::default();
-
+  let mut chunks_ids = ChunkIdSet::default();
+  let module_graph = compilation.get_module_graph();
   for (module, entry) in entries {
-    if let Some(module_id) = compilation
-      .get_module_graph()
-      .module_graph_module_by_identifier(module)
-      .map(|module| {
-        match compilation
-          .chunk_graph
-          .get_module_id(module.module_identifier)
-        {
-          Some(id) => id.as_str(),
-          None => "null",
-        }
+    if let Some(module_id) = module_graph
+      .module_by_identifier(module)
+      .filter(|module| {
+        module
+          .source_types(module_graph)
+          .contains(&SourceType::JavaScript)
+      })
+      .and_then(|module| {
+        ChunkGraph::get_module_id(&compilation.module_ids_artifact, module.identifier())
       })
     {
-      let module_id_expr = serde_json::to_string(module_id).expect("invalid module_id");
+      let module_id_expr = rspack_util::json_stringify(module_id);
       module_id_exprs.push(module_id_expr);
+    } else {
+      continue;
     }
 
-    if let Some(runtime_chunk) = get_chunk_group_from_ukey(entry, &compilation.chunk_group_by_ukey)
-      .map(|e| e.get_runtime_chunk(&compilation.chunk_group_by_ukey))
+    if let Some(runtime_chunk) = compilation
+      .build_chunk_graph_artifact
+      .chunk_group_by_ukey
+      .get(entry)
+      .map(|e| e.get_runtime_chunk(&compilation.build_chunk_graph_artifact.chunk_group_by_ukey))
     {
       let chunks = get_all_chunks(
         entry,
         chunk,
         Some(&runtime_chunk),
-        &compilation.chunk_group_by_ukey,
+        &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
       );
       chunks_ids.extend(
         chunks
           .iter()
           .map(|chunk_ukey| {
-            let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
-            chunk.expect_id().to_string()
+            let chunk = compilation
+              .build_chunk_graph_artifact
+              .chunk_by_ukey
+              .expect_get(chunk_ukey);
+            chunk.expect_id().clone()
           })
           .collect::<HashSet<_>>(),
       );
@@ -190,44 +277,64 @@ pub fn generate_entry_startup(
 
   let mut source = String::default();
   source.push_str(&format!(
-    "var __webpack_exec__ = function(moduleId) {{ return __webpack_require__({} = moduleId) }}\n",
-    RuntimeGlobals::ENTRY_MODULE_ID
+    "var {} = function(moduleId) {{ return {}({} = moduleId) }}\n",
+    runtime_template.render_runtime_variable(&RuntimeVariable::StartupExec),
+    runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+    runtime_template.render_runtime_globals(&RuntimeGlobals::ENTRY_MODULE_ID)
   ));
+
+  let exports_name = runtime_template.render_runtime_variable(&RuntimeVariable::Exports);
 
   let module_ids_code = &module_id_exprs
     .iter()
-    .map(|module_id_expr| format!("__webpack_exec__({module_id_expr})"))
+    .map(|module_id_expr| {
+      format!(
+        "{}({module_id_expr})",
+        runtime_template.render_runtime_variable(&RuntimeVariable::StartupExec)
+      )
+    })
     .collect::<Vec<_>>()
     .join(", ");
   if chunks_ids.is_empty() {
-    source.push_str("var __webpack_exports__ = (");
-    source.push_str(module_ids_code);
-    source.push_str(");\n");
+    if !module_ids_code.is_empty() {
+      if passive {
+        source.push_str(&format!("var {exports_name} = ("));
+        source.push_str(module_ids_code);
+        source.push_str(");\n");
+      } else {
+        // Ensure STARTUP_ENTRYPOINT wrappers run even without dependent chunks (e.g. async startup).
+        source.push_str(&format!(
+          "var {exports_name} = {}(0, [], function() {{\n        return {};\n      }});\n",
+          runtime_template.render_runtime_globals(&RuntimeGlobals::STARTUP_ENTRYPOINT),
+          module_ids_code
+        ));
+      }
+    }
   } else {
     if !passive {
-      source.push_str("var __webpack_exports__ = ");
+      source.push_str(&format!("var {exports_name} = "));
     }
     source.push_str(&format!(
       "{}(0, {}, function() {{
         return {};
       }});\n",
       if passive {
-        RuntimeGlobals::ON_CHUNKS_LOADED
+        runtime_template.render_runtime_globals(&RuntimeGlobals::ON_CHUNKS_LOADED)
       } else {
-        RuntimeGlobals::STARTUP_ENTRYPOINT
+        runtime_template.render_runtime_globals(&RuntimeGlobals::STARTUP_ENTRYPOINT)
       },
       stringify_chunks_to_array(&chunks_ids),
       module_ids_code
     ));
     if passive {
       source.push_str(&format!(
-        "var __webpack_exports__ = {}();\n",
-        RuntimeGlobals::ON_CHUNKS_LOADED
+        "var {exports_name} = {}();\n",
+        runtime_template.render_runtime_globals(&RuntimeGlobals::ON_CHUNKS_LOADED)
       ));
     }
   }
 
-  RawSource::from(source).boxed()
+  RawStringSource::from(source).boxed()
 }
 
 /**
@@ -252,28 +359,237 @@ pub fn get_relative_path(base_chunk_output_name: &str, other_chunk_output_name: 
   format!("{path}{}", other_chunk_output_name_arr.join("/"))
 }
 
-pub fn get_chunk_output_name(chunk: &Chunk, compilation: &Compilation) -> Result<String> {
-  let hash = chunk.get_render_hash(compilation.options.output.hash_digest_length);
+pub async fn get_chunk_output_name(chunk: &Chunk, compilation: &Compilation) -> Result<String> {
+  let hash = chunk.rendered_hash(
+    &compilation.chunk_hashes_artifact,
+    compilation.options.output.hash_digest_length,
+  );
   let filename = get_js_chunk_filename_template(
     chunk,
     &compilation.options.output,
-    &compilation.chunk_group_by_ukey,
+    &compilation.build_chunk_graph_artifact.chunk_group_by_ukey,
   );
-  compilation.get_path(
-    filename,
-    PathData::default()
-      .chunk(chunk)
-      .content_hash_optional(hash)
-      .hash_optional(hash),
-  )
+  compilation
+    .get_path(
+      &filename,
+      PathData::default()
+        .chunk(chunk.ukey(), compilation)
+        .chunk_id_optional(chunk.id().map(|id| id.as_str()))
+        .chunk_hash_optional(chunk.rendered_hash(
+          &compilation.chunk_hashes_artifact,
+          compilation.options.output.hash_digest_length,
+        ))
+        .chunk_name_optional(chunk.name_for_filename_template())
+        .content_hash_optional(chunk.rendered_content_hash_by_source_type(
+          &compilation.chunk_hashes_artifact,
+          &SourceType::JavaScript,
+          compilation.options.output.hash_digest_length,
+        ))
+        .hash_optional(hash),
+    )
+    .await
 }
 
 pub fn get_chunk_runtime_requirements<'a>(
   compilation: &'a Compilation,
   chunk_ukey: &ChunkUkey,
 ) -> &'a RuntimeGlobals {
-  &compilation
-    .chunk_graph
-    .get_chunk_graph_chunk(chunk_ukey)
-    .runtime_requirements
+  ChunkGraph::get_chunk_runtime_requirements(compilation, chunk_ukey)
+}
+
+/// Regex to match EJS `<%- RUNTIME_GLOBALS %>` where the identifier is uppercase (RuntimeGlobals enum style).
+static EJS_RUNTIME_GLOBALS_RE: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"<%\-\s*([A-Z][A-Z0-9_]*)\s*%>").expect("invalid EJS runtime globals regex")
+});
+
+static EJS_RUNTIME_GLOBAL_DEFINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"<%\-\s*define\(\s*([A-Z][A-Z0-9_]*)\s*\)\s*%>")
+    .expect("invalid EJS runtime global define regex")
+});
+
+static EJS_RUNTIME_GLOBAL_WEAK_RE: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"<%\-\s*weak\(\s*([A-Z][A-Z0-9_]*)\s*\)\s*%>")
+    .expect("invalid EJS runtime global weak regex")
+});
+
+static EJS_RUNTIME_MODULE_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r#"<%\-\s*(?:var|fn)\(\s*"([A-Za-z_$][A-Za-z0-9_$]*)"\s*\)\s*%>"#)
+    .expect("invalid EJS runtime module variable regex")
+});
+
+/// Extracts all RuntimeGlobals references from an EJS template string.
+///
+/// Matches patterns like `<%- PUBLIC_PATH %>` or `<%- GET_CHUNK_SCRIPT_FILENAME %>`
+/// where the identifier is uppercase letters, digits and underscores (RuntimeGlobals enum variant naming).
+/// Does not match other EJS placeholders such as `<%- basicFunction(...) %>` or `<%- _modules %>`.
+fn extract_runtime_global_references_from_ejs(ejs_content: &str) -> RuntimeGlobals {
+  let names = EJS_RUNTIME_GLOBALS_RE
+    .captures_iter(ejs_content)
+    .map(|cap| cap[1].to_string())
+    .collect_vec();
+  RuntimeGlobals::from_names(&names)
+}
+
+pub fn extract_runtime_globals_from_ejs(ejs_content: &str) -> RuntimeModuleRuntimeRequirements {
+  let mut dependencies = extract_runtime_global_references_from_ejs(ejs_content);
+  let define_names = EJS_RUNTIME_GLOBAL_DEFINE_RE
+    .captures_iter(ejs_content)
+    .map(|cap| cap[1].to_string())
+    .collect_vec();
+  let define = RuntimeGlobals::from_names(&define_names);
+  let weak_names = EJS_RUNTIME_GLOBAL_WEAK_RE
+    .captures_iter(ejs_content)
+    .map(|cap| cap[1].to_string())
+    .collect_vec();
+  let weak = RuntimeGlobals::from_names(&weak_names);
+  dependencies.remove(weak);
+  RuntimeModuleRuntimeRequirements {
+    dependencies,
+    weak,
+    define,
+    ..Default::default()
+  }
+}
+
+/// Extracts top-level runtime module declarations written with EJS `var()` and `fn()` helpers.
+pub fn extract_runtime_module_variables_from_ejs(
+  ejs_contents: &[&'static str],
+) -> Vec<&'static str> {
+  let mut variables = FxIndexSet::default();
+  for ejs_content in ejs_contents {
+    variables.extend(
+      EJS_RUNTIME_MODULE_VARIABLE_RE
+        .captures_iter(ejs_content)
+        .map(|capture| {
+          capture
+            .get(1)
+            .expect("should have a variable name")
+            .as_str()
+        }),
+    );
+  }
+  variables.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{RuntimeGlobals, extract_runtime_globals_from_ejs};
+
+  fn expected_globals(names: &[&str]) -> RuntimeGlobals {
+    let names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+    RuntimeGlobals::from_names(&names)
+  }
+
+  #[test]
+  fn test_extract_runtime_globals_empty() {
+    assert!(extract_runtime_globals_from_ejs("").dependencies.is_empty());
+    assert!(
+      extract_runtime_globals_from_ejs("plain text")
+        .dependencies
+        .is_empty()
+    );
+  }
+
+  #[test]
+  fn test_extract_runtime_globals_single() {
+    assert_eq!(
+      extract_runtime_globals_from_ejs("<%- PUBLIC_PATH %>").dependencies,
+      expected_globals(&["PUBLIC_PATH"])
+    );
+    assert_eq!(
+      extract_runtime_globals_from_ejs("var x = <%- REQUIRE %>;").dependencies,
+      expected_globals(&["REQUIRE"])
+    );
+  }
+
+  #[test]
+  fn test_extract_runtime_globals_multiple_unique() {
+    let ejs = r#"link.href = <%- PUBLIC_PATH %> + <%- GET_CHUNK_SCRIPT_FILENAME %>(chunkId);
+    if (<%- HAS_OWN_PROPERTY %>(installedChunks, chunkId)) {}"#;
+    assert_eq!(
+      extract_runtime_globals_from_ejs(ejs).dependencies,
+      expected_globals(&[
+        "PUBLIC_PATH",
+        "GET_CHUNK_SCRIPT_FILENAME",
+        "HAS_OWN_PROPERTY"
+      ])
+    );
+  }
+
+  #[test]
+  fn test_extract_runtime_globals_deduplicate() {
+    let ejs = "<%- REQUIRE %>; <%- PUBLIC_PATH %>; <%- REQUIRE %>; <%- PUBLIC_PATH %>";
+    assert_eq!(
+      extract_runtime_globals_from_ejs(ejs).dependencies,
+      expected_globals(&["REQUIRE", "PUBLIC_PATH"])
+    );
+  }
+
+  #[test]
+  fn test_extract_runtime_globals_with_spaces() {
+    assert_eq!(
+      extract_runtime_globals_from_ejs("<%-  ENSURE_CHUNK  %>").dependencies,
+      expected_globals(&["ENSURE_CHUNK"])
+    );
+  }
+
+  #[test]
+  fn test_extract_runtime_globals_ignore_non_globals() {
+    // Should not match: lowercase, underscore prefix, function calls
+    let ejs = r#"<%- basicFunction("resolve, reject")  %>
+    <%- _modules %>
+    <%- _cross_origin %>
+    <%- MODULE_CACHE %>"#;
+    assert_eq!(
+      extract_runtime_globals_from_ejs(ejs).dependencies,
+      expected_globals(&["MODULE_CACHE"])
+    );
+  }
+
+  #[test]
+  fn test_extract_runtime_globals_uppercase_with_underscores() {
+    let ejs = "<%- GET_CHUNK_UPDATE_SCRIPT_FILENAME %> <%- HMR_DOWNLOAD_UPDATE_HANDLERS %>";
+    assert_eq!(
+      extract_runtime_globals_from_ejs(ejs).dependencies,
+      expected_globals(&[
+        "GET_CHUNK_UPDATE_SCRIPT_FILENAME",
+        "HMR_DOWNLOAD_UPDATE_HANDLERS"
+      ])
+    );
+  }
+
+  #[test]
+  fn test_extract_runtime_globals_real_ejs_snippet() {
+    let ejs = r#"var installChunk = <%- basicFunction("data") %> {
+    var <%- _modules %> = data.<%- _modules %>;
+    for (moduleId in <%- _modules %>) {
+        if (<%- HAS_OWN_PROPERTY %>(<%- _modules %>, moduleId)) {
+            <%- MODULE_FACTORIES %>[moduleId] = <%- _modules %>[moduleId];
+        }
+    }
+    if (__rspack_esm_runtime) __rspack_esm_runtime(<%- REQUIRE %>);
+};"#;
+    assert_eq!(
+      extract_runtime_globals_from_ejs(ejs).dependencies,
+      expected_globals(&["HAS_OWN_PROPERTY", "MODULE_FACTORIES", "REQUIRE"])
+    );
+  }
+
+  #[test]
+  fn test_extract_runtime_globals_excludes_define_and_weak_from_dependencies() {
+    let ejs = "<%- PUBLIC_PATH %>; <%- define(ENSURE_CHUNK_HANDLERS) %>; <%- weak(SCRIPT_NONCE) %>; <%- weak(ON_CHUNKS_LOADED) %>;";
+    let requirements = extract_runtime_globals_from_ejs(ejs);
+    assert_eq!(
+      requirements.dependencies,
+      expected_globals(&["PUBLIC_PATH"])
+    );
+    assert_eq!(
+      requirements.define,
+      expected_globals(&["ENSURE_CHUNK_HANDLERS"])
+    );
+    assert_eq!(
+      requirements.weak,
+      expected_globals(&["SCRIPT_NONCE", "ON_CHUNKS_LOADED"])
+    );
+  }
 }

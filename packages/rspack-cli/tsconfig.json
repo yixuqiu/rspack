@@ -3,17 +3,13 @@
   "include": ["src"],
   "compilerOptions": {
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    "module": "ES2022",
+    "moduleResolution": "bundler"
   },
   "references": [
     {
       "path": "../rspack"
-    },
-    {
-      "path": "../rspack-dev-server"
-    },
-    {
-      "path": "../rspack-plugin-react-refresh"
     }
   ]
 }

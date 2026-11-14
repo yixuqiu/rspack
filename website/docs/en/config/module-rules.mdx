@@ -1,0 +1,1211 @@
+---
+description: 'module.rules defines how Rspack processes different types of modules during the build'
+---
+
+import { ApiMeta, Stability } from '../../../components/ApiMeta';
+import PropertyType from '@components/PropertyType';
+import Attribution from '@components/Attribution';
+
+# Module rules
+
+- **Type:** `(Rule | Falsy)[]`
+- **Default:** `[]`
+
+`module.rules` defines how Rspack processes different types of modules during the build.
+
+It is an array of rules. Each rule is matched against a module's metadata when the module is resolved and created, such as its file path, file type, or query parameters. Once a rule matches, Rspack transforms or resolves the module according to the rule's configuration.
+
+The most common use case is configuring [loaders](/guide/features/loader) for different kinds of modules. For example, transforming TypeScript into browser-executable JavaScript, or handling stylesheets, images, and other assets.
+
+By combining various matching conditions with specific processing logic, `module.rules` provides fine-grained control over how different modules are built.
+
+For example, use the [built-in swc-loader](/guide/builtin-loaders/swc-loader) to handle files ending with `.ts`:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.(?:js|mjs|ts)$/,
+        use: 'builtin:swc-loader',
+        options: {
+          // loader options...
+        },
+      },
+    ],
+  },
+};
+```
+
+## Concepts
+
+### Rule
+
+- **Type:** `Rule`
+- **Default:** `{}`
+
+Rule defines the conditions for matching a module and the behavior of handling those modules.
+
+**Rule behavior**
+
+Defines the processing behavior of the corresponding matching module, e.g. :
+
+- Apply the list of Loader to these modules (`rules[].use`)
+- Apply the module's type (`rules[].type`)
+- Apply the module's resolve configuration (`rules[].resolve`)
+
+### Condition
+
+- **Type:**
+
+```ts
+type Condition =
+  | string
+  | RegExp
+  | ((value: string) => boolean)
+  | Conditions
+  | LogicalConditions;
+
+type Conditions = Condition[];
+
+type LogicalConditions = {
+  and?: Conditions;
+  or?: Conditions;
+  not?: Condition;
+};
+```
+
+Defines a module's match conditions, common matches are [resource](#rulesresource), [resourceQuery](#rulesresourcequery), [include](#rulesinclude), and [exclude](#rulesexclude).
+
+Example: app.js imports `./image.png?inline#foo`:
+
+- `resource` is `/path/to/image.png`, and will match against with [rules[].resource](#rulesresource) Condition
+- `resourceQuery` is `?inline`, and will match against with [rules[].resourceQuery](#rulesresourcequery) Condition
+- `resourceFragment` is `#foo`, and will match against with [rules[].resourceFragment](#rulesresourcefragment) Condition
+
+Condition represents the form of matching a given input, and it supports the following types:
+
+- `String`: Given an input, the match is successful when the input string satisfies startsWith. Note: You can think of it as `input.startsWith(condition)`.
+- `RegExp`: Given an input, the match is successful when the input string satisfies the regular expression. Note: You can think of it as `condition.test(input)`.
+- `Condition[]`: A list of conditions. At least one of the Conditions must match.
+- `LogicalConditions`: All specified `and`, `or`, and `not` checks must pass.
+  - `{ and: Condition[] }`: All Conditions must match.
+  - `{ or: Condition[] }`: At least one of the Conditions must match.
+  - `{ not: Condition }`: The condition must not match. If it is an array, none of its conditions may match.
+- `(value: string) => boolean`: If it's called with the input and return a truthy value, the match is succeeds.
+
+When a rule has several conditions, such as `test`, `include`, and `resourceQuery`, all of them must match. `exclude` works in the opposite way: a matching module is skipped, even if it also matches `include`.
+
+### Nested rule
+
+Nested Rule can be specified under the properties [`rules[].rules`](#rulesrules) and [`rules[].oneOf`](#rulesoneof), These rules are evaluated only when the parent Rule condition matches. Each nested rule can contain its own conditions.
+
+The order of evaluation is as follows:
+
+1. The parent Rule
+2. [`rules[].rules`](#rulesrules)
+3. [`rules[].oneOf`](#rulesoneof)
+
+## rules[].exclude
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Excludes all modules that match this condition and will match against the absolute path of the resource (without query and fragment). This option cannot be present together with `rules[].resource`.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        exclude: /\.js$/,
+      },
+    ],
+  },
+};
+```
+
+## rules[].include
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches all modules that match this condition against the absolute path of the resource (without query and fragment). This option cannot be present together with `rules[].resource`.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        include: /\.js$/,
+      },
+    ],
+  },
+};
+```
+
+## rules[].resource
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches all modules that match this resource, and will match against Resource (the absolute path without query and fragment). This option cannot be present together with `rules[].test`.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        resource: /\.js$/,
+      },
+    ],
+  },
+};
+```
+
+## rules[].resourceQuery
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches all modules that match this resource against the Resource's query. Note: Containing `?`, when `rules[].resourceQuery` is `?raw`, it will match the resource request of `foo?raw`
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.css$/,
+        resourceQuery: /inline/,
+        type: 'asset/inline',
+      },
+    ],
+  },
+};
+```
+
+## rules[].resourceFragment
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches all modules that match this resource against the Resource's fragment. Note: Containing `#`, when `rules[].resourceFragment` is `#abc`, it will match the resource request of `foo#abc`
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        resourceFragment: '#abc',
+      },
+    ],
+  },
+};
+```
+
+## rules[].test
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches all modules that match this resource, and will match against Resource (the absolute path without query and fragment). This option cannot be present together with `rules[].resource`.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+      },
+    ],
+  },
+};
+```
+
+## rules[].issuer
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches all modules that match this resource, and will match against Resource (the absolute path without query and fragment) of the module that issued the current module.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        issuer: /\.js$/,
+      },
+    ],
+  },
+};
+```
+
+## rules[].issuerLayer
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches all modules that match this resource, and will match against layer of the module that issued the current module.
+
+For more information about layers, see the [Module layers guide](/guide/advanced/layer).
+
+A basic example:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        issuerLayer: 'other-layer',
+      },
+    ],
+  },
+};
+```
+
+A more complex example is the combination with [entry options](/config/entry#entrydescriptionlayer) to build modern and legacy bundles at the same time:
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    index: {
+      import: './src/index.js',
+      layer: 'modern',
+    },
+    'index-legacy': {
+      import: './src/index.js',
+      layer: 'legacy',
+    },
+  },
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        issuerLayer: 'modern',
+        options: {
+          env: { targets: ['chrome >= 100'] },
+        },
+      },
+      {
+        test: /\.js$/,
+        issuerLayer: 'legacy',
+        options: {
+          env: { targets: ['ie >= 11'] },
+        },
+      },
+    ],
+  },
+};
+```
+
+## rules[].dependency
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches all modules that match this resource, and will match against the category of the dependency that introduced the current module, for example:
+
+- `esm` for `import` and `import()`
+- `cjs` for `require()`
+- `url` for `new URL()` and `url()`.
+
+For example, match all `.js` files, but exclude `url` type dependencies (such as `new URL('./path/to/foo.js', import.meta.url)`):
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        dependency: { not: 'url' },
+      },
+    ],
+  },
+};
+```
+
+## rules[].phase
+
+<ApiMeta stability={Stability.Experimental} addedVersion="2.0.8" />
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches modules by the import phase of the dependency that introduced the module.
+
+The value passed to the condition is one of:
+
+- `evaluation`: normal imports such as `import`, `import()`, `require()`, and other dependencies without a special import phase
+- `defer`: `import defer` and `import.defer()` dependencies when [`experiments.deferImport`](/config/experiments#experimentsdeferimport) is enabled
+- `source`: `import source` and `import.source()` dependencies when [`experiments.sourceImport`](/config/experiments#experimentssourceimport) is enabled
+
+This is useful when the same resource needs different loaders, parser options, or module types depending on how it is imported.
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    deferImport: true,
+    sourceImport: true,
+  },
+  module: {
+    rules: [
+      {
+        test: /module\.js$/,
+        phase: 'evaluation',
+        loader: './evaluation-loader.js',
+      },
+      {
+        test: /module\.js$/,
+        phase: 'defer',
+        loader: './defer-loader.js',
+      },
+      {
+        test: /module\.js$/,
+        phase: 'source',
+        loader: './source-loader.js',
+      },
+    ],
+  },
+};
+```
+
+## rules[].scheme
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches all modules that match this resource, and will match against the Resource's scheme.
+
+For example, you can treat the inline data uri resource as a separate resource with the following configuration:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        scheme: 'data',
+        type: 'asset/resource',
+      },
+    ],
+  },
+};
+```
+
+## rules[].mimetype
+
+- **Type:** [`Condition`](#condition)
+- **Default:** `undefined`
+
+Matches modules based on [MIME type](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/MIME_types) instead of file extension. It's primarily useful for [data URI module](/api/runtime-api/module-methods#data-uri-module).
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        mimetype: 'text/javascript',
+        use: [
+          // ...
+        ],
+      },
+    ],
+  },
+};
+```
+
+## rules[].descriptionData
+
+- **Type:** `{ [key: string]: Condition }`
+- **Default:** `undefined`
+
+`descriptionData` matches property values in a module's description file, typically `package.json`, to determine which modules a rule applies to. This lets you configure rules for modules in specific packages based on metadata such as the package name or version.
+
+Each key in the `descriptionData` object specifies a property to match, such as `name` or `version`, and the corresponding value is a [`Condition`](#condition) used to check that property's value. If you specify multiple properties, all must satisfy their conditions for the module to match `descriptionData`.
+
+A string condition matches property values that start with the given string, so this example matches modules in packages such as `react` and `react-dom`:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        descriptionData: { name: 'react' },
+        // Other rule options...
+      },
+    ],
+  },
+};
+```
+
+A regular expression condition tests the property value against a pattern; this example uses `^` and `$` to match only modules in the package named `react`:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        descriptionData: { name: /^react$/ },
+        // Other rule options...
+      },
+    ],
+  },
+};
+```
+
+A function condition provides custom matching logic; this example matches modules in packages whose names contain `rspack`:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        descriptionData: {
+          name: (name) => name.includes('rspack'),
+        },
+        // Other rule options...
+      },
+    ],
+  },
+};
+```
+
+## rules[].with
+
+- **Type:** `{ [key: string]: Condition }`
+- **Default:** `undefined`
+
+`with` can be used in conjunction with [import attributes](https://github.com/tc39/proposal-import-attributes).
+
+For example, the following configuration will match `{ type: "url" }` and will change the [`type`](/config/module-rules#rulestype) of the matched modules to `"asset/resource"`:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        with: { type: 'url' },
+        type: 'asset/resource',
+      },
+    ],
+  },
+};
+```
+
+The following import will match:
+
+```ts
+import url from './data' with { type: 'url' };
+import('./data', { with: { type: 'url' } });
+```
+
+It should be noted that in order for Rspack to properly match the `with` syntax, when you use [builtin:swc-loader](/guide/builtin-loaders/swc-loader), you need to manually enable the `keepImportAttributes` configuration to preserve import attributes:
+
+```diff title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        with: { type: 'url' },
+        type: 'asset/resource',
+      },
+      {
+        test: /\.(?:js|mjs|ts)$/,
+        exclude: [/node_modules/],
+        loader: 'builtin:swc-loader',
+        options: {
+          detectSyntax: 'auto',
+          jsc: {
+            experimental: {
++             keepImportAttributes: true,
+            },
+          },
+        },
+      },
+    ],
+  },
+};
+```
+
+## rules[].loader
+
+`rules[].loader` is a shortcut to `rules[].use: [ { loader } ]`. See [rules[].use](/config/module-rules#rulesuse) for details.
+
+For example, use the built-in swc-loader to compile TypeScript files:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.(?:js|mjs|ts)$/,
+        loader: 'builtin:swc-loader',
+      },
+    ],
+  },
+};
+```
+
+## rules[].options
+
+`rules[].options` is a shortcut to `rules[].use: [ { options } ]`. See [rules[].use](/config/module-rules#rulesuse) for details.
+
+For example, pass options to the swc-loader:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.ts$/,
+        loader: 'builtin:swc-loader',
+        options: {
+          detectSyntax: 'auto',
+        },
+      },
+    ],
+  },
+};
+```
+
+## rules[].parser
+
+- **Type:** `Object`
+- **Default:** `{}`
+
+Parser options for the specific modules that matched by the rule conditions, this will override the parser options in `module.parser`.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.css/,
+        parser: {
+          namedExports: false,
+        },
+        type: 'css/module',
+      },
+    ],
+  },
+};
+```
+
+For specific parser options and the corresponding module type, you can refer to [`module.parser`](/config/module-parser#parser).
+
+## rules[].generator
+
+- **Type:** `Object`
+- **Default:** `{}`
+
+Generator options for the specific modules that matched by the rule conditions, this will override the parser options in `module.generator`.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.png/,
+        generator: {
+          filename: '[contenthash][ext]',
+        },
+        type: 'asset',
+      },
+    ],
+  },
+};
+```
+
+For specific generator options and the corresponding module type, you can refer to [`module.generator`](/config/module-generator#generator).
+
+## rules[].sideEffects
+
+- **Type:** `boolean`
+
+Flag the module for side effects, this will affect the result of [Tree Shaking](/guide/optimization/tree-shaking).
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /foo\.js$/,
+        sideEffects: false,
+      },
+    ],
+  },
+};
+```
+
+## rules[].enforce
+
+<PropertyType type="'pre' | 'post'" />
+
+Specifies the category of the loader. When not specified, it defaults to normal loader.
+
+There is also an additional category "inlined loader" which are loaders applied inline of the import/require.
+
+When specified as `'pre'`, the loader will execute before all other loaders.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        enforce: 'pre',
+        loader: 'my-pre-loader',
+      },
+    ],
+  },
+};
+```
+
+When specified as `'post'`, the loader will execute after all other loaders.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        enforce: 'post',
+        loader: 'my-post-loader',
+      },
+    ],
+  },
+};
+```
+
+There are two phases that all loaders enter one after the other:
+
+- **Pitching phase:** the `pitch` method on loaders is called in the order `post, inline, normal, pre`. See [Pitching Loader](/api/loader-api/writing-loaders#pitching-loader) for details.
+- **Normal phase:** the default method on loaders is executed in the order `pre, normal, inline, post`. Transformation on the source code of a module happens in this phase.
+
+## rules[].as
+
+<ApiMeta stability={Stability.Experimental} addedVersion="2.3.2" />
+
+- **Type:** `string`
+
+Sets a path template that changes how a resource matches nested and subsequent rules. It only changes the path used for rule matching; file reading and loaders still use the original resource.
+
+### Examples
+
+#### Reusing compilation rules
+
+With `as`, files with different extensions can match the same compilation rule, reusing its loaders and their configuration.
+
+For example, install [`@mdx-js/loader`](https://mdxjs.com/packages/loader/) to convert Markdown and MDX files to JavaScript, then use the following configuration to reuse the SWC rule for `.js` files:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.mdx?$/,
+        // Convert Markdown / MDX to JavaScript before SWC runs
+        enforce: 'pre',
+        loader: '@mdx-js/loader',
+        // Match the JavaScript rule below
+        as: '[resource-path].js',
+      },
+      {
+        test: /\.js$/,
+        loader: 'builtin:swc-loader',
+        options: {
+          jsc: { target: 'es2017' },
+        },
+      },
+    ],
+  },
+};
+```
+
+When you import `./content.mdx`, its matching path becomes `content.mdx.js`, so it also matches the SWC rule. The MDX loader converts the content to JavaScript, then SWC compiles it to the configured target. Regular `.js` files continue to use the same SWC rule.
+
+`as` only changes rule matching; the MDX loader performs the content conversion. [`enforce: 'pre'`](#rulesenforce) ensures this conversion runs before SWC, since rule matching order does not determine loader execution order.
+
+#### Skipping compilation rules
+
+When files with the same extension need different processing, use `as` to let some of them skip subsequent compilation rules that would otherwise apply to all of them.
+
+For example, you may want to handle imports of the same JavaScript file in two ways: compile a regular import with SWC, or emit the file as an asset and return its URL when the import has the `type: 'url'` attribute:
+
+```js
+import example from './example.js';
+import exampleUrl from './example.js' with { type: 'url' };
+```
+
+Use the following configuration to handle both types of imports:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        // Match files imported with the type: 'url' attribute
+        with: { type: 'url' },
+        // Emit the file and provide its URL as the default export
+        type: 'asset/resource',
+        // Append .asset to the matching path to skip the SWC rule below
+        as: '[resource-path].asset',
+      },
+      {
+        test: /\.js$/,
+        loader: 'builtin:swc-loader',
+        options: {
+          // Preserve import attributes in the importing module for Rspack to match
+          jsc: { experimental: { keepImportAttributes: true } },
+        },
+      },
+    ],
+  },
+};
+```
+
+With this configuration:
+
+- The regular import does not match the first rule. Its matching path still ends in `.js`, so the second rule compiles it with SWC.
+- The URL import matches the first rule, which sets its type to [`asset/resource`](/guide/features/asset-module) and changes its matching path to end in `example.js.asset`. It no longer matches the SWC rule, so Rspack emits the file as an asset without processing it with `builtin:swc-loader`.
+
+Skipping `builtin:swc-loader` does not disable asset minification. In production builds, emitted `.js` assets may still be minified. To preserve their original contents, use [`generator.filename`](/config/module-generator#assetfilename) to place these assets in a dedicated output directory, then exclude that directory with [`SwcJsMinimizerRspackPlugin.exclude`](/plugins/swc-js-minimizer-rspack-plugin#exclude).
+
+### Rule matching order
+
+Rules are evaluated in order. The new path produced by `as` is used for the current rule's nested `rules` and `oneOf` rules, as well as subsequent rules.
+
+`as` does not re-evaluate earlier rules or undo their loaders and other settings. This is why the rule for URL imports in the example must come before the SWC rule.
+
+If a later matching rule also applies `as`, its `[resource-path]` expands to the path produced by the previous `as`.
+
+### Path template
+
+The value of `as` is a path template. The only supported placeholder is `[resource-path]`, which expands to the full file path currently used for matching, including its extension. All other text is used literally. For example, `[resource-path].asset` appends `.asset` to the current matching path.
+
+`[resource-path]` excludes the query and fragment, and `as` leaves them unchanged. [`resourceQuery`](#rulesresourcequery) and [`resourceFragment`](#rulesresourcefragment) still match the original query and fragment, respectively.
+
+The generated path is only used for rule matching; it does not change the file being read, the resource processed by loaders, or the output filename. Both imports in the example therefore read `example.js`; no `example.js.asset` file is needed.
+
+## rules[].type
+
+- **Type:** `string`
+
+Common built-in values:
+
+```ts
+type BuiltinRuleType =
+  | 'asset'
+  | 'asset/source'
+  | 'asset/resource'
+  | 'asset/inline'
+  | 'asset/bytes'
+  | 'css'
+  | 'css/auto'
+  | 'css/global'
+  | 'css/module'
+  | 'javascript/auto'
+  | 'javascript/dynamic'
+  | 'javascript/esm'
+  | 'json';
+```
+
+Used to mark the type of the matching module, which affects how the module is handled by Rspack's built-in processing.
+
+By default, Rspack will determine the type of the module based on the file extension. For example:
+
+- `.js` files will be treated as `javascript/auto` modules.
+- `.mjs` files, as well as `.js` files in packages with `type="module"` in package.json, will be treated as `javascript/esm` modules.
+- `.json` files will be treated as `json` modules.
+- `.css` files will be treated as `css/auto` modules.
+
+For example, if you want to load a `.json` file through a custom loader, you'd need to set the type to `javascript/auto` to bypass Rspack's built-in JSON importing.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.json$/,
+        type: 'javascript/auto',
+        loader: 'custom-json-loader',
+      },
+    ],
+  },
+};
+```
+
+The meanings of all `type` options are as follows:
+
+- `'javascript/auto'`: JavaScript modules. Rspack automatically determines the module type based on file content, providing the best compatibility.
+- `'javascript/esm'`: JavaScript modules, treated as strict ES modules.
+- `'javascript/dynamic'`: JavaScript modules, treated as Script.
+- `'json'`: JSON data module, see [JSON](/guide/languages/json).
+- `'css' | 'css/auto' | 'css/global' | 'css/module'`: CSS module, see [Built-in CSS support](/guide/languages/css#built-in-css-support).
+- `'asset' | 'asset/source' | 'asset/resource' | 'asset/inline' | 'asset/bytes'`: Asset module, see [Asset Module](/guide/features/asset-module).
+
+## rules[].layer
+
+- **Type:** `string`
+
+Used to mark the layer of the matching module. A group of modules could be united in one layer which could then be used in split chunks, stats or [entry options](/config/entry#entrydescriptionlayer).
+
+For more information about layers, see the [Module layers guide](/guide/advanced/layer).
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        layer: 'layer-name',
+      },
+    ],
+  },
+};
+```
+
+## rules[].use
+
+- **Type:**
+
+```ts
+type RuleSetUse =
+  | RuleSetUseItem
+  | RuleSetUseItem[]
+  | ((ctx: RawFuncUseCtx) => RuleSetUseItem | RuleSetUseItem[]);
+
+type RuleSetUseItem = string | RuleSetLoaderWithOptions | Falsy;
+
+type RuleSetLoaderCodeFilter = string | RegExp;
+
+type RuleSetLoaderWithOptions = {
+  ident?: string;
+  loader: string;
+  options?: string | Record<string, any>;
+  parallel?: boolean | { maxWorkers?: number };
+  cache?: boolean;
+  codeFilter?: RuleSetLoaderCodeFilter;
+};
+```
+
+An array to pass the Loader package name and its options. `string[]` e.g.: `use: ['svgr-loader']` is shorthand for `use: [ { loader: 'svgr-loader' } ]`.
+Loaders will be executed in right-to-left order.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        use: [
+          'svgr-loader',
+          {
+            loader: 'svgo-loader',
+            options: {
+              configFile: false,
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+A function can also be used to select loaders for each module. It can return a loader name, a loader options object, or an array of these:
+
+```js title="rspack.config.mjs"
+import { basename } from 'node:path';
+
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.svg$/,
+        type: 'asset',
+        use: (info) => [
+          {
+            loader: 'svgo-loader',
+            options: {
+              plugins: [
+                {
+                  cleanupIDs: { prefix: basename(info.resource) },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+## rules[].use.codeFilter
+
+- **Type:**
+
+```ts
+type RuleSetLoaderCodeFilter = string | RegExp;
+```
+
+- **Default:** `undefined`
+
+Controls whether a loader runs based on its current input code. When the code does not match the filter, Rspack skips that loader's code transformation and passes the input to the next loader unchanged. Use this to avoid unnecessary transformations for modules that do not contain the relevant syntax.
+
+- `string`: matches if the code contains the given substring.
+- `RegExp`: matches if the code satisfies the regular expression.
+
+Rspack checks the filter immediately before the loader transforms the code. Since loaders run from right to left, the filter checks the output of loaders to its right, if any. The filter does not affect the loader's pitch function.
+
+**String matching**
+
+For a custom loader that removes console logs, run it only when the input code contains `console.log`:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.[cm]?[jt]sx?$/,
+        use: [
+          {
+            loader: './remove-console-loader.js',
+            codeFilter: 'console.log',
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+**Regular expression matching**
+
+Run `remove-console-loader.js` only when the input code contains `console.log` or `console.debug`:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.[cm]?[jt]sx?$/,
+        use: [
+          {
+            loader: './remove-console-loader.js',
+            codeFilter: /\bconsole\.(log|debug)\b/,
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+**Matching another loader's output**
+
+Here, `generate-loader.js` runs first. Rspack then runs `transform-loader.js` only if the generated code contains `generated:marker`, even if that substring was absent from the original source:
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        use: [
+          {
+            loader: './transform-loader.js',
+            codeFilter: 'generated:marker',
+          },
+          './generate-loader.js',
+        ],
+      },
+    ],
+  },
+};
+```
+
+## rules[].use.ident
+
+- **Type:** `string`
+- **Default:** `undefined`
+
+Provides a stable name for object-form loader options. Rspack uses it when building the loader request, so generated rules or reused options can keep the same `??<ident>` reference.
+
+Most configurations do not need to set it manually. If omitted, Rspack uses `options.ident` when present, otherwise it generates an internal identifier.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.svg$/,
+        use: [
+          {
+            loader: 'svgo-loader',
+            ident: 'svgo-inline',
+            options: {
+              multipass: true,
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+## rules[].use.parallel
+
+<ApiMeta addedVersion="1.3.1" />
+
+- **Type**: `boolean | { maxWorkers?: number }`
+- **Default:** `false`
+
+Controls whether a given loader should run in worker threads for parallel execution. Loaders marked with `parallel` are scheduled across multiple threads, reducing pressure on the main thread and improving overall build performance.
+
+- When set to `true`, the loader runs in a worker. Rspack automatically selects an appropriate number of worker threads.
+- When set to `{ maxWorkers }`, you can explicitly define the maximum number of workers to use.
+- When set to `false` or omitted, the loader runs on the main thread.
+
+For usage examples and limitations, see [Parallel loader](/guide/features/loader#parallel-loader).
+
+## rules[].use.parallel.maxWorkers
+
+- **Type:** `number`
+- **Default:** `Math.max(os.cpus().length - 1, 1)`
+
+Limits the maximum number of worker threads used by the shared loader worker pool when `parallel` is configured as an object. Use a positive integer.
+
+By default, Rspack uses the number of logical CPUs reported by `os.cpus()` minus one, with a minimum of one worker.
+
+The loader worker pool is shared within the current process, so use a consistent `maxWorkers` value if multiple loaders configure `parallel`.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.less$/,
+        use: [
+          {
+            loader: 'less-loader',
+            parallel: {
+              maxWorkers: 4,
+            },
+            options: {},
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+## rules[].resolve
+
+Set specific module [resolve](/config/resolve) options based on the matching modules.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.css$/,
+        resolve: {
+          preferRelative: true,
+        },
+      },
+    ],
+  },
+};
+```
+
+## rules[].rules
+
+- **Type:** <code>[Rule](#rule)[]</code>
+- **Default:** `undefined`
+
+A kind of [Nested Rule](#nested-rule), an array of Rules that is also used when the parent Rule matches.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.css$/,
+        // When a CSS file is matched, continue to use these nested rules
+        rules: [
+          {
+            // Handle CSS files with "?raw" query
+            resourceQuery: /raw/,
+            type: 'asset/source',
+          },
+          {
+            // Handle normal CSS files
+            resourceQuery: {
+              not: /raw/,
+            },
+            type: 'css/auto',
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+## rules[].oneOf
+
+- **Type:** <code>([Rule](#rule) | Falsy)[]</code>
+- **Default:** `undefined`
+
+A kind of [Nested Rule](#nested-rule), an array of Rules from which only the first matching Rule is used when the parent Rule matches.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpg)$/i,
+        oneOf: [
+          {
+            // Handle images with "?raw" query
+            resourceQuery: /raw/,
+            type: 'asset/source',
+          },
+          {
+            // Otherwise, output as a separate file
+            type: 'asset/resource',
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+## rules[].extractSourceMap
+
+<ApiMeta addedVersion="1.6.0" />
+
+- **Type**: `boolean`
+- **Default:** `false`
+
+Extracts existing source map data from files (from their `//# sourceMappingURL` comment), useful for preserving the source maps of third-party libraries.
+
+```js title="rspack.config.mjs"
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.m?js$/,
+        extractSourceMap: true,
+      },
+    ],
+  },
+};
+```
+
+<Attribution url="https://webpack.js.org/configuration/module/" />

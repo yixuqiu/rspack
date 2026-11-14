@@ -1,11 +1,12 @@
-import { BuiltinPluginName } from "@rspack/binding";
-import { create } from "./base";
-import { runLoaders } from "../loader-runner";
-import { Compiler } from "../Compiler";
+import { BuiltinPluginName } from '@rspack/binding';
+
+import type { Compiler } from '../Compiler';
+import { runLoaders } from '../loader-runner';
+import { create } from './base';
 
 export const JsLoaderRspackPlugin = create(
-	BuiltinPluginName.JsLoaderRspackPlugin,
-	(compiler: Compiler) => runLoaders.bind(null, compiler),
-	/* Not Inheretable */
-	"thisCompilation"
+  BuiltinPluginName.JsLoaderRspackPlugin,
+  (compiler: Compiler) => runLoaders.bind(null, compiler),
+  /* Not Inheretable */
+  'thisCompilation',
 );

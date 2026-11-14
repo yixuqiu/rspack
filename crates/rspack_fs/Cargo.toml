@@ -1,25 +1,30 @@
 [package]
-edition    = "2021"
-license    = "MIT"
-name       = "rspack_fs"
-repository = "https://github.com/web-infra-dev/rspack"
-version    = "0.1.0"
+description       = "rspack fs"
+edition.workspace = true
+license           = "MIT"
+name              = "rspack_fs"
+repository        = "https://github.com/web-infra-dev/rspack"
+version.workspace = true
 
-[features]
-async        = ["dep:futures", "dep:tokio"]
-default      = ["native"]
-native       = []
-rspack-error = ["dep:rspack_error"]
+[dependencies]
+async-trait  = { workspace = true }
+cfg-if       = { workspace = true }
+dunce        = { workspace = true }
+pnp          = { workspace = true }
+rspack_error = { workspace = true }
+rspack_paths = { workspace = true }
+rspack_util  = { workspace = true }
+tokio        = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+tracing      = { workspace = true }
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "sync", "fs"] }
 
-[dependencies.rspack_error]
-optional = true
-path     = "../rspack_error"
+[dev-dependencies]
+tempfile = { workspace = true }
 
-[dependencies.futures]
-optional  = true
+[lints]
 workspace = true
 
-[dependencies.tokio]
-optional  = true
-workspace = true
+[lib]
+doctest = false

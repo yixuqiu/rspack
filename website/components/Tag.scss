@@ -1,0 +1,21 @@
+.ant-tag {
+  border: none;
+}
+
+.dark {
+  .ant-tag {
+    background-color: transparent;
+  }
+
+  .ant-tag.ant-tag-geekblue:not(.ant-tag-disabled) {
+    color: #a8c1f8;
+    background-color: transparent;
+    border: 1px solid rgba(168, 193, 248, 0.4);
+  }
+
+  .ant-tag.ant-tag-purple:not(.ant-tag-disabled) {
+    color: #cda8f0;
+    background-color: transparent;
+    border: 1px solid rgba(205, 168, 240, 0.4);
+  }
+}

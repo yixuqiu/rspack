@@ -1,0 +1,193 @@
+---
+description: '懒编译（Lazy Compilation）是一种优化技术，可以延迟模块的编译，直到它们被实际请求时才进行构建。'
+---
+
+import Attribution from '@components/Attribution';
+import { ApiMeta } from '@components/ApiMeta';
+
+# LazyCompilation
+
+<ApiMeta addedVersion="1.5.0" />
+
+懒编译（Lazy Compilation）是一种优化技术，可以延迟模块的编译，直到它们被实际请求时才进行构建。**只有在真正访问到某个入口或模块时，才进行构建。**
+
+开启懒编译，对提高多入口应用（MPA）或大型单页面应用（SPA）的 dev 启动性能会非常有帮助。
+
+:::tip
+参考 [指南](/guide/advanced/lazy-compilation) 来快速上手。
+:::
+
+- **类型：**
+
+```ts
+type LazyCompilationOptions =
+  | boolean
+  | {
+      /**
+       * 为 entries 启用 lazy compilation
+       */
+      entries?: boolean;
+      /**
+       * 为 dynamic imports 启用 lazy compilation
+       */
+      imports?: boolean;
+      /**
+       * 指定哪些导入的模块应该被延迟编译
+       */
+      test?: RegExp | ((m: Module) => boolean);
+      /**
+       * 自定义客户端脚本路径
+       */
+      client?: string;
+      /**
+       * 自定义服务端路径
+       */
+      serverUrl?: string;
+      /**
+       * 自定义懒编译端点的前缀
+       * @default "/_rspack/lazy/trigger"
+       */
+      prefix?: string;
+    };
+```
+
+## 默认行为
+
+- **JavaScript API：** 默认关闭懒编译。启用 `lazyCompilation` 后，需要将 lazy compilation 中间件注册到开发服务器。参见[与自定义的服务器集成](/guide/advanced/lazy-compilation#integrating-with-custom-server)。
+- **Rspack CLI：** `rspack dev` 会自动注册中间件。当 [`target`](/config/target) 仅面向浏览器环境且未显式配置 `lazyCompilation` 时，还会默认使用 `{ entries: false, imports: true }`；其他情况下，未配置时保持关闭。
+
+## 编译范围
+
+懒编译可以作用于两类模块：入口模块，以及通过 `import()` 动态导入的模块。启用后，Rspack 会将这些模块的构建推迟到它们被实际访问时。
+
+例如，如果应用包含二十个入口，Rspack 只会构建实际访问到的入口，其余入口会等到被访问时再构建。通过 `import()` 动态导入的模块也是如此。
+
+将 `lazyCompilation` 设置为 `true`，会同时对这两类模块开启懒编译：
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: true,
+};
+```
+
+这等价于：
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    entries: true,
+    imports: true,
+  },
+};
+```
+
+如果只想对其中一类模块开启懒编译，可以使用配置对象分别设置 [`entries`](#entries) 和 [`imports`](#imports)。`entries` 控制入口模块，`imports` 控制通过 `import()` 动态导入的模块。
+
+如果还需要进一步缩小懒编译范围，可以使用 [`test`](#test) 筛选模块。`test` 支持正则表达式，也支持接收 `Module` 并返回 `boolean` 的函数。
+
+## 选项
+
+### entries
+
+- **类型：** `boolean`
+- **默认值：** 在对象中省略 `entries` 时，该选项默认为 `true`
+
+控制是否对入口模块启用懒编译。
+
+设为 `false` 时，入口模块会在首次编译中完成构建。
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    entries: false,
+  },
+};
+```
+
+### imports
+
+- **类型：** `boolean`
+- **默认值：** 在对象中省略 `imports` 时，该选项默认为 `true`
+
+控制是否对 `import()` 动态导入的模块启用懒编译。
+
+设为 `false` 时，动态导入的模块会在首次编译中完成构建。
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    imports: false,
+  },
+};
+```
+
+### test
+
+- **类型：** `RegExp | ((module: Module) => boolean)`
+- **默认值：** `undefined`
+
+在 `entries` 和 `imports` 选出的入口模块及动态导入模块上进一步筛选。两者均未设置时，都会默认为 `true`，因此 `test` 会同时筛选这两类模块。正则表达式会匹配 `module.nameForCondition()`，函数则直接接收 `Module` 实例。匹配成功或返回 `true` 时，该模块会进行懒编译；否则会正常构建。
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    test: /src/,
+  },
+};
+```
+
+配置示例参见[筛选部分模块](/guide/advanced/lazy-compilation#filtering-modules)。
+
+### client
+
+- **类型：** `string`
+- **默认值：** 自动选择内置的 Web 或 Node.js 客户端
+
+用于指定自定义运行时代码路径，以覆盖默认的懒编译客户端。默认情况下，启用 [`externalsPresets.node`](/config/externals#externalspresetsnode) 时使用内置的 Node.js 客户端，否则使用内置的 Web 客户端。
+
+你可以参考默认实现：
+
+- [web 环境运行时](https://github.com/web-infra-dev/rspack/blob/699229b9e7c33b7db7968c2f803f750e0367fe8a/packages/rspack/hot/lazy-compilation-web.js)
+- [node 环境运行时](https://github.com/web-infra-dev/rspack/blob/699229b9e7c33b7db7968c2f803f750e0367fe8a/packages/rspack/hot/lazy-compilation-node.js)
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  lazyCompilation: {
+    client: path.resolve('custom-client.js'),
+  },
+};
+```
+
+### serverUrl
+
+- **类型：** `string`
+- **默认值：** `''`
+
+设置懒编译客户端请求的服务端基础 URL，Rspack 会在该值后拼接 [`lazyCompilation.prefix`](#prefix)。未设置时，Web 客户端会向当前页面所在的服务端发送请求；在 Node.js 环境中，需要显式指定开发服务器 URL。
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    serverUrl: 'http://localhost:3000',
+  },
+};
+```
+
+### prefix
+
+- **类型：** `string`
+- **默认值：** `'/_rspack/lazy/trigger'`
+
+自定义懒编译请求前缀。默认情况下，懒编译中间件使用 `/_rspack/lazy/trigger` 前缀来处理请求。
+
+```js title="rspack.config.mjs"
+export default {
+  lazyCompilation: {
+    prefix: '/custom-lazy-endpoint-',
+  },
+};
+```
+
+<Attribution url="https://webpack.docschina.org/configuration/experiments/#experimentslazycompilation" />

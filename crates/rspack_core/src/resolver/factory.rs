@@ -1,10 +1,11 @@
 use std::{hash::BuildHasherDefault, sync::Arc};
 
 use dashmap::DashMap;
+use rspack_fs::ReadableFileSystem;
 use rustc_hash::FxHasher;
 
 use super::resolver_impl::Resolver;
-use crate::{DependencyCategory, Resolve};
+use crate::{DependencyCategory, Resolve, ResolverCache};
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 // Actually this should be ResolveOptionsWithDependencyCategory, it's a mistake from webpack, but keep the alignment for easily find the code in webpack
@@ -23,21 +24,19 @@ pub struct ResolverFactory {
   resolvers: DashMap<ResolveOptionsWithDependencyType, Arc<Resolver>, BuildHasherDefault<FxHasher>>,
 }
 
-impl Default for ResolverFactory {
-  fn default() -> Self {
-    Self::new(Resolve::default())
-  }
-}
-
 impl ResolverFactory {
   pub fn clear_cache(&self) {
     self.resolver.clear_cache();
   }
 
-  pub fn new(options: Resolve) -> Self {
+  pub fn set_resolver_cache(&self, cache: Option<ResolverCache>) {
+    self.resolver.set_resolver_cache(cache);
+  }
+
+  pub fn new(options: Resolve, fs: Arc<dyn ReadableFileSystem>) -> Self {
     Self {
       base_options: options.clone(),
-      resolver: Resolver::new(options),
+      resolver: Resolver::new(options, fs),
       resolvers: Default::default(),
     }
   }

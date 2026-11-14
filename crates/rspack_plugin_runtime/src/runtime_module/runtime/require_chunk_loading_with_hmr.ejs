@@ -1,0 +1,5 @@
+<%- fn("requireLoadUpdateChunk") %>(chunkId, updatedModulesList, full) {
+	var filename = <%- GET_CHUNK_UPDATE_SCRIPT_FILENAME %>(chunkId);
+	var update = require("<%- _output_dir %>" + filename + (full ? (/\.mjs$/.test(filename) ? ".full.mjs" : ".full.js") : ""));
+	hotAddUpdateChunk(chunkId, update.modules, update.runtime, updatedModulesList, full);
+}

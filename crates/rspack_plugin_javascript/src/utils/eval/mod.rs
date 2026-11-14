@@ -3,43 +3,36 @@ mod eval_binary_expr;
 mod eval_call_expr;
 mod eval_cond_expr;
 mod eval_lit_expr;
+mod eval_member_expr;
 mod eval_new_expr;
+mod eval_source;
 mod eval_tpl_expr;
 mod eval_unary_expr;
 
+use std::{borrow::Cow, fmt};
+
 use bitflags::bitflags;
-use rspack_core::DependencyLocation;
+use num_bigint::BigInt;
+use rspack_core::{DependencyId, DependencyRange};
+use rspack_util::ryu_js;
+use swc_next_ecma_ast::{Expr, Span};
 
-pub use self::eval_array_expr::eval_array_expression;
-pub use self::eval_binary_expr::eval_binary_expression;
-pub use self::eval_call_expr::eval_call_expression;
-pub use self::eval_cond_expr::eval_cond_expression;
-pub use self::eval_lit_expr::{eval_lit_expr, eval_prop_name};
-pub use self::eval_new_expr::eval_new_expression;
-pub use self::eval_tpl_expr::{
-  eval_tagged_tpl_expression, eval_tpl_expression, TemplateStringKind,
+pub use self::{
+  eval_array_expr::eval_array_expression,
+  eval_binary_expr::{eval_binary_expression, eval_logical_expression},
+  eval_call_expr::eval_call_expression,
+  eval_cond_expr::eval_cond_expression,
+  eval_lit_expr::eval_lit_expr,
+  eval_member_expr::{eval_member_expression, eval_member_expression_with_info},
+  eval_new_expr::eval_new_expression,
+  eval_source::eval_source,
+  eval_tpl_expr::{TemplateStringKind, eval_tagged_tpl_expression, eval_tpl_expression},
+  eval_unary_expr::eval_unary_expression,
 };
-pub use self::eval_unary_expr::eval_unary_expression;
-use crate::visitors::ExportedVariableInfo;
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Ty {
-  Unknown,
-  Undefined,
-  Null,
-  String,
-  Number,
-  Boolean,
-  RegExp,
-  Conditional,
-  Array,
-  Wrapped,
-  ConstArray,
-  BigInt,
-  Identifier,
-  TemplateString,
-}
+use crate::{
+  Atom,
+  visitors::{AtomMembers, ExportedVariableInfo, MemberRanges, OptionalMembers},
+};
 
 type Boolean = bool;
 type Number = f64;
@@ -48,65 +41,132 @@ type Bigint = num_bigint::BigInt;
 type String = std::string::String;
 type Regexp = (String, String); // (expr, flags)
 
-// I really don't want there has many alloc, maybe this can be optimized after
-// parse finished.
 #[derive(Debug, Clone)]
-pub struct BasicEvaluatedExpression {
-  ty: Ty,
-  range: Option<DependencyLocation>,
+struct IdentifierData {
+  identifier: Atom,
+  root_info: ExportedVariableInfo,
+  member_path: Option<MemberPathData>,
+}
+
+/// Keeps short member paths inline when transferring them from the parser.
+#[derive(Debug, Clone)]
+struct MemberPathData {
+  members: AtomMembers,
+  members_optionals: OptionalMembers,
+  member_ranges: MemberRanges,
+}
+
+#[derive(Debug, Clone)]
+struct WrappedData<'a> {
+  prefix: Option<Box<BasicEvaluatedExpression<'a>>>,
+  postfix: Option<Box<BasicEvaluatedExpression<'a>>>,
+  inner_expressions: Vec<BasicEvaluatedExpression<'a>>,
+}
+
+#[derive(Debug, Clone)]
+struct TemplateStringData<'a> {
+  // Static quasis occupy the even slots; intervening slots are dynamic expressions.
+  parts: Vec<BasicEvaluatedExpression<'a>>,
+  kind: TemplateStringKind,
+}
+
+#[rspack_cacheable::cacheable]
+#[derive(Debug, Clone)]
+pub enum DependencyData {
+  Dependency(DependencyId),
+  Or(
+    #[cacheable(omit_bounds)] Box<DependencyData>,
+    #[cacheable(omit_bounds)] Box<DependencyData>,
+  ),
+  And(
+    #[cacheable(omit_bounds)] Box<DependencyData>,
+    #[cacheable(omit_bounds)] Box<DependencyData>,
+  ),
+  Not(#[cacheable(omit_bounds)] Box<DependencyData>),
+}
+
+impl DependencyData {
+  pub fn or(self, other: DependencyData) -> Self {
+    DependencyData::Or(Box::new(self), Box::new(other))
+  }
+
+  pub fn and(self, other: DependencyData) -> Self {
+    DependencyData::And(Box::new(self), Box::new(other))
+  }
+
+  #[allow(clippy::should_implement_trait)]
+  pub fn not(self) -> Self {
+    DependencyData::Not(Box::new(self))
+  }
+}
+
+#[derive(Debug, Clone)]
+enum Payload<'a> {
+  // Compile time value
+  Undefined,
+  Null,
+  // AST-backed strings borrow their storage; computed strings own it.
+  String(Cow<'a, str>),
+  Number(Number),
+  Boolean(Boolean),
+  RegExp(Box<Regexp>),
+  ConstArray(Vec<String>),
+  BigInt(Bigint),
+  // Non-compile time value
+  Conditional(Vec<BasicEvaluatedExpression<'a>>),
+  Array(Vec<BasicEvaluatedExpression<'a>>),
+  Wrapped(Box<WrappedData<'a>>),
+  Identifier(Box<IdentifierData>),
+  Dependency(DependencyData),
+  TemplateString(Box<TemplateStringData<'a>>),
+  Unknown,
+}
+
+#[derive(Clone, Copy)]
+struct EvaluatedExpression {
+  expression: Expr,
+  /// Synthetic expressions are handles into a separately parsed flat AST.
+  /// Ordinary expressions use the parser's current AST and leave this empty.
+  ast: Option<usize>,
+}
+
+impl fmt::Debug for EvaluatedExpression {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("EvaluatedExpression")
+      .field("expression", &self.expression)
+      .field("has_synthetic_ast", &self.ast.is_some())
+      .finish()
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct BasicEvaluatedExpression<'a> {
+  // The handle is meaningful only with the parser-owned AST used for this evaluation.
+  expression: Option<EvaluatedExpression>,
+  payload: Payload<'a>,
+  range: Option<DependencyRange>,
   falsy: bool,
   truthy: bool,
   side_effects: bool,
   nullish: Option<bool>,
-  boolean: Option<Boolean>,
-  number: Option<Number>,
-  string: Option<String>,
-  bigint: Option<Bigint>,
-  regexp: Option<Regexp>,
-  identifier: Option<String>,
-  root_info: Option<ExportedVariableInfo>,
-  items: Option<Vec<BasicEvaluatedExpression>>,
-  quasis: Option<Vec<BasicEvaluatedExpression>>,
-  parts: Option<Vec<BasicEvaluatedExpression>>,
-  prefix: Option<Box<BasicEvaluatedExpression>>,
-  postfix: Option<Box<BasicEvaluatedExpression>>,
-  wrapped_inner_expressions: Option<Vec<BasicEvaluatedExpression>>,
-  // array: Option<Array>
-  template_string_kind: Option<TemplateStringKind>,
-
-  options: Option<Vec<BasicEvaluatedExpression>>,
 }
 
-impl Default for BasicEvaluatedExpression {
+impl Default for BasicEvaluatedExpression<'_> {
   fn default() -> Self {
     Self::new()
   }
 }
 
-impl BasicEvaluatedExpression {
+impl<'a> BasicEvaluatedExpression<'a> {
   pub fn new() -> Self {
     Self {
-      ty: Ty::Unknown,
+      expression: None,
+      payload: Payload::Unknown,
       range: None,
       falsy: false,
       truthy: false,
       side_effects: true,
       nullish: None,
-      boolean: None,
-      number: None,
-      bigint: None,
-      quasis: None,
-      parts: None,
-      identifier: None,
-      root_info: None,
-      template_string_kind: None,
-      options: None,
-      string: None,
-      items: None,
-      regexp: None,
-      postfix: None,
-      prefix: None,
-      wrapped_inner_expressions: None,
     }
   }
 
@@ -121,68 +181,76 @@ impl BasicEvaluatedExpression {
   // }
 
   pub fn is_identifier(&self) -> bool {
-    matches!(self.ty, Ty::Identifier)
+    matches!(self.payload, Payload::Identifier(_))
+  }
+
+  pub fn is_dependency(&self) -> bool {
+    matches!(self.payload, Payload::Dependency(_))
   }
 
   pub fn is_null(&self) -> bool {
-    matches!(self.ty, Ty::Null)
+    matches!(self.payload, Payload::Null)
   }
 
   pub fn is_unknown(&self) -> bool {
-    matches!(self.ty, Ty::Unknown)
+    matches!(self.payload, Payload::Unknown)
   }
 
   pub fn is_undefined(&self) -> bool {
-    matches!(self.ty, Ty::Undefined)
+    matches!(self.payload, Payload::Undefined)
   }
 
   pub fn is_conditional(&self) -> bool {
-    matches!(self.ty, Ty::Conditional)
+    matches!(self.payload, Payload::Conditional(_))
   }
 
   pub fn is_string(&self) -> bool {
-    matches!(self.ty, Ty::String)
+    matches!(self.payload, Payload::String(_))
   }
 
   pub fn is_bool(&self) -> bool {
-    matches!(self.ty, Ty::Boolean)
+    matches!(self.payload, Payload::Boolean(_))
   }
 
   pub fn is_array(&self) -> bool {
-    matches!(self.ty, Ty::Array)
+    matches!(self.payload, Payload::Array(_))
+  }
+
+  pub fn is_const_array(&self) -> bool {
+    matches!(self.payload, Payload::ConstArray(_))
   }
 
   pub fn is_wrapped(&self) -> bool {
-    matches!(self.ty, Ty::Wrapped)
+    matches!(self.payload, Payload::Wrapped(_))
   }
 
   pub fn is_number(&self) -> bool {
-    matches!(self.ty, Ty::Number)
+    matches!(self.payload, Payload::Number(_))
   }
 
   pub fn is_bigint(&self) -> bool {
-    matches!(self.ty, Ty::BigInt)
+    matches!(self.payload, Payload::BigInt(_))
   }
 
   pub fn is_template_string(&self) -> bool {
-    matches!(self.ty, Ty::TemplateString)
+    matches!(self.payload, Payload::TemplateString { .. })
   }
 
   pub fn is_regexp(&self) -> bool {
-    matches!(self.ty, Ty::RegExp)
+    matches!(self.payload, Payload::RegExp(_))
   }
 
   pub fn is_compile_time_value(&self) -> bool {
     matches!(
-      self.ty,
-      Ty::Undefined
-        | Ty::Null
-        | Ty::String
-        | Ty::Number
-        | Ty::Boolean
-        | Ty::RegExp
-        | Ty::ConstArray
-        | Ty::BigInt
+      self.payload,
+      Payload::Undefined
+        | Payload::Null
+        | Payload::String(_)
+        | Payload::Number(_)
+        | Payload::Boolean(_)
+        | Payload::RegExp(_)
+        | Payload::ConstArray(_)
+        | Payload::BigInt(_)
     )
   }
 
@@ -191,17 +259,45 @@ impl BasicEvaluatedExpression {
   }
 
   pub fn is_primitive_type(&self) -> Option<bool> {
-    match self.ty {
-      Ty::Undefined
-      | Ty::Null
-      | Ty::String
-      | Ty::Number
-      | Ty::Boolean
-      | Ty::BigInt
-      | Ty::Wrapped
-      | Ty::TemplateString => Some(true),
-      Ty::RegExp | Ty::Array | Ty::ConstArray => Some(false),
+    match self.payload {
+      Payload::Undefined
+      | Payload::Null
+      | Payload::String(_)
+      | Payload::Number(_)
+      | Payload::Boolean(_)
+      | Payload::BigInt(_)
+      | Payload::Wrapped(_)
+      | Payload::TemplateString { .. } => Some(true),
+      Payload::RegExp(_) | Payload::Array(_) | Payload::ConstArray(_) => Some(false),
       _ => None,
+    }
+  }
+
+  pub fn as_number(&self) -> Option<f64> {
+    if self.is_bool() {
+      Some(if self.bool() { 1_f64 } else { 0_f64 })
+    } else if self.is_null() {
+      Some(0_f64)
+    } else if self.is_string() {
+      self.string().parse::<f64>().ok()
+    } else if self.is_number() {
+      Some(self.number())
+    } else {
+      None
+    }
+  }
+
+  pub fn as_int(&self) -> Option<i32> {
+    if self.is_bool() {
+      Some(if self.bool() { 1_i32 } else { 0_i32 })
+    } else if self.is_null() {
+      Some(0_i32)
+    } else if self.is_string() {
+      self.string().parse::<i32>().ok()
+    } else if self.is_number() {
+      Some(self.number() as i32)
+    } else {
+      None
     }
   }
 
@@ -213,19 +309,20 @@ impl BasicEvaluatedExpression {
     } else if self.is_undefined() {
       Some("undefined".to_string())
     } else if self.is_string() {
-      Some(self.string().to_string())
+      Some(self.string().to_owned())
     } else if self.is_number() {
-      Some(self.number().to_string())
+      Some(ryu_js::Buffer::new().format(self.number()).to_owned())
     } else if self.is_array() {
-      let mut arr = Vec::new();
-      for item in self.items() {
-        if let Some(item) = item.as_string() {
-          arr.push(item)
-        } else {
-          return None;
+      let mut result = String::new();
+      for (index, item) in self.items().iter().enumerate() {
+        if index != 0 {
+          result.push(',');
+        }
+        if !item.is_null() && !item.is_undefined() {
+          result.push_str(&item.as_string()?);
         }
       }
-      Some(format!("[{}]", arr.join(", ")))
+      Some(result)
     } else if self.is_template_string() {
       let mut s = String::new();
       for p in self.parts() {
@@ -247,7 +344,7 @@ impl BasicEvaluatedExpression {
     } else if self.falsy || self.nullish == Some(true) || self.is_null() || self.is_undefined() {
       Some(false)
     } else if self.is_bool() {
-      self.boolean
+      Some(self.bool())
     } else if self.is_string() {
       Some(!self.string().is_empty())
     } else if self.is_number() {
@@ -273,33 +370,15 @@ impl BasicEvaluatedExpression {
   }
 
   pub fn compare_compile_time_value(&self, b: &BasicEvaluatedExpression) -> bool {
-    if self.ty != b.ty {
-      false
-    } else {
-      match self.ty {
-        Ty::Undefined => matches!(b.ty, Ty::Undefined),
-        Ty::Null => matches!(b.ty, Ty::Null),
-        Ty::String => {
-          b.string.as_ref().expect("should not empty")
-            == self.string.as_ref().expect("should not empty")
-        }
-        Ty::Number => {
-          b.number.as_ref().expect("should not empty")
-            == self.number.as_ref().expect("should not empty")
-        }
-        Ty::Boolean => {
-          b.boolean.as_ref().expect("should not empty")
-            == self.boolean.as_ref().expect("should not empty")
-        }
-        Ty::RegExp => false, // FIXME: maybe we can use std::ptr::eq
-        // Ty::ConstArray => {
-        // },
-        Ty::BigInt => {
-          b.bigint.as_ref().expect("should not empty")
-            == self.bigint.as_ref().expect("should not empty")
-        }
-        _ => unreachable!("can only compare compile-time values"),
-      }
+    match (&self.payload, &b.payload) {
+      (Payload::Undefined, Payload::Undefined) => true,
+      (Payload::Null, Payload::Null) => true,
+      (Payload::String(a), Payload::String(b)) => a == b,
+      (Payload::Number(a), Payload::Number(b)) => a == b,
+      (Payload::Boolean(a), Payload::Boolean(b)) => a == b,
+      (Payload::RegExp(_), Payload::RegExp(_)) => false, // FIXME: maybe we can use std::ptr::eq
+      (Payload::BigInt(a), Payload::BigInt(b)) => a == b,
+      _ => false,
     }
   }
 
@@ -312,18 +391,22 @@ impl BasicEvaluatedExpression {
   }
 
   pub fn set_null(&mut self) {
-    self.ty = Ty::Null;
+    self.payload = Payload::Null;
     self.side_effects = false
   }
 
   pub fn set_undefined(&mut self) {
-    self.ty = Ty::Undefined;
+    self.payload = Payload::Undefined;
     self.side_effects = false;
   }
 
   pub fn set_number(&mut self, number: Number) {
-    self.ty = Ty::Number;
-    self.number = Some(number);
+    self.payload = Payload::Number(number);
+    self.side_effects = false;
+  }
+
+  pub fn set_bigint(&mut self, bigint: BigInt) {
+    self.payload = Payload::BigInt(bigint);
     self.side_effects = false;
   }
 
@@ -345,184 +428,358 @@ impl BasicEvaluatedExpression {
     }
   }
 
-  pub fn set_items(&mut self, items: Vec<BasicEvaluatedExpression>) {
-    self.ty = Ty::Array;
+  pub fn set_items(&mut self, items: Vec<BasicEvaluatedExpression<'a>>) {
     self.side_effects = items.iter().any(|item| item.could_have_side_effects());
-    self.items = Some(items);
+    self.payload = Payload::Array(items);
   }
 
-  pub fn options(&self) -> &Vec<BasicEvaluatedExpression> {
-    self.options.as_ref().expect("options should not empty")
+  pub fn set_array(&mut self, array: Vec<String>) {
+    self.payload = Payload::ConstArray(array);
+    self.side_effects = false;
   }
 
-  pub fn set_options(&mut self, options: Option<Vec<BasicEvaluatedExpression>>) {
-    self.ty = Ty::Conditional;
-    self.options = options;
-    self.side_effects = true;
-  }
-
-  pub fn add_options(&mut self, options: Vec<BasicEvaluatedExpression>) {
-    if let Some(old) = &mut self.options {
-      old.extend(options);
-    } else {
-      self.ty = Ty::Conditional;
-      self.options = Some(options);
-      self.side_effects = true;
+  pub fn options(&self) -> &Vec<BasicEvaluatedExpression<'_>> {
+    match &self.payload {
+      Payload::Conditional(options) => options,
+      _ => panic!("options should not empty"),
     }
   }
 
-  pub fn set_identifier(&mut self, name: String, root_info: ExportedVariableInfo) {
-    self.ty = Ty::Identifier;
-    self.identifier = Some(name);
-    self.root_info = Some(root_info);
+  pub fn set_options(&mut self, options: Option<Vec<BasicEvaluatedExpression<'a>>>) {
+    self.payload = Payload::Conditional(options.unwrap_or_default());
+    self.side_effects = true;
+  }
+
+  pub fn add_options(&mut self, options: Vec<BasicEvaluatedExpression<'a>>) {
+    match &mut self.payload {
+      Payload::Conditional(old) => old.extend(options),
+      _ => {
+        self.payload = Payload::Conditional(options);
+        self.side_effects = true;
+      }
+    }
+  }
+
+  pub fn set_identifier(
+    &mut self,
+    name: Atom,
+    root_info: ExportedVariableInfo,
+    member_path: Option<(AtomMembers, OptionalMembers, MemberRanges)>,
+  ) {
+    self.payload = Payload::Identifier(Box::new(IdentifierData {
+      identifier: name,
+      root_info,
+      member_path: member_path.map(
+        |(members, members_optionals, member_ranges)| MemberPathData {
+          members,
+          members_optionals,
+          member_ranges,
+        },
+      ),
+    }));
+    self.side_effects = true;
+  }
+
+  pub fn set_dependency(&mut self, dep_data: DependencyData) {
+    self.payload = Payload::Dependency(dep_data);
     self.side_effects = true;
   }
 
   pub fn set_bool(&mut self, boolean: Boolean) {
-    self.ty = Ty::Boolean;
-    self.boolean = Some(boolean);
-    self.side_effects = true
+    self.payload = Payload::Boolean(boolean);
+    self.side_effects = false
   }
 
   pub fn set_range(&mut self, start: u32, end: u32) {
-    self.range = Some(DependencyLocation::new(start, end))
+    self.range = Some(DependencyRange::new(start, end))
   }
 
   pub fn set_template_string(
     &mut self,
-    quasis: Vec<BasicEvaluatedExpression>,
-    parts: Vec<BasicEvaluatedExpression>,
+    parts: Vec<BasicEvaluatedExpression<'a>>,
     kind: TemplateStringKind,
   ) {
-    self.ty = Ty::TemplateString;
-    self.quasis = Some(quasis);
     self.side_effects = parts.iter().any(|p| p.side_effects);
-    self.parts = Some(parts);
-    self.template_string_kind = Some(kind);
+    self.payload = Payload::TemplateString(Box::new(TemplateStringData { parts, kind }));
   }
 
-  pub fn set_string(&mut self, string: String) {
-    self.ty = Ty::String;
-    self.string = Some(string);
+  pub fn set_string(&mut self, string: impl Into<Cow<'a, str>>) {
+    self.payload = Payload::String(string.into());
     self.side_effects = false;
   }
 
   pub fn set_regexp(&mut self, regexp: String, flags: String) {
-    self.ty = Ty::RegExp;
-    self.regexp = Some((regexp, flags));
+    self.payload = Payload::RegExp(Box::new((regexp, flags)));
     self.side_effects = false;
   }
 
   pub fn set_wrapped(
     &mut self,
-    prefix: Option<BasicEvaluatedExpression>,
-    postfix: Option<BasicEvaluatedExpression>,
-    inner_expressions: Vec<BasicEvaluatedExpression>,
+    prefix: Option<BasicEvaluatedExpression<'a>>,
+    postfix: Option<BasicEvaluatedExpression<'a>>,
+    inner_expressions: Vec<BasicEvaluatedExpression<'a>>,
   ) {
-    self.ty = Ty::Wrapped;
-    self.prefix = prefix.map(Box::new);
-    self.postfix = postfix.map(Box::new);
-    self.wrapped_inner_expressions = Some(inner_expressions);
+    self.payload = Payload::Wrapped(Box::new(WrappedData {
+      prefix: prefix.map(Box::new),
+      postfix: postfix.map(Box::new),
+      inner_expressions,
+    }));
     self.side_effects = true;
   }
 
-  pub fn string(&self) -> &String {
-    self.string.as_ref().expect("make sure string exist")
+  pub fn string(&self) -> &str {
+    match &self.payload {
+      Payload::String(string) => string,
+      _ => panic!("make sure string exist"),
+    }
   }
 
-  pub fn identifier(&self) -> &String {
+  pub fn bigint(&self) -> Option<&BigInt> {
+    match &self.payload {
+      Payload::BigInt(bigint) => Some(bigint),
+      _ => None,
+    }
+  }
+
+  pub fn identifier(&self) -> &Atom {
     assert!(self.is_identifier());
-    self
-      .identifier
-      .as_ref()
-      .expect("make sure identifier exist")
+    match &self.payload {
+      Payload::Identifier(identifier) => &identifier.identifier,
+      _ => panic!("make sure identifier exist"),
+    }
   }
 
   pub fn root_info(&self) -> &ExportedVariableInfo {
     assert!(self.is_identifier());
-    self.root_info.as_ref().expect("make sure identifier exist")
+    match &self.payload {
+      Payload::Identifier(identifier) => &identifier.root_info,
+      _ => panic!("make sure identifier exist"),
+    }
+  }
+
+  pub fn members(&self) -> Option<&AtomMembers> {
+    assert!(self.is_identifier());
+    match &self.payload {
+      Payload::Identifier(identifier) => identifier.member_path.as_ref().map(|path| &path.members),
+      _ => panic!("make sure identifier exist"),
+    }
+  }
+
+  pub fn member_path(&self) -> Option<(&[Atom], &[bool], &[Span])> {
+    assert!(self.is_identifier());
+    match &self.payload {
+      Payload::Identifier(identifier) => identifier.member_path.as_ref().map(|path| {
+        (
+          path.members.as_slice(),
+          path.members_optionals.as_slice(),
+          path.member_ranges.as_slice(),
+        )
+      }),
+      _ => panic!("make sure identifier exist"),
+    }
+  }
+
+  pub fn into_dependency(self) -> DependencyData {
+    match self.payload {
+      Payload::Dependency(dep_data) => dep_data,
+      _ => panic!("make sure dependency exist"),
+    }
   }
 
   pub fn regexp(&self) -> &Regexp {
-    self.regexp.as_ref().expect("make sure regexp exist")
+    match &self.payload {
+      Payload::RegExp(regexp) => regexp,
+      _ => panic!("make sure regexp exist"),
+    }
   }
 
   pub fn bool(&self) -> Boolean {
-    self.boolean.expect("make sure bool exist")
+    match &self.payload {
+      Payload::Boolean(boolean) => *boolean,
+      _ => panic!("make sure bool exist"),
+    }
   }
 
   pub fn range(&self) -> (u32, u32) {
     let range = self.range.expect("range should not empty");
-    (range.start(), range.end())
+    (range.start, range.end)
   }
 
-  pub fn prefix(&self) -> Option<&BasicEvaluatedExpression> {
+  pub fn prefix(&self) -> Option<&BasicEvaluatedExpression<'a>> {
     assert!(self.is_wrapped(), "prefix is only used in wrapped");
-    self.prefix.as_deref()
+    match &self.payload {
+      Payload::Wrapped(wrapped) => wrapped.prefix.as_deref(),
+      _ => panic!("prefix is only used in wrapped"),
+    }
   }
 
-  pub fn postfix(&self) -> Option<&BasicEvaluatedExpression> {
+  pub fn postfix(&self) -> Option<&BasicEvaluatedExpression<'a>> {
     assert!(self.is_wrapped(), "postfix is only used in wrapped");
-    self.postfix.as_deref()
+    match &self.payload {
+      Payload::Wrapped(wrapped) => wrapped.postfix.as_deref(),
+      _ => panic!("postfix is only used in wrapped"),
+    }
   }
 
-  pub fn wrapped_inner_expressions(&self) -> Option<&[BasicEvaluatedExpression]> {
+  pub fn wrapped_inner_expressions(&self) -> Option<&[BasicEvaluatedExpression<'a>]> {
     assert!(
       self.is_wrapped(),
       "wrapped_inner_expressions is only used in wrapped"
     );
-    self.wrapped_inner_expressions.as_deref()
+    match &self.payload {
+      Payload::Wrapped(wrapped) => Some(wrapped.inner_expressions.as_slice()),
+      _ => panic!("wrapped_inner_expressions is only used in wrapped"),
+    }
   }
 
   pub fn template_string_kind(&self) -> TemplateStringKind {
     assert!(self.is_template_string());
-    self
-      .template_string_kind
-      .expect("make sure template string exist")
+    match &self.payload {
+      Payload::TemplateString(tpl) => tpl.kind,
+      _ => panic!("make sure template string exist"),
+    }
   }
 
-  pub fn parts(&self) -> &Vec<BasicEvaluatedExpression> {
+  pub fn parts(&self) -> &Vec<BasicEvaluatedExpression<'a>> {
     assert!(self.is_template_string());
-    self
-      .parts
-      .as_ref()
-      .expect("make sure template string exist")
+    match &self.payload {
+      Payload::TemplateString(tpl) => &tpl.parts,
+      _ => panic!("make sure template string exist"),
+    }
   }
 
-  pub fn quasis(&self) -> &Vec<BasicEvaluatedExpression> {
-    assert!(self.is_template_string(),);
-    self
-      .quasis
-      .as_ref()
-      .expect("quasis must exists for template string")
+  pub fn quasis(
+    &self,
+  ) -> impl DoubleEndedIterator<Item = &BasicEvaluatedExpression<'a>> + ExactSizeIterator {
+    self.parts().iter().step_by(2)
   }
 
-  pub fn items(&self) -> &Vec<BasicEvaluatedExpression> {
+  pub fn items(&self) -> &Vec<BasicEvaluatedExpression<'_>> {
     assert!(self.is_array());
-    self.items.as_ref().expect("items must exists for array")
+    match &self.payload {
+      Payload::Array(items) => items,
+      _ => panic!("items must exists for array"),
+    }
+  }
+
+  pub fn array(&self) -> &Vec<String> {
+    assert!(self.is_const_array());
+    match &self.payload {
+      Payload::ConstArray(array) => array,
+      _ => panic!("array must exists for const array"),
+    }
   }
 
   pub fn number(&self) -> Number {
     assert!(self.is_number());
-    self.number.expect("number must exists in ty::number")
+    match &self.payload {
+      Payload::Number(number) => *number,
+      _ => panic!("number must exists in ty::number"),
+    }
+  }
+
+  pub fn into_options(self) -> Option<Vec<BasicEvaluatedExpression<'a>>> {
+    match self.payload {
+      Payload::Conditional(options) => Some(options),
+      _ => None,
+    }
+  }
+
+  pub fn into_wrapped(
+    self,
+  ) -> Option<(
+    Option<BasicEvaluatedExpression<'a>>,
+    Option<BasicEvaluatedExpression<'a>>,
+    Vec<BasicEvaluatedExpression<'a>>,
+  )> {
+    match self.payload {
+      Payload::Wrapped(tpl) => Some((
+        tpl.prefix.map(|p| *p),
+        tpl.postfix.map(|p| *p),
+        tpl.inner_expressions,
+      )),
+      _ => None,
+    }
+  }
+
+  pub fn range_ref(&self) -> Option<&DependencyRange> {
+    self.range.as_ref()
+  }
+
+  pub fn set_expression(&mut self, expression: Option<Expr>) {
+    self.set_expression_with_ast(expression, None);
+  }
+
+  pub fn with_expression(mut self, expression: Option<Expr>) -> Self {
+    self.set_expression(expression);
+    self
+  }
+
+  pub fn expression(&self) -> Option<Expr> {
+    self.expression.map(|expression| expression.expression)
+  }
+
+  pub(crate) fn expression_ast(&self) -> Option<usize> {
+    self.expression.and_then(|expression| expression.ast)
+  }
+
+  pub(crate) fn with_expression_ast(
+    mut self,
+    expression: Option<Expr>,
+    ast: Option<usize>,
+  ) -> Self {
+    self.set_expression_with_ast(expression, ast);
+    self
+  }
+
+  fn set_expression_with_ast(&mut self, expression: Option<Expr>, ast: Option<usize>) {
+    self.expression = expression.map(|expression| EvaluatedExpression { expression, ast });
   }
 }
 
-pub fn evaluate_to_string(value: String, start: u32, end: u32) -> BasicEvaluatedExpression {
+pub fn evaluate_to_string<'a>(
+  value: impl Into<Cow<'a, str>>,
+  start: u32,
+  end: u32,
+) -> BasicEvaluatedExpression<'a> {
   let mut eval = BasicEvaluatedExpression::with_range(start, end);
   eval.set_string(value);
   eval
 }
 
-pub fn evaluate_to_identifier(
-  identifier: String,
-  root_info: String,
+pub fn evaluate_to_number<'a>(value: f64, start: u32, end: u32) -> BasicEvaluatedExpression<'a> {
+  let mut eval = BasicEvaluatedExpression::with_range(start, end);
+  eval.set_number(value);
+  eval
+}
+
+pub fn evaluate_to_boolean<'a>(value: bool, start: u32, end: u32) -> BasicEvaluatedExpression<'a> {
+  let mut eval = BasicEvaluatedExpression::with_range(start, end);
+  eval.set_bool(value);
+  eval
+}
+
+pub fn evaluate_to_null<'a>(start: u32, end: u32) -> BasicEvaluatedExpression<'a> {
+  let mut eval = BasicEvaluatedExpression::with_range(start, end);
+  eval.set_null();
+  eval
+}
+
+pub fn evaluate_to_undefined<'a>(start: u32, end: u32) -> BasicEvaluatedExpression<'a> {
+  let mut eval = BasicEvaluatedExpression::with_range(start, end);
+  eval.set_undefined();
+  eval
+}
+
+pub fn evaluate_to_identifier<'a>(
+  identifier: Atom,
+  root_info: Atom,
   truthy: Option<bool>,
   start: u32,
   end: u32,
-) -> BasicEvaluatedExpression {
+) -> BasicEvaluatedExpression<'a> {
   let mut eval = BasicEvaluatedExpression::with_range(start, end);
-  eval.set_identifier(identifier, ExportedVariableInfo::Name(root_info));
+  eval.set_identifier(identifier, ExportedVariableInfo::Name(root_info), None);
   eval.set_side_effects(false);
   match truthy {
     Some(v) => {

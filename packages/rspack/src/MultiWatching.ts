@@ -8,69 +8,93 @@
  * https://github.com/webpack/webpack/blob/main/LICENSE
  */
 
-import { MultiCompiler } from "./MultiCompiler";
-import { Watching } from "./Watching";
-import asyncLib from "neo-async";
+import type { Callback } from '@rspack/lite-tapable';
+import type { MultiCompiler } from './MultiCompiler';
+import asyncLib from './util/asyncLib';
+import type { Watching } from './Watching';
 
 class MultiWatching {
-	watchings: Watching[];
-	compiler: MultiCompiler;
+  watchings: Watching[];
+  compiler: MultiCompiler;
 
-	/**
-	 * @param watchings - child compilers' watchers
-	 * @param compiler - the compiler
-	 */
-	constructor(watchings: Watching[], compiler: MultiCompiler) {
-		this.watchings = watchings;
-		this.compiler = compiler;
-	}
-	// @ts-expect-error
-	invalidate(callback) {
-		if (callback) {
-			asyncLib.each(
-				this.watchings,
-				(watching, callback) => watching.invalidate(callback),
-				callback
-			);
-		} else {
-			for (const watching of this.watchings) {
-				watching.invalidate();
-			}
-		}
-	}
+  /**
+   * @param watchings - child compilers' watchers
+   * @param compiler - the compiler
+   */
+  constructor(watchings: Watching[], compiler: MultiCompiler) {
+    this.watchings = watchings;
+    this.compiler = compiler;
+  }
+  invalidate(callback?: Callback<Error, void>) {
+    if (callback) {
+      asyncLib.each(
+        this.watchings,
+        (watching, callback) => watching.invalidate(callback),
+        // cannot be resolved without assertion
+        // Type 'Error | null | undefined' is not assignable to type 'Error | null'
+        callback as (err: Error | null | undefined) => void,
+      );
+    } else {
+      for (const watching of this.watchings) {
+        watching.invalidate();
+      }
+    }
+  }
 
-	/**
-	 * @param {Callback<void>} callback signals when the watcher is closed
-	 * @returns {void}
-	 */
-	// @ts-expect-error
-	close(callback) {
-		asyncLib.forEach(
-			this.watchings,
-			(watching, finishedCallback) => {
-				watching.close(finishedCallback);
-			},
-			err => {
-				this.compiler.hooks.watchClose.call();
-				if (typeof callback === "function") {
-					this.compiler.running = false;
-					callback(err);
-				}
-			}
-		);
-	}
+  invalidateWithChangesAndRemovals(
+    changedFiles?: Set<string>,
+    removedFiles?: Set<string>,
+    callback?: Callback<Error, void>,
+  ) {
+    if (callback) {
+      asyncLib.each(
+        this.watchings,
+        (watching, callback) =>
+          watching.invalidateWithChangesAndRemovals(
+            changedFiles,
+            removedFiles,
+            callback,
+          ),
+        // cannot be resolved without assertion
+        // Type 'Error | null | undefined' is not assignable to type 'Error | null'
+        callback as (err: Error | null | undefined) => void,
+      );
+    } else {
+      for (const watching of this.watchings) {
+        watching.invalidateWithChangesAndRemovals(changedFiles, removedFiles);
+      }
+    }
+  }
 
-	suspend() {
-		for (const watching of this.watchings) {
-			watching.suspend();
-		}
-	}
+  close(callback: Callback<Error, void>) {
+    asyncLib.each(
+      this.watchings,
+      (watching, finishedCallback) => {
+        watching.close(finishedCallback);
+      },
+      (err) => {
+        this.compiler.hooks.watchClose.call();
+        if (typeof callback === 'function') {
+          this.compiler.running = false;
+          // cannot be resolved without assertion
+          // Type 'Error | null | undefined' is not assignable to type 'Error | null'
+          callback(err as Error | null);
+        }
+      },
+    );
+  }
 
-	resume() {
-		for (const watching of this.watchings) {
-			watching.resume();
-		}
-	}
+  suspend() {
+    for (const watching of this.watchings) {
+      watching.suspend();
+    }
+  }
+
+  resume() {
+    for (const watching of this.watchings) {
+      watching.resume();
+    }
+  }
 }
 
 export default MultiWatching;

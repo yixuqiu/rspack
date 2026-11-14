@@ -2,6 +2,7 @@ use rspack_core::{BoxPlugin, ExternalItem, PluginExt};
 
 use crate::ExternalsPlugin;
 
+#[derive(Debug)]
 pub enum ElectronTargetContext {
   Main,
   Preload,
@@ -40,6 +41,7 @@ pub fn electron_target_plugin(context: ElectronTargetContext, plugins: &mut Vec<
       .into_iter()
       .map(|i| ExternalItem::String(i.to_string()))
       .collect(),
+      false,
     )
     .boxed(),
   );
@@ -67,6 +69,7 @@ pub fn electron_target_plugin(context: ElectronTargetContext, plugins: &mut Vec<
         .into_iter()
         .map(|i| ExternalItem::String(i.to_string()))
         .collect(),
+        false,
       )
       .boxed(),
     ),
@@ -77,6 +80,7 @@ pub fn electron_target_plugin(context: ElectronTargetContext, plugins: &mut Vec<
           .into_iter()
           .map(|i| ExternalItem::String(i.to_string()))
           .collect(),
+        false,
       )
       .boxed(),
     ),

@@ -1,14 +1,21 @@
-use rspack_core::{DependencyLocation, SpanExt};
-use swc_core::ecma::ast::{BinExpr, BinaryOp};
+use rspack_core::DependencyRange;
+use rspack_util::{SpanExt, ryu_js};
+use swc_next_ecma_ast::{
+  BinaryExpression, BinaryOperator, GetSpan, LogicalExpression, LogicalOperator,
+};
 
-use crate::{utils::eval::BasicEvaluatedExpression, visitors::JavascriptParser};
+use crate::{
+  parser_plugin::JavascriptParserPlugin, utils::eval::BasicEvaluatedExpression,
+  visitors::JavascriptParser,
+};
 
-fn handle_template_string_compare(
+#[inline]
+fn handle_template_string_compare<'parser>(
   left: &BasicEvaluatedExpression,
   right: &BasicEvaluatedExpression,
-  mut res: BasicEvaluatedExpression,
+  mut res: BasicEvaluatedExpression<'parser>,
   eql: bool,
-) -> Option<BasicEvaluatedExpression> {
+) -> Option<BasicEvaluatedExpression<'parser>> {
   let get_prefix = |parts: &Vec<BasicEvaluatedExpression>| {
     let mut value = vec![];
     for p in parts {
@@ -35,8 +42,7 @@ fn handle_template_string_compare(
   let prefix_res = {
     let left_prefix = get_prefix(left.parts());
     let right_prefix = get_prefix(right.parts());
-    let len_prefix = usize::min(left_prefix.len(), right_prefix.len());
-    len_prefix > 0 && left_prefix[0..len_prefix] != right_prefix[0..len_prefix]
+    !left_prefix.starts_with(&right_prefix) && !right_prefix.starts_with(&left_prefix)
   };
   if prefix_res {
     res.set_bool(!eql);
@@ -47,10 +53,7 @@ fn handle_template_string_compare(
   let suffix_res = {
     let left_suffix = get_suffix(left.parts());
     let right_suffix = get_suffix(right.parts());
-    let len_suffix = usize::min(left_suffix.len(), right_suffix.len());
-    len_suffix > 0
-      && left_suffix[left_suffix.len() - len_suffix..]
-        != right_suffix[right_suffix.len() - len_suffix..]
+    !left_suffix.ends_with(&right_suffix) && !right_suffix.ends_with(&left_suffix)
   };
   if suffix_res {
     res.set_bool(!eql);
@@ -61,6 +64,7 @@ fn handle_template_string_compare(
   None
 }
 
+#[inline]
 fn is_always_different(a: Option<bool>, b: Option<bool>) -> bool {
   match (a, b) {
     (Some(a), Some(b)) => a != b,
@@ -69,19 +73,25 @@ fn is_always_different(a: Option<bool>, b: Option<bool>) -> bool {
 }
 
 /// `eql` is `true` for `===` and `false` for `!==`
-fn handle_strict_equality_comparison(
+#[inline]
+fn handle_strict_equality_comparison<'parser>(
   eql: bool,
-  expr: &BinExpr,
-  scanner: &mut JavascriptParser,
-) -> Option<BasicEvaluatedExpression> {
-  assert!(expr.op == BinaryOp::EqEqEq || expr.op == BinaryOp::NotEqEq);
-  let left = scanner.evaluate_expression(&expr.left);
-  let right = scanner.evaluate_expression(&expr.right);
-  let mut res = BasicEvaluatedExpression::with_range(expr.span.real_lo(), expr.span.hi().0);
+  left: BasicEvaluatedExpression<'parser>,
+  expr: BinaryExpression,
+  scanner: &mut JavascriptParser<'parser>,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = scanner.ast.ast;
+  assert!(matches!(
+    expr.operator(ast),
+    BinaryOperator::StrictEqual | BinaryOperator::StrictNotEqual
+  ));
+  let right = scanner.evaluate_expression(expr.right(ast));
+  let mut res =
+    BasicEvaluatedExpression::with_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
   let left_const = left.is_compile_time_value();
   let right_const = right.is_compile_time_value();
 
-  let common = |mut res: BasicEvaluatedExpression| {
+  let common = |mut res: BasicEvaluatedExpression<'parser>| {
     res.set_bool(!eql);
     res.set_side_effects(left.could_have_side_effects() || right.could_have_side_effects());
     Some(res)
@@ -113,21 +123,36 @@ fn handle_strict_equality_comparison(
 }
 
 /// `eql` is `true` for `==` and `false` for `!=`
-fn handle_abstract_equality_comparison(
+#[inline(always)]
+fn handle_abstract_equality_comparison<'parser>(
   eql: bool,
-  expr: &BinExpr,
-  scanner: &mut JavascriptParser,
-) -> Option<BasicEvaluatedExpression> {
-  assert!(expr.op == BinaryOp::EqEq || expr.op == BinaryOp::NotEq);
-  let left = scanner.evaluate_expression(&expr.left);
-  let right = scanner.evaluate_expression(&expr.right);
-  let mut res = BasicEvaluatedExpression::with_range(expr.span.real_lo(), expr.span.hi().0);
+  left: BasicEvaluatedExpression<'parser>,
+  expr: BinaryExpression,
+  scanner: &mut JavascriptParser<'parser>,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = scanner.ast.ast;
+  assert!(matches!(
+    expr.operator(ast),
+    BinaryOperator::Equal | BinaryOperator::NotEqual
+  ));
+  let right = scanner.evaluate_expression(expr.right(ast));
+  let mut res =
+    BasicEvaluatedExpression::with_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
 
   let left_const = left.is_compile_time_value();
   let right_const = right.is_compile_time_value();
 
   if left_const && right_const {
-    res.set_bool(eql == left.compare_compile_time_value(&right));
+    let left_nullish = left.is_null() || left.is_undefined();
+    let right_nullish = right.is_null() || right.is_undefined();
+    let equal = if left_nullish || right_nullish {
+      left_nullish && right_nullish
+    } else if std::mem::discriminant(&left.payload) == std::mem::discriminant(&right.payload) {
+      left.compare_compile_time_value(&right)
+    } else {
+      return None;
+    };
+    res.set_bool(eql == equal);
     res.set_side_effects(left.could_have_side_effects() || right.could_have_side_effects());
     Some(res)
   } else if left.is_array() && right.is_array() {
@@ -141,89 +166,145 @@ fn handle_abstract_equality_comparison(
   }
 }
 
-fn handle_logical_or(
-  expr: &BinExpr,
-  scanner: &mut JavascriptParser,
-) -> Option<BasicEvaluatedExpression> {
-  let mut res = BasicEvaluatedExpression::with_range(expr.span.real_lo(), expr.span.hi().0);
-  let left = scanner.evaluate_expression(&expr.left);
-
-  match left.as_bool() {
+#[inline(always)]
+fn handle_nullish_coalescing<'parser>(
+  left: BasicEvaluatedExpression<'parser>,
+  expr: LogicalExpression,
+  scanner: &mut JavascriptParser<'parser>,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = scanner.ast.ast;
+  let left_nullish = left.as_nullish();
+  match left_nullish {
     Some(true) => {
-      // truthy || unknown = true
-      res.set_bool(true);
-      res.set_side_effects(left.could_have_side_effects());
-      Some(res)
-    }
-    Some(false) => {
-      let right = scanner.evaluate_expression(&expr.right);
-      // falsy || unknown = unknown
-      right.as_bool().map(|b| {
-        // falsy || right = right
-        res.set_bool(b);
-        res.set_side_effects(left.could_have_side_effects() || right.could_have_side_effects());
-        res
-      })
-    }
-    None => {
-      let right = scanner.evaluate_expression(&expr.right);
-      match right.as_bool() {
-        // unknown || truthy = unknown truthy
-        Some(true) => {
-          res.set_truthy();
-          Some(res)
-        }
-        // unknown || falsy/unknown = undetermined
-        _ => None,
-      }
-    }
-  }
-}
-
-fn handle_logical_and(
-  expr: &BinExpr,
-  scanner: &mut JavascriptParser,
-) -> Option<BasicEvaluatedExpression> {
-  let mut res = BasicEvaluatedExpression::with_range(expr.span.real_lo(), expr.span.hi().0);
-
-  let left = scanner.evaluate_expression(&expr.left);
-  match left.as_bool() {
-    Some(true) => {
-      // true && unknown = unknown
-      let mut right = scanner.evaluate_expression(&expr.right);
+      let mut right = scanner.evaluate_expression(expr.right(ast));
       if left.could_have_side_effects() {
         right.set_side_effects(true)
       }
-      right.set_range(expr.span.real_lo(), expr.span.hi.0);
+      right.set_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
       Some(right)
     }
     Some(false) => {
-      // false && any = false
-      res.set_bool(false);
-      res.set_side_effects(left.could_have_side_effects());
+      let mut res = left;
+      res.set_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
       Some(res)
     }
+    _ => None,
+  }
+}
+
+#[inline(always)]
+fn handle_logical_or<'parser>(
+  mut left: BasicEvaluatedExpression<'parser>,
+  expr: LogicalExpression,
+  scanner: &mut JavascriptParser<'parser>,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = scanner.ast.ast;
+  let left_bool = left.as_bool();
+  match left_bool {
+    Some(true) => {
+      let mut res = left;
+      res.set_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
+      Some(res)
+    }
+    Some(false) => {
+      let mut right = scanner.evaluate_expression(expr.right(ast));
+      if left.could_have_side_effects() {
+        right.set_side_effects(true)
+      }
+      right.set_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
+      Some(right)
+    }
     None => {
-      let right = scanner.evaluate_expression(&expr.right);
-      match right.as_bool() {
-        // unknown && false = false
-        Some(false) => {
-          res.set_bool(false);
-          res.set_side_effects(left.could_have_side_effects() || right.could_have_side_effects());
+      let right = scanner.evaluate_expression(expr.right(ast));
+      let right_bool = right.as_bool();
+      if right_bool == Some(true) {
+        let mut res =
+          BasicEvaluatedExpression::with_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
+        res.set_truthy();
+        Some(res)
+      } else if left.is_dependency() {
+        if right_bool == Some(false) {
+          left.set_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
+          Some(left)
+        } else if right.is_dependency() {
+          let mut res = BasicEvaluatedExpression::with_range(
+            expr.span(ast).real_lo(),
+            expr.span(ast).real_hi(),
+          );
+          res.set_dependency(left.into_dependency().or(right.into_dependency()));
           Some(res)
+        } else {
+          None
         }
-        // unknown && true/unknown = unknown
-        _ => None,
+      } else {
+        None
       }
     }
   }
 }
 
-fn handle_add(expr: &BinExpr, scanner: &mut JavascriptParser) -> Option<BasicEvaluatedExpression> {
-  assert_eq!(expr.op, BinaryOp::Add);
-  let left = scanner.evaluate_expression(&expr.left);
-  let right = scanner.evaluate_expression(&expr.right);
-  let mut res = BasicEvaluatedExpression::with_range(expr.span.real_lo(), expr.span.hi.0);
+#[inline(always)]
+fn handle_logical_and<'parser>(
+  mut left: BasicEvaluatedExpression<'parser>,
+  expr: LogicalExpression,
+  scanner: &mut JavascriptParser<'parser>,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = scanner.ast.ast;
+  let left_bool = left.as_bool();
+  match left_bool {
+    Some(true) => {
+      let mut right = scanner.evaluate_expression(expr.right(ast));
+      if left.could_have_side_effects() {
+        right.set_side_effects(true)
+      }
+      right.set_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
+      Some(right)
+    }
+    Some(false) => {
+      let mut res = left;
+      res.set_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
+      Some(res)
+    }
+    None => {
+      let right = scanner.evaluate_expression(expr.right(ast));
+      let right_bool = right.as_bool();
+      if right_bool == Some(false) {
+        let mut res =
+          BasicEvaluatedExpression::with_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
+        res.set_falsy();
+        Some(res)
+      } else if left.is_dependency() {
+        if right_bool == Some(true) {
+          left.set_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
+          Some(left)
+        } else if right.is_dependency() {
+          let mut res = BasicEvaluatedExpression::with_range(
+            expr.span(ast).real_lo(),
+            expr.span(ast).real_hi(),
+          );
+          res.set_dependency(left.into_dependency().and(right.into_dependency()));
+          Some(res)
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    }
+  }
+}
+
+#[inline(always)]
+fn handle_add<'parser>(
+  left: BasicEvaluatedExpression<'parser>,
+  expr: BinaryExpression,
+  scanner: &mut JavascriptParser<'parser>,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = scanner.ast.ast;
+  assert_eq!(expr.operator(ast), BinaryOperator::Add);
+  let right = scanner.evaluate_expression(expr.right(ast));
+  let mut res =
+    BasicEvaluatedExpression::with_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
   if left.could_have_side_effects() || right.could_have_side_effects() {
     res.set_side_effects(true)
   }
@@ -231,137 +312,127 @@ fn handle_add(expr: &BinExpr, scanner: &mut JavascriptParser) -> Option<BasicEva
     if right.is_string() {
       res.set_string(format!("{}{}", left.string(), right.string()));
     } else if right.is_number() {
-      res.set_string(format!("{}{}", left.string(), right.number()));
-    } else if right.is_wrapped()
-      && let Some(prefix) = right.prefix()
-      && prefix.is_string()
-    {
-      let (start, end) = join_locations(left.range.as_ref(), prefix.range.as_ref());
-      let mut left_prefix = BasicEvaluatedExpression::with_range(start, end);
-      left_prefix.set_string(format!("{}{}", left.string(), prefix.string()));
-      res.set_wrapped(
-        Some(left_prefix),
-        right.postfix.map(|postfix| *postfix),
-        right
-          .wrapped_inner_expressions
-          .expect("wrapped_inner_expressions must be exists under wrapped"),
-      )
+      res.set_string(format!(
+        "{}{}",
+        left.string(),
+        ryu_js::Buffer::new().format(right.number())
+      ));
     } else if right.is_wrapped() {
-      res.set_wrapped(
-        Some(left),
-        right.postfix.map(|postfix| *postfix),
-        right
-          .wrapped_inner_expressions
-          .expect("wrapped_inner_expressions must be exists under wrapped"),
-      );
+      let (right_prefix, right_postfix, right_inner_expressions) =
+        right.into_wrapped().expect("right should be wrapped");
+      if let Some(prefix) = right_prefix.as_ref()
+        && prefix.is_string()
+      {
+        let (start, end) = join_locations(left.range_ref(), prefix.range_ref());
+        let mut left_prefix = BasicEvaluatedExpression::with_range(start, end);
+        left_prefix.set_string(format!("{}{}", left.string(), prefix.string()));
+        res.set_wrapped(Some(left_prefix), right_postfix, right_inner_expressions)
+      } else {
+        res.set_wrapped(Some(left), right_postfix, right_inner_expressions);
+      }
     } else {
       res.set_wrapped(Some(left), None, vec![right])
     }
   } else if left.is_number() {
     if right.is_string() {
-      res.set_string(format!("{}{}", left.number(), right.string()));
+      res.set_string(format!(
+        "{}{}",
+        ryu_js::Buffer::new().format(left.number()),
+        right.string()
+      ));
     } else if right.is_number() {
       res.set_number(left.number() + right.number())
     } else {
       return None;
     }
   } else if left.is_bigint() {
-    // TODO: handle `left.is_bigint`
+    let had_side_effects = res.could_have_side_effects();
+    if let (Some(l), Some(r)) = (left.bigint(), right.bigint()) {
+      res.set_bigint(l.clone() + r.clone());
+      if had_side_effects {
+        res.set_side_effects(true);
+      }
+      return Some(res);
+    }
     return None;
   } else if left.is_wrapped() {
-    if let Some(postfix) = left.postfix {
-      if postfix.is_string() && right.is_string() {
-        let range = join_locations(postfix.range.as_ref(), right.range.as_ref());
-        let mut right_postfix = BasicEvaluatedExpression::with_range(range.0, range.1);
-        right_postfix.set_string(format!("{}{}", postfix.string(), right.string()));
-        res.set_wrapped(
-          left.prefix.map(|prefix| *prefix),
-          Some(right_postfix),
-          left
-            .wrapped_inner_expressions
-            .expect("wrapped_inner_expressions must be exists under wrapped"),
-        )
-      } else if postfix.is_string() && right.is_number() {
-        let range = join_locations(postfix.range.as_ref(), right.range.as_ref());
-        let mut right_postfix = BasicEvaluatedExpression::with_range(range.0, range.1);
-        right_postfix.set_string(format!("{}{}", postfix.string(), right.number()));
-        res.set_wrapped(
-          left.prefix.map(|prefix| *prefix),
-          Some(right_postfix),
-          left
-            .wrapped_inner_expressions
-            .expect("wrapped_inner_expressions must be exists under wrapped"),
-        )
-      }
+    let (mut left_prefix, mut left_postfix, mut left_inner_expressions) =
+      left.into_wrapped().expect("left should be wrapped");
+    if let Some(postfix) = left_postfix.as_ref()
+      && postfix.is_string()
+      && right.is_string()
+    {
+      let range = join_locations(postfix.range_ref(), right.range_ref());
+      let mut right_postfix = BasicEvaluatedExpression::with_range(range.0, range.1);
+      right_postfix.set_string(format!("{}{}", postfix.string(), right.string()));
+      res.set_wrapped(
+        left_prefix.take(),
+        Some(right_postfix),
+        std::mem::take(&mut left_inner_expressions),
+      )
+    } else if let Some(postfix) = left_postfix.as_ref()
+      && postfix.is_string()
+      && right.is_number()
+    {
+      let range = join_locations(postfix.range_ref(), right.range_ref());
+      let mut right_postfix = BasicEvaluatedExpression::with_range(range.0, range.1);
+      right_postfix.set_string(format!(
+        "{}{}",
+        postfix.string(),
+        ryu_js::Buffer::new().format(right.number())
+      ));
+      res.set_wrapped(
+        left_prefix.take(),
+        Some(right_postfix),
+        std::mem::take(&mut left_inner_expressions),
+      )
     } else if right.is_string() {
       res.set_wrapped(
-        left.prefix.map(|prefix| *prefix),
+        left_prefix.take(),
         Some(right),
-        left
-          .wrapped_inner_expressions
-          .expect("wrapped_inner_expressions must be exists under wrapped"),
+        std::mem::take(&mut left_inner_expressions),
       );
     } else if right.is_number() {
       let range = right.range();
       let mut postfix = BasicEvaluatedExpression::with_range(range.0, range.1);
-      postfix.set_string(right.number().to_string());
+      postfix.set_string(ryu_js::Buffer::new().format(right.number()).to_owned());
       res.set_wrapped(
-        left.prefix.map(|prefix| *prefix),
+        left_prefix.take(),
         Some(postfix),
-        left
-          .wrapped_inner_expressions
-          .expect("wrapped_inner_expressions must be exists under wrapped"),
+        std::mem::take(&mut left_inner_expressions),
       )
     } else if right.is_wrapped() {
-      let inner_expressions = if let Some(mut left_inner_expression) =
-        left.wrapped_inner_expressions
-        && let Some(mut right_inner_expression) = right.wrapped_inner_expressions
-      {
-        if let Some(postfix) = left.postfix {
-          left_inner_expression.push(*postfix);
-        }
-        if let Some(prefix) = right.prefix {
-          left_inner_expression.push(*prefix);
-        }
-        left_inner_expression.append(&mut right_inner_expression);
-        left_inner_expression
-      } else {
-        vec![]
-      };
-      res.set_wrapped(
-        left.prefix.map(|prefix| *prefix),
-        right.postfix.map(|postfix| *postfix),
-        inner_expressions,
-      );
+      let (right_prefix, right_postfix, mut right_inner_expression) =
+        right.into_wrapped().expect("right should be wrapped");
+      let mut inner_expressions = std::mem::take(&mut left_inner_expressions);
+      if let Some(postfix) = left_postfix.take() {
+        inner_expressions.push(postfix);
+      }
+      if let Some(prefix) = right_prefix {
+        inner_expressions.push(prefix);
+      }
+      inner_expressions.append(&mut right_inner_expression);
+      res.set_wrapped(left_prefix.take(), right_postfix, inner_expressions);
     } else {
-      let inner_expressions =
-        if let Some(mut left_inner_expression) = left.wrapped_inner_expressions {
-          if let Some(postfix) = left.postfix {
-            left_inner_expression.push(*postfix);
-          }
-          left_inner_expression.push(right);
-          left_inner_expression
-        } else {
-          vec![]
-        };
-      res.set_wrapped(left.prefix.map(|prefix| *prefix), None, inner_expressions)
+      let mut inner_expressions = std::mem::take(&mut left_inner_expressions);
+      if let Some(postfix) = left_postfix.take() {
+        inner_expressions.push(postfix);
+      }
+      inner_expressions.push(right);
+      res.set_wrapped(left_prefix.take(), None, inner_expressions)
     }
   } else if right.is_string() {
     res.set_wrapped(None, Some(right), vec![left]);
   } else if right.is_wrapped() {
-    let mut inner_expressions = if let Some(right_prefix) = right.prefix {
-      vec![left, *right_prefix]
+    let (right_prefix, right_postfix, mut right_inner_expressions) =
+      right.into_wrapped().expect("right should be wrapped");
+    let mut inner_expressions = if let Some(right_prefix) = right_prefix {
+      vec![left, right_prefix]
     } else {
       vec![left]
     };
-    if let Some(mut right_inner_expressions) = right.wrapped_inner_expressions {
-      inner_expressions.append(&mut right_inner_expressions)
-    }
-    res.set_wrapped(
-      None,
-      right.postfix.map(|postfix| *postfix),
-      inner_expressions,
-    );
+    inner_expressions.append(&mut right_inner_expressions);
+    res.set_wrapped(None, right_postfix, inner_expressions);
   } else {
     return None;
   }
@@ -369,34 +440,195 @@ fn handle_add(expr: &BinExpr, scanner: &mut JavascriptParser) -> Option<BasicEva
   Some(res)
 }
 
-pub fn eval_binary_expression(
-  scanner: &mut JavascriptParser,
-  expr: &BinExpr,
-) -> Option<BasicEvaluatedExpression> {
-  match expr.op {
-    BinaryOp::EqEq => handle_abstract_equality_comparison(true, expr, scanner),
-    BinaryOp::NotEq => handle_abstract_equality_comparison(false, expr, scanner),
-    BinaryOp::EqEqEq => handle_strict_equality_comparison(true, expr, scanner),
-    BinaryOp::NotEqEq => handle_strict_equality_comparison(false, expr, scanner),
-    BinaryOp::LogicalAnd => handle_logical_and(expr, scanner),
-    BinaryOp::LogicalOr => handle_logical_or(expr, scanner),
-    BinaryOp::Add => handle_add(expr, scanner),
+#[inline(always)]
+pub fn handle_const_operation<'parser>(
+  left: BasicEvaluatedExpression<'parser>,
+  expr: BinaryExpression,
+  scanner: &mut JavascriptParser<'parser>,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = scanner.ast.ast;
+  if !left.is_compile_time_value() {
+    return None;
+  }
+  let right = scanner.evaluate_expression(expr.right(ast));
+  if !right.is_compile_time_value() {
+    return None;
+  }
+
+  let had_side_effects = left.could_have_side_effects() || right.could_have_side_effects();
+  let mut res =
+    BasicEvaluatedExpression::with_range(expr.span(ast).real_lo(), expr.span(ast).real_hi());
+
+  match expr.operator(ast) {
+    BinaryOperator::Subtract
+    | BinaryOperator::Multiply
+    | BinaryOperator::Divide
+    | BinaryOperator::Modulo
+    | BinaryOperator::Exponent => {
+      if let Some(left_number) = left.as_number()
+        && let Some(right_number) = right.as_number()
+      {
+        res.set_number(match expr.operator(ast) {
+          BinaryOperator::Subtract => left_number - right_number,
+          BinaryOperator::Multiply => left_number * right_number,
+          BinaryOperator::Divide => left_number / right_number,
+          BinaryOperator::Modulo => left_number % right_number,
+          BinaryOperator::Exponent => left_number.powf(right_number),
+          _ => unreachable!(),
+        });
+        if had_side_effects {
+          res.set_side_effects(true);
+        }
+        Some(res)
+      } else {
+        None
+      }
+    }
+    BinaryOperator::LeftShift | BinaryOperator::RightShift | BinaryOperator::UnsignedRightShift => {
+      if let Some(left_int) = left.as_int() {
+        let right_int = right.as_int()?;
+        let shift_bits = (right_int as u32) & 31;
+        let result = match expr.operator(ast) {
+          BinaryOperator::LeftShift => (left_int << shift_bits) as f64,
+          BinaryOperator::RightShift => (left_int >> shift_bits) as f64,
+          BinaryOperator::UnsignedRightShift => (left_int as u32).wrapping_shr(shift_bits) as f64,
+          _ => unreachable!(),
+        };
+        res.set_number(result);
+        if had_side_effects {
+          res.set_side_effects(true);
+        }
+        Some(res)
+      } else {
+        None
+      }
+    }
+    BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseXor | BinaryOperator::BitwiseOr => {
+      if let Some(left_number) = left.as_int()
+        && let Some(right_number) = right.as_int()
+      {
+        res.set_number(match expr.operator(ast) {
+          BinaryOperator::BitwiseAnd => left_number & right_number,
+          BinaryOperator::BitwiseXor => left_number ^ right_number,
+          BinaryOperator::BitwiseOr => left_number | right_number,
+          _ => unreachable!(),
+        } as f64);
+        if had_side_effects {
+          res.set_side_effects(true);
+        }
+        Some(res)
+      } else {
+        None
+      }
+    }
+    BinaryOperator::LessThan
+    | BinaryOperator::GreaterThan
+    | BinaryOperator::LessThanOrEqual
+    | BinaryOperator::GreaterThanOrEqual => {
+      if left.is_string() && right.is_string() {
+        let left_str = left.string();
+        let right_str = right.string();
+        res.set_bool(match expr.operator(ast) {
+          BinaryOperator::LessThan => left_str < right_str,
+          BinaryOperator::LessThanOrEqual => left_str <= right_str,
+          BinaryOperator::GreaterThan => left_str > right_str,
+          BinaryOperator::GreaterThanOrEqual => left_str >= right_str,
+          _ => unreachable!(),
+        });
+        Some(res)
+      } else if let Some(left_number) = left.as_number()
+        && let Some(right_number) = right.as_number()
+      {
+        res.set_bool(match expr.operator(ast) {
+          BinaryOperator::LessThan => left_number < right_number,
+          BinaryOperator::LessThanOrEqual => left_number <= right_number,
+          BinaryOperator::GreaterThan => left_number > right_number,
+          BinaryOperator::GreaterThanOrEqual => left_number >= right_number,
+          _ => unreachable!(),
+        });
+        Some(res)
+      } else {
+        None
+      }
+    }
     _ => None,
   }
 }
 
-fn join_locations(
-  start: Option<&DependencyLocation>,
-  end: Option<&DependencyLocation>,
-) -> (u32, u32) {
+pub fn eval_binary_expression<'parser>(
+  scanner: &mut JavascriptParser<'parser>,
+  expr: BinaryExpression,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = scanner.ast.ast;
+  let mut stack = vec![expr];
+  let mut left_expression = expr.left(ast);
+  while let Some(bin) = left_expression.as_binary_expression(ast) {
+    stack.push(bin);
+    left_expression = bin.left(ast);
+  }
+  let mut evaluated = None;
+  while let Some(expr) = stack.pop() {
+    let left = evaluated.unwrap_or_else(|| scanner.evaluate_expression(expr.left(ast)));
+    let drive = scanner.plugin_drive();
+    evaluated = drive
+      .evaluate_binary_expression(scanner, expr, &left)
+      .or_else(|| match expr.operator(ast) {
+        BinaryOperator::Equal => handle_abstract_equality_comparison(true, left, expr, scanner),
+        BinaryOperator::NotEqual => handle_abstract_equality_comparison(false, left, expr, scanner),
+        BinaryOperator::StrictEqual => handle_strict_equality_comparison(true, left, expr, scanner),
+        BinaryOperator::StrictNotEqual => {
+          handle_strict_equality_comparison(false, left, expr, scanner)
+        }
+        BinaryOperator::Add => handle_add(left, expr, scanner),
+        _ => handle_const_operation(left, expr, scanner),
+      })
+      .or_else(|| {
+        Some(BasicEvaluatedExpression::with_range(
+          expr.span(ast).real_lo(),
+          expr.span(ast).real_hi(),
+        ))
+      });
+  }
+  evaluated
+}
+
+pub fn eval_logical_expression<'parser>(
+  scanner: &mut JavascriptParser<'parser>,
+  expr: LogicalExpression,
+) -> Option<BasicEvaluatedExpression<'parser>> {
+  let ast = scanner.ast.ast;
+  let mut stack = vec![expr];
+  let mut left_expression = expr.left(ast);
+  while let Some(logical) = left_expression.as_logical_expression(ast) {
+    stack.push(logical);
+    left_expression = logical.left(ast);
+  }
+  let mut evaluated = None;
+  while let Some(expr) = stack.pop() {
+    let left = evaluated.unwrap_or_else(|| scanner.evaluate_expression(expr.left(ast)));
+    evaluated = match expr.operator(ast) {
+      LogicalOperator::And => handle_logical_and(left, expr, scanner),
+      LogicalOperator::Or => handle_logical_or(left, expr, scanner),
+      LogicalOperator::NullishCoalescing => handle_nullish_coalescing(left, expr, scanner),
+    }
+    .or_else(|| {
+      Some(BasicEvaluatedExpression::with_range(
+        expr.span(ast).real_lo(),
+        expr.span(ast).real_hi(),
+      ))
+    });
+  }
+  evaluated
+}
+
+fn join_locations(start: Option<&DependencyRange>, end: Option<&DependencyRange>) -> (u32, u32) {
   match (start, end) {
     (None, None) => unreachable!("invalid range"),
-    (None, Some(end)) => (end.start(), end.end()),
-    (Some(start), None) => (start.start(), start.end()),
-    (Some(start), Some(end)) => join_ranges(
-      Some((start.start(), start.end())),
-      Some((end.start(), end.end())),
-    ),
+    (None, Some(end)) => (end.start, end.end),
+    (Some(start), None) => (start.start, start.end),
+    (Some(start), Some(end)) => {
+      join_ranges(Some((start.start, start.end)), Some((end.start, end.end)))
+    }
   }
 }
 

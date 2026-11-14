@@ -1,221 +1,258 @@
 use std::{
-  fmt::{Debug, Display},
+  fmt::Display,
   ops::Deref,
   sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
   },
 };
 
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
-use regex::{Match, Regex};
+use derive_more::Debug;
+use memchr::{memchr2, memchr3};
+use rspack_cacheable::cacheable_dyn;
+use rspack_collections::Identifier;
 use rspack_error::Result;
-use rspack_identifier::{Identifiable, Identifier};
+use rspack_paths::{Utf8Path, Utf8PathBuf};
+use rspack_util::identifier::strip_zero_width_space_for_fragment;
 
-use crate::{runner::LoaderContext, BUILTIN_LOADER_PREFIX};
+use super::{Content, LoaderContext, LoaderFilter, LoaderRunnerOptions};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderExecutionKind {
+  Native,
+  JavaScript,
+}
 
 #[derive(Debug)]
-struct LoaderItemDataInner {
+struct LoaderFilterExecution {
+  filter: Arc<LoaderFilter>,
+  matched: AtomicBool,
+}
+
+impl LoaderFilterExecution {
+  fn new(filter: Arc<LoaderFilter>) -> Self {
+    Self {
+      filter,
+      matched: AtomicBool::new(false),
+    }
+  }
+}
+
+#[derive(Debug)]
+pub struct LoaderItem<Context: Send> {
+  #[debug("{}", loader.identifier())]
+  loader: Arc<dyn Loader<Context>>,
   /// Loader identifier
-  identifier: Box<str>,
+  request: Identifier,
   /// An absolute path or a virtual path for represent the loader.
   /// The absolute path is used to represent a loader stayed on the JS side.
   /// `$` split chain may be used to represent a composed loader chain from the JS side.
   /// Virtual path with a builtin protocol to represent a loader from the native side. e.g "builtin:".
-  path: Box<str>,
+  #[allow(dead_code)]
+  path: Utf8PathBuf,
   /// Query of a loader, starts with `?`
-  query: Option<Box<str>>,
+  #[allow(dead_code)]
+  query: Option<String>,
   /// Fragment of a loader, starts with `#`.
-  fragment: Option<Box<str>>,
-  #[allow(unused)]
-  meta: LoaderItemDataMeta,
-}
-
-#[derive(Debug)]
-enum LoaderItemData {
-  /// Composed JavaScript loaders
-  Composed(Vec<LoaderItemDataInner>),
-  /// Normal Loader
-  Normal(LoaderItemDataInner),
-}
-
-impl LoaderItemData {
-  fn is_composed(&self) -> bool {
-    matches!(self, LoaderItemData::Composed(_))
-  }
-}
-
-pub struct LoaderItem<C> {
-  pub(crate) loader: Arc<dyn Loader<C>>,
-  data: LoaderItemData,
+  #[allow(dead_code)]
+  fragment: Option<String>,
+  /// Data shared between pitching and normal
+  data: serde_json::Value,
+  r#type: String,
+  cache_options: Option<Box<LoaderRunnerOptions>>,
+  filter: Option<LoaderFilterExecution>,
+  execution_kind: LoaderExecutionKind,
   pitch_executed: AtomicBool,
   normal_executed: AtomicBool,
+  /// Whether loader was called with [LoaderContext::finish_with].
+  ///
+  /// Indicates that the loader has finished its work,
+  /// otherwise loader runner will reset [`LoaderContext::content`], [`LoaderContext::source_map`], [`LoaderContext::additional_data`].
+  ///
+  /// This flag is used to align with webpack's behavior:
+  /// If nothing is modified in the loader, the loader will reset the content, source map, and additional data.
+  finish_called: AtomicBool,
 }
 
-impl<C> Debug for LoaderItem<C> {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("LoaderItem")
-      .field("data", &self.data)
-      .field("loader", &self.loader.identifier())
-      .finish()
-  }
-}
-
-impl<C> LoaderItem<C> {
-  pub fn is_composed(&self) -> bool {
-    self.data.is_composed()
+impl<C: Send> LoaderItem<C> {
+  #[inline]
+  pub fn execution_kind(&self) -> LoaderExecutionKind {
+    self.execution_kind
   }
 
-  pub fn composed_index_by_identifier(&self, ident: &str) -> Option<u32> {
-    if let LoaderItemData::Composed(c) = &self.data {
-      c.iter().enumerate().find_map(|(idx, inner)| {
-        if &*inner.identifier == ident {
-          return Some(idx as u32);
-        }
-        None
-      })
-    } else {
-      None
-    }
+  pub fn loader(&self) -> &Arc<dyn Loader<C>> {
+    &self.loader
   }
 
-  pub(crate) fn pitch_executed(&self) -> bool {
+  #[inline]
+  pub fn request(&self) -> Identifier {
+    self.request
+  }
+
+  #[inline]
+  pub fn path(&self) -> &Utf8Path {
+    &self.path
+  }
+
+  #[inline]
+  pub fn query(&self) -> Option<&str> {
+    self.query.as_deref()
+  }
+
+  #[inline]
+  pub fn r#type(&self) -> &str {
+    &self.r#type
+  }
+
+  #[inline]
+  pub fn cache(&self) -> bool {
+    self.cache_options.is_some()
+  }
+
+  #[inline]
+  pub fn loader_name(&self) -> &str {
+    self
+      .cache_options
+      .as_deref()
+      .map_or("", |options| &options.loader_name)
+  }
+
+  #[inline]
+  pub fn options_cache_key(&self) -> &str {
+    self
+      .cache_options
+      .as_deref()
+      .map_or("", |options| &options.options_cache_key)
+  }
+
+  #[inline]
+  pub fn loader_version(&self) -> &str {
+    self
+      .cache_options
+      .as_deref()
+      .map_or("", |options| &options.loader_version)
+  }
+
+  #[inline]
+  pub fn cache_options(&self) -> Option<&LoaderRunnerOptions> {
+    self.cache_options.as_deref()
+  }
+
+  #[inline]
+  pub fn data(&self) -> &serde_json::Value {
+    &self.data
+  }
+
+  #[inline]
+  #[doc(hidden)]
+  pub fn set_data(&mut self, data: serde_json::Value) {
+    self.data = data;
+  }
+
+  #[inline]
+  #[doc(hidden)]
+  pub fn pitch_executed(&self) -> bool {
     self.pitch_executed.load(Ordering::Relaxed)
   }
 
-  pub(crate) fn normal_executed(&self) -> bool {
+  #[inline]
+  pub fn normal_executed(&self) -> bool {
     self.normal_executed.load(Ordering::Relaxed)
   }
 
-  pub(crate) fn set_pitch_executed(&self) {
+  #[inline]
+  pub fn filter(&self) -> Option<&LoaderFilter> {
+    self.filter.as_ref().map(|entry| entry.filter.as_ref())
+  }
+
+  #[inline]
+  pub fn filter_matched(&self) -> bool {
+    self
+      .filter
+      .as_ref()
+      .is_some_and(|entry| entry.matched.load(Ordering::Relaxed))
+  }
+
+  #[inline]
+  pub fn should_skip_normal(&self, content: Option<&Content>) -> bool {
+    let Some(entry) = &self.filter else {
+      return false;
+    };
+    if entry.matched.load(Ordering::Relaxed) {
+      return false;
+    }
+    let Some(content) = content else {
+      return false;
+    };
+    let content = match content {
+      Content::String(content) => content.as_str(),
+      Content::Buffer(content) => {
+        let Ok(content) = simdutf8::basic::from_utf8(content) else {
+          return false;
+        };
+        // Match the JS filter's TextDecoder view of a UTF-8 buffer.
+        content.strip_prefix('\u{feff}').unwrap_or(content)
+      }
+    };
+    let matched = entry.filter.matches(content);
+    if matched {
+      entry.matched.store(true, Ordering::Relaxed);
+    }
+    !matched
+  }
+
+  #[inline]
+  #[doc(hidden)]
+  pub fn finish_called(&self) -> bool {
+    self.finish_called.load(Ordering::Relaxed)
+  }
+
+  #[inline]
+  #[doc(hidden)]
+  pub fn set_pitch_executed(&self) {
     self.pitch_executed.store(true, Ordering::Relaxed)
   }
 
-  pub(crate) fn set_normal_executed(&self) {
+  #[inline]
+  #[doc(hidden)]
+  pub fn set_normal_executed(&self) {
     self.normal_executed.store(true, Ordering::Relaxed)
   }
 
-  pub fn __do_not_use_or_you_will_be_fired_set_normal_executed(&self) {
-    self.set_normal_executed()
-  }
-}
-
-bitflags::bitflags! {
-  #[derive(Debug)]
-  struct LoaderItemDataMeta: u8 {
-    /// Builtin loader
-    const BUILTIN = 1 << 0;
-    /// JS loader
-    const JS = 1 << 1;
-  }
-}
-
-impl LoaderItemDataMeta {
-  fn insert_builtin(&mut self) {
-    self.insert(Self::BUILTIN);
-  }
-  fn insert_js(&mut self) {
-    self.insert(Self::JS)
-  }
-  fn has_builtin(&self) -> bool {
-    self.contains(Self::BUILTIN)
-  }
-  fn has_js(&self) -> bool {
-    self.contains(Self::JS)
-  }
-}
-
-impl Display for LoaderItemDataMeta {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    let proto = if self.has_js() {
-      "js:"
-    } else if self.has_builtin() {
-      BUILTIN_LOADER_PREFIX
-    } else {
-      ""
-    };
-
-    write!(f, "{proto}")
-  }
-}
-
-impl From<&str> for LoaderItemDataMeta {
-  fn from(value: &str) -> Self {
-    let mut meta = Self::empty();
-
-    if value.starts_with(BUILTIN_LOADER_PREFIX) {
-      meta.insert_builtin();
+  #[inline]
+  #[doc(hidden)]
+  pub fn set_filter_matched(&self) {
+    if let Some(entry) = &self.filter {
+      entry.matched.store(true, Ordering::Relaxed);
     }
+  }
 
-    if value.starts_with("js:") {
-      meta.insert_js();
-    }
-
-    meta
+  #[inline]
+  #[doc(hidden)]
+  pub fn set_finish_called(&self) {
+    self.finish_called.store(true, Ordering::Relaxed)
   }
 }
 
-impl Display for LoaderItemDataInner {
+impl<C: Send> Display for LoaderItem<C> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(f, "{}", self.path)?;
-
-    if let Some(query) = &self.query {
-      if !query.starts_with('?') {
-        write!(f, "?")?;
-      }
-      write!(f, "{query}")?;
-    }
-    if let Some(fragment) = &self.fragment {
-      if !fragment.starts_with('#') {
-        write!(f, "#")?;
-      }
-      write!(f, "{fragment}")?;
-    }
-
-    Ok(())
-  }
-}
-
-impl Display for LoaderItemData {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(
-      f,
-      "{}",
-      match self {
-        Self::Composed(l) => l
-          .iter()
-          .map(|i| i.to_string())
-          .collect::<Vec<_>>()
-          .join("$"),
-        Self::Normal(l) => l.to_string(),
-      }
-    )?;
-
-    Ok(())
-  }
-}
-
-impl<C> Display for LoaderItem<C> {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(f, "{}", self.data)?;
-
-    Ok(())
+    write!(f, "{}", self.loader.identifier())
   }
 }
 
 #[derive(Debug)]
-pub struct LoaderItemList<'l, C>(pub &'l [LoaderItem<C>]);
+pub struct LoaderItemList<'a, Context: Send>(pub &'a [LoaderItem<Context>]);
 
-impl<'l, C> Deref for LoaderItemList<'l, C> {
-  type Target = [LoaderItem<C>];
+impl<Context: Send> Deref for LoaderItemList<'_, Context> {
+  type Target = [LoaderItem<Context>];
 
   fn deref(&self) -> &Self::Target {
     self.0
   }
 }
 
-impl<'l, C> Default for LoaderItemList<'l, C> {
+impl<Context: Send> Default for LoaderItemList<'_, Context> {
   fn default() -> Self {
     Self(&[])
   }
@@ -223,15 +260,17 @@ impl<'l, C> Default for LoaderItemList<'l, C> {
 
 pub trait DisplayWithSuffix: Display {
   fn display_with_suffix(&self, suffix: &str) -> String {
+    let s = self.to_string();
+    if s.is_empty() {
+      return suffix.to_string();
+    }
     self.to_string() + "!" + suffix
   }
 }
 
-impl<'l, C> DisplayWithSuffix for LoaderItemList<'l, C> {}
-impl<C> DisplayWithSuffix for LoaderItem<C> {}
-impl DisplayWithSuffix for LoaderItemData {}
-
-impl<'l, C> Display for LoaderItemList<'l, C> {
+impl<Context: Send> DisplayWithSuffix for LoaderItemList<'_, Context> {}
+impl<Context: Send> DisplayWithSuffix for LoaderItem<Context> {}
+impl<Context: Send> Display for LoaderItemList<'_, Context> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     let s = self
       .0
@@ -244,222 +283,250 @@ impl<'l, C> Display for LoaderItemList<'l, C> {
   }
 }
 
-impl<C> Identifiable for LoaderItem<C> {
-  fn identifier(&self) -> Identifier {
-    self.loader.identifier()
-  }
-}
-
+#[cacheable_dyn]
 #[async_trait]
-pub trait Loader<C = ()>: Identifiable + Send + Sync {
-  async fn run(&self, _loader_context: &mut LoaderContext<'_, C>) -> Result<()> {
+pub trait Loader<Context = ()>: Send + Sync
+where
+  Context: Send,
+{
+  /// Returns the unique identifier for this loader
+  fn identifier(&self) -> Identifier;
+
+  async fn run(&self, loader_context: &mut LoaderContext<Context>) -> Result<()> {
+    // If loader does not implement normal stage,
+    // it should inherit the result from the previous loader.
+    loader_context.current_loader().set_finish_called();
+    Ok(())
+  }
+
+  async fn pitch(&self, _loader_context: &mut LoaderContext<Context>) -> Result<()> {
     // noop
     Ok(())
   }
-  async fn pitch(&self, _loader_context: &mut LoaderContext<'_, C>) -> Result<()> {
-    // noop
-    Ok(())
+
+  /// Returns the loader type based on the module's package.json type field or file extension.
+  /// This affects how the loader context interprets the module (e.g., "commonjs", "module").
+  fn r#type(&self) -> Option<&str> {
+    None
+  }
+
+  /// Version identity used by loader caching.
+  fn cache_version(&self) -> Option<&str> {
+    None
+  }
+
+  /// Selects the runtime responsible for executing this loader.
+  fn execution_kind(&self) -> LoaderExecutionKind {
+    LoaderExecutionKind::Native
   }
 }
 
-impl<C> From<Arc<dyn Loader<C>>> for LoaderItem<C> {
+impl<C: Send> From<Arc<dyn Loader<C>>> for LoaderItem<C> {
   fn from(loader: Arc<dyn Loader<C>>) -> Self {
+    Self::new(loader, LoaderRunnerOptions::default(), None)
+  }
+}
+
+impl<C: Send> LoaderItem<C> {
+  pub(crate) fn new(
+    loader: Arc<dyn Loader<C>>,
+    options: LoaderRunnerOptions,
+    filter: Option<Arc<LoaderFilter>>,
+  ) -> Self {
+    let cache_options = options.cache.then(|| Box::new(options));
+    let filter = filter.map(LoaderFilterExecution::new);
+    let ident = &**loader.identifier();
+    let execution_kind = loader.execution_kind();
+    if let Some(r#type) = loader.r#type() {
+      let ResourceParsedData {
+        path,
+        query,
+        fragment,
+      } = parse_resource(ident).expect("identifier should be valid");
+      let ty = r#type.to_string();
+      return Self {
+        loader,
+        request: ident.into(),
+        path,
+        query,
+        fragment,
+        data: serde_json::Value::Null,
+        r#type: ty,
+        cache_options,
+        filter,
+        execution_kind,
+        pitch_executed: AtomicBool::new(false),
+        normal_executed: AtomicBool::new(false),
+        finish_called: AtomicBool::new(false),
+      };
+    }
     let ident = loader.identifier();
-
-    // Passthrough composed Node loader
-    let data = if ident.contains('$') {
-      let loaders = ident
-        .split('$')
-        .map(convert_to_loader_item_inner)
-        .collect::<Vec<_>>();
-      assert!(loaders.len() > 1);
-      LoaderItemData::Composed(loaders)
-    } else {
-      LoaderItemData::Normal(convert_to_loader_item_inner(&ident))
-    };
-
+    let ResourceParsedData {
+      path,
+      query,
+      fragment,
+    } = parse_resource(&ident).expect("identifier should be valid");
     Self {
-      data,
       loader,
+      request: ident,
+      path,
+      query,
+      fragment,
+      data: serde_json::Value::Null,
+      r#type: String::default(),
+      cache_options,
+      filter,
+      execution_kind,
       pitch_executed: AtomicBool::new(false),
       normal_executed: AtomicBool::new(false),
+      finish_called: AtomicBool::new(false),
     }
   }
 }
 
-static PATH_QUERY_FRAGMENT_REGEXP: Lazy<Regex> = Lazy::new(|| {
-  Regex::new("^((?:\0.|[^?#\0])*)(\\?(?:\0.|[^#\0])*)?(#.*)?$")
-    .expect("Failed to initialize `PATH_QUERY_FRAGMENT_REGEXP`")
-});
-
-fn to_segment_owned(v: Option<Match<'_>>) -> Option<String> {
-  v.map(|v| v.as_str().to_owned())
+#[derive(Debug)]
+pub struct ResourceParsedData {
+  pub path: Utf8PathBuf,
+  pub query: Option<String>,
+  pub fragment: Option<String>,
 }
 
-fn convert_to_loader_item_inner(ident: &str) -> LoaderItemDataInner {
-  let groups = PATH_QUERY_FRAGMENT_REGEXP
-    .captures(ident)
-    .expect("Group expected");
+pub fn parse_resource(resource: &str) -> Option<ResourceParsedData> {
+  let (path, query, fragment) = path_query_fragment(resource);
 
-  LoaderItemDataInner {
-    identifier: ident.into(),
-    path: to_segment_owned(groups.get(1))
-      .expect("Path expected")
+  Some(ResourceParsedData {
+    path: strip_zero_width_space_for_fragment(path)
+      .into_owned()
       .into(),
-    query: to_segment_owned(groups.get(2)).map(Into::into),
-    fragment: to_segment_owned(groups.get(3)).map(Into::into),
-    meta: ident.into(),
+    query: query.map(|q| strip_zero_width_space_for_fragment(q).into_owned()),
+    fragment: fragment.map(|f| f.to_owned()),
+  })
+}
+
+fn path_query_fragment(input: &str) -> (&str, Option<&str>, Option<&str>) {
+  #[cfg(windows)]
+  let prefix_len = rspack_paths::dos_device_path_prefix_len(input);
+  #[cfg(not(windows))]
+  let prefix_len = 0;
+
+  let path_end = prefix_len + find_resource_delimiter(&input[prefix_len..], true);
+  let (path, rest) = input.split_at(path_end);
+  let (query, rest) = if let Some(query_body) = rest.strip_prefix('?') {
+    let (query, rest) = rest.split_at(1 + find_resource_delimiter(query_body, false));
+    (Some(query), rest)
+  } else {
+    (None, rest)
+  };
+  (path, query, rest.starts_with('#').then_some(rest))
+}
+
+fn find_resource_delimiter(input: &str, allow_query: bool) -> usize {
+  const ESCAPE_START: u8 = 0xe2; // The first UTF-8 byte of U+200B.
+
+  let mut offset = 0;
+  loop {
+    let tail = &input[offset..];
+    let bytes = tail.as_bytes();
+    let next = if allow_query {
+      memchr3(b'?', b'#', ESCAPE_START, bytes)
+    } else {
+      memchr2(b'#', ESCAPE_START, bytes)
+    };
+    let Some(next) = next else {
+      return input.len();
+    };
+    if bytes[next] != ESCAPE_START {
+      return offset + next;
+    }
+
+    // The UTF-8 leading byte can also match other characters.
+    let mut chars = tail[next..].chars();
+    if chars.next() == Some('\u{200b}') && chars.next().is_none() {
+      // A trailing escape ends the path or query without becoming part of it.
+      return offset + next;
+    }
+    offset = input.len() - chars.as_str().len();
   }
 }
 
 #[cfg(test)]
 pub(crate) mod test {
-  use std::sync::Arc;
+  use std::{path::PathBuf, sync::Arc};
 
-  use rspack_error::{error, Result};
-  use rspack_identifier::{Identifiable, Identifier};
+  use rspack_cacheable::{cacheable, cacheable_dyn};
+  use rspack_collections::Identifier;
 
-  use super::{
-    Loader, LoaderContext, LoaderItem, LoaderItemData, LoaderItemDataInner, LoaderItemDataMeta,
-    LoaderItemList,
-  };
+  use super::{Loader, LoaderItem};
 
-  impl LoaderItemData {
-    fn try_as_normal(&self) -> Result<&LoaderItemDataInner> {
-      match self {
-        LoaderItemData::Normal(i) => Ok(i),
-        _ => Err(error!("Failed to cast to normal loader")),
-      }
-    }
-
-    fn try_as_composed(&self) -> Result<&[LoaderItemDataInner]> {
-      match self {
-        LoaderItemData::Composed(i) => Ok(i),
-        _ => Err(error!("Failed to cast to composed loader")),
-      }
-    }
-  }
-
+  #[cacheable]
+  #[allow(dead_code)]
   pub(crate) struct Custom;
-
+  #[cacheable_dyn]
   #[async_trait::async_trait]
   impl Loader<()> for Custom {
-    async fn run(&self, _loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
-      Ok(())
-    }
-    async fn pitch(&self, _loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
-      Ok(())
-    }
-  }
-
-  impl Identifiable for Custom {
     fn identifier(&self) -> Identifier {
       "/rspack/custom-loader-1/index.js?foo=1#baz".into()
     }
   }
 
+  #[cacheable]
+  #[allow(dead_code)]
   pub(crate) struct Custom2;
-
+  #[cacheable_dyn]
   #[async_trait::async_trait]
   impl Loader<()> for Custom2 {
-    async fn run(&self, _loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
-      Ok(())
-    }
-    async fn pitch(&self, _loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
-      Ok(())
-    }
-  }
-
-  impl Identifiable for Custom2 {
     fn identifier(&self) -> Identifier {
       "/rspack/custom-loader-2/index.js?bar=2#baz".into()
     }
   }
 
-  pub(crate) struct Composed;
-
-  #[async_trait::async_trait]
-  impl Loader<()> for Composed {
-    async fn run(&self, _loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
-      Ok(())
-    }
-    async fn pitch(&self, _loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
-      Ok(())
-    }
-  }
-
-  impl Identifiable for Composed {
-    fn identifier(&self) -> Identifier {
-      "/rspack/style-loader/index.js?foo=1#baz$/rspack/css-loader/index.js?bar=2#qux".into()
-    }
-  }
-
+  #[cacheable]
+  #[allow(dead_code)]
   pub(crate) struct Builtin;
-
+  #[cacheable_dyn]
   #[async_trait::async_trait]
   impl Loader<()> for Builtin {
-    async fn run(&self, _loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
-      Ok(())
-    }
-    async fn pitch(&self, _loader_context: &mut LoaderContext<'_, ()>) -> Result<()> {
-      Ok(())
-    }
-  }
-
-  impl Identifiable for Builtin {
     fn identifier(&self) -> Identifier {
       "builtin:test-loader".into()
     }
   }
 
-  #[test]
-  fn should_extract_and_compose_loader_info_correctly() {
-    let c1 = Arc::new(Custom) as Arc<dyn Loader<()>>;
-    let c2 = Arc::new(Custom2) as Arc<dyn Loader<()>>;
-    let l: Vec<LoaderItem<()>> = vec![c1.into(), c2.into()];
-    let item = l[0].data.try_as_normal().unwrap();
-    assert_eq!(item.path, "/rspack/custom-loader-1/index.js".into());
-    assert_eq!(item.query, Some("?foo=1".into()));
-    assert_eq!(item.fragment, Some("#baz".into()));
-    let ll = LoaderItemList(&l[..]);
-    assert_eq!(
-      ll.to_string(),
-      "/rspack/custom-loader-1/index.js?foo=1#baz!/rspack/custom-loader-2/index.js?bar=2#baz"
-    );
+  #[cacheable]
+  pub(crate) struct PosixNonLenBlankUnicode;
+
+  #[cacheable_dyn]
+  #[async_trait::async_trait]
+  impl Loader<()> for PosixNonLenBlankUnicode {
+    fn identifier(&self) -> Identifier {
+      "/a/b/c.js?{\"c\": \"\u{200b}#foo\"}".into()
+    }
+  }
+
+  #[cacheable]
+  pub(crate) struct WinNonLenBlankUnicode;
+  #[cacheable_dyn]
+  #[async_trait::async_trait]
+  impl Loader<()> for WinNonLenBlankUnicode {
+    fn identifier(&self) -> Identifier {
+      "\\a\\b\\c.js?{\"c\": \"\u{200b}#foo\"}".into()
+    }
   }
 
   #[test]
-  fn should_extract_composed_loader_correctly() {
-    let c1 = Arc::new(Composed) as Arc<dyn Loader<()>>;
-    let ident = c1.identifier();
+  fn should_handle_posix_non_len_blank_unicode_correctly() {
+    let c1 = Arc::new(PosixNonLenBlankUnicode) as Arc<dyn Loader<()>>;
     let l: LoaderItem<()> = c1.into();
-    let items = l.data.try_as_composed().unwrap();
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].path, "/rspack/style-loader/index.js".into());
-    assert_eq!(items[0].query, Some("?foo=1".into()));
-    assert_eq!(items[0].fragment, Some("#baz".into()));
-
-    assert_eq!(items[1].path, "/rspack/css-loader/index.js".into());
-    assert_eq!(items[1].query, Some("?bar=2".into()));
-    assert_eq!(items[1].fragment, Some("#qux".into()));
-
-    let i = &[l];
-    let ll = LoaderItemList(i);
-    assert_eq!(ll.to_string(), ident.to_string());
+    assert_eq!(l.path, PathBuf::from("/a/b/c.js"));
+    assert_eq!(l.query, Some("?{\"c\": \"#foo\"}".into()));
+    assert_eq!(l.fragment, None);
   }
 
   #[test]
-  fn should_handle_builtin_loader_correctly() {
-    let c1 = Arc::new(Builtin) as Arc<dyn Loader<()>>;
-    let ident1 = c1.identifier();
+  fn should_handle_win_non_len_blank_unicode_correctly() {
+    let c1 = Arc::new(WinNonLenBlankUnicode) as Arc<dyn Loader<()>>;
     let l: LoaderItem<()> = c1.into();
-    let item = l.data.try_as_normal().unwrap();
-    assert!(item.meta.contains(LoaderItemDataMeta::BUILTIN));
-
-    let c2 = Arc::new(Composed) as Arc<dyn Loader<()>>;
-    let ident2 = c2.identifier();
-    let l = vec![l, c2.into()];
-    let ll = LoaderItemList(&l[..]);
-    assert_eq!(ll.to_string(), ident1.to_string() + "!" + ident2.as_str());
+    assert_eq!(l.path, PathBuf::from(r#"\a\b\c.js"#));
+    assert_eq!(l.query, Some("?{\"c\": \"#foo\"}".into()));
+    assert_eq!(l.fragment, None);
   }
 }

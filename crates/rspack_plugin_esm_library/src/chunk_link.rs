@@ -1,0 +1,384 @@
+use std::{borrow::Cow, sync::Arc};
+
+use rspack_collections::{IdentifierIndexMap, IdentifierIndexSet, IdentifierMap, IdentifierSet};
+use rspack_core::{
+  BoxChunkInitFragment, ChunkGraph, ChunkUkey, Compilation, ConcatenationNameAllocator, ImportSpec,
+  ModuleGraph, ModuleIdentifier, RuntimeCodeTemplate, RuntimeGlobals,
+  rspack_sources::{ConcatSource, RawStringSource},
+};
+use rspack_intern::{Atom, AtomMap, IndexAtomMap, IndexAtomSet};
+use rspack_util::fx_hash::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet};
+
+#[derive(Debug, Clone)]
+pub enum Ref {
+  Symbol(SymbolRef),
+  Inline(String),
+}
+
+impl Ref {
+  pub fn render(&self) -> Cow<'_, str> {
+    match self {
+      Ref::Symbol(symbol_ref) => Cow::Owned(symbol_ref.render()),
+      Ref::Inline(inline) => Cow::Borrowed(inline),
+    }
+  }
+}
+
+#[derive(Clone)]
+pub struct SymbolRef {
+  pub module: ModuleIdentifier,
+  pub symbol: Atom,
+  pub ids: Vec<Atom>,
+  renderer: Arc<dyn Fn(&SymbolRef) -> String + Send + Sync>,
+}
+
+impl std::fmt::Debug for SymbolRef {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SymbolRef")
+      .field("module", &self.module)
+      .field("symbol", &self.symbol)
+      .field("ids", &self.ids)
+      .finish()
+  }
+}
+
+impl SymbolRef {
+  pub fn new(
+    module: ModuleIdentifier,
+    symbol: Atom,
+    ids: Vec<Atom>,
+    renderer: Arc<dyn Fn(&SymbolRef) -> String + Send + Sync>,
+  ) -> Self {
+    Self {
+      module,
+      symbol,
+      ids,
+      renderer,
+    }
+  }
+
+  pub fn render(&self) -> String {
+    (self.renderer)(self)
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalInterop {
+  pub module: ModuleIdentifier,
+  pub from_module: IdentifierSet,
+  pub set_entry_module_id: bool,
+  pub required_symbol: Option<Atom>,
+  pub default_access: Option<Atom>,
+  pub default_exported: Option<Atom>,
+  pub namespace_object: Option<Atom>,
+  pub namespace_object2: Option<Atom>,
+  pub property_access: IndexAtomMap<Atom>,
+}
+
+fn get_or_create_interop_name(
+  required_symbol: &mut Option<Atom>,
+  field: &mut Option<Atom>,
+  suffix: &str,
+  name_allocator: &mut ConcatenationNameAllocator,
+) -> Atom {
+  if required_symbol.is_none() {
+    let new_name = name_allocator.find_new_name("", &[]);
+    *required_symbol = Some(new_name);
+  }
+  if let Some(existing) = field {
+    return existing.clone();
+  }
+  let mut new_name = Atom::new(format!(
+    "{}{}",
+    required_symbol.as_ref().expect("already set"),
+    suffix
+  ));
+  if name_allocator.contains(&new_name) {
+    new_name = name_allocator.find_new_name(new_name.as_str(), &[]);
+  } else {
+    name_allocator.insert(new_name.clone());
+  }
+  *field = Some(new_name.clone());
+  new_name
+}
+
+impl ExternalInterop {
+  pub fn namespace(&mut self, name_allocator: &mut ConcatenationNameAllocator) -> Atom {
+    get_or_create_interop_name(
+      &mut self.required_symbol,
+      &mut self.namespace_object,
+      "_namespace",
+      name_allocator,
+    )
+  }
+
+  pub fn namespace2(&mut self, name_allocator: &mut ConcatenationNameAllocator) -> Atom {
+    get_or_create_interop_name(
+      &mut self.required_symbol,
+      &mut self.namespace_object2,
+      "_namespace2",
+      name_allocator,
+    )
+  }
+
+  pub fn default_access(&mut self, name_allocator: &mut ConcatenationNameAllocator) -> Atom {
+    get_or_create_interop_name(
+      &mut self.required_symbol,
+      &mut self.default_access,
+      "_default",
+      name_allocator,
+    )
+  }
+
+  pub fn default_exported(&mut self, name_allocator: &mut ConcatenationNameAllocator) -> Atom {
+    if self.required_symbol.is_none() {
+      let new_name = name_allocator.find_new_name("", &[]);
+      self.required_symbol = Some(new_name);
+    }
+
+    if let Some(default_exported) = &self.default_exported {
+      return default_exported.clone();
+    }
+
+    let default_access_symbol = self.default_access(name_allocator);
+    let default_exported_symbol = name_allocator.find_new_name(&default_access_symbol, &[]);
+    self.default_exported = Some(default_exported_symbol.clone());
+    default_exported_symbol
+  }
+
+  pub fn property_access(
+    &mut self,
+    atom: &Atom,
+    name_allocator: &mut ConcatenationNameAllocator,
+  ) -> Atom {
+    self.property_access.get(atom).cloned().unwrap_or_else(|| {
+      let local_name = name_allocator.find_new_name(atom, &[]);
+      self.property_access.insert(atom.clone(), local_name);
+      self
+        .property_access
+        .get(atom)
+        .expect("just inserted")
+        .clone()
+    })
+  }
+
+  pub fn render(
+    &self,
+    compilation: &Compilation,
+    runtime_template: &RuntimeCodeTemplate,
+  ) -> ConcatSource {
+    let mut source = ConcatSource::default();
+    let name = self.required_symbol.as_ref();
+
+    let is_async = ModuleGraph::is_async(&compilation.async_modules_artifact, &self.module);
+    let module_id = ChunkGraph::get_module_id(&compilation.module_ids_artifact, self.module)
+      .unwrap_or_else(|| panic!("should set module id for {:?}", self.module));
+    let mut module_id_expr = rspack_util::json_stringify(module_id.as_str());
+    if self.set_entry_module_id {
+      module_id_expr = format!(
+        "{} = {module_id_expr}",
+        runtime_template.render_runtime_globals(&RuntimeGlobals::ENTRY_MODULE_ID)
+      );
+    }
+
+    if let Some(name) = name {
+      source.add(RawStringSource::from(format!(
+        // this render only happens at top level scope of the chunk
+        "const {name} = {}{}({});\n",
+        if is_async { "await " } else { "" },
+        runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+        module_id_expr
+      )));
+
+      if let Some(namespace_object) = &self.namespace_object {
+        source.add(RawStringSource::from(format!(
+          "var {} = /*#__PURE__*/{}({}, 2);\n",
+          namespace_object,
+          runtime_template.render_runtime_globals(&RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT),
+          name
+        )));
+      }
+
+      if let Some(namespace_object) = &self.namespace_object2 {
+        source.add(RawStringSource::from(format!(
+          "var {} = /*#__PURE__*/{}({});\n",
+          namespace_object,
+          runtime_template.render_runtime_globals(&RuntimeGlobals::CREATE_FAKE_NAMESPACE_OBJECT),
+          name
+        )));
+      }
+
+      if let Some(default_access) = &self.default_access {
+        source.add(RawStringSource::from(format!(
+          "var {} = /*#__PURE__*/{}({});\n",
+          default_access,
+          runtime_template.render_runtime_globals(&RuntimeGlobals::COMPAT_GET_DEFAULT_EXPORT),
+          name
+        )));
+
+        if let Some(default_exported_symbol) = &self.default_exported {
+          source.add(RawStringSource::from(format!(
+            "var {default_exported_symbol} = {default_access}();\n",
+          )));
+        }
+      }
+
+      for (s, local) in &self.property_access {
+        source.add(RawStringSource::from(format!(
+          "var {local} = {name}.{s};\n"
+        )));
+      }
+    } else {
+      source.add(RawStringSource::from(format!(
+        "{}{}({});\n",
+        if is_async { "await " } else { "" },
+        runtime_template.render_runtime_globals(&RuntimeGlobals::REQUIRE),
+        module_id_expr
+      )));
+    }
+
+    source
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReExportFrom {
+  Chunk(ChunkUkey),
+  Request(String),
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+pub enum RawImportSource {
+  Chunk(ChunkUkey),
+  Source((String, Option<String>)),
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkLinkContext {
+  pub chunk: ChunkUkey,
+
+  pub decl_before_exports: FxIndexSet<String>,
+
+  /**
+  specifier order doesn't matter, we can sort them based on name
+  Map<module_id, Map<local_name, export_name>>
+  */
+  exports: AtomMap<IndexAtomSet>,
+
+  /**
+  symbols that this chunk provides
+  */
+  pub exported_symbols: FxHashSet<Atom>,
+
+  /**
+  exports that need to be re-exported
+  Map<chunk, Map<local_name, export_name>>
+  */
+  re_exports: FxIndexMap<ReExportFrom, FxHashMap<Atom, FxHashSet<Atom>>>,
+
+  /**
+   * re exports in raw form, used for rendering export * from 'module'
+   */
+  pub raw_star_exports: FxIndexMap<String, IndexAtomSet>,
+
+  /**
+  import order matters, it affects execution order
+  */
+  pub imports: IdentifierIndexMap<FxHashMap<Atom, Atom>>,
+
+  /**
+  raw import statements
+   */
+  pub raw_import_stmts: FxIndexMap<RawImportSource, ImportSpec>,
+
+  /**
+  namespace imports already provided by module init fragments
+   */
+  pub module_external_namespace_imports: FxHashMap<RawImportSource, Atom>,
+
+  /**
+  `const symbol = __rspack_require(module_id)`
+  */
+  pub required: IdentifierIndexMap<ExternalInterop>,
+
+  /**
+  which module needs namespace objects
+  */
+  pub needed_namespace_objects: IdentifierIndexSet,
+
+  pub namespace_object_sources: IdentifierMap<String>,
+
+  pub init_fragments: Vec<BoxChunkInitFragment>,
+
+  pub hashbang: Option<String>,
+
+  pub directives: Vec<String>,
+
+  /**
+  modules that can be scope hoisted
+  */
+  pub hoisted_modules: IdentifierIndexSet,
+
+  /**
+  modules that needs wrapper
+  */
+  pub decl_modules: IdentifierIndexSet,
+
+  /**
+  modules that needs wrapper
+  */
+  pub refs: FxHashMap<String, Ref>,
+
+  /**
+  Allocator for all symbols used in the current chunk.
+  */
+  pub name_allocator: ConcatenationNameAllocator,
+}
+
+impl ChunkLinkContext {
+  pub fn new(
+    chunk_ukey: ChunkUkey,
+    hoisted_modules: IdentifierIndexSet,
+    decl_modules: IdentifierIndexSet,
+  ) -> Self {
+    ChunkLinkContext {
+      chunk: chunk_ukey,
+      hoisted_modules,
+      decl_modules,
+      decl_before_exports: Default::default(),
+      exports: Default::default(),
+      re_exports: Default::default(),
+      imports: Default::default(),
+      required: Default::default(),
+      needed_namespace_objects: Default::default(),
+      namespace_object_sources: Default::default(),
+      init_fragments: Default::default(),
+      hashbang: None,
+      directives: Default::default(),
+      refs: Default::default(),
+      name_allocator: Default::default(),
+      exported_symbols: Default::default(),
+      raw_import_stmts: Default::default(),
+      module_external_namespace_imports: Default::default(),
+      raw_star_exports: Default::default(),
+    }
+  }
+
+  pub fn exports(&self) -> &AtomMap<IndexAtomSet> {
+    &self.exports
+  }
+
+  pub fn exports_mut(&mut self) -> &mut AtomMap<IndexAtomSet> {
+    &mut self.exports
+  }
+
+  pub fn re_exports(&self) -> &FxIndexMap<ReExportFrom, FxHashMap<Atom, FxHashSet<Atom>>> {
+    &self.re_exports
+  }
+
+  pub fn re_exports_mut(
+    &mut self,
+  ) -> &mut FxIndexMap<ReExportFrom, FxHashMap<Atom, FxHashSet<Atom>>> {
+    &mut self.re_exports
+  }
+}

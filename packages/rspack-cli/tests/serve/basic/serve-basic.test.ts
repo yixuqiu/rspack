@@ -1,10 +1,13 @@
-import { normalizeStderr, runWatch } from "../../utils/test-utils";
+import { normalizeStdout, runWatch } from '../../utils/test-utils';
 
-describe("basic serve usage", () => {
-	it.skip("should work", async () => {
-		const { stderr } = await runWatch(__dirname, ["serve"]);
+describe('basic serve usage', () => {
+  it('should work', async () => {
+    const { stdout } = await runWatch(__dirname, ['serve'], {
+      killString: /localhost/,
+    });
 
-		// @todo current server implementation is too buggy to test
-		expect(normalizeStderr(stderr)).toBeTruthy;
-	});
+    expect(normalizeStdout(stdout)).toMatch(
+      /Local:\s+http:\/\/localhost:\d+\//,
+    );
+  });
 });

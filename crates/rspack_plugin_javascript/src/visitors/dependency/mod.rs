@@ -1,106 +1,100 @@
 mod context_dependency_helper;
-mod context_helper;
 mod parser;
 mod util;
 
-use rspack_ast::javascript::Program;
-use rspack_core::needs_refactor::WorkerSyntaxList;
 use rspack_core::{
-  AsyncDependenciesBlock, BoxDependency, BoxDependencyTemplate, BuildInfo, ParserOptions,
+  ArcComputed, AsyncDependenciesBlock, BoxDependency, BuildInfo, BuildMeta, CompilerOptions,
+  DependencyCodeGenerationRef, FactoryMeta, ImportMeta, ModuleIdentifier, ModuleLayer, ModuleType,
+  ParseMeta, ParserOptions, ResolvedModuleOptions, ResourceData, SideEffectsBailoutItemWithSpan,
+  ValueCacheVersions,
 };
-use rspack_core::{BuildMeta, CompilerOptions, ModuleIdentifier, ModuleType, ResourceData};
-use rspack_error::miette::Diagnostic;
-use rustc_hash::FxHashMap;
-use swc_core::common::comments::Comments;
-use swc_core::common::{SourceFile, Span};
-use swc_core::ecma::atoms::Atom;
+use rspack_error::Diagnostic;
+use rspack_util::swc::RspackComments;
+use rustc_hash::FxHashSet;
+use swc_next_ecma_ast::{Ast, Program};
+use swc_next_ecma_semantic::Semantic;
 
-pub use self::context_dependency_helper::create_context_dependency;
-pub use self::context_helper::{scanner_context_module, ContextModuleScanResult};
-pub use self::parser::{CallExpressionInfo, CallHooksName, ExportedVariableInfo};
-pub use self::parser::{JavascriptParser, MemberExpressionInfo, TagInfoData, TopLevelScope};
-pub use self::util::*;
-use crate::dependency::Specifier;
-
-#[derive(Debug)]
-pub struct ImporterReferenceInfo {
-  pub request: Atom,
-  pub specifier: Specifier,
-  pub names: Option<Atom>,
-  pub source_order: i32,
-}
-
-impl ImporterReferenceInfo {
-  pub fn new(request: Atom, specifier: Specifier, names: Option<Atom>, source_order: i32) -> Self {
-    Self {
-      request,
-      specifier,
-      names,
-      source_order,
-    }
-  }
-}
-
-pub type ImportMap = FxHashMap<swc_core::ecma::ast::Id, ImporterReferenceInfo>;
+pub(crate) use self::parser::{StatementPath, member_property_key_to_atom};
+pub use self::{
+  context_dependency_helper::{ContextModuleScanResult, create_context_dependency},
+  parser::{
+    AllowedMemberTypes, AtomMembers, CallExpressionInfo, CallHooksName,
+    DestructuringAssignmentProperties, DestructuringAssignmentProperty, ExportedVariableInfo,
+    ExpressionExpressionInfo, JavascriptParser, MemberExpressionInfo, MemberRanges,
+    OptionalMembers, PatRef, RootName, ScopeTerminated, TagInfoData, TopLevelScope, estree::*,
+  },
+  util::*,
+};
+use crate::{BoxJavascriptParserPlugin, parser_and_generator::ParserRuntimeRequirementsData};
 
 pub struct ScanDependenciesResult {
   pub dependencies: Vec<BoxDependency>,
-  pub blocks: Vec<AsyncDependenciesBlock>,
-  pub presentational_dependencies: Vec<BoxDependencyTemplate>,
-  pub usage_span_record: FxHashMap<Span, ExtraSpanInfo>,
-  pub import_map: ImportMap,
-  pub warning_diagnostics: Vec<Box<dyn Diagnostic + Send + Sync>>,
+  pub blocks: Vec<Box<AsyncDependenciesBlock>>,
+  pub presentational_dependencies: Vec<DependencyCodeGenerationRef>,
+  pub warning_diagnostics: Vec<Diagnostic>,
+  pub side_effects_item: Option<SideEffectsBailoutItemWithSpan>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub enum ExtraSpanInfo {
-  #[default]
-  ReWriteUsedByExports,
-  // (symbol, usage)
-  // (local, exported) refer https://github.com/webpack/webpack/blob/ac7e531436b0d47cd88451f497cdfd0dad41535d/lib/javascript/JavascriptParser.js#L2347-L2352
-  AddVariableUsage(Vec<(Atom, Atom)>),
+pub struct ParsedJavaScriptAst<'ast> {
+  pub ast: &'ast Ast<'ast>,
+  pub comments: &'ast RspackComments<'ast>,
+  pub semantic: &'ast Semantic<'ast>,
+  pub program: Program,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn scan_dependencies(
-  source_file: &SourceFile,
-  program: &Program,
-  worker_syntax_list: &mut WorkerSyntaxList,
+  source: &str,
+  ast: &ParsedJavaScriptAst<'_>,
   resource_data: &ResourceData,
   compiler_options: &CompilerOptions,
+  value_cache_versions: &ValueCacheVersions,
   module_type: &ModuleType,
-  build_info: &mut BuildInfo,
+  module_layer: Option<&ModuleLayer>,
+  factory_meta: Option<&FactoryMeta>,
   build_meta: &mut BuildMeta,
+  build_info: &mut BuildInfo,
   module_identifier: ModuleIdentifier,
   module_parser_options: Option<&ParserOptions>,
-) -> Result<ScanDependenciesResult, Vec<Box<dyn Diagnostic + Send + Sync>>> {
-  let mut parser = JavascriptParser::new(
-    source_file,
+  import_meta: ArcComputed<ResolvedModuleOptions, ImportMeta>,
+  semicolons: &mut FxHashSet<u32>,
+  parser_plugins: &mut Vec<BoxJavascriptParserPlugin>,
+  parse_meta: ParseMeta,
+  parser_runtime_requirements: &ParserRuntimeRequirementsData,
+) -> Result<ScanDependenciesResult, Vec<Diagnostic>> {
+  let javascript_options = module_parser_options
+    .and_then(|p| p.get_javascript())
+    .expect("should at least have a global javascript parser options");
+  // The drive is owned here and borrowed by the parser: hooks receive
+  // `&mut parser`, so a parser that owned its drive could not lend it out
+  // without cloning the handle on every hook call.
+  let plugin_drive = JavascriptParser::build_plugin_drive(
     compiler_options,
-    module_parser_options
-      .and_then(|p| p.get_javascript())
-      .expect("should at least have a global javascript parser options"),
-    program.comments.as_ref().map(|c| c as &dyn Comments),
+    javascript_options,
+    module_type,
+    import_meta,
+    build_info,
+    parser_plugins,
+  );
+  let mut parser = JavascriptParser::new(
+    source,
+    ast,
+    compiler_options,
+    value_cache_versions,
+    javascript_options,
+    &plugin_drive,
     &module_identifier,
     module_type,
-    worker_syntax_list,
+    module_layer,
     resource_data,
+    factory_meta,
     build_meta,
     build_info,
+    semicolons,
+    parse_meta,
+    parser_runtime_requirements,
   );
 
-  parser.walk_program(program.get_inner_program());
-
-  if parser.errors.is_empty() {
-    Ok(ScanDependenciesResult {
-      dependencies: parser.dependencies,
-      blocks: parser.blocks,
-      presentational_dependencies: parser.presentational_dependencies,
-      usage_span_record: parser.rewrite_usage_span,
-      import_map: parser.import_map,
-      warning_diagnostics: parser.warning_diagnostics,
-    })
-  } else {
-    Err(parser.errors)
-  }
+  parser.walk_program(ast.program);
+  parser.into_results()
 }

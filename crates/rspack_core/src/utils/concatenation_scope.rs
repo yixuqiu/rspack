@@ -1,48 +1,119 @@
-use std::collections::hash_map::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use indexmap::IndexMap;
-use once_cell::sync::Lazy;
-use regex::Regex;
-use swc_core::atoms::Atom;
+use anymap::CloneAny;
+use rspack_cacheable::{
+  cacheable,
+  with::{AsCacheable, AsMap, AsOption, AsPreset, AsVec},
+};
+use rspack_collections::IdentifierIndexMap;
+use rspack_intern::Atom;
+use rspack_util::{fx_hash::FxIndexMap, itoa};
+use rustc_hash::FxHashMap as HashMap;
 
-use crate::concatenated_module::{ConcatenatedModuleInfo, ModuleInfo};
-use crate::ModuleIdentifier;
+use crate::{
+  ModuleIdentifier,
+  concatenated_module::{ConcatenatedImportMap, ConcatenatedModuleInfo, ModuleInfo},
+};
 
-pub const DEFAULT_EXPORT: &str = "__WEBPACK_DEFAULT_EXPORT__";
-pub const NAMESPACE_OBJECT_EXPORT: &str = "__WEBPACK_NAMESPACE_OBJECT__";
+pub static DEFAULT_EXPORT_ATOM: LazyLock<Atom> = LazyLock::new(|| "__rspack_default_export".into());
+pub const NAMESPACE_OBJECT_EXPORT: &str = "__rspack_ns_object";
+pub const DEFAULT_EXPORT: &str = "__rspack_default_export";
+const MODULE_REFERENCE_PREFIX: &str = "__rspack_module_ref";
+const MODULE_REFERENCE_PROPERTY_ACCESS_SUFFIX: &str = "._";
 
-static MODULE_REFERENCE_REGEXP: Lazy<Regex> = once_cell::sync::Lazy::new(|| {
-  Regex::new(
-    r"^__WEBPACK_MODULE_REFERENCE__(\d+)_([\da-f]+|ns)(_call)?(_directImport)?(?:_asiSafe(\d))?__$",
-  )
-  .expect("should initialized regex")
-});
-
-#[derive(Default, Debug)]
+#[cacheable]
+#[derive(Default, Debug, Clone)]
 pub struct ModuleReferenceOptions {
+  #[cacheable(with=AsVec<AsPreset>)]
   pub ids: Vec<Atom>,
   pub call: bool,
   pub direct_import: bool,
+  pub deferred_import: bool,
   pub asi_safe: Option<bool>,
   pub index: usize,
 }
 
+/// Cacheable mutations produced while generating a module with a
+/// [`ConcatenationScope`]. The ESM library plugin opts into collecting this
+/// output because it consumes the mutations after the module codegen pass.
+#[cacheable]
+#[derive(Debug, Default)]
+pub struct CodeGenerationDataConcatenationScopeOutput {
+  #[cacheable(with=AsOption<AsPreset>)]
+  namespace_export_symbol: Option<Atom>,
+  #[cacheable(with=AsOption<AsMap<AsPreset, AsCacheable>>)]
+  export_map: Option<HashMap<Atom, String>>,
+  #[cacheable(with=AsOption<AsMap<AsPreset, AsCacheable>>)]
+  raw_export_map: Option<HashMap<Atom, String>>,
+  #[cacheable(with=AsOption<AsMap<AsCacheable, AsCacheable>>)]
+  import_map: ConcatenatedImportMap,
+  #[cacheable(with=AsMap<AsCacheable, AsMap<AsCacheable, AsCacheable>>)]
+  refs: IdentifierIndexMap<FxIndexMap<String, ModuleReferenceOptions>>,
+}
+
+impl CodeGenerationDataConcatenationScopeOutput {
+  pub fn apply_to(&self, current_module: &mut ConcatenatedModuleInfo) {
+    current_module
+      .namespace_export_symbol
+      .clone_from(&self.namespace_export_symbol);
+    current_module.export_map.clone_from(&self.export_map);
+    current_module
+      .raw_export_map
+      .clone_from(&self.raw_export_map);
+    current_module.import_map.clone_from(&self.import_map);
+  }
+
+  pub fn refs(&self) -> &IdentifierIndexMap<FxIndexMap<String, ModuleReferenceOptions>> {
+    &self.refs
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConcatenationScope {
+  pub concat_module_id: ModuleIdentifier,
   pub current_module: ConcatenatedModuleInfo,
-  pub modules_map: Arc<IndexMap<ModuleIdentifier, ModuleInfo>>,
+  pub modules_map: Arc<IdentifierIndexMap<ModuleInfo>>,
+  pub data: anymap::Map<dyn CloneAny + Send + Sync>,
+  pub refs: IdentifierIndexMap<FxIndexMap<String, ModuleReferenceOptions>>,
+  collect_codegen_data: bool,
 }
 
 #[allow(unused)]
 impl ConcatenationScope {
   pub fn new(
-    modules_map: Arc<IndexMap<ModuleIdentifier, ModuleInfo>>,
+    concat_module_id: ModuleIdentifier,
+    modules_map: Arc<IdentifierIndexMap<ModuleInfo>>,
     current_module: ConcatenatedModuleInfo,
   ) -> Self {
     ConcatenationScope {
+      concat_module_id,
       current_module,
       modules_map,
+      data: Default::default(),
+      refs: IdentifierIndexMap::default(),
+      collect_codegen_data: false,
+    }
+  }
+
+  /// Persist the codegen mutations that are consumed after module code
+  /// generation. This is opt-in so regular module concatenation does not pay
+  /// the collection or cache-storage cost.
+  pub fn enable_codegen_data_collection(&mut self) {
+    self.collect_codegen_data = true;
+  }
+
+  pub fn is_codegen_data_collection_enabled(&self) -> bool {
+    self.collect_codegen_data
+  }
+
+  pub(crate) fn take_codegen_data_output(&mut self) -> CodeGenerationDataConcatenationScopeOutput {
+    assert!(self.collect_codegen_data);
+    CodeGenerationDataConcatenationScopeOutput {
+      namespace_export_symbol: self.current_module.namespace_export_symbol.take(),
+      export_map: self.current_module.export_map.take(),
+      raw_export_map: self.current_module.raw_export_map.take(),
+      import_map: self.current_module.import_map.take(),
+      refs: std::mem::take(&mut self.refs),
     }
   }
 
@@ -50,28 +121,56 @@ impl ConcatenationScope {
     self.modules_map.contains_key(module)
   }
 
+  /**
+  export { symbol as export_name }
+  */
   pub fn register_export(&mut self, export_name: Atom, symbol: String) {
     let export_map = self.current_module.export_map.get_or_insert_default();
-    match export_map.entry(export_name) {
-      Entry::Occupied(mut occ) => {
-        occ.insert(symbol);
-      }
-      Entry::Vacant(vac) => {
-        vac.insert(symbol);
-      }
-    }
+    export_map.insert(export_name, symbol);
   }
 
   pub fn register_raw_export(&mut self, export_name: Atom, symbol: String) {
     let raw_export_map = self.current_module.raw_export_map.get_or_insert_default();
-    match raw_export_map.entry(export_name) {
-      Entry::Occupied(mut occ) => {
-        occ.insert(symbol);
-      }
-      Entry::Vacant(vac) => {
-        vac.insert(symbol);
-      }
+    raw_export_map.insert(export_name, symbol);
+  }
+
+  pub fn register_namespace_import(
+    &mut self,
+    import_source: String,
+    attributes: Option<String>,
+    import_symbol: Atom,
+  ) -> &Atom {
+    let raw_import_map = self.current_module.import_map.get_or_insert_default();
+    let entry = raw_import_map
+      .entry((import_source, attributes))
+      .or_default();
+
+    if entry.namespace.is_none() {
+      entry.namespace = Some(import_symbol)
     }
+
+    entry
+      .namespace
+      .as_ref()
+      .expect("should have namespace symbol")
+  }
+
+  pub fn register_import(
+    &mut self,
+    import_source: String,
+    attributes: Option<String>,
+    import_symbol: Option<Atom>,
+  ) {
+    let raw_import_map = self.current_module.import_map.get_or_insert_default();
+    let entry = raw_import_map
+      .entry((import_source, attributes))
+      .or_default();
+
+    let Some(import_symbol) = import_symbol else {
+      return;
+    };
+
+    entry.specifiers.insert(import_symbol);
   }
 
   pub fn register_namespace_export(&mut self, symbol: &str) {
@@ -79,70 +178,204 @@ impl ConcatenationScope {
   }
 
   pub fn create_module_reference(
-    &self,
+    &mut self,
     module: &ModuleIdentifier,
-    options: &ModuleReferenceOptions,
+    options: ModuleReferenceOptions,
   ) -> String {
     let info = self
       .modules_map
       .get(module)
       .expect("should have module info");
 
-    let call_flag = match options.call {
-      true => "_call",
-      _ => "",
-    };
-    let direct_import_flag = match options.direct_import {
-      true => "_directImport",
-      _ => "",
-    };
-    let asi_safe_flag = match options.asi_safe {
-      Some(true) => "_asiSafe1",
-      Some(false) => "_asiSafe0",
-      None => "",
-    };
-
     let export_data = if !options.ids.is_empty() {
-      hex::encode(serde_json::to_string(&options.ids).expect("should serialize to json string"))
+      hex::encode(simd_json::to_string(&options.ids).expect("should serialize to json string"))
     } else {
       "ns".to_string()
     };
 
-    format!(
-      "__WEBPACK_MODULE_REFERENCE__{}_{}{}{}{}__._",
-      info.index(),
-      export_data,
-      call_flag,
-      direct_import_flag,
-      asi_safe_flag
-    )
-  }
+    let mut index_buffer = itoa::Buffer::new();
+    let index_str = index_buffer.format(info.index());
+    let mut module_ref = String::with_capacity(index_str.len() + export_data.len() + 64);
+    module_ref.push_str("__rspack_module_ref");
+    module_ref.push_str(index_str);
+    module_ref.push('_');
+    module_ref.push_str(&export_data);
+    if options.call {
+      module_ref.push_str("_call");
+    }
+    if options.direct_import {
+      module_ref.push_str("_directImport");
+    }
+    if options.deferred_import {
+      module_ref.push_str("_deferredImport");
+    }
+    if let Some(asi_safe) = options.asi_safe {
+      module_ref.push_str(if asi_safe { "_asiSafe1" } else { "_asiSafe0" });
+    }
+    module_ref.push_str("__._");
+    let entry = self.refs.entry(*module).or_default();
+    entry.insert(module_ref.clone(), options);
 
-  pub fn is_module_reference(name: &str) -> bool {
-    MODULE_REFERENCE_REGEXP.is_match(name)
+    module_ref
   }
 
   pub fn match_module_reference(name: &str) -> Option<ModuleReferenceOptions> {
-    if let Some(captures) = MODULE_REFERENCE_REGEXP.captures(name) {
-      let index: usize = captures[1].parse().expect("");
-      let ids: Vec<Atom> = if &captures[2] == "ns" {
-        vec![]
-      } else {
-        serde_json::from_slice(&hex::decode(&captures[2]).expect("should decode hex"))
-          .expect("should have deserialize")
-      };
-      let call = captures.get(3).is_some();
-      let direct_import = captures.get(4).is_some();
-      let asi_safe = captures.get(5).map(|s| s.as_str() == "1");
-      Some(ModuleReferenceOptions {
-        ids,
-        call,
-        direct_import,
-        asi_safe,
-        index,
-      })
+    let name = name
+      .strip_suffix(MODULE_REFERENCE_PROPERTY_ACCESS_SUFFIX)
+      .unwrap_or(name);
+    let encoded = name
+      .strip_prefix(MODULE_REFERENCE_PREFIX)?
+      .strip_suffix("__")?;
+    let (index, encoded) = encoded.split_once('_')?;
+    let index = index.parse().ok()?;
+
+    let export_data_len = encoded.find('_').unwrap_or(encoded.len());
+    let (export_data, mut flags) = encoded.split_at(export_data_len);
+    let ids = if export_data == "ns" {
+      vec![]
+    } else {
+      serde_json::from_slice(&hex::decode(export_data).ok()?).ok()?
+    };
+
+    let call = if let Some(stripped) = flags.strip_prefix("_call") {
+      flags = stripped;
+      true
+    } else {
+      false
+    };
+    let direct_import = if let Some(stripped) = flags.strip_prefix("_directImport") {
+      flags = stripped;
+      true
+    } else {
+      false
+    };
+    let deferred_import = if let Some(stripped) = flags.strip_prefix("_deferredImport") {
+      flags = stripped;
+      true
+    } else {
+      false
+    };
+    let asi_safe = if let Some(stripped) = flags.strip_prefix("_asiSafe") {
+      let (flag, rest) = stripped.split_at(1);
+      flags = rest;
+      match flag {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => return None,
+      }
     } else {
       None
+    };
+
+    if !flags.is_empty() {
+      return None;
     }
+
+    Some(ModuleReferenceOptions {
+      ids,
+      call,
+      direct_import,
+      deferred_import,
+      asi_safe,
+      index,
+    })
+  }
+
+  pub fn is_module_concatenated(&self, module: &ModuleIdentifier) -> bool {
+    matches!(
+      self.modules_map.get(module).expect("should have module"),
+      ModuleInfo::Concatenated(_)
+    )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::concatenated_module::ExternalModuleInfo;
+
+  fn create_test_scope(index: usize) -> (ConcatenationScope, ModuleIdentifier) {
+    let concat_module_id: ModuleIdentifier = "concat-module".into();
+    let referenced_module_id: ModuleIdentifier = "referenced-module".into();
+
+    let current_module = ConcatenatedModuleInfo {
+      module: concat_module_id,
+      ..Default::default()
+    };
+
+    let mut modules_map = IdentifierIndexMap::default();
+    modules_map.insert(
+      referenced_module_id,
+      ModuleInfo::External(ExternalModuleInfo::new(index, referenced_module_id)),
+    );
+
+    (
+      ConcatenationScope::new(concat_module_id, Arc::new(modules_map), current_module),
+      referenced_module_id,
+    )
+  }
+
+  fn assert_module_reference_options_eq(
+    actual: &ModuleReferenceOptions,
+    expected: &ModuleReferenceOptions,
+  ) {
+    assert_eq!(actual.ids, expected.ids);
+    assert_eq!(actual.call, expected.call);
+    assert_eq!(actual.direct_import, expected.direct_import);
+    assert_eq!(actual.deferred_import, expected.deferred_import);
+    assert_eq!(actual.asi_safe, expected.asi_safe);
+    assert_eq!(actual.index, expected.index);
+  }
+
+  #[test]
+  fn create_module_reference_round_trips_through_matcher() {
+    let (mut scope, referenced_module_id) = create_test_scope(7);
+    let options = ModuleReferenceOptions {
+      ids: vec![Atom::from("default"), Atom::from("named")],
+      call: true,
+      direct_import: true,
+      deferred_import: true,
+      asi_safe: Some(false),
+      ..Default::default()
+    };
+
+    let module_ref = scope.create_module_reference(&referenced_module_id, options.clone());
+
+    let stored = scope
+      .refs
+      .get(&referenced_module_id)
+      .and_then(|refs| refs.get(&module_ref))
+      .expect("should store created module reference");
+    assert_module_reference_options_eq(stored, &options);
+
+    let parsed = ConcatenationScope::match_module_reference(&module_ref)
+      .expect("should parse full module reference");
+    let expected = ModuleReferenceOptions {
+      index: 7,
+      ..options
+    };
+    assert_module_reference_options_eq(&parsed, &expected);
+  }
+
+  #[test]
+  fn match_module_reference_accepts_identifier_without_property_access_suffix() {
+    let parsed = ConcatenationScope::match_module_reference(
+      "__rspack_module_ref3_ns_call_directImport_deferredImport_asiSafe1__",
+    )
+    .expect("should parse identifier-only module reference");
+
+    assert!(parsed.ids.is_empty());
+    assert!(parsed.call);
+    assert!(parsed.direct_import);
+    assert!(parsed.deferred_import);
+    assert_eq!(parsed.asi_safe, Some(true));
+    assert_eq!(parsed.index, 3);
+  }
+
+  #[test]
+  fn match_module_reference_rejects_invalid_suffix() {
+    assert!(
+      ConcatenationScope::match_module_reference("__rspack_module_ref1_ns_asiSafe2__").is_none()
+    );
   }
 }

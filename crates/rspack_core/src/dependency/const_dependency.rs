@@ -1,48 +1,77 @@
+use rspack_cacheable::{cacheable, cacheable_dyn, with::AsRefStr};
+use rspack_hash::{RspackHash, RspackHasher};
+
+use super::DependencyRange;
 use crate::{
-  AsDependency, DependencyTemplate, RuntimeGlobals, TemplateContext, TemplateReplaceSource,
+  Compilation, DependencyCodeGeneration, DependencyTemplate, DependencyTemplateType, RuntimeSpec,
+  TemplateContext, TemplateReplaceSource,
 };
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct ConstDependency {
-  pub start: u32,
-  pub end: u32,
+  pub range: DependencyRange,
+  #[cacheable(with=AsRefStr)]
   pub content: Box<str>,
-  pub runtime_requirements: Option<RuntimeGlobals>,
 }
 
 impl ConstDependency {
-  pub fn new(
-    start: u32,
-    end: u32,
-    content: Box<str>,
-    runtime_requirements: Option<RuntimeGlobals>,
-  ) -> Self {
-    Self {
-      start,
-      end,
-      content,
-      runtime_requirements,
-    }
+  pub fn new(range: DependencyRange, content: Box<str>) -> Self {
+    Self { range, content }
   }
 }
 
-impl DependencyTemplate for ConstDependency {
-  fn apply(
+impl RspackHash for ConstDependency {
+  fn hash(&self, state: &mut RspackHasher) {
+    self.range.hash(state);
+    state.write(b"|");
+    self.content.hash(state);
+  }
+}
+
+#[cacheable_dyn]
+impl DependencyCodeGeneration for ConstDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(ConstDependencyTemplate::template_type())
+  }
+
+  fn update_hash(
     &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
+    hasher: &mut RspackHasher,
+    _compilation: &Compilation,
+    _runtime: Option<&RuntimeSpec>,
   ) {
-    if let Some(runtime_requirements) = &self.runtime_requirements {
-      code_generatable_context
-        .runtime_requirements
-        .insert(*runtime_requirements);
-    }
-    source.replace(self.start, self.end, self.content.as_ref(), None);
-  }
-
-  fn dependency_id(&self) -> Option<crate::DependencyId> {
-    None
+    RspackHash::hash(self, hasher);
   }
 }
 
-impl AsDependency for ConstDependency {}
+#[cacheable]
+#[derive(Debug, Default)]
+pub struct ConstDependencyTemplate;
+
+impl ConstDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Custom("ConstDependency")
+  }
+}
+
+impl DependencyTemplate for ConstDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    _code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<ConstDependency>()
+      .expect("ConstDependencyTemplate should be used for ConstDependency");
+
+    source.replace(
+      dep.range.start,
+      dep.range.end,
+      dep.content.to_string(),
+      None,
+    );
+  }
+}

@@ -1,43 +1,46 @@
-use std::borrow::Cow;
-use std::hash::Hash;
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_collections::{Identifiable, Identifier};
 use rspack_core::{
-  impl_module_meta_info, impl_source_map_config,
-  rspack_sources::{RawSource, Source, SourceExt},
-  AsyncDependenciesBlockIdentifier, BoxDependency, BuildContext, BuildInfo, BuildMeta, BuildResult,
-  CodeGenerationResult, Compilation, ConcatenationScope, Context, DependenciesBlock, DependencyId,
-  FactoryMeta, LibIdentOptions, Module, ModuleIdentifier, ModuleType, RuntimeSpec, SourceType,
+  BoxDependency, BoxModule, BuildContext, BuildInfo, BuildMeta, ChunkGraph,
+  CodeGenerationResultBuilder, Compilation, Context, DependenciesBlock, DependenciesBlockData,
+  Dependency, ExportsType, FactoryMetaStore, FreezeLock, LibIdentOptions, Module,
+  ModuleCodeGenerationContext, ModuleGraph, ModuleIdentifier, ModuleType, NeedBuildContext,
+  RuntimeSpec, SourceType, impl_module_meta_info, impl_source_map_config, module_update_hash,
+  rspack_sources::{BoxSource, RawStringSource, SourceExt},
+  runtime_mode::RuntimeMode,
 };
-use rspack_error::{impl_empty_diagnosable_trait, Diagnostic, Result};
-use rspack_hash::RspackHash;
-use rspack_identifier::{Identifiable, Identifier};
+use rspack_error::{Result, impl_empty_diagnosable_trait};
+use rspack_hash::{RspackHashDigest, RspackHasher};
 use rspack_util::source_map::SourceMapKind;
 
 use super::{
-  fallback_dependency::FallbackDependency,
+  fallback_dependency::FallbackDependency, federation_modules_plugin::FederationModulesPlugin,
   remote_to_external_dependency::RemoteToExternalDependency,
 };
 use crate::{
-  sharing::share_runtime_module::DataInitInfo, CodeGenerationDataShareInit, ShareInitData,
+  CodeGenerationDataShareInit, ShareInitData, ShareScope,
+  sharing::share_runtime_module::DataInitInfo, utils::module_identifier_namespace,
 };
 
 #[impl_source_map_config]
+#[cacheable]
 #[derive(Debug)]
 pub struct RemoteModule {
-  blocks: Vec<AsyncDependenciesBlockIdentifier>,
-  dependencies: Vec<DependencyId>,
+  dependencies_block: DependenciesBlockData,
   identifier: ModuleIdentifier,
   readable_identifier: String,
   lib_ident: String,
   request: String,
   external_requests: Vec<String>,
   pub internal_request: String,
-  pub share_scope: String,
+  pub share_scope: ShareScope,
   pub remote_key: String,
-  factory_meta: Option<FactoryMeta>,
-  build_info: Option<BuildInfo>,
-  build_meta: Option<BuildMeta>,
+  factory_meta: FactoryMetaStore,
+  build_info: FreezeLock<BuildInfo>,
+  build_meta: FreezeLock<BuildMeta>,
 }
 
 impl RemoteModule {
@@ -45,17 +48,18 @@ impl RemoteModule {
     request: String,
     external_requests: Vec<String>,
     internal_request: String,
-    share_scope: String,
+    share_scope: ShareScope,
     remote_key: String,
+    runtime_mode: RuntimeMode,
   ) -> Self {
     let readable_identifier = format!("remote {}", &request);
-    let lib_ident = format!("webpack/container/remote/{}", &request);
+    let namespace = module_identifier_namespace(runtime_mode);
+    let lib_ident = format!("{namespace}/container/remote/{request}");
     Self {
-      blocks: Default::default(),
-      dependencies: Default::default(),
+      dependencies_block: Default::default(),
       identifier: ModuleIdentifier::from(format!(
         "remote ({}) {} {}",
-        share_scope,
+        share_scope.key(),
         external_requests.join(" "),
         internal_request
       )),
@@ -66,10 +70,14 @@ impl RemoteModule {
       internal_request,
       share_scope,
       remote_key,
-      factory_meta: None,
-      build_info: None,
-      build_meta: None,
-      source_map_kind: SourceMapKind::None,
+      factory_meta: Default::default(),
+      build_info: BuildInfo {
+        strict: true,
+        ..Default::default()
+      }
+      .into(),
+      build_meta: Default::default(),
+      source_map_kind: SourceMapKind::empty(),
     }
   }
 }
@@ -81,28 +89,21 @@ impl Identifiable for RemoteModule {
 }
 
 impl DependenciesBlock for RemoteModule {
-  fn add_block_id(&mut self, block: AsyncDependenciesBlockIdentifier) {
-    self.blocks.push(block)
+  fn dependencies_block(&self) -> &DependenciesBlockData {
+    &self.dependencies_block
   }
 
-  fn get_blocks(&self) -> &[AsyncDependenciesBlockIdentifier] {
-    &self.blocks
-  }
-
-  fn add_dependency_id(&mut self, dependency: DependencyId) {
-    self.dependencies.push(dependency)
-  }
-
-  fn get_dependencies(&self) -> &[DependencyId] {
-    &self.dependencies
+  fn dependencies_block_mut(&mut self) -> &mut DependenciesBlockData {
+    &mut self.dependencies_block
   }
 }
 
+#[cacheable_dyn]
 #[async_trait]
 impl Module for RemoteModule {
   impl_module_meta_info!();
 
-  fn size(&self, _source_type: &SourceType) -> f64 {
+  fn size(&self, _source_type: Option<&SourceType>) -> f64 {
     6.0
   }
 
@@ -110,23 +111,19 @@ impl Module for RemoteModule {
     &ModuleType::Remote
   }
 
-  fn get_diagnostics(&self) -> Vec<Diagnostic> {
-    vec![]
-  }
-
-  fn source_types(&self) -> &[SourceType] {
+  fn source_types(&self, _module_graph: &ModuleGraph) -> &[SourceType] {
     &[SourceType::Remote, SourceType::ShareInit]
   }
 
-  fn original_source(&self) -> Option<&dyn Source> {
+  fn source(&self) -> Option<&BoxSource> {
     None
   }
 
-  fn readable_identifier(&self, _context: &Context) -> Cow<str> {
+  fn readable_identifier(&self, _context: &Context) -> Cow<'_, str> {
     self.readable_identifier.as_str().into()
   }
 
-  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<str>> {
+  fn lib_ident(&self, _options: LibIdentOptions) -> Option<Cow<'_, str>> {
     Some(self.lib_ident.as_str().into())
   }
 
@@ -134,80 +131,102 @@ impl Module for RemoteModule {
     Some(self.request.as_str().into())
   }
 
-  async fn build(
-    &mut self,
-    build_context: BuildContext<'_>,
-    _: Option<&Compilation>,
-  ) -> Result<BuildResult> {
-    let mut hasher = RspackHash::from(&build_context.compiler_options.output);
-    self.update_hash(&mut hasher);
-
-    let build_info = BuildInfo {
-      strict: true,
-      hash: Some(hasher.digest(&build_context.compiler_options.output.hash_digest)),
-      ..Default::default()
-    };
-
-    let mut dependencies: Vec<BoxDependency> = Vec::new();
-    if self.external_requests.len() == 1 {
-      let dep = RemoteToExternalDependency::new(self.external_requests[0].clone());
-      dependencies.push(Box::new(dep));
-    } else {
-      let dep = FallbackDependency::new(self.external_requests.clone());
-      dependencies.push(Box::new(dep));
-    }
-
-    Ok(BuildResult {
-      build_info,
-      build_meta: Default::default(),
-      dependencies,
-      blocks: Vec::new(),
-      analyze_result: Default::default(),
-      optimization_bailouts: vec![],
-    })
+  fn get_exports_type(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &rspack_core::ModuleGraphCacheArtifact,
+    _exports_info_artifact: &rspack_core::ExportsInfoArtifact,
+    _strict: bool,
+  ) -> ExportsType {
+    ExportsType::Dynamic
   }
 
-  #[allow(clippy::unwrap_in_result)]
-  fn code_generation(
+  async fn need_build(&self, _context: &NeedBuildContext<'_>) -> Result<bool> {
+    Ok(self.build_info.frozen().is_none())
+  }
+
+  async fn build(
+    mut self: Box<Self>,
+    build_context: Arc<BuildContext>,
+    _compilation: Option<&Compilation>,
+  ) -> Result<BoxModule> {
+    let mut dependencies: Vec<BoxDependency> = Vec::new();
+
+    if self.external_requests.len() == 1 {
+      let dep = RemoteToExternalDependency::new(self.external_requests[0].clone());
+
+      // Call federation hooks here using the BuildContext - this runs before optimize_chunks!
+      let hooks =
+        FederationModulesPlugin::get_compilation_hooks_by_id(build_context.compilation_id);
+      hooks
+        .add_remote_dependency
+        .lock()
+        .await
+        .call(&dep as &dyn Dependency)
+        .await?;
+
+      dependencies.push(BoxDependency::new(dep));
+    } else {
+      let dep = FallbackDependency::new(self.external_requests.clone());
+
+      // Call federation hooks here using the BuildContext - this runs before optimize_chunks!
+      let hooks =
+        FederationModulesPlugin::get_compilation_hooks_by_id(build_context.compilation_id);
+      hooks
+        .add_remote_dependency
+        .lock()
+        .await
+        .call(&dep as &dyn Dependency)
+        .await?;
+
+      dependencies.push(BoxDependency::new(dep));
+    }
+
+    Ok(
+      BoxModule::new(self)
+        .with_dependencies(dependencies.into_iter().map(Into::into).collect(), vec![]),
+    )
+  }
+
+  // #[tracing::instrument("RemoteModule::code_generation", skip_all, fields(identifier = ?self.identifier()))]
+  async fn code_generation(
     &self,
-    compilation: &Compilation,
-    _runtime: Option<&RuntimeSpec>,
-    _: Option<ConcatenationScope>,
-  ) -> Result<CodeGenerationResult> {
-    let mut codegen = CodeGenerationResult::default();
-    let module_graph = compilation.get_module_graph();
-    let module = module_graph.get_module_by_dependency_id(&self.dependencies[0]);
+    code_generation_context: &mut ModuleCodeGenerationContext,
+  ) -> Result<CodeGenerationResultBuilder> {
+    let mut codegen = CodeGenerationResultBuilder::default();
+    let module_graph = code_generation_context.compilation.get_module_graph();
+    let module = module_graph.get_module_by_dependency_id(
+      self
+        .get_dependency_ids()
+        .next()
+        .expect("should have external dependency"),
+    );
     let id = module.and_then(|m| {
-      compilation
-        .chunk_graph
-        .get_module_id(m.identifier())
-        .as_deref()
+      ChunkGraph::get_module_id(
+        &code_generation_context.compilation.module_ids_artifact,
+        m.identifier(),
+      )
     });
-    codegen.add(SourceType::Remote, RawSource::from("").boxed());
-    codegen.data.insert(CodeGenerationDataShareInit {
+    codegen.add(SourceType::Remote, RawStringSource::from_static("").boxed());
+    codegen.data_mut().insert(CodeGenerationDataShareInit {
       items: vec![ShareInitData {
         share_scope: self.share_scope.clone(),
         init_stage: 20,
-        init: DataInitInfo::ExternalModuleId(id.map(|i| i.to_owned())),
+        init: DataInitInfo::ExternalModuleId(id.cloned()),
       }],
     });
     Ok(codegen)
   }
+
+  async fn get_runtime_hash(
+    &self,
+    compilation: &Compilation,
+    runtime: Option<&RuntimeSpec>,
+  ) -> Result<RspackHashDigest> {
+    let mut hasher = RspackHasher::from(&compilation.options.output);
+    module_update_hash(self, &mut hasher, compilation, runtime);
+    Ok(hasher.digest(&compilation.options.output.hash_digest))
+  }
 }
 
 impl_empty_diagnosable_trait!(RemoteModule);
-
-impl Hash for RemoteModule {
-  fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    "__rspack_internal__RemoteModule".hash(state);
-    self.identifier().hash(state);
-  }
-}
-
-impl PartialEq for RemoteModule {
-  fn eq(&self, other: &Self) -> bool {
-    self.identifier() == other.identifier()
-  }
-}
-
-impl Eq for RemoteModule {}

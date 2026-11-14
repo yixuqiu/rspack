@@ -8,23 +8,23 @@ use crate::{CacheGroup, SplitChunksPlugin};
 impl SplitChunksPlugin {
   /// Affected by `splitChunks.maxInitialRequests`/`splitChunks.cacheGroups.{cacheGroup}.maxInitialRequests`
   /// Affected by `splitChunks.maxAsyncRequests`/`splitChunks.cacheGroups.{cacheGroup}.maxAsyncRequests`
-  #[tracing::instrument(skip_all)]
+  // #[tracing::instrument(skip_all)]
   pub(crate) fn ensure_max_request_fit(
     &self,
     compilation: &Compilation,
     cache_group: &CacheGroup,
     used_chunks: &mut Cow<FxHashSet<ChunkUkey>>,
   ) {
-    let chunk_db = &compilation.chunk_by_ukey;
-    let chunk_group_db = &compilation.chunk_group_by_ukey;
+    let chunk_db = &compilation.build_chunk_graph_artifact.chunk_by_ukey;
+    let chunk_group_db = &compilation.build_chunk_graph_artifact.chunk_group_by_ukey;
     let invalided_chunks = used_chunks
       .iter()
-      .map(|c| c.as_ref(chunk_db))
+      .map(|c| chunk_db.expect_get(c))
       .filter_map(|chunk| {
         let allowed_max_request = if chunk.is_only_initial(chunk_group_db) {
           cache_group.max_initial_requests
         } else if chunk.can_be_initial(chunk_group_db) {
-          u32::max(
+          f64::max(
             cache_group.max_initial_requests,
             cache_group.max_async_requests,
           )
@@ -46,16 +46,16 @@ impl SplitChunksPlugin {
         // chunk.
 
         let actually_requests = chunk
-          .groups
+          .groups()
           .iter()
-          .map(|g| g.as_ref(chunk_group_db))
+          .map(|g| chunk_group_db.expect_get(g))
           .map(|group| group.chunks.len())
           .reduce(usize::max)
           .map(|requests| requests as u32)
           .unwrap_or_default();
 
-        if actually_requests >= allowed_max_request {
-          Some(chunk.ukey)
+        if actually_requests as f64 >= allowed_max_request {
+          Some(chunk.ukey())
         } else {
           None
         }

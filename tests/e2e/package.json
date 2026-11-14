@@ -1,0 +1,40 @@
+{
+  "name": "e2e-test",
+  "private": true,
+  "version": "0.1.8",
+  "type": "module",
+  "scripts": {
+    "test": "rs test",
+    "test:CI": "CI=1 pnpm run test",
+    "test:configs": "tsc -p tsconfig.configs.json"
+  },
+  "devDependencies": {
+    "@babel/core": "catalog:",
+    "@babel/preset-react": "catalog:",
+    "@module-federation/runtime-tools": "catalog:",
+    "@rspack/cli": "workspace:*",
+    "@rspack/core": "workspace:*",
+    "@rspack/dev-server": "catalog:",
+    "@rspack/plugin-react-refresh": "catalog:",
+    "@rstest/core": "catalog:",
+    "@rstest/playwright": "catalog:",
+    "@swc/helpers": "catalog:",
+    "@types/fs-extra": "catalog:",
+    "babel-loader": "catalog:",
+    "core-js": "catalog:",
+    "css-loader": "catalog:",
+    "fs-extra": "catalog:",
+    "playwright": "catalog:",
+    "postcss": "catalog:",
+    "postcss-loader": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "react-refresh": "catalog:",
+    "rspack-vue-loader": "catalog:",
+    "rstack": "catalog:",
+    "tailwindcss": "catalog:tailwindcss3",
+    "typescript": "catalog:",
+    "vue": "catalog:",
+    "ws": "catalog:"
+  }
+}

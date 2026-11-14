@@ -1,371 +1,498 @@
+---
+description: '配置 Rspack 的 WebAssembly、HTTP 导入等实验性功能，并了解其稳定性限制。'
+---
+
 import { ApiMeta, Stability } from '../../../components/ApiMeta';
+import Attribution from '@components/Attribution';
+import PropertyType from '@components/PropertyType';
+import { Table } from '@builtIns';
+import { Tabs, Tab } from '@theme';
 
 # Experiments
 
-实验性功能：该选项通过此配置项可以开启并试用一些实验的功能。
+该选项允许用户开启和尝试一些实验性的功能。
 
 - **类型：** `object`
 
-## experiments.incrementalRebuild
+:::tip
+在 minor release 中，Rspack 可能对这些实验性特性的 public API 做一些调整，并在更新日志中对这些变动进行详细的说明。因此，如果你使用了实验性特性，请留意 minor 版本的更新日志。
+:::
 
-<ApiMeta
-  deprecatedVersion="0.4.0"
-  removedVersion="0.5.0"
-  stability={Stability.Removed}
-/>
+## experiments.asyncWebAssembly
 
-启用增量重新编译。当启用此选项，Rspack 在重新编译时会尝试复用上次构建的结果来提升构建速度，支持对不同阶段进行配置，默认为开启状态。
-
-0.5 版本移除该配置并内置开启该功能。
-
-- **类型：** `boolean | { make?: boolean, emitAsset?: boolean }`
+- **类型：** `boolean`
 - **默认值：** `true`
 
-## experiments.outputModule
+支持基于[新规范](https://github.com/WebAssembly/esm-integration)的 WebAssembly，这使 WebAssembly 模块成为异步模块。
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    asyncWebAssembly: true,
+  },
+};
+```
+
+## experiments.buildHttp
+
+<ApiMeta addedVersion="1.3.0" />
+
+- **类型：** `HttpUriOptions`
+- **默认值：** `undefined`
+
+```ts
+type HttpUriOptions = {
+  /**
+   * A list of allowed URIs
+   */
+  allowedUris: (string | RegExp)[];
+  /**
+   * Define the location to store the lockfile
+   */
+  lockfileLocation?: string;
+  /**
+   * Define the location for caching remote resources
+   */
+  cacheLocation?: string | false;
+  /**
+   * Detect changes to remote resources and upgrade them automatically
+   * @default false
+   */
+  upgrade?: boolean;
+  /**
+   * Freeze the remote resources and lockfile
+   * @default true in production mode, false otherwise
+   */
+  frozen?: boolean;
+  /**
+   * Custom http client
+   */
+  httpClient?: (
+    url: string,
+    headers: Record<string, string>,
+  ) => Promise<{
+    status: number;
+    headers: Record<string, string>;
+    body: Buffer;
+  }>;
+};
+```
+
+启用此功能后，Rspack 可以构建以 `http(s):` 协议开头的远程资源。Rspack 会将资源下载到本地，然后再进行打包。
+
+`allowedUris` 中的字符串必须是有效的绝对 URL。Rspack 会先规范化请求 URL 和各个字符串规则，再比较前缀。例如，`'https://example.com'` 会被规范化为 `'https://example.com/'`。无效字符串（如 `'https://'`）会被忽略。正则表达式匹配的是规范化后的 URL；如果你希望允许任意 HTTPS URL，可以使用 `/^https:\/\//`。重定向目标也必须匹配 `allowedUris`。
+
+默认情况下，Rspack 会在 [context](/config/context) 文件夹下生成 `rspack.lock` 和 `rspack.lock.data` 分别作为 Lockfile 和缓存的位置，你也可以通过 `lockfileLocation` 和 `cacheLocation` 进行配置。
+
+:::note
+你应该将 `lockfileLocation` 和 `cacheLocation` 的文件提交到版本控制系统中，以便生产构建使用缓存内容。
+:::
+
+Rspack 会根据 lockfile 中记录的 SHA-512 校验缓存内容。`frozen` 在生产模式下默认为 `true`，其他模式下默认为 `false`。冻结时，缺少锁定条目、缓存内容损坏、缓存文件缺失，以及资源内容、最终 URL 或内容类型发生变化，都会导致构建报错。此时不会更新 lockfile 及其内容缓存。即使设置了 `cacheLocation: false`，下载的内容也必须与锁定条目一致。
+
+旧版 lockfile 可能只在重定向的最终 URL 下记录条目。如果原始 URL 没有条目，冻结构建会发起网络请求，沿允许的重定向查找已有锁定条目，然后校验其内容，不会重写 lockfile 或缓存。未能到达锁定资源的导入仍会报错。如果原始 URL 已有条目，则始终以该条目为准。
+
+首次生成 lockfile 和缓存时，请运行开发模式构建，或显式设置 `frozen: false`。若需检查远程更新，还应设置 `upgrade: true`，随后审查并提交文件变化。`upgrade: false` 表示优先使用缓存，不代表需要下载内容时禁止更新 lockfile。与 webpack 一致，非冻结构建也可以更新 lockfile，以接受本地修改过的缓存文件。
+
+记录为 `"no-cache"` 或 `"ignore"` 的资源不会锁定下载内容，冻结模式下也一样。完整性检查依赖可信的 lockfile，无法验证首次下载的真实性。为防止 Git 转换缓存文件的换行符，请在 `.gitattributes` 中加入 `**/*rspack.lock.data/** -text`；使用自定义缓存位置时，请调整匹配路径。
+
+示例：
+
+```js title="rspack.config.mjs"
+import path from 'node:path';
+
+export default {
+  experiments: {
+    buildHttp: {
+      allowedUris: ['https://example.com/'],
+      lockfileLocation: path.join(import.meta.dirname, 'my_project.lock'),
+      cacheLocation: path.join(import.meta.dirname, 'my_project.lock.data'),
+    },
+  },
+};
+```
+
+启用此功能后，你可以直接从网址导入模块：
+
+```js
+// Import from a remote URL
+import { something } from 'https://example.com/module.js';
+
+// Or import assets
+import imageUrl from 'https://example.com/image.png';
+```
+
+## experiments.deferImport
+
+<ApiMeta addedVersion="1.6.0" />
 
 - **类型：** `boolean`
 - **默认值：** `false`
 
-开启之后，将尽可能输出符合 ECMAScript 语法的代码。例如，使用 `import()` 加载 chunk，使用 ESM exports 等等。
+开启后 Rspack 会支持打包 [Deferred Imports Evaluation](https://github.com/tc39/proposal-defer-import-eval) 提案，该功能允许延迟模块的执行直到首次使用。Rspack 支持 `import defer * as ns from "./module"` 和 `import.defer()` 两种语法。
 
-```js
-module.exports = {
+```js title="rspack.config.mjs"
+export default {
   experiments: {
-    outputModule: true,
+    deferImport: true,
   },
 };
 ```
 
-## experiments.css
+:::info 已知的限制
+目前在使用 `output.module: true` 时，对 external 模块使用 `defer import` 语法会被编译为普通的 `import` 语法。
 
-启用原生 CSS 支持和 CSS 相关的 parser 和 generator options：
+例如，当 `jquery` 配置为 external 时：
 
-- [`module.parser["css/auto"]`](/config/module#moduleparsercssauto)
-- [`module.parser.css`](/config/module#moduleparsercss)
-- [`module.parser["css/module"]`](/config/module#moduleparsercssmodule)
-- [`module.generator["css/auto"]`](/config/module#modulegeneratorcssauto)
-- [`module.generator.css`](/config/module#modulegeneratorcss)
-- [`module.generator["css/module"]`](/config/module#modulegeneratorcssmodule)
+```js
+import defer * as $ from 'jquery';
+```
 
-:::warning
-如果你在使用 `style-loader` 和 `css-loader` 请关闭该配置，因为 `style-loader` 和 `css-loader` 和原生 CSS 功能冲突。
+将会生成：
+
+```js
+import * as __rspack_external_jquery from 'jquery';
+```
+
+这是因为目前尚未有运行时支持 `defer import` 语法。未来当更多运行时支持该语法后，Rspack 将会根据 target 配置决定是否保留 `defer import` 语法，生成如下代码：
+
+```js
+import defer * as __rspack_external_jquery from 'jquery';
+```
+
 :::
 
-## experiments.topLevelAwait
+## experiments.sourceImport
 
-<ApiMeta addedVersion="0.3.8" />
-
-开启打包 [top level await](https://github.com/tc39/proposal-top-level-await) 的支持，`top level await` 仅能在 [ModuleType](/config/module#ruletype) 为 `javascript/esm` 的模块中使用。
-
-默认开启，可通过该配置关闭。
-
-## experiments.rspackFuture
-
-<ApiMeta addedVersion="0.3.2" />
-
-- **类型：** `object`
-
-- **默认值：** 参考下方各项配置
-
-用于控制是否开启 Rspack 未来的默认行为，详情请参考[这里](https://github.com/web-infra-dev/rspack/pull/4107)。
-
-### experiments.rspackFuture.disableTransformByDefault
-
-<ApiMeta
-  addedVersion="0.3.5"
-  removedVersion="0.5.0"
-  stability={Stability.Removed}
-/>
+<ApiMeta stability={Stability.Experimental} addedVersion="2.0.8" />
 
 - **类型：** `boolean`
+- **默认值：** `false`
 
-- **引入版本：** v0.3.5
+开启对 TC39 [Source Phase Imports](https://github.com/tc39/proposal-source-phase-imports) 提案的支持。
 
-- **默认开启版本：** v0.4.0
+Source phase import 允许在模块执行前导入模块。Rspack 当前主要面向 WebAssembly 模块提供该能力：以 source phase 导入 `.wasm` 模块时，返回的是编译后的 [`WebAssembly.Module`](https://developer.mozilla.org/zh-CN/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly/Module)，你可以自行实例化它、使用不同 imports 多次实例化，或将它传递给 worker。
 
-- **移除版本：** v0.5.0
+启用 `experiments.sourceImport`：
 
-- **说明：**
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    sourceImport: true,
+  },
+};
+```
 
-  该功能主要对于三类问题进行处理：[builtins](/config/builtins) 代码转换功能，[target](/config/target)，自定义 [Rule.type](/config/module#ruletype)
+你可以使用静态的 source-phase 语法：
 
-  1. **移除对部分 [builtins](/config/builtins) 功能的支持：**
+```js
+import source wasmModule from './module.wasm';
 
-  - [builtins.relay](/config/builtins#builtinsrelay)
-  - [builtins.react](/config/builtins#builtinsreact)
-  - [builtins.emotion](/config/builtins#builtinsemotion)
-  - [builtins.pluginImport](/config/builtins#builtinspluginimport)
-  - [builtins.decorator](/config/builtins#builtinsdecorator)
-  - [builtins.presetEnv](/config/builtins#builtinspresetenv)
+const instance = await WebAssembly.instantiate(wasmModule, {
+  // imports...
+});
+```
 
-  这部分配置项应当作用于被选中的相应模块，而使用 `builtins.(relay|react|emotion|pluginImport|decorator)` 则等于是全局开启，这种方案不被推崇，因此将被废弃。
+也可以使用动态语法：
 
-  在开启 `disableTransformByDefault` 后，上述配置项将失效，迁移指南可以参考 [builtin:swc-loader/options.rspackExperiments](/guide/features/loader#optionsrspackexperiments)。
+```js
+const wasmModule = await import.source('./module.wasm');
+const instance = await WebAssembly.instantiate(wasmModule);
+```
 
-  例如我们希望 `emotion` 的转换被应用于所有 `jsx` 文件：
+:::note
+普通 WebAssembly 导入会由 Rspack 实例化模块并暴露其导出；source phase 导入会返回编译后的 `WebAssembly.Module`，需要你的代码自行调用 `WebAssembly.instantiate`。
+:::
 
-  ```js title="rspack.config.js"
-  module.exports = {
-    module: {
-      rules: [
-        {
-          test: /\.jsx$/,
-          loader: 'builtin:swc-loader',
-          options: {
-            jsc: {
-              parser: {
-                syntax: "ecmascript",
-                jsx: true
-              }
-            },
-            rspackExperiments: {
-              emotion: true // 配置项和原 builtins 保持一致
-            }
-          }
-          type: 'javascript/auto',
-        },
-      ],
+## experiments.futureDefaults
+
+- **类型：** `boolean`
+- **默认值：** `false`
+
+使用下一个主版本 Rspack 的默认值，并在任何有问题的地方显示警告。
+
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    futureDefaults: true,
+  },
+};
+```
+
+## experiments.nativeWatcher
+
+<ApiMeta addedVersion="1.4.7" />
+
+- **类型：** `boolean`
+- **默认值：** `false`
+
+默认情况下，Rspack 使用 Watchpack 来监听文件变化，这在大多数情况下都能正常工作，但在某些特定的环境下可能会出现问题。
+例如在大量文件变化时，Watchpack 可能会出现性能问题, 更多详情请参考 [Watchpack issue #223](https://github.com/webpack/watchpack/issues/223)。
+
+如果你使用默认的 watcher 出现性能问题，可以尝试启用 `nativeWatcher`。
+
+启用 `nativeWatcher` 后，Rspack 将使用 Rust Native 文件系统监听文件变化，实现增量监听文件变更能力，这提供更好的性能和稳定性。
+
+```js title="rspack.config.mjs"
+export default {
+  watchOptions: {
+    // Other watch options...
+  },
+  experiments: {
+    nativeWatcher: true,
+  },
+};
+```
+
+## experiments.newCache
+
+<ApiMeta stability={Stability.Experimental} />
+
+- **类型：** `boolean | NewCache`
+- **默认值：** `false`
+
+启用实验性的缓存实现。设置为 `true` 时使用默认的缓存阶段，也可以传入对象来单独配置各阶段。`true` 等价于 `{}`。设置为 `false` 时继续使用现有的缓存实现。
+
+[`cache`](/config/cache) 控制是否启用缓存以及缓存数据的存储方式。使用 `cache: true` 或 `cache: { type: 'memory' }` 启用内存缓存，使用 `cache: { type: 'persistent' }` 在进程之间复用缓存。设置了 `cache: false` 时，即使启用 `experiments.newCache`，缓存仍然关闭。production 和 none 模式默认关闭 `cache`，因此需要显式开启。
+
+```js title="rspack.config.mjs"
+export default {
+  cache: true,
+  experiments: {
+    newCache: true,
+  },
+};
+```
+
+此选项与 [`incremental`](/config/incremental) 相互独立。切换缓存实现不会改变增量编译各阶段的启用状态。
+
+### 缓存阶段 \{#cache-stages}
+
+```ts
+type NewCache = {
+  codeGeneration?: boolean;
+  module?: boolean;
+  devtool?: boolean;
+  loader?: boolean;
+  minimize?: boolean;
+  resolver?: boolean;
+};
+```
+
+当 `newCache` 为 `true` 或对象时，使用以下默认值。未配置的属性会保留其默认值。
+
+| 选项             | 默认值  | 说明                                                                                                |
+| ---------------- | ------- | --------------------------------------------------------------------------------------------------- |
+| `codeGeneration` | `true`  | 缓存模块代码生成结果。                                                                              |
+| `module`         | `true`  | 缓存模块构建结果，包括 loader 执行和解析的结果。                                                    |
+| `devtool`        | `true`  | 缓存 [SourceMapDevToolPlugin](/plugins/source-map-dev-tool-plugin) 生成的 source map 产物。         |
+| `loader`         | `true`  | 为配置了 `cache: true` 的 loader 启用单独缓存。                                                     |
+| `minimize`       | `true`  | 缓存 [SwcJsMinimizerRspackPlugin](/plugins/swc-js-minimizer-rspack-plugin) 的 JavaScript 压缩结果。 |
+| `resolver`       | `false` | 缓存模块和 loader 的路径解析结果。                                                                  |
+
+例如，启用持久化缓存和路径解析缓存，其他阶段保留默认值：
+
+```js title="rspack.config.mjs"
+export default {
+  cache: {
+    type: 'persistent',
+  },
+  experiments: {
+    newCache: {
+      resolver: true,
     },
-    experiments: {
-      rspackFuture: {
-        disableTransformByDefault: true
-      }
-    }
-  };
-  ```
+  },
+};
+```
 
-  对于 decorator 的配置项可以在，swc 代码中找到并替换，如 [legacyDecorator](https://swc.rs/docs/configuration/compilation#jsctransformlegacydecorator)，[decoratorMetadata](https://swc.rs/docs/configuration/compilation#jsctransformlegacydecorator)。
+新的缓存实现目前不支持 [`cache.maxAge`](/config/cache#maxage) 和 [`cache.portable`](/config/cache#portable)。
 
-  2. **[target](/config/target) 将不会对用户侧代码做降级**
+## experiments.pureFunctions
 
-  在**以往**的版本中，我们通常会配置 `target: ["web", "es5"]` 来生成适用于 web 和降级后的代码。
+<ApiMeta addedVersion="2.0.0" />
 
-  现在，当用户开启了 `disableTransformByDefault` 配置项后，`target` 仅会被用于控制 runtime 代码（除了用户编写、node_modules 内的 rspack 生成的代码，例如 chunk 加载等等）
+- **类型：** `boolean`
+- **默认值：** 生产模式下为 `true`，其他模式下为 `false`
 
-  这和 webpack 的插件化设计思维完成了对齐，你可以使用 `builtin:swc-loader` 的 [`env`](https://swc.rs/docs/configuration/compilation#env) 或 [`target`](https://swc.rs/docs/configuration/compilation#jsctarget) 进行迁移，
-  并精确控制需要转译的模块：
+开启跨模块的无副作用函数调用优化，包括 `/*#__NO_SIDE_EFFECTS__*/` 注解和 [`module.parser.javascript.pureFunctions`](/config/module-parser#javascriptpurefunctions) 配置。被注解或用户配置标记的无副作用函数如果没有被真正使用到，则不会被打包进产物。
 
-  ```js title="rspack.config.js"
-  module.exports = {
-    module: {
-      rules: [
-        {
-          test: /\.js$/,
-          exclude: /node_modules/,
-          loader: 'builtin:swc-loader',
-          options: {
-            jsc: {
-              parser: {
-                syntax: "ecmascript"
-              },
-              target: "es5" // 注意，env 和 jsc.target 不能同时设置
-            },
-            env: { // 注意，env 和 jsc.target 不能同时设置
-              targets: "chrome >= 48"
-            }
-          }
-          type: 'javascript/auto',
-        },
-      ],
-    },
-    experiments: {
-      rspackFuture: {
-        disableTransformByDefault: true
-      }
-    }
-  };
-  ```
+更多背景可参考 [pureFunctions](/guide/optimization/tree-shaking#purefunctions) 和 [NO_SIDE_EFFECTS 注解](/guide/optimization/tree-shaking#no_side_effects-注解)。
 
-  **注意**：在未开启 `disableTransformByDefault` 时，rspack 内置的转译器会对 `node_modules` 下的所有内容进行转译。
-  因此在开启了 `disableTransformByDefault` 后，`builtin:swc-loader` 配合 `exclude: /node_modules/` 需要确保 `node_modules` 下代码已经完成了降级，否则可能会存在兼容性问题。
+该能力在生产模式下默认开启。若要关闭 pure function 分析，可将该选项设为 `false`。若要手动为命中的模块标记标识符 —— 既可以是第三方库中的导出函数，也可以是你自己代码中的 import 或本地声明 —— 推荐通过 `module.rules[i].parser` 来配置 [`module.parser.javascript.pureFunctions`](/config/module-parser#javascriptpurefunctions)，这样规则只会作用于目标模块。
 
-  3. **移除了非 webpack 兼容的 [Rule.type](/config/module#ruletype)**
-
-  这些类型被移除：
-
-  - `"typescript"`
-  - `"jsx"`
-  - `"tsx"`
-
-  对于 JS 相关的类型仅会保留：
-
-  - `"javascript/auto"`
-  - `"javascript/esm"`
-  - `"javascript/dynamic"`
-
-  在开启 `disableTransformByDefault` 后，rspack 仅支持符合 web 标准的输入，对齐 webpack 的设计理念。
-
-  在我们完成和 webpack 的讨论后，webpack 和 rspack 将会提供更加开箱即用的配置，以支持非标准的输入，如 TypeScript 等。
-
-  由于目前对于 `jsx`, `tsx`, `ts` 后缀名的文件会隐式地开启转译，因此在开启 `disableTransformByDefault` 后会提示编译报错，你可以这样完成迁移：
-
-  ```js title="rspack.config.js"
-  module.exports = {
-    module: {
-      rules: [
-        {
-          test: /\.ts$/,
-          exclude: /node_modules/,
-          loader: 'builtin:swc-loader',
-          options: {
-            jsc: {
-              parser: {
-                syntax: "typescript"
-              }
-            }
-          }
-          type: 'javascript/auto',
-        },
-      ],
+```js title="rspack.config.mjs"
+export default {
+  experiments: {
+    pureFunctions: true,
+  },
+  module: {
+    rules: [
       {
-        test: /\.tsx$/,
-        exclude: /node_modules/,
-        loader: 'builtin:swc-loader',
-        options: {
-          jsc: {
-            parser: {
-              syntax: "typescript",
-              tsx: true
-            }
-          }
-        }
-        type: 'javascript/auto',
+        test: /node_modules\/some-library\/index\.js$/,
+        parser: {
+          pureFunctions: ['isString'],
+        },
       },
-      {
-        test: /\.jsx$/,
-        exclude: /node_modules/,
-        loader: 'builtin:swc-loader',
-        options: {
-          jsc: {
-            parser: {
-              syntax: "ecmascript",
-              jsx: true
-            }
-          }
-        }
-      }
-    },
-    experiments: {
-      rspackFuture: {
-        disableTransformByDefault: true
-      }
-    }
-  };
-  ```
-
-### experiments.rspackFuture.newResolver
-
-<ApiMeta
-  addedVersion="0.3.7"
-  removedVersion="0.5.0"
-  stability={Stability.Removed}
-/>
-
-- **类型：** `boolean`
-
-- **引入版本：** v0.3.5
-
-- **默认开启版本：** v0.4.0
-
-- **移除版本：** v0.5.0
-
-该功能将会开启 [oxc](https://github.com/web-infra-dev/oxc) 提供的 resolver，新的实现比旧版的 resolver 快了 5 倍。
-
-```js title="rspack.config.js"
-module.exports = {
-  experiments: {
-    rspackFuture: {
-      newResolver: true,
-    },
+    ],
   },
 };
 ```
 
-新的 resolver 同时提供了在 [tsconfig-paths-webpack-plugin](https://github.com/dividab/tsconfig-paths-webpack-plugin#references-_string-defaultundefined) 中定义的[tsconfig project references](https://www.typescriptlang.org/docs/handbook/project-references.html) 功能。
-具体请参考 [resolve API](/config/resolve#resolvetsconfig).
+:::warning
+这个选项依赖 `optimization.sideEffects`。如果你关闭了 [`optimization.sideEffects`](/config/optimization#optimizationsideeffects)，pure function 相关提示将不会被分析。
+:::
 
-```js title="rspack.config.js"
-module.exports = {
-  resolve: {
-    tsconfig: {
-      configFile: path.resolve(__dirname, './tsconfig.json'),
-      references: 'auto'
-    },
-  }
+## experiments.runtimeMode
+
+<ApiMeta addedVersion="2.2.0" />
+
+- **类型：** `'webpack' | 'rspack'`
+- **默认值：** `'webpack'`
+
+将 `experiments.runtimeMode` 设置为 `'rspack'` 会启用一种实验性的 Rspack 运行时产物格式。该产物模式仍在开发中，请谨慎使用。目前，它在 [`output.module`](/config/output#outputmodule) 为 `true`，且 [`output.library.type`](/config/output#outputlibrarytype) 为 `'modern-module'` 时能够精简产物。在这种情况下，Rspack 运行时不再只导出一个挂载了多个辅助函数的 `__webpack_require__`，而是将加载函数、模块工厂和辅助函数分别导出为具名 ESM 绑定，让每个产物 chunk 只需导入实际使用的绑定。
+
+### 示例
+
+```js title="rspack.config.mjs"
+export default {
   experiments: {
-    rspackFuture: {
-      newResolver: true
-    }
-  }
-}
-```
-
-### experiments.rspackFuture.newTreeshaking
-
-<ApiMeta addedVersion="0.4.2" />
-
-- **类型：** `boolean`
-- **引入版本：** v0.4.2
-- **默认开启版本：** v0.6.0
-
-该功能启用了与 webpack 相同的新摇树优化实现，可以生成更高效和更小的代码。
-
-```js title="rspack.config.js"
-module.exports = {
-  experiments: {
-    rspackFuture: {
-      newTreeshaking: true,
+    runtimeMode: 'rspack',
+  },
+  output: {
+    module: true,
+    library: {
+      type: 'modern-module',
     },
+  },
+  optimization: {
+    runtimeChunk: 'single',
   },
 };
 ```
 
-### experiments.rspackFuture.disableApplyEntryLazily
+生成的 Rspack 运行时及使用它的 chunk 会采用如下组织方式（代码经过简化）：
 
-<ApiMeta
-  addedVersion="0.4.5"
-  removedVersion="0.6.0"
-  stability={Stability.Removed}
-/>
-
-- **类型：** `boolean`
-- **引入版本：** v0.4.5
-- **默认开启版本：** v0.5.0
-- **移除版本：** v0.6.0
-
-在未开启该功能时，在 `compiler.hooks.afterEnvironment` 调用之后仍然可以对 `options.entry` 进行有效的修改。
-
-而在开启该功能后，在 `compiler.hooks.afterEnvironment` 调用之后不会再进行 `options.entry` 的有效修改。该行为与 Webpack 一致，所以该配置对于使用 Rspack 开发应用的用户来说基本没有影响，而对于 Rspack 的插件或上层框架开发者需要注意。
-
-一个常见的场景就是在[创建 Compiler 之后增加一些入口](https://github.com/webpack/webpack-dev-server/blob/540c43852ea33f9cb18820e1cef05d5ddb86cc3e/lib/Server.js#L719-L783)：
+<Tabs>
+  <Tab label="runtimeMode: 'webpack'">
 
 ```js
-const rspack = require('@rspack/core');
-const compiler = rspack(options);
-
-function prependEntry(compiler, additionalEntry) {
-  for (const key in compiler.options.entry) {
-    compiler.options.entry[key].import = [
-      additionalEntry,
-      ...(compiler.options.entry[key].import || []),
-    ];
-  }
+// runtime.js
+var __webpack_modules__ = {};
+function __webpack_require__(moduleId) {
+  /* ... */
 }
+__webpack_require__.m = __webpack_modules__;
+__webpack_require__.n = (module) => {
+  /* ... */
+};
 
-prependEntry(compiler, 'dev-client.js');
+export { __webpack_require__ };
+
+// main.js
+import { __webpack_require__ } from './runtime.js';
+
+const value = __webpack_require__(moduleId);
+const getDefault = __webpack_require__.n(value);
 ```
 
-在开启该功能后修改将不生效，需要进行如下修改：
+  </Tab>
+  <Tab label="runtimeMode: 'rspack'">
 
 ```js
-const rspack = require('@rspack/core');
-const compiler = rspack(options);
-
-function prependEntry(compiler, additionalEntry) {
-  new compiler.webpack.EntryPlugin(compiler.context, additionalEntry, {
-    name: undefined,
-  }).apply(compiler);
+// runtime.js
+var modules = {};
+function rspackRequire(moduleId) {
+  /* ... */
 }
+var moduleFactories = modules;
+var compatGetDefaultExport = (module) => {
+  /* ... */
+};
 
-prependEntry(compiler, 'dev-client.js');
+export { rspackRequire, moduleFactories, compatGetDefaultExport };
+
+// main.js
+import { rspackRequire, compatGetDefaultExport } from './runtime.js';
+
+const value = rspackRequire(moduleId);
+const getDefault = compatGetDefaultExport(value);
 ```
+
+  </Tab>
+</Tabs>
+
+## experiments.useInputFileSystem
+
+<ApiMeta addedVersion="1.3.14" />
+
+- **类型：** `false | RegExp[]`
+- **默认值：** `false`
+
+默认情况下，Rspack 使用原生文件系统从磁盘读取文件。
+但你也可以通过更换 inputFileSystem，使用其他类型的文件系统。例如，可以用 memfs 替代默认文件系统来支持虚拟模块。
+
+不过，由于调用 Node.js 实现的文件系统存在性能开销，会显著拖慢 Rspack 的运行速度。
+因此，Rspack 提供了 `useInputFileSystem` 配置项，用于控制是使用原生文件系统还是自定义的 inputFileSystem。
+一般项目中，只有少量文件需要通过自定义文件系统访问，合理配置 `experiments.useInputFileSystem` 可以确保 Rspack 高效运行。
+
+下面的例子演示了如何替换默认的 inputFileSystem 为一个自定义的文件系统，只要自定义文件系统满足 [`InputFileSystem`](/api/javascript-api/compiler#inputfilesystem-1) 的接口定义。
+更多细节参考[测试用例](https://github.com/web-infra-dev/rspack/tree/main/tests/rspack-test/configCases/input-file-system/rspack.config.js)。
+
+```js title="rspack.config.mjs"
+export default {
+  entry: {
+    index: './virtual_index.js',
+  },
+  plugins: [
+    {
+      apply: (compiler) => {
+        compiler.hooks.beforeCompile.tap('SimpleInputFileSystem', () => {
+          compiler.inputFileSystem = {
+            readFile(path, cb) {
+              cb(null, `// the file content`);
+            },
+            stat(p, cb) {
+              cb(null, fsState);
+            },
+          };
+        });
+      },
+    },
+  ],
+  experiments: {
+    useInputFileSystem: [/virtual_.*\.js/],
+  },
+};
+```
+
+:::info 注意
+只有在 `compiler.run` 执行前替换的 `compiler.inputFileSystem` 才会生效；在 `compiler.run` 执行后替换将不会生效。
+:::
+
+### 配合 webpack-virtual-modules 使用
+
+例子：
+
+```js title="rspack.config.mjs"
+import VirtualModulesPlugin from 'webpack-virtual-modules';
+
+const virtualModules = new VirtualModulesPlugin({
+  'virtual-entry.js': `
+    import "./src/another-virtual.js";
+    import "./src/disk-file.js";
+    `,
+  'src/another-virtual.js': 'export default 42;',
+});
+
+export default {
+  entry: './virtual-entry.js',
+  plugins: [virtualModules],
+  experiments: {
+    useInputFileSystem: [/.*virtual.*\.js$/],
+  },
+};
+```
+
+当访问 `virtual-entry.js` 和 `src/another-virtual.js` 时，它们匹配了 `experiments.useInputFileSystem` 中的正则规则，Rspack 会通过 `VirtualModulesPlugin` 包装的输入文件系统读取它们；而像 `src/disk-file.js`，则会使用原生文件系统读取。
+
+<Attribution url="https://webpack.js.org/configuration/experiments/" />

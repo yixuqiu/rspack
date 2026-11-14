@@ -1,34 +1,83 @@
-use rspack_core::{module_id_expr, AsModuleDependency, ContextDependency};
-use rspack_core::{ContextOptions, Dependency, DependencyCategory, DependencyId};
-use rspack_core::{DependencyTemplate, DependencyType, ErrorSpan, RuntimeGlobals};
-use rspack_core::{TemplateContext, TemplateReplaceSource};
+use rspack_cacheable::{cacheable, cacheable_dyn};
+use rspack_core::{
+  AsModuleDependency, ContextDependency, ContextOptions, Dependency, DependencyCategory,
+  DependencyCodeGeneration, DependencyId, DependencyRange, DependencyTemplate,
+  DependencyTemplateType, DependencyType, ExportsInfoArtifact, ModuleGraph,
+  ModuleGraphCacheArtifact, ResourceIdentifier, TemplateContext, TemplateReplaceSource,
+};
+use rspack_error::Diagnostic;
 
 use super::create_resource_identifier_for_context_dependency;
 
-#[derive(Debug, Clone)]
+#[cacheable]
+#[derive(Debug)]
 pub struct ImportMetaContextDependency {
-  start: u32,
-  end: u32,
   id: DependencyId,
   options: ContextOptions,
-  span: Option<ErrorSpan>,
-  resource_identifier: String,
+  range: DependencyRange,
+  resource_identifier: ResourceIdentifier,
+  optional: bool,
+  critical: rspack_core::DependencyCriticalState,
+  kind: ImportMetaContextDependencyKind,
+}
+
+#[cacheable]
+#[derive(Debug, Clone, Copy)]
+enum ImportMetaContextDependencyKind {
+  WebpackContext,
+  Glob,
 }
 
 impl ImportMetaContextDependency {
-  pub fn new(start: u32, end: u32, options: ContextOptions, span: Option<ErrorSpan>) -> Self {
-    let resource_identifier = create_resource_identifier_for_context_dependency(None, &options);
-    Self {
-      start,
-      end,
+  pub fn new(options: ContextOptions, range: DependencyRange, optional: bool) -> Self {
+    Self::new_with_kind(
       options,
-      span,
-      id: DependencyId::new(),
+      range,
+      optional,
+      ImportMetaContextDependencyKind::WebpackContext,
+    )
+  }
+
+  pub fn new_glob(options: ContextOptions, range: DependencyRange, optional: bool) -> Self {
+    Self::new_with_kind(
+      options,
+      range,
+      optional,
+      ImportMetaContextDependencyKind::Glob,
+    )
+  }
+
+  fn new_with_kind(
+    options: ContextOptions,
+    range: DependencyRange,
+    optional: bool,
+    kind: ImportMetaContextDependencyKind,
+  ) -> Self {
+    let context = match kind {
+      ImportMetaContextDependencyKind::WebpackContext => None,
+      ImportMetaContextDependencyKind::Glob => Some(options.context.as_str()),
+    };
+    let resource_identifier = create_resource_identifier_for_context_dependency(context, &options);
+    Self {
+      options,
+      range,
       resource_identifier,
+      optional,
+      id: DependencyId::new(),
+      critical: Default::default(),
+      kind,
+    }
+  }
+
+  fn dependency_type_value(&self) -> DependencyType {
+    match self.kind {
+      ImportMetaContextDependencyKind::WebpackContext => DependencyType::ImportMetaContext,
+      ImportMetaContextDependencyKind::Glob => DependencyType::ImportMetaGlob,
     }
   }
 }
 
+#[cacheable_dyn]
 impl Dependency for ImportMetaContextDependency {
   fn id(&self) -> &DependencyId {
     &self.id
@@ -39,15 +88,27 @@ impl Dependency for ImportMetaContextDependency {
   }
 
   fn dependency_type(&self) -> &DependencyType {
-    &DependencyType::ImportMetaContext
+    match self.kind {
+      ImportMetaContextDependencyKind::WebpackContext => &DependencyType::ImportMetaContext,
+      ImportMetaContextDependencyKind::Glob => &DependencyType::ImportMetaGlob,
+    }
   }
 
-  fn span(&self) -> Option<ErrorSpan> {
-    self.span
+  fn range(&self) -> Option<DependencyRange> {
+    Some(self.range)
   }
 
-  fn dependency_debug_name(&self) -> &'static str {
-    "ImportMetaContextDependency"
+  fn could_affect_referencing_module(&self) -> rspack_core::AffectType {
+    rspack_core::AffectType::True
+  }
+
+  fn get_diagnostics(
+    &self,
+    _module_graph: &ModuleGraph,
+    _module_graph_cache: &ModuleGraphCacheArtifact,
+    _exports_info_artifact: &ExportsInfoArtifact,
+  ) -> Option<Vec<Diagnostic>> {
+    self.critical().map(|critical| vec![critical])
   }
 }
 
@@ -61,50 +122,78 @@ impl ContextDependency for ImportMetaContextDependency {
   }
 
   fn get_context(&self) -> Option<&str> {
-    None
+    match self.kind {
+      ImportMetaContextDependencyKind::WebpackContext => None,
+      ImportMetaContextDependencyKind::Glob => Some(self.options.context.as_str()),
+    }
   }
 
   fn resource_identifier(&self) -> &str {
     &self.resource_identifier
   }
 
-  fn set_request(&mut self, request: String) {
-    self.options.request = request;
+  fn get_optional(&self) -> bool {
+    self.optional
+  }
+
+  fn type_prefix(&self) -> rspack_core::ContextTypePrefix {
+    rspack_core::ContextTypePrefix::Normal
+  }
+
+  fn critical(&self) -> Option<Diagnostic> {
+    self.critical.get()
+  }
+
+  fn set_critical(&self, critical: Option<Diagnostic>) {
+    self.critical.set(critical);
   }
 }
 
-impl DependencyTemplate for ImportMetaContextDependency {
-  fn apply(
-    &self,
-    source: &mut TemplateReplaceSource,
-    code_generatable_context: &mut TemplateContext,
-  ) {
-    let TemplateContext {
-      compilation,
-      runtime_requirements,
-      ..
-    } = code_generatable_context;
-
-    let module_id = compilation
-      .get_module_graph()
-      .module_graph_module_by_dependency_id(&self.id)
-      .map(|m| m.id(&compilation.chunk_graph))
-      .expect("should have dependency id");
-
-    let module_id_str = module_id_expr(&compilation.options, &self.options.request, module_id);
-
-    runtime_requirements.insert(RuntimeGlobals::REQUIRE);
-    source.replace(
-      self.start,
-      self.end,
-      format!("{}({module_id_str})", RuntimeGlobals::REQUIRE).as_str(),
-      None,
-    );
-  }
-
-  fn dependency_id(&self) -> Option<DependencyId> {
-    Some(self.id)
+#[cacheable_dyn]
+impl DependencyCodeGeneration for ImportMetaContextDependency {
+  fn dependency_template(&self) -> Option<DependencyTemplateType> {
+    Some(DependencyTemplateType::Dependency(
+      self.dependency_type_value(),
+    ))
   }
 }
 
 impl AsModuleDependency for ImportMetaContextDependency {}
+
+#[cacheable]
+#[derive(Debug, Clone, Default)]
+pub struct ImportMetaContextDependencyTemplate;
+
+impl ImportMetaContextDependencyTemplate {
+  pub fn template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::ImportMetaContext)
+  }
+
+  pub fn glob_template_type() -> DependencyTemplateType {
+    DependencyTemplateType::Dependency(DependencyType::ImportMetaGlob)
+  }
+}
+
+impl DependencyTemplate for ImportMetaContextDependencyTemplate {
+  fn render(
+    &self,
+    dep: &dyn DependencyCodeGeneration,
+    source: &mut TemplateReplaceSource,
+    code_generatable_context: &mut TemplateContext,
+  ) {
+    let dep = dep
+      .as_any()
+      .downcast_ref::<ImportMetaContextDependency>()
+      .expect("ImportMetaContextDependencyTemplate should be used for ImportMetaContextDependency");
+
+    let TemplateContext {
+      compilation,
+      runtime_template,
+      ..
+    } = code_generatable_context;
+
+    let content =
+      runtime_template.module_raw(compilation, &dep.id, &dep.options.request, dep.optional);
+    source.replace(dep.range.start, dep.range.end, content, None);
+  }
+}

@@ -1,8 +1,10 @@
-import { ApiMeta } from '../../../components/ApiMeta';
+---
+description: 'Configure loader resolution with resolveLoader, including loader aliases and package entry defaults.'
+---
+
+import { Tabs, Tab } from '@theme';
 
 # ResolveLoader
-
-<ApiMeta addedVersion="0.3.1" />
 
 This configuration item is consistent in type with [`resolve`](/config/resolve), but this setting only affects the resolution of [loaders](/guide/features/loader).
 
@@ -21,9 +23,29 @@ This configuration item is consistent in type with [`resolve`](/config/resolve),
 
 ## Example
 
-For instance, if you are developing a loader and want to showcase its usage from a user's perspective in an example, you can write:
+For example, if you are developing a loader and want to showcase its usage from a user's perspective in an example, you can write:
 
-```js title="rspack.config.js"
+<Tabs>
+  <Tab label="ESM">
+
+```js title="rspack.config.mjs"
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+
+export default {
+  resolveLoader: {
+    alias: {
+      'amazing-loader': require.resolve('path-to-your-amazing-loader'),
+    },
+  },
+};
+```
+
+  </Tab>
+  <Tab label="CJS">
+
+```js title="rspack.config.cjs"
 module.exports = {
   resolveLoader: {
     alias: {
@@ -32,6 +54,9 @@ module.exports = {
   },
 };
 ```
+
+  </Tab>
+</Tabs>
 
 Then, in the example code, you can write:
 
